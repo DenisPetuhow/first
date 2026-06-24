@@ -2,36 +2,40 @@
 """
 MODEL · Главный класс модели SimulationModel.
 
-Держит состояние задачи (параметры, ГСЧ, накопленную выборку маршрутов,
-структуру покрытия, текущее расположение датчиков) и реализует:
-  * динамику инкрементального SAA (add_and_replace) — пересчёт расположения
-    на каждой итерации по всей накопленной выборке;
-  * пакетный расчёт (run_batch) — оптимум сразу по выборке T;
-  * сравнение трёх режимов на единой выборке (compare_modes);
-  * итоговые показатели (evaluate) и онлайн-показатели пролёта (live_metrics).
+Держит состояние задачи (параметры, ГСЧ, накопленную выборку, структуру
+покрытия, текущее расположение датчиков) и реализует:
+  * динамику инкрементального SAA (step / add_and_replace);
+  * пакетный расчёт (run_batch) и сравнение режимов (compare_modes);
+  * «вероятные пути» (probable_paths): веер дуг с шагом угла (этап 1) либо
+    кластеры частых пролётов (этап 2), с пометкой крайних путей;
+  * поле плотности маршрутов (density_field) для тепловой карты;
+  * итоговые и онлайн-показатели.
 
-Класс не зависит от средств отображения — допускает автономный прогон.
+Класс не зависит от средств отображения.
 """
 import numpy as np
 
 from config import Params, MODES
 from . import detection
-from .geometry import ellipse_geometry
-from .trajectories import max_sagitta, SAMPLERS, signed_max_lateral
+from .geometry import ellipse_geometry, auto_axes_limits, geo_to_local_km
+from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
+                           signed_max_lateral)
 from .optimization import candidate_grid, CoverageCache
 
 
 class SimulationModel:
-    """Вычислительная модель размещения датчиков (этап 1: пучок дуг)."""
+    """Вычислительная модель размещения датчиков обнаружения БПЛА."""
 
     def __init__(self, params: Params):
         params.validate()
         self.p = params
+        self._geo_info = None
         self.geom = ellipse_geometry(params.A, params.B, params.L_max)
+        if params.geo:
+            _, _, lat0, lon0 = geo_to_local_km(params.A_geo, params.B_geo)
+            self._geo_info = (lat0, lon0)
         self.reset()
 
-    # ------------------------------------------------------------------
-    # Сброс состояния и пересоздание производных структур
     # ------------------------------------------------------------------
     def reset(self, seed=None):
         """Полный сброс: новая выборка, пустое расположение датчиков."""
@@ -39,13 +43,13 @@ class SimulationModel:
         if seed is not None:
             p.seed = seed
         self.rng = np.random.default_rng(p.seed)
-        # кэшируем предельную стрелу прогиба и сетку кандидатов (не меняются)
-        self.s_max = max_sagitta(p.A, p.B, p.L_max, p.n_points)
+        self.geom = ellipse_geometry(p.A, p.B, p.L_max)
+        self.theta_max = max_deflection_angle(p.A, p.B, p.L_max)
         self.candidates = candidate_grid(p.A, p.B, p.L_max, p.grid_step)
         self.cache = CoverageCache(self.candidates, p.R, p.L_seg, p.k)
-        self.trajectories = []        # накопленные маршруты
-        self.features = []            # скалярный признак каждого маршрута
-        self.sensors = np.empty((0, 2), float)   # текущее расположение S
+        self.trajectories = []
+        self.features = []
+        self.sensors = np.empty((0, 2), float)
         self.iteration = 0
 
     def set_mode(self, mode):
@@ -58,28 +62,24 @@ class SimulationModel:
     def weights(self):
         return MODES[self.p.mode]
 
+    def axes_limits(self):
+        return auto_axes_limits(self.geom, margin=0.10)
+
     # ------------------------------------------------------------------
     # Порождение и накопление маршрутов
     # ------------------------------------------------------------------
     def sample_trajectory(self):
-        """Случайный маршрут текущей модели движения. Возвращает (traj, feature)."""
         p = self.p
         sampler = SAMPLERS[p.traj_model]
         return sampler(p.A, p.B, p.L_max, self.rng,
                        sigma_frac=p.sigma_frac, n_points=p.n_points,
-                       s_max=self.s_max)
+                       theta_max=self.theta_max)
 
     def recompute_placement(self):
-        """Заново решить задачу размещения по всей накопленной выборке."""
         self.sensors = self.cache.greedy(self.p.N, self.weights)
         return self.sensors
 
     def add_and_replace(self, traj, feature):
-        """Один шаг динамики SAA: добавить маршрут и пересчитать расположение.
-
-        Реализует принцип «усредняется статистика, а не координаты»: расположение
-        выводится заново как оптимум по накопленной выборке.
-        """
         self.trajectories.append(traj)
         self.features.append(feature)
         self.cache.add_trajectory(traj)
@@ -87,19 +87,11 @@ class SimulationModel:
         return self.recompute_placement()
 
     def step(self):
-        """Породить маршрут, добавить его и пересчитать расположение."""
         traj, feature = self.sample_trajectory()
         sensors = self.add_and_replace(traj, feature)
         return traj, sensors
 
-    # ------------------------------------------------------------------
-    # Пакетный расчёт по всей выборке
-    # ------------------------------------------------------------------
     def run_batch(self, T=None, mode=None):
-        """Полный расчёт: набрать T маршрутов и разместить датчики один раз.
-
-        Возвращает (sensors, metrics).
-        """
         if mode is not None:
             self.p.mode = mode
         T = T or self.p.T
@@ -113,46 +105,80 @@ class SimulationModel:
         self.recompute_placement()
         return self.sensors, self.evaluate()
 
-    def top_flights(self, top=10):
-        """Десять наиболее частых пролётов: гистограмма по скалярному признаку
-        маршрута, для каждой частой корзины — представительный реальный маршрут.
+    # ------------------------------------------------------------------
+    # Вероятные пути (для обеих моделей движения)
+    # ------------------------------------------------------------------
+    def probable_paths(self, top=10):
+        """Единый список вероятных путей: для дуг — веер по шагу угла;
+        для петель — представители частых кластеров. Крайние пути помечены
+        is_extreme (рисуются пунктиром).
 
-        Возвращает список (traj, weight) с weight in [0..1].
+        Каждый элемент: dict(traj, weight[0..1], is_extreme, label).
         """
+        p = self.p
+        if p.traj_model == "arc":
+            fan = arc_fan(p.A, p.B, p.L_max, p.angle_step_deg,
+                          sigma_frac=p.sigma_frac, n_points=p.n_points)
+            for f in fan:
+                f["label"] = f"{f['theta']:+.0f}°"
+            return fan
+        # петли: кластеризация накопленных маршрутов по боковому отклонению
+        return self._serpentine_clusters(top)
+
+    def _serpentine_clusters(self, top):
         if not self.trajectories:
             return []
         feats = np.asarray(self.features)
-        bins = max(top, 12)
-        counts, edges = np.histogram(feats, bins=bins)
-        order = np.argsort(counts)[::-1]
-        order = [b for b in order if counts[b] > 0][:top]
+        counts, edges = np.histogram(feats, bins=max(top, 12))
+        order = [b for b in np.argsort(counts)[::-1] if counts[b] > 0][:top]
         if not order:
             return []
         centers = 0.5 * (edges[:-1] + edges[1:])
-        max_count = counts[order].max()
-        result = []
+        cmax = counts[order].max()
+        fmin, fmax = feats.min(), feats.max()
+        out = []
         for b in order:
             lo, hi = edges[b], edges[b + 1]
             in_bin = np.where((feats >= lo) & (feats <= hi))[0]
             if len(in_bin) == 0:
                 continue
-            # представитель — маршрут, ближайший к центру корзины
             rep = in_bin[np.argmin(np.abs(feats[in_bin] - centers[b]))]
-            weight = counts[b] / max_count
-            result.append((self.trajectories[rep], float(weight)))
-        return result
+            fval = feats[rep]
+            out.append(dict(
+                traj=self.trajectories[rep],
+                weight=float(counts[b] / cmax),
+                is_extreme=bool(fval <= fmin + 1e-6 or fval >= fmax - 1e-6),
+                label=f"{fval:+.0f} км",
+            ))
+        return out
+
+    def density_field(self, nbins=160):
+        """2D-плотность точек накопленных маршрутов для тепловой карты.
+
+        Возвращает (H, extent) либо (None, None), если выборка пуста.
+        """
+        if not self.trajectories:
+            return None, None
+        pts = np.vstack(self.trajectories)
+        (x0, x1), (y0, y1) = self.axes_limits()
+        H, xe, ye = np.histogram2d(pts[:, 0], pts[:, 1], bins=nbins,
+                                   range=[[x0, x1], [y0, y1]])
+        H = H.T
+        if H.max() > 0:
+            H = H / H.max()
+        return H, (x0, x1, y0, y1)
 
     # ------------------------------------------------------------------
     # Показатели
     # ------------------------------------------------------------------
     def evaluate(self, sensors=None, trajectories=None):
-        """Итоговые показатели по выборке (раздел 6 требований)."""
         S = self.sensors if sensors is None else sensors
         trajs = self.trajectories if trajectories is None else trajectories
         p = self.p
         if not trajs:
             return dict(avg_crossings=0.0, avg_uncovered_distance=0.0,
-                        avg_coverage_percent=0.0, share_meeting_k=0.0)
+                        avg_coverage_percent=0.0, share_meeting_k=0.0,
+                        n_sensors=len(S))
         n_list, cov_list, unc_list = [], [], []
         for t in trajs:
             n_list.append(detection.n_detections(t, S, p.R))
@@ -164,13 +190,10 @@ class SimulationModel:
             avg_uncovered_distance=float(np.mean(unc_list)),
             avg_coverage_percent=float(np.mean(cov_list) * 100.0),
             share_meeting_k=float(np.mean([x >= p.k for x in n_list]) * 100.0),
+            n_sensors=len(S),
         )
 
     def compare_modes(self):
-        """Сравнение трёх режимов на текущей накопленной выборке.
-
-        Возвращает {mode: metrics}. Текущий режим модели восстанавливается.
-        """
         saved = self.p.mode
         out = {}
         for m in MODES:
@@ -181,8 +204,6 @@ class SimulationModel:
         return out
 
     def live_metrics(self, partial_traj):
-        """Онлайн-показатели для участка маршрута, пройденного БПЛА:
-        процент пути под наблюдением и число пересечений (засечек)."""
         if len(partial_traj) < 2:
             return 0.0, 0
         seen = detection.continuous_coverage(partial_traj, self.sensors, self.p.R) * 100.0
