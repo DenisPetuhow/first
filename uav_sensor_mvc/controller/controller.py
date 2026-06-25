@@ -90,6 +90,7 @@ class SimulationController:
         self.speed = int(val)
 
     def on_toggle(self):
+        self._sync_geometry()
         t = self._toggles()
         freq, fan, density = self._layers(t)
         if self.cur_traj is not None:
@@ -111,6 +112,7 @@ class SimulationController:
         self._pause()
         traj, sensors = self.model.step()
         self.cur_traj = None
+        self._sync_geometry()
         t = self._toggles()
         freq, fan, density = self._layers(t)
         self.view.draw_static_frame(sensors, self.model.p.R, freq, fan, density,
@@ -131,6 +133,7 @@ class SimulationController:
         self.view.flash_title("Идёт пакетный расчёт…", color=None)
         self.view.fig.canvas.draw_idle()
         sensors, metrics = self.model.run_batch()
+        self._sync_geometry()
         t = self._toggles()
         freq, fan, density = self._layers(t)
         title = (f"Пакетно | {MODE_LABELS[self.model.p.mode]} | "
@@ -159,6 +162,7 @@ class SimulationController:
             traj, _ = self.model.step()
             self.cur_traj = traj
             self.j = 0
+            self._sync_geometry()
             t = self._toggles()
             freq, fan, density = self._layers(t)
             self.view.setup_flight(traj, self.model.sensors, self.model.p.R,
@@ -190,12 +194,20 @@ class SimulationController:
             self.view.set_running_label(False)
         self.timer.stop()
 
+    def _current_bbox(self):
+        # «веер» включён -> показываем весь коридор (с пределами);
+        # иначе зум на зону типичных маршрутов
+        if self._toggles()["show_fan"]:
+            return self.model.corridor_bbox()
+        return self.model.view_bbox()
+
     def _sync_geometry(self):
         self.view.update_geometry(self.model.p.A, self.model.p.B,
                                   self.model.corridor_outline(),
-                                  self.model.corridor_bbox())
+                                  self._current_bbox())
 
     def _redraw_idle_or_last(self, title=None):
+        self._sync_geometry()
         t = self._toggles()
         freq, fan, density = self._layers(t)
         if not self.model.trajectories:

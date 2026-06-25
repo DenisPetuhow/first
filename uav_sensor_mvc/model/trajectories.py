@@ -68,10 +68,29 @@ def arc_length_from_angle(c_len, theta_rad):
 
 
 def make_arc_by_angle(A, B, theta_deg, n_points=140):
+    """Дуга A->B по знаковому касательно-хордовому углу theta (градусы).
+
+    Прямая параметризация центральным углом: корректна для ЛЮБОГО theta, включая
+    theta > 90° (большие дуги со стрелой > c/2), где формула через стрелу прогиба
+    давала вырождение.
+    """
     A, B = np.asarray(A, float), np.asarray(B, float)
-    c_len = float(np.linalg.norm(B - A))
-    sag = np.sign(theta_deg) * _sagitta_from_angle(c_len, np.radians(theta_deg))
-    return make_arc(A, B, sag, n_points)
+    chord = B - A
+    c_len = float(np.linalg.norm(chord))
+    mid = 0.5 * (A + B)
+    th = np.radians(theta_deg)
+    if abs(th) < 1e-9:
+        t = np.linspace(0.0, 1.0, n_points)
+        return A[None, :] + t[:, None] * chord[None, :]
+    ux = chord / c_len
+    un = np.array([-ux[1], ux[0]])
+    ath = abs(th)
+    R = c_len / (2.0 * np.sin(ath))            # радиус дуги
+    yc = -R * np.cos(ath)                       # центр окружности (лок. коорд.)
+    alphas = np.linspace(-ath, ath, n_points)   # от A (-ath) к B (+ath)
+    xl = R * np.sin(alphas)                      # локальная x в [-c/2, c/2]
+    yl = np.sign(theta_deg) * (yc + R * np.cos(alphas))  # сторона по знаку угла
+    return mid[None, :] + xl[:, None] * ux[None, :] + yl[:, None] * un[None, :]
 
 
 def max_deflection_angle(A, B, L_max):

@@ -58,6 +58,30 @@ class SimulationModel:
         self.features = []
         self.sensors = np.empty((0, 2), float)
         self.iteration = 0
+        # кэш геометрии отображения (пересчитывается при смене параметров)
+        self._corr_outline = corridor_outline(p.A, p.B, p.L_max, p.traj_model)
+        self._corr_bbox = corridor_bbox(p.A, p.B, p.L_max, p.traj_model)
+        self._view_bbox = self._compute_view_bbox()
+
+    def _compute_view_bbox(self, n=200, margin=0.06):
+        """Габариты ЗОНЫ МАРШРУТОВ: где реально лежат ~96% траекторий выбранного
+        профиля (детерминированная пред-выборка, не зависит от живого прогона).
+        Используется для зума карты вместо полного коридора."""
+        p = self.p
+        sampler = SAMPLERS[p.traj_model]
+        rng = np.random.default_rng(12345)
+        pts = []
+        for _ in range(n):
+            tr, _ = sampler(p.A, p.B, p.L_max, rng, sigma_frac=p.sigma_frac,
+                            n_points=p.n_points, theta_max=self.theta_max,
+                            profile=p.motion_profile)
+            pts.append(tr)
+        P = np.vstack(pts)
+        x0, x1 = np.percentile(P[:, 0], [1, 99])
+        y0, y1 = np.percentile(P[:, 1], [2, 98])
+        x0 = min(x0, p.A[0]); x1 = max(x1, p.B[0])      # концы A, B всегда в кадре
+        dx, dy = (x1 - x0) * margin, (y1 - y0) * margin + 1e-6
+        return (float(x0 - dx), float(x1 + dx), float(y0 - dy), float(y1 + dy))
 
     def set_mode(self, mode):
         self.p.mode = mode
@@ -73,12 +97,16 @@ class SimulationModel:
         return MODES[self.p.mode]
 
     def corridor_bbox(self):
-        """Габариты коридора движения (x0, x1, y0, y1) — для масштаба карты."""
-        return corridor_bbox(self.p.A, self.p.B, self.p.L_max, self.p.traj_model)
+        """Габариты полного коридора движения (все возможные маршруты)."""
+        return self._corr_bbox
 
     def corridor_outline(self):
         """Границы коридора движения (upper, lower) — для контура на карте."""
-        return corridor_outline(self.p.A, self.p.B, self.p.L_max, self.p.traj_model)
+        return self._corr_outline
+
+    def view_bbox(self):
+        """Габариты зоны типичных маршрутов (зум карты, профиль-зависимо)."""
+        return self._view_bbox
 
     # ------------------------------------------------------------------
     # Порождение и накопление маршрутов
