@@ -17,9 +17,9 @@ import numpy as np
 
 from config import Params, MODES
 from . import detection
-from .geometry import ellipse_geometry, auto_axes_limits, geo_to_local_km
+from .geometry import ellipse_geometry, geo_to_local_km
 from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
-                           signed_max_lateral)
+                           signed_max_lateral, corridor_bbox, corridor_outline)
 from .optimization import candidate_grid, CoverageCache
 
 
@@ -38,14 +38,20 @@ class SimulationModel:
 
     # ------------------------------------------------------------------
     def reset(self, seed=None):
-        """Полный сброс: новая выборка, пустое расположение датчиков."""
+        """Полный сброс: НОВАЯ случайная выборка, пустое расположение датчиков.
+
+        Если seed не задан явно (p.seed=None), генератор инициализируется от
+        системной энтропии — каждый прогон даёт другой случайный результат.
+        Передайте seed (или задайте p.seed) для воспроизводимости.
+        """
         p = self.p
         if seed is not None:
             p.seed = seed
         self.rng = np.random.default_rng(p.seed)
         self.geom = ellipse_geometry(p.A, p.B, p.L_max)
         self.theta_max = max_deflection_angle(p.A, p.B, p.L_max)
-        self.candidates = candidate_grid(p.A, p.B, p.L_max, p.grid_step)
+        self.candidates = candidate_grid(p.A, p.B, p.L_max, p.grid_step,
+                                         traj_model=p.traj_model)
         self.cache = CoverageCache(self.candidates, p.R, p.L_seg, p.k)
         self.trajectories = []
         self.features = []
@@ -58,12 +64,20 @@ class SimulationModel:
     def set_traj_model(self, traj_model):
         self.p.traj_model = traj_model
 
+    def set_profile(self, profile):
+        self.p.motion_profile = profile
+
     @property
     def weights(self):
         return MODES[self.p.mode]
 
-    def axes_limits(self):
-        return auto_axes_limits(self.geom, margin=0.10)
+    def corridor_bbox(self):
+        """Габариты коридора движения (x0, x1, y0, y1) — для масштаба карты."""
+        return corridor_bbox(self.p.A, self.p.B, self.p.L_max, self.p.traj_model)
+
+    def corridor_outline(self):
+        """Границы коридора движения (upper, lower) — для контура на карте."""
+        return corridor_outline(self.p.A, self.p.B, self.p.L_max, self.p.traj_model)
 
     # ------------------------------------------------------------------
     # Порождение и накопление маршрутов
@@ -73,7 +87,7 @@ class SimulationModel:
         sampler = SAMPLERS[p.traj_model]
         return sampler(p.A, p.B, p.L_max, self.rng,
                        sigma_frac=p.sigma_frac, n_points=p.n_points,
-                       theta_max=self.theta_max)
+                       theta_max=self.theta_max, profile=p.motion_profile)
 
     def recompute_placement(self):
         self.sensors = self.cache.greedy(self.p.N, self.weights)
@@ -117,11 +131,9 @@ class SimulationModel:
         """
         p = self.p
         if p.traj_model == "arc":
-            fan = arc_fan(p.A, p.B, p.L_max, p.angle_step_deg,
-                          sigma_frac=p.sigma_frac, n_points=p.n_points)
-            for f in fan:
-                f["label"] = f"{f['theta']:+.0f}°"
-            return fan
+            return arc_fan(p.A, p.B, p.L_max, p.angle_step_deg,
+                           sigma_frac=p.sigma_frac, n_points=p.n_points,
+                           profile=p.motion_profile)
         # петли: кластеризация накопленных маршрутов по боковому отклонению
         return self._serpentine_clusters(top)
 
@@ -160,7 +172,7 @@ class SimulationModel:
         if not self.trajectories:
             return None, None
         pts = np.vstack(self.trajectories)
-        (x0, x1), (y0, y1) = self.axes_limits()
+        x0, x1, y0, y1 = self.corridor_bbox()
         H, xe, ye = np.histogram2d(pts[:, 0], pts[:, 1], bins=nbins,
                                    range=[[x0, x1], [y0, y1]])
         H = H.T

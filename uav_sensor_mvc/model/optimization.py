@@ -18,6 +18,7 @@ import numpy as np
 
 from config import SPREAD_EPS
 from .geometry import ellipse_geometry, points_in_ellipse
+from .trajectories import corridor_filter
 
 
 # ----------------------------------------------------------------------
@@ -37,17 +38,25 @@ def _popcount(a):
 # ----------------------------------------------------------------------
 # Сетка кандидатных позиций датчиков внутри эллипса достижимости
 # ----------------------------------------------------------------------
-def candidate_grid(A, B, L_max, step):
-    """Сетка кандидатных позиций (M, 2), целиком лежащих в эллипсе достижимости."""
+def candidate_grid(A, B, L_max, step, corridor=True, traj_model="arc"):
+    """Сетка кандидатных позиций (M, 2).
+
+    По умолчанию ограничена КОРИДОРОМ движения (зоной всех возможных маршрутов)
+    — датчики не попадают в недостижимые «мёртвые» зоны эллипса.
+    corridor=False оставляет весь эллипс достижимости.
+    """
     g = ellipse_geometry(A, B, L_max)
     cx, cy = g["center"]
     a, b = g["a"], g["b"]
     xs = np.arange(cx - a, cx + a + step, step)
     ys = np.arange(cy - b, cy + b + step, step)
-    # обход x-major: согласует разрешение совпадений с эталонной реализацией
+    # обход x-major: стабильное разрешение совпадений жадного алгоритма
     gx, gy = np.meshgrid(xs, ys, indexing="ij")
     pts = np.column_stack([gx.ravel(), gy.ravel()])
-    return pts[points_in_ellipse(pts, A, B, L_max)]
+    pts = pts[points_in_ellipse(pts, A, B, L_max)]
+    if corridor and len(pts):
+        pts = pts[corridor_filter(pts, A, B, L_max, traj_model)]
+    return pts
 
 
 # ----------------------------------------------------------------------

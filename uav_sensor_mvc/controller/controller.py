@@ -2,45 +2,53 @@
 """
 CONTROLLER · Связующее звено между моделью и представлением.
 
-Регистрирует обработчики виджетов, применяет правку параметров (с перезапуском
-расчёта), ведёт анимацию итеративного режима через таймер холста, рисует веер
-вероятных путей и тепловую карту плотности, запускает пакетный расчёт и
-сравнение режимов, поддерживает панель показателей.
+Обрабатывает события виджетов (правка параметров с перезапуском, режимы
+просмотра, переключатели, чекбоксы слоёв), ведёт ПЛАВНУЮ анимацию полёта через
+блиттинг, запускает пакетный расчёт и сравнение режимов, поддерживает панель
+показателей. Бизнес-логику делегирует модели, отрисовку — представлению.
 """
-from config import MODE_LABELS, TRAJ_LABELS
+from config import MODE_LABELS, TRAJ_LABELS, MOTION_LABELS
 from view.view import PARAM_SPECS
 
 
 class SimulationController:
-    INTERVAL_MS = 45
+    INTERVAL_MS = 33                     # ~30 кадров/с (с блиттингом плавно)
 
     def __init__(self, model, view):
         self.model = model
         self.view = view
         self.speed = int(view.slider_speed.val)
-
         self.running = False
         self.cur_traj = None
         self.j = 0
         self.target_iters = model.p.T
-        self._paths = []
-        self._density = None
 
         self.timer = view.fig.canvas.new_timer(interval=self.INTERVAL_MS)
         self.timer.add_callback(self._tick)
 
         view.set_callbacks(
             on_start_pause=self.on_start_pause, on_step=self.on_step,
-            on_reset=self.on_reset, on_batch=self.on_batch,
-            on_apply=self.on_apply, on_mode=self.on_mode,
-            on_traj=self.on_traj, on_speed=self.on_speed)
+            on_reset=self.on_reset, on_batch=self.on_batch, on_apply=self.on_apply,
+            on_mode=self.on_mode, on_traj=self.on_traj, on_profile=self.on_profile,
+            on_speed=self.on_speed, on_toggle=self.on_toggle)
 
-        self._refresh_paths()
-        self.view.draw_clear(paths=self._paths)
+        self._sync_geometry()
+        self._redraw_idle_or_last()
         self._update_metrics_idle()
 
     # ------------------------------------------------------------------
-    # Правка параметров -> перезапуск
+    # Слои отображения (по чекбоксам)
+    # ------------------------------------------------------------------
+    def _toggles(self):
+        return self.view.get_toggles()        # {show_heat, show_paths}
+
+    def _layers(self, t):
+        paths = self.model.probable_paths(top=10) if t["show_paths"] else None
+        density = self.model.density_field() if t["show_heat"] else None
+        return paths, density
+
+    # ------------------------------------------------------------------
+    # Правка параметров и переключатели -> перезапуск
     # ------------------------------------------------------------------
     def on_apply(self):
         try:
@@ -49,71 +57,65 @@ class SimulationController:
             self.view.set_param_values(self.model.p)
             self.view.flash_title("Ошибка ввода: проверьте числовые поля.")
             return
-        snapshot = {n: getattr(self.model.p, n) for n, _l, _t in PARAM_SPECS}
+        snap = {n: getattr(self.model.p, n) for n, _l, _t in PARAM_SPECS}
         for n, v in vals.items():
             setattr(self.model.p, n, v)
         try:
             self.model.p.validate()
         except ValueError as e:
-            for n, v in snapshot.items():
+            for n, v in snap.items():
                 setattr(self.model.p, n, v)
             self.view.set_param_values(self.model.p)
             self.view.flash_title(f"Недопустимо: {e}")
             return
-        self._pause()
-        self.model.reset()
-        self._sync_geometry()
-        self.cur_traj = None
-        self.target_iters = self.model.p.T
-        self._density = None
-        self._refresh_paths()
-        self.view.draw_clear(paths=self._paths,
-                             title="Параметры применены — расчёт перезапущен.")
-        self._update_metrics_idle()
+        self._restart("Параметры применены — расчёт перезапущен.")
 
     def on_mode(self, key):
         self.model.set_mode(key)
         if self.model.trajectories:
             self.model.recompute_placement()
-            self._redraw_current()
+            self._redraw_idle_or_last()
             self._update_metrics_full()
 
     def on_traj(self, key):
         self.model.set_traj_model(key)
-        self._pause()
-        self.model.reset()
-        self.cur_traj = None
-        self._density = None
-        self._refresh_paths()
-        self.view.draw_clear(
-            paths=self._paths,
-            title=f"Модель движения: {TRAJ_LABELS[key]}. Нажмите «Пуск».")
-        self._update_metrics_idle()
+        self._restart(f"Модель движения: {TRAJ_LABELS[key]}. Нажмите «Пуск».")
+
+    def on_profile(self, key):
+        self.model.set_profile(key)
+        self._restart(f"Профиль разброса: {MOTION_LABELS[key]}. Нажмите «Пуск».")
 
     def on_speed(self, val):
         self.speed = int(val)
 
+    def on_toggle(self):
+        t = self._toggles()
+        paths, density = self._layers(t)
+        if self.cur_traj is not None:
+            self.view.setup_flight(self.cur_traj, self.model.sensors, self.model.p.R,
+                                   paths, density, t["show_paths"], t["show_heat"],
+                                   self._iter_title(self.j))
+        else:
+            self._redraw_idle_or_last()
+
     # ------------------------------------------------------------------
-    # Запуск / шаг / сброс / пакетно
+    # Пуск / шаг / сброс / пакетно
     # ------------------------------------------------------------------
     def on_start_pause(self):
         self.running = not self.running
         self.view.set_running_label(self.running)
-        if self.running:
-            self.timer.start()
-        else:
-            self.timer.stop()
+        (self.timer.start if self.running else self.timer.stop)()
 
     def on_step(self):
         self._pause()
         traj, sensors = self.model.step()
         self.cur_traj = None
-        self._refresh_paths()
-        self._density = self.model.density_field()
-        self.view.draw_iterative_frame(traj, sensors, len(traj) - 1,
-                                       self.model.p.R,
-                                       self._iter_title(len(traj) - 1, traj),
-                                       paths=self._paths, density=self._density)
+        t = self._toggles()
+        paths, density = self._layers(t)
+        self.view.draw_iterative_frame(
+            traj, sensors, len(traj) - 1, self.model.p.R,
+            self._iter_title(len(traj) - 1, traj), paths, density,
+            t["show_paths"], t["show_heat"])
         self._update_metrics_full()
 
     def on_reset(self):
@@ -121,29 +123,28 @@ class SimulationController:
         self.model.reset()
         self.cur_traj = None
         self.j = 0
-        self._density = None
-        self._refresh_paths()
-        self.view.draw_clear(paths=self._paths)
+        self._sync_geometry()
+        self._redraw_idle_or_last("Сброшено. Новая случайная выборка.")
         self._update_metrics_idle()
 
     def on_batch(self):
         self._pause()
         self.view.flash_title("Идёт пакетный расчёт…", color=None)
         self.view.fig.canvas.draw_idle()
-        sensors, metrics = self.model.run_batch()
-        self._refresh_paths()
-        self._density = self.model.density_field()
-        title = (f"Пакетный режим | {MODE_LABELS[self.model.p.mode]} | "
+        sensors, metrics = self.model.run_batch()      # сразу весь результат
+        t = self._toggles()
+        paths, density = self._layers(t)
+        title = (f"Пакетно | {MODE_LABELS[self.model.p.mode]} | "
                  f"датчиков {metrics['n_sensors']} | "
                  f"покрытие {metrics['avg_coverage_percent']:.0f}% | "
-                 f"ср. пересечений {metrics['avg_crossings']:.1f} | "
-                 f"вне зоны {metrics['avg_uncovered_distance']:.1f} км")
-        self.view.draw_batch(self._paths, sensors, self.model.p.R, title,
-                             density=self._density)
+                 f"пересеч. {metrics['avg_crossings']:.1f} | "
+                 f"вне зоны {metrics['avg_uncovered_distance']:.0f} км")
+        self.view.draw_batch(paths, sensors, self.model.p.R, title, density,
+                             t["show_paths"], t["show_heat"])
         self._update_metrics_full(extra_compare=True)
 
     # ------------------------------------------------------------------
-    # Анимация
+    # Анимация (блиттинг)
     # ------------------------------------------------------------------
     def _tick(self):
         if not self.running:
@@ -159,73 +160,88 @@ class SimulationController:
             traj, _ = self.model.step()
             self.cur_traj = traj
             self.j = 0
-            self._refresh_paths()
-            self._density = self.model.density_field()
-
-        self.j += self.speed * (1 + self.model.iteration // 6)
+            t = self._toggles()
+            paths, density = self._layers(t)
+            self.view.setup_flight(traj, self.model.sensors, self.model.p.R,
+                                   paths, density, t["show_paths"], t["show_heat"],
+                                   self._iter_title(0))
+        self.j += self.speed * (1 + self.model.iteration // 8)
         end = len(self.cur_traj) - 1
         finished = self.j >= end
         if finished:
             self.j = end
-        self.view.draw_iterative_frame(
-            self.cur_traj, self.model.sensors, self.j, self.model.p.R,
-            self._iter_title(self.j, self.cur_traj),
-            paths=self._paths, density=self._density)
+        self.view.update_flight(self.j, self._hud_text(self.j))
         if finished:
             self._update_metrics_full()
             self.cur_traj = None
 
     # ------------------------------------------------------------------
+    def _restart(self, title):
+        self._pause()
+        self.model.reset()
+        self.cur_traj = None
+        self.j = 0
+        self.target_iters = self.model.p.T
+        self._sync_geometry()
+        self._redraw_idle_or_last(title)
+        self._update_metrics_idle()
+
     def _pause(self):
         if self.running:
             self.running = False
             self.view.set_running_label(False)
         self.timer.stop()
 
-    def _refresh_paths(self):
-        self._paths = self.model.probable_paths(top=10)
-
     def _sync_geometry(self):
-        xlim, ylim = self.model.axes_limits()
-        self.view.update_geometry(self.model.geom, self.model.p.A,
-                                  self.model.p.B, xlim, ylim)
+        self.view.update_geometry(self.model.p.A, self.model.p.B,
+                                  self.model.corridor_outline(),
+                                  self.model.corridor_bbox())
 
-    def _redraw_current(self):
-        traj = self.cur_traj
-        self.view.draw_iterative_frame(
-            traj, self.model.sensors,
-            (len(traj) - 1 if traj is not None else 0), self.model.p.R,
-            f"Режим: {MODE_LABELS[self.model.p.mode]} | "
-            f"датчиков {len(self.model.sensors)}",
-            paths=self._paths, density=self._density)
+    def _redraw_idle_or_last(self, title=None):
+        t = self._toggles()
+        paths, density = self._layers(t)
+        if not self.model.trajectories:
+            self.view.draw_clear(paths, density, t["show_paths"], t["show_heat"],
+                                 title or "Готово. «Пуск», «Шаг» или «Пакетно».")
+        else:
+            self.view.draw_iterative_frame(
+                None, self.model.sensors, 0, self.model.p.R,
+                title or (f"Режим: {MODE_LABELS[self.model.p.mode]} | "
+                          f"датчиков {len(self.model.sensors)}/{self.model.p.N}"),
+                paths, density, t["show_paths"], t["show_heat"])
 
-    def _iter_title(self, j, traj):
-        seen, nd = self.model.live_metrics(traj[:j + 1])
-        return (f"Итерация {self.model.iteration}/{self.target_iters} | "
-                f"датчиков {len(self.model.sensors)}/{self.model.p.N} | "
-                f"под наблюдением {seen:.0f}% | пересечений {nd}")
+    def _hud_text(self, j):
+        seen, nd = self.model.live_metrics(self.cur_traj[:j + 1])
+        return f"под наблюдением {seen:.0f}%   пересечений {nd}"
+
+    def _iter_title(self, j, traj=None):
+        return (f"Итерация {self.model.iteration}/{self.target_iters}   |   "
+                f"датчиков {len(self.model.sensors)}/{self.model.p.N}   |   "
+                f"профиль: {MOTION_LABELS[self.model.p.motion_profile]}")
 
     def _update_metrics_idle(self):
         p = self.model.p
+        x0, x1, y0, y1 = self.model.corridor_bbox()
         lines = [
             "ГЕОМЕТРИЯ",
-            f"  |AB|={p.ab_distance:g} км  L_max={p.L_max:g} км",
-            f"  эллипс a={self.model.geom['a']:.0f} b={self.model.geom['b']:.0f} км",
-            f"  предельный угол ±{self.model.theta_max:.0f}°",
-            f"  кандидатов: {len(self.model.candidates)}",
+            f"  |AB| = {p.ab_distance:g} км,  запас L_max = {p.L_max:g} км",
+            f"  большая полуось a = L_max/2 = {p.L_max/2:g} км",
+            f"  предельный угол дуги ±{self.model.theta_max:.0f}°",
+            f"  коридор: длина {x1-x0:.0f} × ширина {y1-y0:.0f} км",
+            f"  кандидатных позиций: {len(self.model.candidates)}",
             "",
             "РЕСУРС",
-            f"  датчиков N={p.N}  радиус R={p.R:g} км",
-            f"  кратность k={p.k}  сегментов={p.L_seg}",
+            f"  датчиков N = {p.N},  радиус R = {p.R:g} км",
+            f"  кратность k = {p.k},  сегментов = {p.L_seg}",
             "",
-            "Нажмите «Пуск», «Шаг» или «Пакетно».",
+            "Профиль: " + MOTION_LABELS[p.motion_profile],
         ]
         self.view.set_metrics(lines)
 
     def _update_metrics_full(self, extra_compare=False):
         m = self.model.evaluate()
         lines = [
-            f"ВЫБОРКА t = {self.model.iteration}",
+            f"ВЫБОРКА  t = {self.model.iteration}",
             f"  режим: {MODE_LABELS[self.model.p.mode]}",
             f"  задействовано датчиков: {m['n_sensors']}/{self.model.p.N}",
             "",
@@ -242,6 +258,5 @@ class SimulationController:
                              f"{mt['share_meeting_k']:3.0f}%")
         self.view.set_metrics(lines)
 
-    # ------------------------------------------------------------------
     def run(self):
         self.view.show()

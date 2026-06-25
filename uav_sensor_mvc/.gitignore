@@ -4,5 +4,7 @@ out/
 out_serp/
 _serp/
 out_test/
+examples/
+*.png
 *.gif
 .DS_Store
