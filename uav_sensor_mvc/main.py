@@ -19,7 +19,8 @@
 """
 import argparse
 
-from config import Params, MODES, MODE_LABELS, MOTION_LABELS, MOTION_PROFILES
+from config import (Params, MODES, MODE_LABELS, MOTION_LABELS, MOTION_PROFILES,
+                    TRAJ_LABELS)
 
 
 def build_params(args) -> Params:
@@ -183,7 +184,7 @@ def main():
         description="Размещение датчиков обнаружения БПЛА (MVC).")
     ap.add_argument("--mode", choices=["gui", "selftest", "render"], default="gui")
     ap.add_argument("--opt", choices=list(MODES), default="balanced")
-    ap.add_argument("--traj", choices=["arc", "serpentine"], default="arc")
+    ap.add_argument("--traj", choices=list(TRAJ_LABELS), default="arc")
     ap.add_argument("--profile", choices=list(MOTION_PROFILES), default="mixed",
                     help="профиль разброса маршрутов")
     ap.add_argument("--ab", type=float, help="расстояние |AB|, км")

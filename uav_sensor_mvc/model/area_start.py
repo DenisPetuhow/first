@@ -23,7 +23,7 @@ from config import MODES
 from . import detection
 from .geometry import ellipse_geometry
 from .trajectories import (make_arc_by_angle, max_deflection_angle, _sample_angle,
-                           polyline_length, arc_fan)
+                           polyline_length, arc_fan, maneuver_path)
 from .optimization import CoverageCache
 
 
@@ -84,58 +84,13 @@ def sample_area_arc(A, B, depth, width, L_max, rng, sigma_frac, n_points, profil
     return make_arc_by_angle(S0, B, theta, n_points), S0
 
 
-# Параметры манёвра по профилю: (макс. доля «петляния», коэф. наведения, доля
-# wander от предельного поворота). Сложный — максимально извилистый.
-_MANEUVER = {
-    "normal":  dict(slack=1.08, gain=0.85, wander=0.18),
-    "mixed":   dict(slack=1.30, gain=0.55, wander=0.55),
-    "complex": dict(slack=1.70, gain=0.32, wander=1.00),
-}
-
-
 def sample_maneuver(A, B, depth, width, L_max, rng, n_points, profile,
                     rmin_frac=0.11):
-    """Манёвренная ломаная из точки старта в B как у БПЛА самолётного типа.
-
-    Случайные повороты курса с ОГРАНИЧЕНИЕМ на поворот за шаг (радиус разворота
-    >= rmin). Наведение на цель усиливается к концу пути, чтобы маршрут приходил
-    в B. Длина ограничена запасом хода L_max.
-    """
+    """Манёвренная ломаная из СЛУЧАЙНОЙ точки старта зоны в B (БПЛА самолётного
+    типа). Использует общее ядро maneuver_path (ограничение радиуса разворота,
+    наведение на цель, длина <= L_max)."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    B = np.asarray(B, float)
-    D = float(np.linalg.norm(B - S0))
-    M = max(int(n_points) - 1, 8)
-    if D < 1e-6:
-        return np.repeat(S0[None, :], n_points, axis=0), S0
-
-    par = _MANEUVER.get(profile, _MANEUVER["mixed"])
-    slack_cap = min(L_max / D, par["slack"])
-    slack = 1.0 + (slack_cap - 1.0) * rng.uniform(0.6, 1.0)
-    Ltarget = D * slack                                # желаемая длина <= L_max
-    ds = Ltarget / M
-    rmin = rmin_frac * D                               # мин. радиус разворота
-    turn_max = ds / max(rmin, 1e-6)                    # предел поворота за шаг
-    wander = par["wander"] * turn_max
-
-    pos = S0.astype(float).copy()
-    head = np.arctan2(B[1] - S0[1], B[0] - S0[0]) + rng.normal(0, 0.25 * wander + 0.03)
-    pts = [pos.copy()]
-    for i in range(M):
-        frac = i / M
-        conv = 0.0 if frac < 0.7 else (frac - 0.7) / 0.3      # схождение к B к концу
-        g = par["gain"] * (1 - conv) + 0.95 * conv
-        w = wander * (1 - conv)
-        tb = np.arctan2(B[1] - pos[1], B[0] - pos[0])
-        dh = (tb - head + np.pi) % (2 * np.pi) - np.pi        # кратчайший доворот
-        turn = np.clip(g * dh + rng.normal(0, w), -turn_max, turn_max)
-        head += turn
-        pos = pos + ds * np.array([np.cos(head), np.sin(head)])
-        pts.append(pos.copy())
-    pts[-1] = B                                                # привести конец к цели
-    traj = np.asarray(pts, float)
-    if polyline_length(traj) > L_max * 1.03:                   # страховка по длине
-        t = np.linspace(0, 1, n_points)
-        return S0[None, :] + t[:, None] * (B - S0)[None, :], S0
+    traj = maneuver_path(S0, B, L_max, rng, profile, n_points, rmin_frac)
     return traj, S0
 
 

@@ -215,16 +215,16 @@ class SimulationView:
         self._header(0.838, 0.700, "ДВИЖЕНИЕ")
         self._traj_keys = list(TRAJ_LABELS)
         self.radio_traj = RadioButtons(
-            self.fig.add_axes([0.840, 0.648, 0.135, 0.045], facecolor=THEME["panel"]),
+            self.fig.add_axes([0.840, 0.618, 0.135, 0.074], facecolor=THEME["panel"]),
             [TRAJ_LABELS[k] for k in self._traj_keys],
             active=self._traj_keys.index(params.traj_model))
         self._style_radio(self.radio_traj)
         self.radio_traj.on_clicked(self._traj_clicked)
 
-        self._header(0.838, 0.628, "РАЗБРОС")
+        self._header(0.838, 0.598, "РАЗБРОС")
         self._prof_keys = list(MOTION_LABELS)
         self.radio_prof = RadioButtons(
-            self.fig.add_axes([0.840, 0.520, 0.135, 0.100], facecolor=THEME["panel"]),
+            self.fig.add_axes([0.840, 0.508, 0.135, 0.082], facecolor=THEME["panel"]),
             [MOTION_LABELS[k] for k in self._prof_keys],
             active=self._prof_keys.index(params.motion_profile))
         self._style_radio(self.radio_prof)

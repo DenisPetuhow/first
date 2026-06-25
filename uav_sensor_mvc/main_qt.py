@@ -18,14 +18,14 @@
 import argparse
 import sys
 
-from config import MODES, MOTION_PROFILES
+from config import MODES, MOTION_PROFILES, TRAJ_LABELS
 from main import build_params
 
 
 def main():
     ap = argparse.ArgumentParser(description="Размещение датчиков БПЛА — Qt/pyqtgraph.")
     ap.add_argument("--opt", choices=list(MODES), default="balanced")
-    ap.add_argument("--traj", choices=["arc", "serpentine"], default="arc")
+    ap.add_argument("--traj", choices=list(TRAJ_LABELS), default="arc")
     ap.add_argument("--profile", choices=list(MOTION_PROFILES), default="mixed")
     ap.add_argument("--ab", type=float); ap.add_argument("--Lmax", type=float)
     ap.add_argument("--N", type=int); ap.add_argument("--R", type=float)

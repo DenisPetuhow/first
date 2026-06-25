@@ -20,7 +20,8 @@ from . import detection
 from .geometry import ellipse_geometry, geo_to_local_km
 from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
                            signed_max_lateral, corridor_bbox, corridor_outline,
-                           frequent_arcs, frequent_serpentines, serpentine_fan)
+                           frequent_arcs, frequent_serpentines, serpentine_fan,
+                           frequent_maneuvers, maneuver_fan)
 from .optimization import candidate_grid, CoverageCache
 
 
@@ -159,6 +160,9 @@ class SimulationModel:
         if p.traj_model == "arc":
             return frequent_arcs(p.A, p.B, p.L_max, p.motion_profile,
                                  p.sigma_frac, n=n, n_points=p.n_points)
+        if p.traj_model == "maneuver":
+            return frequent_maneuvers(p.A, p.B, p.L_max, p.motion_profile,
+                                      p.sigma_frac, n=n, n_points=p.n_points)
         return frequent_serpentines(p.A, p.B, p.L_max, p.motion_profile,
                                     p.sigma_frac, n=n, n_points=p.n_points)
 
@@ -170,6 +174,9 @@ class SimulationModel:
             return arc_fan(p.A, p.B, p.L_max, p.angle_step_deg,
                            sigma_frac=p.sigma_frac, n_points=p.n_points,
                            profile=p.motion_profile)
+        if p.traj_model == "maneuver":
+            return maneuver_fan(p.A, p.B, p.L_max, profile=p.motion_profile,
+                                n_points=p.n_points)
         return serpentine_fan(p.A, p.B, p.L_max, n_points=p.n_points)
 
     def density_field(self, nbins=160):

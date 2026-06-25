@@ -167,9 +167,28 @@ def arc_fan(A, B, L_max, angle_step_deg, sigma_frac=0.45, n_points=140,
 #   serpentine — область под огибающей петель |y| <= b*sin(pi*x/d).
 # Кандидатные позиции датчиков и масштаб карты ограничиваются коридором.
 # ======================================================================
+def _reach_ellipse_halves(A, B, L_max, n_points=160):
+    """Верхняя/нижняя половины эллипса достижимости A<->B (для манёвра)."""
+    A, B = np.asarray(A, float), np.asarray(B, float)
+    mid = 0.5 * (A + B)
+    d = B - A
+    L = float(np.linalg.norm(d))
+    u = d / L if L > 1e-9 else np.array([1.0, 0.0])
+    nrm = np.array([-u[1], u[0]])
+    a = 0.5 * L_max
+    b = ellipse_b(A, B, L_max)
+    t = np.linspace(0.0, np.pi, n_points)
+    base = mid[None, :] + a * np.cos(t)[:, None] * u[None, :]
+    up = base + b * np.sin(t)[:, None] * nrm[None, :]
+    lo = base - b * np.sin(t)[:, None] * nrm[None, :]
+    return up, lo
+
+
 def corridor_outline(A, B, L_max, traj_model="arc", n_points=160):
     """Верхняя и нижняя границы коридора движения: (upper, lower) — массивы точек."""
     A, B = np.asarray(A, float), np.asarray(B, float)
+    if traj_model == "maneuver":
+        return _reach_ellipse_halves(A, B, L_max, n_points)
     if traj_model == "serpentine":
         d = float(np.linalg.norm(B - A))
         b = ellipse_b(A, B, L_max)
@@ -353,7 +372,78 @@ def serpentine_fan(A, B, L_max, k=7, n_points=140):
     return out
 
 
+# ======================================================================
+# Манёвренное движение БПЛА самолётного типа (ломаная)
+#   Случайные повороты курса с ОГРАНИЧЕНИЕМ радиуса разворота (rmin); наведение
+#   на цель усиливается к концу пути; длина <= L_max. Профиль задаёт извилистость:
+#   «обычный» — почти прямо, «смешанный» — зигзаг, «сложный» — максимально извилисто.
+# ======================================================================
+_MANEUVER_PARAMS = {
+    "normal":  dict(slack=1.08, gain=0.85, wander=0.18),
+    "mixed":   dict(slack=1.30, gain=0.55, wander=0.55),
+    "complex": dict(slack=1.70, gain=0.32, wander=1.00),
+}
+
+
+def maneuver_path(S0, B, L_max, rng, profile="mixed", n_points=140, rmin_frac=0.11):
+    """Манёвренная ломаная из S0 в B с ограничением радиуса разворота, длина <= L_max."""
+    S0 = np.asarray(S0, float); B = np.asarray(B, float)
+    D = float(np.linalg.norm(B - S0)); M = max(int(n_points) - 1, 8)
+    if D < 1e-6:
+        return np.repeat(S0[None, :], n_points, axis=0)
+    par = _MANEUVER_PARAMS.get(profile, _MANEUVER_PARAMS["mixed"])
+    slack_cap = min(L_max / D, par["slack"])
+    slack = 1.0 + (slack_cap - 1.0) * rng.uniform(0.6, 1.0)
+    Ltarget = D * slack; ds = Ltarget / M
+    rmin = rmin_frac * D; turn_max = ds / max(rmin, 1e-6)
+    wander = par["wander"] * turn_max
+    pos = S0.copy()
+    head = np.arctan2(B[1] - S0[1], B[0] - S0[0]) + rng.normal(0, 0.25 * wander + 0.03)
+    pts = [pos.copy()]
+    for i in range(M):
+        frac = i / M
+        conv = 0.0 if frac < 0.7 else (frac - 0.7) / 0.3
+        g = par["gain"] * (1 - conv) + 0.95 * conv
+        w = wander * (1 - conv)
+        tb = np.arctan2(B[1] - pos[1], B[0] - pos[0])
+        dh = (tb - head + np.pi) % (2 * np.pi) - np.pi
+        turn = np.clip(g * dh + rng.normal(0, w), -turn_max, turn_max)
+        head += turn
+        pos = pos + ds * np.array([np.cos(head), np.sin(head)])
+        pts.append(pos.copy())
+    pts[-1] = B
+    traj = np.asarray(pts, float)
+    if polyline_length(traj) > L_max * 1.03:
+        t = np.linspace(0, 1, n_points)
+        return S0[None, :] + t[:, None] * (B - S0)[None, :]
+    return traj
+
+
+def sample_maneuver_trajectory(A, B, L_max, rng, sigma_frac=0.45, n_points=140,
+                               theta_max=None, profile="normal"):
+    """Случайный манёвренный маршрут A->B. Возвращает (traj, feature)."""
+    traj = maneuver_path(A, B, L_max, rng, profile, n_points)
+    return traj, signed_max_lateral(traj, A, B)
+
+
+def frequent_maneuvers(A, B, L_max, profile, sigma_frac=0.45, n=10, n_points=140):
+    """n представительных манёвренных маршрутов (детерминированно)."""
+    rng = np.random.default_rng(4321)
+    return [dict(traj=maneuver_path(A, B, L_max, rng, profile, n_points),
+                 weight=0.6, is_extreme=False, label="манёвр")
+            for _ in range(n)]
+
+
+def maneuver_fan(A, B, L_max, profile="mixed", n_points=140, k=14):
+    """Веер манёвренных маршрутов (геометрия пространства манёвров)."""
+    rng = np.random.default_rng(321)
+    return [dict(traj=maneuver_path(A, B, L_max, rng, profile, n_points),
+                 weight=0.5, is_extreme=False, label="манёвр")
+            for _ in range(k)]
+
+
 SAMPLERS = {
     "arc": sample_arc_trajectory,
     "serpentine": sample_serpentine_trajectory,
+    "maneuver": sample_maneuver_trajectory,
 }
