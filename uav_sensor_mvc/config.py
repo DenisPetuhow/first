@@ -30,6 +30,12 @@ TRAJ_LABELS = {
     "serpentine": "петли (этап 2)",
 }
 
+# Модели движения для вкладки 2 (старт из зоны -> цель B)
+AREA_TRAJ_LABELS = {
+    "area_arc":  "дуги из старта",
+    "maneuver":  "ломаная (манёвр)",
+}
+
 # Профили разброса маршрутов (как часто выбираются длинные/короткие пути)
 MOTION_PROFILES = ("normal", "mixed", "complex")
 MOTION_LABELS = {
@@ -59,6 +65,8 @@ class Params:
     k: int = 3                     # требуемая кратность обнаружения
     L_seg: int = 10                # число сегментов разбиения маршрута
     angle_step_deg: float = 10.0   # шаг угла веера вероятных дуг
+    corridor_depth: float = 60.0   # глубина зоны старта (вдоль A->B), вкладка 2
+    corridor_width: float = 120.0  # ширина зоны старта (поперёк A->B), вкладка 2
     mode: str = "balanced"         # режим оптимизации
     traj_model: str = "arc"        # модель движения
     motion_profile: str = "mixed"  # профиль разброса маршрутов

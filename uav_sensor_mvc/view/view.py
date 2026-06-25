@@ -284,6 +284,9 @@ class SimulationView:
                 self.on_profile(k); return
 
     # ----- API для контроллера -----
+    def get_param_specs(self):
+        return PARAM_SPECS
+
     def set_callbacks(self, **cbs):
         for name, fn in cbs.items():
             setattr(self, name, fn)

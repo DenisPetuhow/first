@@ -39,16 +39,42 @@ def main():
     params = build_params(args)
 
     from pyqtgraph.Qt import QtWidgets
+    from config import THEME
     from model import SimulationModel
+    from model.area_start import AreaStartModel
     from view_qt import SimulationView
+    from view_qt.area_view import AreaStartView
     from controller_qt import QtSimulationController
+    from controller_qt.area_controller import AreaStartController
 
     app = QtWidgets.QApplication(sys.argv)
-    model = SimulationModel(params)
-    view = SimulationView(params.A, params.B, model.corridor_outline(),
-                          model.corridor_bbox(), params, speed=args.speed)
-    QtSimulationController(model, view)
-    view.show()
+
+    # Вкладка 1 — маршрут A->B как есть
+    p1 = params
+    m1 = SimulationModel(p1)
+    v1 = SimulationView(p1.A, p1.B, m1.corridor_outline(), m1.corridor_bbox(),
+                        p1, speed=args.speed)
+    c1 = QtSimulationController(m1, v1)
+
+    # Вкладка 2 — старт из зоны -> цель
+    p2 = build_params(args)
+    m2 = AreaStartModel(p2)
+    v2 = AreaStartView(p2.A, p2.B, m2.corridor_outline(), m2.corridor_bbox(),
+                       p2, speed=args.speed)
+    c2 = AreaStartController(m2, v2)
+
+    tabs = QtWidgets.QTabWidget()
+    tabs.setWindowTitle("Размещение датчиков обнаружения БПЛА — Qt/pyqtgraph")
+    tabs.setStyleSheet(
+        f"QTabWidget::pane {{ border: 0; }} "
+        f"QTabBar::tab {{ background: {THEME['panel']}; color: {THEME['text']};"
+        f" padding: 8px 16px; }} "
+        f"QTabBar::tab:selected {{ background: {THEME['accent']}; color: white; }}")
+    tabs.addTab(v1, "Маршрут A→B")
+    tabs.addTab(v2, "Зона старта → цель")
+    tabs._controllers = (c1, c2)        # удержать от сборки мусора
+    tabs.resize(1380, 800)
+    tabs.show()
     sys.exit(app.exec_())
 
 

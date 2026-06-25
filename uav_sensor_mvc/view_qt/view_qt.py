@@ -319,6 +319,9 @@ class SimulationView(QtWidgets.QWidget):
     # ==================================================================
     # API для контроллера
     # ==================================================================
+    def get_param_specs(self):
+        return PARAM_SPECS
+
     def set_callbacks(self, **cbs):
         for name, fn in cbs.items():
             setattr(self, name, fn)
@@ -333,7 +336,7 @@ class SimulationView(QtWidgets.QWidget):
 
     def get_param_values(self):
         out = {}
-        for name, _l, typ in PARAM_SPECS:
+        for name, _l, typ in self.get_param_specs():
             raw = self._fields[name].text().strip().replace(",", ".")
             out[name] = typ(float(raw)) if typ is int else typ(raw)
         return out
@@ -341,7 +344,7 @@ class SimulationView(QtWidgets.QWidget):
     def set_param_values(self, params):
         self._suppress = True
         try:
-            for name, _l, _t in PARAM_SPECS:
+            for name, _l, _t in self.get_param_specs():
                 self._fields[name].setText(str(getattr(params, name)))
         finally:
             self._suppress = False

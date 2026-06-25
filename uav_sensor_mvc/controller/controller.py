@@ -63,7 +63,7 @@ class SimulationController:
             self.view.set_param_values(self.model.p)
             self.view.flash_title("Ошибка ввода: проверьте числовые поля.")
             return
-        snap = {n: getattr(self.model.p, n) for n, _l, _t in PARAM_SPECS}
+        snap = {n: getattr(self.model.p, n) for n, _l, _t in self.view.get_param_specs()}
         for n, v in vals.items():
             setattr(self.model.p, n, v)
         try:
