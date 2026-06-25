@@ -23,7 +23,7 @@ class SimulationController:
         self.j = 0
         self.target_iters = model.p.T
 
-        self.timer = view.fig.canvas.new_timer(interval=self.INTERVAL_MS)
+        self.timer = self._make_timer()
         self.timer.add_callback(self._tick)
 
         view.set_callbacks(
@@ -35,6 +35,11 @@ class SimulationController:
         self._sync_geometry()
         self._redraw_idle_or_last()
         self._update_metrics_idle()
+
+    def _make_timer(self):
+        """Фабрика таймера анимации. Переопределяется в Qt-контроллере (QTimer);
+        базовая реализация использует таймер холста matplotlib."""
+        return self.view.fig.canvas.new_timer(interval=self.INTERVAL_MS)
 
     # ------------------------------------------------------------------
     # Слои отображения по чекбоксам
@@ -131,7 +136,7 @@ class SimulationController:
     def on_batch(self):
         self._pause()
         self.view.flash_title("Идёт пакетный расчёт…", color=None)
-        self.view.fig.canvas.draw_idle()
+        self.view.process_pending()
         sensors, metrics = self.model.run_batch()
         self._sync_geometry()
         t = self._toggles()

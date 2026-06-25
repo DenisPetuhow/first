@@ -395,6 +395,14 @@ class SimulationView:
         self._metrics_text.set_text("\n".join(lines))
         self.fig.canvas.draw_idle()
 
+    def process_pending(self):
+        """Принудительно отрисовать отложенные изменения (общий метод с Qt-View)."""
+        self.fig.canvas.draw_idle()
+        try:
+            self.fig.canvas.flush_events()
+        except Exception:
+            pass
+
     def flash_title(self, text, color=None):
         self.ax.set_title(text, fontsize=10, color=color or THEME["warn"])
         self.fig.canvas.draw_idle()

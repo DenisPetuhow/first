@@ -2,3 +2,5 @@ numpy>=1.20
 matplotlib>=3.5
 pillow>=8.0        ; экспорт GIF в режиме --mode render (для GUI/selftest не требуется)
 python-docx>=1.0  ; только для пересборки docs/Теория_и_математика.docx (не для приложения)
+PyQt5>=5.15       ; только для Qt-версии main_qt.py (базовая main.py не требует)
+pyqtgraph>=0.13   ; только для Qt-версии main_qt.py
