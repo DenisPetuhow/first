@@ -36,13 +36,13 @@ def _viridis_qcolor(w):
     return QtGui.QColor(int(r * 255), int(g * 255), int(b * 255))
 
 
-def _heat_lut():
+def _heat_cmap():
     try:
-        cmap = pg.colormap.getFromMatplotlib("turbo")
-        return cmap.getLookupTable(0.0, 1.0, 256)
+        return pg.colormap.getFromMatplotlib("turbo")
     except Exception:
-        lut = (cm.turbo(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.ubyte)
-        return lut
+        stops = np.linspace(0, 1, 256)
+        cols = (cm.turbo(stops) * 255).astype(np.ubyte)
+        return pg.colormap.ColorMap(stops, cols)
 
 
 class _SpeedAdapter:
@@ -63,7 +63,8 @@ class SimulationView(QtWidgets.QWidget):
         self.A, self.B = A, B
         self._outline, self._bbox = outline, bbox
         self._last_bbox = None
-        self._heat_lut = _heat_lut()
+        self._heat_cmap = _heat_cmap()
+        self._heat_lut = self._heat_cmap.getLookupTable(0.0, 1.0, 256)
 
         # callbacks (контроллер переопределит через set_callbacks)
         self.on_start_pause = self.on_step = self.on_reset = lambda: None
@@ -252,6 +253,31 @@ class SimulationView(QtWidgets.QWidget):
         self.heat.setZValue(0); self.heat.setOpacity(0.85); self.heat.setVisible(False)
         self.pi.addItem(self.heat)
 
+        # цветовая шкала плотности (легенда тепловой карты)
+        self.cbar = pg.ColorBarItem(values=(0, 1), colorMap=self._heat_cmap,
+                                    label="плотность (редко → часто)",
+                                    interactive=False)
+        try:
+            self.cbar.setImageItem(self.heat, insert_in=self.pi)
+        except Exception:
+            pass
+        self.cbar.setVisible(False)
+
+        # легенда слоёв (типы линий маршрутов)
+        self.legend = self.pi.addLegend(offset=(8, 8),
+                                        brush=pg.mkBrush(_qcolor(THEME["panel"], 210)),
+                                        pen=pg.mkPen(_qcolor(THEME["grid"])))
+        try:
+            self.legend.setLabelTextColor(THEME["text"])
+        except Exception:
+            pass
+        self._sw_route = pg.PlotDataItem([0, 1], [0, 0],
+                                         pen=pg.mkPen(_viridis_qcolor(0.75), width=2.6))
+        self._sw_limit = pg.PlotDataItem([0, 1], [0, 0],
+                                         pen=pg.mkPen(_qcolor(THEME["warn"]), width=1.7,
+                                                      dash=[7, 4]))
+        self.legend.setVisible(False)
+
         dash = pg.mkPen(_qcolor(THEME["ellipse"], 150), width=1.2, dash=[6, 4])
         self.outline_up = self.pi.plot([], [], pen=dash); self.outline_up.setZValue(1)
         self.outline_lo = self.pi.plot([], [], pen=dash); self.outline_lo.setZValue(1)
@@ -352,13 +378,23 @@ class SimulationView(QtWidgets.QWidget):
     # ---- слои ----
     def _render_density(self, density, show):
         if not show or not density or density[0] is None:
-            self.heat.setVisible(False); return
+            self.heat.setVisible(False); self.cbar.setVisible(False); return
         H, extent = density
         disp = np.power(np.clip(H, 0, 1), 0.45)
         self.heat.setImage(disp, levels=(0, 1), lut=self._heat_lut, autoLevels=False)
         x0, x1, y0, y1 = extent
         self.heat.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
-        self.heat.setVisible(True)
+        self.heat.setVisible(True); self.cbar.setVisible(True)
+
+    def _update_legend(self, freq, fan, t, flight):
+        self.legend.clear()
+        show = (not flight) and ((t["show_freq"] and freq) or (t["show_fan"] and fan))
+        if not show:
+            self.legend.setVisible(False); return
+        self.legend.addItem(self._sw_route, "вероятные маршруты")
+        if t["show_fan"] and fan and any(p.get("is_extreme") for p in fan):
+            self.legend.addItem(self._sw_limit, "предел запаса хода")
+        self.legend.setVisible(True)
 
     def _render_paths(self, paths, show):
         if not show or not paths:
@@ -401,6 +437,7 @@ class SimulationView(QtWidgets.QWidget):
         self._render_paths(fan, t["show_fan"])
         self._render_paths(freq, t["show_freq"])
         self._render_sensors(sensors, R)
+        self._update_legend(freq, fan, t, flight=False)
 
     # ---- кадры ----
     def draw_clear(self, freq=None, fan=None, density=None, toggles=None,
@@ -417,6 +454,7 @@ class SimulationView(QtWidgets.QWidget):
 
     def setup_flight(self, traj, sensors, R, freq, fan, density, toggles, title):
         self._render_static(sensors, R, freq, fan, density, toggles)
+        self._update_legend(freq, fan, toggles, flight=True)   # без легенды в полёте
         self._cur_traj = traj
         self.full_path.setData(traj[:, 0], traj[:, 1])
         self.flown.setData([], [])
