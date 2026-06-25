@@ -3,16 +3,16 @@
 CONTROLLER · Связующее звено между моделью и представлением.
 
 Обрабатывает события виджетов (правка параметров с перезапуском, режимы
-просмотра, переключатели, чекбоксы слоёв), ведёт ПЛАВНУЮ анимацию полёта через
-блиттинг, запускает пакетный расчёт и сравнение режимов, поддерживает панель
-показателей. Бизнес-логику делегирует модели, отрисовку — представлению.
+просмотра, переключатели, 3 чекбокса слоёв), ведёт плавную анимацию полёта
+через блиттинг, запускает пакетный расчёт и сравнение режимов, поддерживает
+панель показателей.
 """
 from config import MODE_LABELS, TRAJ_LABELS, MOTION_LABELS
 from view.view import PARAM_SPECS
 
 
 class SimulationController:
-    INTERVAL_MS = 33                     # ~30 кадров/с (с блиттингом плавно)
+    INTERVAL_MS = 33
 
     def __init__(self, model, view):
         self.model = model
@@ -37,15 +37,16 @@ class SimulationController:
         self._update_metrics_idle()
 
     # ------------------------------------------------------------------
-    # Слои отображения (по чекбоксам)
+    # Слои отображения по чекбоксам
     # ------------------------------------------------------------------
     def _toggles(self):
-        return self.view.get_toggles()        # {show_heat, show_paths}
+        return self.view.get_toggles()        # show_heat / show_freq / show_fan
 
     def _layers(self, t):
-        paths = self.model.probable_paths(top=10) if t["show_paths"] else None
+        freq = self.model.frequent_paths(10) if t["show_freq"] else None
+        fan = self.model.fan_paths() if t["show_fan"] else None
         density = self.model.density_field() if t["show_heat"] else None
-        return paths, density
+        return freq, fan, density
 
     # ------------------------------------------------------------------
     # Правка параметров и переключатели -> перезапуск
@@ -90,10 +91,10 @@ class SimulationController:
 
     def on_toggle(self):
         t = self._toggles()
-        paths, density = self._layers(t)
+        freq, fan, density = self._layers(t)
         if self.cur_traj is not None:
-            self.view.setup_flight(self.cur_traj, self.model.sensors, self.model.p.R,
-                                   paths, density, t["show_paths"], t["show_heat"],
+            self.view.setup_flight(self.cur_traj, self.model.sensors,
+                                   self.model.p.R, freq, fan, density, t,
                                    self._iter_title(self.j))
         else:
             self._redraw_idle_or_last()
@@ -111,11 +112,9 @@ class SimulationController:
         traj, sensors = self.model.step()
         self.cur_traj = None
         t = self._toggles()
-        paths, density = self._layers(t)
-        self.view.draw_iterative_frame(
-            traj, sensors, len(traj) - 1, self.model.p.R,
-            self._iter_title(len(traj) - 1, traj), paths, density,
-            t["show_paths"], t["show_heat"])
+        freq, fan, density = self._layers(t)
+        self.view.draw_static_frame(sensors, self.model.p.R, freq, fan, density,
+                                    t, self._iter_title(0))
         self._update_metrics_full()
 
     def on_reset(self):
@@ -131,16 +130,16 @@ class SimulationController:
         self._pause()
         self.view.flash_title("Идёт пакетный расчёт…", color=None)
         self.view.fig.canvas.draw_idle()
-        sensors, metrics = self.model.run_batch()      # сразу весь результат
+        sensors, metrics = self.model.run_batch()
         t = self._toggles()
-        paths, density = self._layers(t)
+        freq, fan, density = self._layers(t)
         title = (f"Пакетно | {MODE_LABELS[self.model.p.mode]} | "
                  f"датчиков {metrics['n_sensors']} | "
                  f"покрытие {metrics['avg_coverage_percent']:.0f}% | "
                  f"пересеч. {metrics['avg_crossings']:.1f} | "
                  f"вне зоны {metrics['avg_uncovered_distance']:.0f} км")
-        self.view.draw_batch(paths, sensors, self.model.p.R, title, density,
-                             t["show_paths"], t["show_heat"])
+        self.view.draw_static_frame(sensors, self.model.p.R, freq, fan, density,
+                                    t, title)
         self._update_metrics_full(extra_compare=True)
 
     # ------------------------------------------------------------------
@@ -161,10 +160,9 @@ class SimulationController:
             self.cur_traj = traj
             self.j = 0
             t = self._toggles()
-            paths, density = self._layers(t)
+            freq, fan, density = self._layers(t)
             self.view.setup_flight(traj, self.model.sensors, self.model.p.R,
-                                   paths, density, t["show_paths"], t["show_heat"],
-                                   self._iter_title(0))
+                                   freq, fan, density, t, self._iter_title(0))
         self.j += self.speed * (1 + self.model.iteration // 8)
         end = len(self.cur_traj) - 1
         finished = self.j >= end
@@ -199,22 +197,21 @@ class SimulationController:
 
     def _redraw_idle_or_last(self, title=None):
         t = self._toggles()
-        paths, density = self._layers(t)
+        freq, fan, density = self._layers(t)
         if not self.model.trajectories:
-            self.view.draw_clear(paths, density, t["show_paths"], t["show_heat"],
+            self.view.draw_clear(freq, fan, density, t,
                                  title or "Готово. «Пуск», «Шаг» или «Пакетно».")
         else:
-            self.view.draw_iterative_frame(
-                None, self.model.sensors, 0, self.model.p.R,
+            self.view.draw_static_frame(
+                self.model.sensors, self.model.p.R, freq, fan, density, t,
                 title or (f"Режим: {MODE_LABELS[self.model.p.mode]} | "
-                          f"датчиков {len(self.model.sensors)}/{self.model.p.N}"),
-                paths, density, t["show_paths"], t["show_heat"])
+                          f"датчиков {len(self.model.sensors)}/{self.model.p.N}"))
 
     def _hud_text(self, j):
         seen, nd = self.model.live_metrics(self.cur_traj[:j + 1])
         return f"под наблюдением {seen:.0f}%   пересечений {nd}"
 
-    def _iter_title(self, j, traj=None):
+    def _iter_title(self, j):
         return (f"Итерация {self.model.iteration}/{self.target_iters}   |   "
                 f"датчиков {len(self.model.sensors)}/{self.model.p.N}   |   "
                 f"профиль: {MOTION_LABELS[self.model.p.motion_profile]}")
@@ -224,26 +221,26 @@ class SimulationController:
         x0, x1, y0, y1 = self.model.corridor_bbox()
         lines = [
             "ГЕОМЕТРИЯ",
-            f"  |AB| = {p.ab_distance:g} км,  запас L_max = {p.L_max:g} км",
-            f"  большая полуось a = L_max/2 = {p.L_max/2:g} км",
-            f"  предельный угол дуги ±{self.model.theta_max:.0f}°",
-            f"  коридор: длина {x1-x0:.0f} × ширина {y1-y0:.0f} км",
-            f"  кандидатных позиций: {len(self.model.candidates)}",
+            f"  |AB|={p.ab_distance:g} км  L_max={p.L_max:g} км",
+            f"  большая полуось a=L_max/2={p.L_max/2:g} км",
+            f"  предельный угол ±{self.model.theta_max:.0f}°",
+            f"  коридор {x1-x0:.0f}×{y1-y0:.0f} км",
+            f"  кандидатов: {len(self.model.candidates)}",
             "",
             "РЕСУРС",
-            f"  датчиков N = {p.N},  радиус R = {p.R:g} км",
-            f"  кратность k = {p.k},  сегментов = {p.L_seg}",
+            f"  N={p.N}  R={p.R:g} км  k={p.k}  L_seg={p.L_seg}",
+            f"  профиль: {MOTION_LABELS[p.motion_profile]}",
             "",
-            "Профиль: " + MOTION_LABELS[p.motion_profile],
+            "Нажмите «Пуск», «Шаг» или «Пакетно».",
         ]
         self.view.set_metrics(lines)
 
     def _update_metrics_full(self, extra_compare=False):
         m = self.model.evaluate()
         lines = [
-            f"ВЫБОРКА  t = {self.model.iteration}",
+            f"ВЫБОРКА t={self.model.iteration}",
             f"  режим: {MODE_LABELS[self.model.p.mode]}",
-            f"  задействовано датчиков: {m['n_sensors']}/{self.model.p.N}",
+            f"  задействовано: {m['n_sensors']}/{self.model.p.N}",
             "",
             f"  ср. пересечений : {m['avg_crossings']:.2f}",
             f"  покрытие пути   : {m['avg_coverage_percent']:.1f}%",

@@ -19,7 +19,8 @@ from config import Params, MODES
 from . import detection
 from .geometry import ellipse_geometry, geo_to_local_km
 from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
-                           signed_max_lateral, corridor_bbox, corridor_outline)
+                           signed_max_lateral, corridor_bbox, corridor_outline,
+                           frequent_arcs, frequent_serpentines, serpentine_fan)
 from .optimization import candidate_grid, CoverageCache
 
 
@@ -120,49 +121,28 @@ class SimulationModel:
         return self.sensors, self.evaluate()
 
     # ------------------------------------------------------------------
-    # Вероятные пути (для обеих моделей движения)
+    # Слои вероятных путей (аналитические, данные не требуются)
     # ------------------------------------------------------------------
-    def probable_paths(self, top=10):
-        """Единый список вероятных путей: для дуг — веер по шагу угла;
-        для петель — представители частых кластеров. Крайние пути помечены
-        is_extreme (рисуются пунктиром).
+    def frequent_paths(self, n=10):
+        """10 наиболее вероятных маршрутов (квантили распределения по профилю):
+        дуги — 10 дуг, петли — 10 представительных петель. Сплошные линии,
+        вес = относительная частота (без предельных пунктирных)."""
+        p = self.p
+        if p.traj_model == "arc":
+            return frequent_arcs(p.A, p.B, p.L_max, p.motion_profile,
+                                 p.sigma_frac, n=n, n_points=p.n_points)
+        return frequent_serpentines(p.A, p.B, p.L_max, p.motion_profile,
+                                    p.sigma_frac, n=n, n_points=p.n_points)
 
-        Каждый элемент: dict(traj, weight[0..1], is_extreme, label).
-        """
+    def fan_paths(self):
+        """Веер ВОЗМОЖНЫХ маршрутов по шагу (геометрия пространства маршрутов):
+        дуги — по шагу угла (предельные пунктиром), петли — по шагу амплитуды."""
         p = self.p
         if p.traj_model == "arc":
             return arc_fan(p.A, p.B, p.L_max, p.angle_step_deg,
                            sigma_frac=p.sigma_frac, n_points=p.n_points,
                            profile=p.motion_profile)
-        # петли: кластеризация накопленных маршрутов по боковому отклонению
-        return self._serpentine_clusters(top)
-
-    def _serpentine_clusters(self, top):
-        if not self.trajectories:
-            return []
-        feats = np.asarray(self.features)
-        counts, edges = np.histogram(feats, bins=max(top, 12))
-        order = [b for b in np.argsort(counts)[::-1] if counts[b] > 0][:top]
-        if not order:
-            return []
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        cmax = counts[order].max()
-        fmin, fmax = feats.min(), feats.max()
-        out = []
-        for b in order:
-            lo, hi = edges[b], edges[b + 1]
-            in_bin = np.where((feats >= lo) & (feats <= hi))[0]
-            if len(in_bin) == 0:
-                continue
-            rep = in_bin[np.argmin(np.abs(feats[in_bin] - centers[b]))]
-            fval = feats[rep]
-            out.append(dict(
-                traj=self.trajectories[rep],
-                weight=float(counts[b] / cmax),
-                is_extreme=bool(fval <= fmin + 1e-6 or fval >= fmax - 1e-6),
-                label=f"{fval:+.0f} км",
-            ))
-        return out
+        return serpentine_fan(p.A, p.B, p.L_max, n_points=p.n_points)
 
     def density_field(self, nbins=160):
         """2D-плотность точек накопленных маршрутов для тепловой карты.

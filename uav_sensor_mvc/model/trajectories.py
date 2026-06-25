@@ -18,6 +18,7 @@ MODEL · Генераторы случайных маршрутов БПЛА и 
 возможный маршрут лежит в нём, поэтому кандидатные позиции датчиков и масштаб
 карты ограничиваются именно коридором (а не всем эллипсом достижимости).
 """
+import functools
 import numpy as np
 
 
@@ -219,24 +220,47 @@ def make_serpentine(A, B, amplitude, n_lobes, phase, n_points=140):
     return base + lateral[:, None] * un[None, :]
 
 
+@functools.lru_cache(maxsize=256)
+def max_serpentine_amplitude(ab_distance, L_max, n_lobes, n_points=140):
+    """Предельная амплитуда петли (для данного числа лепестков), при которой
+    длина траектории = L_max. Аналог theta_max для дуг — гарантирует, что
+    выбранная амплитуда укладывается в запас хода (никаких откатов в прямую)."""
+    A = (0.0, 0.0); B = (float(ab_distance), 0.0)
+    b = ellipse_b(A, B, L_max)
+    lo, hi = 0.0, b
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        if polyline_length(make_serpentine(A, B, mid, n_lobes, np.pi / 2, n_points)) <= L_max:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 def sample_serpentine_trajectory(A, B, L_max, rng, sigma_frac=0.45, n_points=140,
                                  theta_max=None, profile="normal"):
-    """Случайная петляющая траектория по профилю. Возвращает (traj, feature)."""
+    """Случайная петляющая траектория по профилю. Возвращает (traj, feature).
+
+    Амплитуда выбирается в пределах ДОПУСТИМОЙ по запасу хода (max_serpentine_
+    amplitude), поэтому все три профиля работают, а «сложный» даёт крупные петли.
+    """
     A2, B2 = np.asarray(A, float), np.asarray(B, float)
-    b = ellipse_b(A2, B2, L_max)
-    for _ in range(300):
-        n_lobes = int(rng.integers(2, 6))
-        phase = float(rng.uniform(0.0, np.pi))
-        if profile == "mixed":
-            amp = rng.uniform(0.0, b)
-        elif profile == "complex":
-            amp = b * (0.7 + 0.3 * rng.random())
-        else:
-            amp = abs(rng.normal(0.0, sigma_frac * b))
+    ab = float(np.linalg.norm(B2 - A2))
+    n_lobes = int(rng.integers(2, 6))
+    phase = float(rng.uniform(0.0, np.pi))
+    amp_max = max_serpentine_amplitude(ab, float(L_max), n_lobes, n_points)
+    if profile == "mixed":
+        amp = rng.uniform(0.0, amp_max)
+    elif profile == "complex":
+        amp = amp_max * (0.7 + 0.3 * rng.random())
+    else:  # normal — малые амплитуды чаще
+        amp = min(abs(rng.normal(0.0, sigma_frac * amp_max)), amp_max)
+    traj = make_serpentine(A2, B2, amp, n_lobes, phase, n_points)
+    # страховка на случай влияния фазы на длину
+    while polyline_length(traj) > L_max and amp > 1e-6:
+        amp *= 0.9
         traj = make_serpentine(A2, B2, amp, n_lobes, phase, n_points)
-        if polyline_length(traj) <= L_max:
-            return traj, signed_max_lateral(traj, A2, B2)
-    return make_arc(A2, B2, 0.0, n_points), 0.0
+    return traj, signed_max_lateral(traj, A2, B2)
 
 
 def signed_max_lateral(traj, A, B):
@@ -245,6 +269,69 @@ def signed_max_lateral(traj, A, B):
     un = np.array([-chord[1], chord[0]]) / np.linalg.norm(chord)
     lateral = (traj - A) @ un
     return float(lateral[int(np.argmax(np.abs(lateral)))])
+
+
+# ======================================================================
+# Вероятные маршруты: «10 частых» (квантили распределения) и «веер по шагу»
+# ======================================================================
+def _profile_quantiles(profile, lim, sigma, n, seed=0):
+    """n квантилей величины (угла/амплитуды) по профилю разброса.
+
+    Детерминированно (фиксированный seed). lim — предел, sigma — ширина «обычного».
+    Для амплитуды (одностороннее) знак потом задаётся отдельно.
+    """
+    rng = np.random.default_rng(seed)
+    xs = np.array([_sample_angle(rng, lim, sigma, profile) for _ in range(4000)])
+    return np.quantile(xs, (np.arange(n) + 0.5) / n)
+
+
+def _arc_density(theta, profile, theta_max, sigma):
+    if profile == "mixed":
+        return 1.0
+    if profile == "complex":
+        return float(np.exp(-0.5 * ((abs(theta) - theta_max) / (0.30 * theta_max)) ** 2))
+    return float(np.exp(-0.5 * (theta / sigma) ** 2))
+
+
+def frequent_arcs(A, B, L_max, profile, sigma_frac, n=10, n_points=140):
+    """10 наиболее вероятных дуг (квантили распределения углов по профилю)."""
+    tmax = max_deflection_angle(A, B, L_max)
+    sigma = max(sigma_frac * tmax, 1e-3)
+    angles = _profile_quantiles(profile, tmax, sigma, n)
+    dens = [_arc_density(a, profile, tmax, sigma) for a in angles]
+    dmax = max(dens) or 1.0
+    return [dict(traj=make_arc_by_angle(A, B, a, n_points), weight=d / dmax,
+                 is_extreme=False, label=f"{a:+.0f}°")
+            for a, d in zip(angles, dens)]
+
+
+def frequent_serpentines(A, B, L_max, profile, sigma_frac, n=10, n_points=140):
+    """10 представительных петель (квантили амплитуды по профилю)."""
+    ab = float(np.linalg.norm(np.asarray(B, float) - np.asarray(A, float)))
+    amp_max = max_serpentine_amplitude(ab, float(L_max), 3, n_points)
+    qs = _profile_quantiles(profile, amp_max, max(sigma_frac * amp_max, 1e-3), n)
+    out = []
+    for i, a in enumerate(sorted(np.abs(qs))):
+        sign = 1.0 if i % 2 == 0 else -1.0
+        lobes = 2 + (i % 3)
+        w = a / amp_max if amp_max else 0.0
+        out.append(dict(traj=make_serpentine(A, B, sign * a, lobes, np.pi / 2, n_points),
+                        weight=float(w), is_extreme=False, label=f"{a:.0f} км"))
+    return out
+
+
+def serpentine_fan(A, B, L_max, k=7, n_points=140):
+    """Веер петель: амплитуды от 0 до предельной (крайняя — пунктир)."""
+    ab = float(np.linalg.norm(np.asarray(B, float) - np.asarray(A, float)))
+    amp_max = max_serpentine_amplitude(ab, float(L_max), 3, n_points)
+    amps = np.linspace(0.0, amp_max, k)
+    out = []
+    for i, a in enumerate(amps):
+        sign = 1.0 if i % 2 == 0 else -1.0
+        out.append(dict(traj=make_serpentine(A, B, sign * a, 3, np.pi / 2, n_points),
+                        weight=a / amp_max if amp_max else 0.0,
+                        is_extreme=(i == len(amps) - 1), label=f"{a:.0f} км"))
+    return out
 
 
 SAMPLERS = {

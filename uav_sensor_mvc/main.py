@@ -119,12 +119,12 @@ def run_render(params: Params, out_dir: str, speed: int, n_iter: int):
     print("Пакетный рендер по режимам:")
     for mode in MODES:
         sensors, metrics = model.run_batch(mode=mode)
-        paths = model.probable_paths(top=10)
+        freq = model.frequent_paths(10)
         density = model.density_field()
         fig, ax = plt.subplots(figsize=(11.5, 6.4), facecolor=THEME["bg"])
         draw_static(ax, params.A, params.B, outline, bbox)
         draw_density(ax, *density)
-        draw_probable(ax, paths)
+        draw_probable(ax, freq)
         draw_sensors(ax, sensors, params.R)
         ax.set_title(f"Пакетный режим | {MODE_LABELS[mode]} | "
                      f"датчиков {metrics['n_sensors']} | "
