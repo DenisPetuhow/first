@@ -16,13 +16,46 @@
 клик по карте («View All»). По умолчанию seed случаен (см. --seed).
 """
 import argparse
+import os
 import sys
 
 from config import MODES, MOTION_PROFILES, TRAJ_LABELS
 from main import build_params
 
 
+def _ensure_qt_plugin_path():
+    """Указать Qt путь к платформенным плагинам PyQt5.
+
+    Чинит частую ошибку Windows «Could not find the Qt platform plugin "windows"»,
+    когда путь к плагинам пуст или перебит сторонним пакетом (cv2, conda и т.п.).
+    Возвращает каталог plugins или None, если он не найден (плагины не установлены).
+    """
+    try:
+        import PyQt5
+    except Exception:
+        return None
+    base = os.path.dirname(PyQt5.__file__)
+    for sub in ("Qt5", "Qt"):
+        plugins = os.path.join(base, sub, "plugins")
+        if os.path.isdir(os.path.join(plugins, "platforms")):
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugins
+            bin_dir = os.path.join(base, sub, "bin")
+            if os.path.isdir(bin_dir):
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+            return plugins
+    return None
+
+
 def main():
+    if _ensure_qt_plugin_path() is None and sys.platform.startswith("win"):
+        print("ВНИМАНИЕ: не найдены платформенные плагины Qt (PyQt5).\n"
+              "Переустановите PyQt5:\n"
+              "  pip uninstall -y PyQt5 PyQt5-Qt5 PyQt5-sip\n"
+              "  pip install PyQt5\n"
+              "Если установлен opencv-python — он конфликтует с Qt:\n"
+              "  pip uninstall -y opencv-python && pip install opencv-python-headless\n",
+              file=sys.stderr)
+
     ap = argparse.ArgumentParser(description="Размещение датчиков БПЛА — Qt/pyqtgraph.")
     ap.add_argument("--opt", choices=list(MODES), default="balanced")
     ap.add_argument("--traj", choices=list(TRAJ_LABELS), default="arc")
