@@ -26,8 +26,12 @@ class AreaStartController(QtSimulationController):
 
     # ---- гейтинг геометрии/отрисовки до создания маршрута ----
     def _sync_geometry(self):
+        # ВАЖНО: брать A/B из кликнутого маршрута модели (model.A/B), а НЕ из
+        # model.p (там дефолтные координаты) — иначе точки рисуются не там.
         if self.model.has_route:
-            super()._sync_geometry()
+            self.view.update_geometry(tuple(self.model.A), tuple(self.model.B),
+                                      self.model.corridor_outline(),
+                                      self._current_bbox())
 
     def _redraw_idle_or_last(self, title=None):
         if not self.model.has_route:
@@ -62,8 +66,15 @@ class AreaStartController(QtSimulationController):
 
     # ---- создание маршрута ----
     def on_create(self):
+        # сброс старого маршрута (и программно, и графически) перед новой постановкой
         self._pause()
+        self.model.has_route = False
+        self.model.reset()
+        self.cur_traj = None
+        self.j = 0
+        self.view.prompt_create()
         self.view.begin_create()
+        self._update_metrics_idle()
 
     def on_route_ready(self, A, dir_pt):
         A = np.asarray(A, float); v = np.asarray(dir_pt, float) - A

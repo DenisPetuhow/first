@@ -23,7 +23,7 @@ from config import MODES
 from . import detection
 from .geometry import ellipse_geometry
 from .trajectories import (make_arc_by_angle, max_deflection_angle, _sample_angle,
-                           polyline_length, arc_fan, maneuver_path)
+                           polyline_length, arc_fan, maneuver_path, polyline_path)
 from .optimization import CoverageCache
 
 
@@ -84,17 +84,16 @@ def sample_area_arc(A, B, depth, width, L_max, rng, sigma_frac, n_points, profil
     return make_arc_by_angle(S0, B, theta, n_points), S0
 
 
-def sample_maneuver(A, B, depth, width, L_max, rng, n_points, profile,
-                    rmin_frac=0.11):
-    """Манёвренная ломаная из СЛУЧАЙНОЙ точки старта зоны в B (БПЛА самолётного
-    типа). Использует общее ядро maneuver_path (ограничение радиуса разворота,
-    наведение на цель, длина <= L_max)."""
+def sample_maneuver(A, B, depth, width, L_max, rng, n_points, profile, rmin_frac=0.11):
+    """Гладкий манёвр из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро maneuver_path)."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    traj = maneuver_path(S0, B, L_max, rng, profile, n_points, rmin_frac)
-    return traj, S0
+    return maneuver_path(S0, B, L_max, rng, profile, n_points, rmin_frac), S0
 
 
-SAMPLE_FUNCS = {"area_arc": sample_area_arc, "maneuver": sample_maneuver}
+def sample_polyline(A, B, depth, width, L_max, rng, n_points, profile, rmin_frac=0.11):
+    """Ломаная из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро polyline_path)."""
+    S0 = sample_start_point(A, B, depth, width, rng)
+    return polyline_path(S0, B, L_max, rng, profile, n_points, rmin_frac), S0
 
 
 # ----------------------------------------------------------------------
@@ -216,6 +215,9 @@ class AreaStartModel:
         p = self.p
         if self.movement == "maneuver":
             return sample_maneuver(self.A, self.B, p.corridor_depth, p.corridor_width,
+                                   p.L_max, rng, p.n_points, p.motion_profile)
+        if self.movement == "polyline":
+            return sample_polyline(self.A, self.B, p.corridor_depth, p.corridor_width,
                                    p.L_max, rng, p.n_points, p.motion_profile)
         return sample_area_arc(self.A, self.B, p.corridor_depth, p.corridor_width,
                                p.L_max, rng, p.sigma_frac, p.n_points, p.motion_profile)
