@@ -21,8 +21,9 @@ import matplotlib.cm as cm
 from config import MODE_LABELS, TRAJ_LABELS, MOTION_LABELS, THEME
 from view.view import PARAM_SPECS          # единый источник списка параметров
 
-# Дополнительные поля Qt-версии (ТТХ БПЛА -> радиус разворота R_min)
-QT_EXTRA = [("speed_kmh", "Скорость км/ч", float), ("bank_deg", "Крен °", float)]
+# Дополнительные поля Qt-версии: ТТХ БПЛА (-> R_min) и диапазон числа точек маршрута
+QT_EXTRA = [("speed_kmh", "Скорость км/ч", float), ("bank_deg", "Крен °", float),
+            ("n_min", "Точек от", int), ("n_max", "Точек до", int)]
 
 pg.setConfigOptions(antialias=True, background=THEME["axes"], foreground=THEME["text"])
 

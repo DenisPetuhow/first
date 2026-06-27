@@ -119,7 +119,7 @@ class SimulationModel:
         return sampler(p.A, p.B, p.L_max, self.rng,
                        sigma_frac=p.sigma_frac, n_points=p.n_points,
                        theta_max=self.theta_max, profile=p.motion_profile,
-                       r_min=self.r_min, n_cap=p.n_cap)
+                       r_min=self.r_min, nrange=(p.n_min, p.n_max))
 
     def _anchor_idx(self):
         """Индекс кандидата для «якорного» датчика у цели B (1/3 R заходит за B)."""
@@ -178,7 +178,7 @@ class SimulationModel:
         if p.traj_model == "maneuver":
             return frequent_maneuvers(p.A, p.B, p.L_max, p.motion_profile,
                                       p.sigma_frac, n=n, n_points=p.n_points,
-                                      r_min=self.r_min, n_cap=p.n_cap)
+                                      r_min=self.r_min, nrange=(p.n_min, p.n_max))
         return frequent_serpentines(p.A, p.B, p.L_max, p.motion_profile,
                                     p.sigma_frac, n=n, n_points=p.n_points)
 
@@ -192,7 +192,8 @@ class SimulationModel:
                            profile=p.motion_profile)
         if p.traj_model == "maneuver":
             return maneuver_fan(p.A, p.B, p.L_max, profile=p.motion_profile,
-                                n_points=p.n_points, r_min=self.r_min, n_cap=p.n_cap)
+                                n_points=p.n_points, r_min=self.r_min,
+                                nrange=(p.n_min, p.n_max))
         return serpentine_fan(p.A, p.B, p.L_max, n_points=p.n_points)
 
     def density_field(self, nbins=160):
