@@ -58,6 +58,8 @@ class AreaStartController(QtSimulationController):
             f"  зона старта {p.corridor_depth:g}×{p.corridor_width:g} км",
             f"  область движения {x1-x0:.0f}×{y1-y0:.0f} км",
             f"  кандидатов: {len(self.model.candidates)}", "",
+            "БПЛА", f"  V={p.speed_kmh:g} км/ч  крен={p.bank_deg:g}°  "
+            f"R_min={self.model.r_min*1000:.0f} м", "",
             "РЕСУРС", f"  N={p.N}  R={p.R:g}  k={p.k}  L_seg={p.L_seg}",
             f"  движение: {AREA_TRAJ_LABELS[self.model.movement]}",
             f"  разброс: {MOTION_LABELS[p.motion_profile]}", "",

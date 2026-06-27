@@ -21,6 +21,9 @@ import matplotlib.cm as cm
 from config import MODE_LABELS, TRAJ_LABELS, MOTION_LABELS, THEME
 from view.view import PARAM_SPECS          # единый источник списка параметров
 
+# Дополнительные поля Qt-версии (ТТХ БПЛА -> радиус разворота R_min)
+QT_EXTRA = [("speed_kmh", "Скорость км/ч", float), ("bank_deg", "Крен °", float)]
+
 pg.setConfigOptions(antialias=True, background=THEME["axes"], foreground=THEME["text"])
 
 
@@ -132,7 +135,7 @@ class SimulationView(QtWidgets.QWidget):
 
         col.addWidget(self._header("ПАРАМЕТРЫ  (Enter — пересчёт)"))
         grid = QtWidgets.QGridLayout(); grid.setSpacing(6)
-        for i, (name, label, _t) in enumerate(PARAM_SPECS):
+        for i, (name, label, _t) in enumerate(self.get_param_specs()):
             r, c = divmod(i, 2)
             cell = QtWidgets.QVBoxLayout(); cell.setSpacing(1)
             lab = QtWidgets.QLabel(label); lab.setObjectName("muted")
@@ -320,7 +323,7 @@ class SimulationView(QtWidgets.QWidget):
     # API для контроллера
     # ==================================================================
     def get_param_specs(self):
-        return PARAM_SPECS
+        return PARAM_SPECS + QT_EXTRA
 
     def set_callbacks(self, **cbs):
         for name, fn in cbs.items():

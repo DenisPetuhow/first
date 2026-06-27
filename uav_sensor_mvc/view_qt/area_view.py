@@ -16,9 +16,9 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from config import (MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS, THEME)
 from view.view import PARAM_SPECS
-from .view_qt import SimulationView, _qcolor
+from .view_qt import SimulationView, _qcolor, QT_EXTRA
 
-AREA_PARAM_SPECS = list(PARAM_SPECS) + [
+AREA_PARAM_SPECS = list(PARAM_SPECS) + QT_EXTRA + [
     ("corridor_depth", "Глубина зоны", float),
     ("corridor_width", "Ширина зоны", float),
 ]

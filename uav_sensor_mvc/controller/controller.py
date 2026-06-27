@@ -244,6 +244,12 @@ class SimulationController:
             f"  коридор {x1-x0:.0f}×{y1-y0:.0f} км",
             f"  кандидатов: {len(self.model.candidates)}",
             "",
+            "БПЛА (ТТХ -> физика)",
+            f"  V={p.speed_kmh:g} км/ч  крен={p.bank_deg:g}°",
+            f"  радиус разворота R_min={getattr(self.model,'r_min',0)*1000:.0f} м",
+            f"  время полёта {p.ab_distance/max(p.speed_kmh,1)*60:.0f}–"
+            f"{p.L_max/max(p.speed_kmh,1)*60:.0f} мин",
+            "",
             "РЕСУРС",
             f"  N={p.N}  R={p.R:g} км  k={p.k}  L_seg={p.L_seg}",
             f"  профиль: {MOTION_LABELS[p.motion_profile]}",

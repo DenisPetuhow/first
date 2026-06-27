@@ -21,7 +21,7 @@ from .geometry import ellipse_geometry, geo_to_local_km
 from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
                            signed_max_lateral, corridor_bbox, corridor_outline,
                            frequent_arcs, frequent_serpentines, serpentine_fan,
-                           frequent_maneuvers, maneuver_fan)
+                           frequent_maneuvers, maneuver_fan, turn_radius_km)
 from .optimization import candidate_grid, CoverageCache
 
 
@@ -52,6 +52,7 @@ class SimulationModel:
         self.rng = np.random.default_rng(p.seed)
         self.geom = ellipse_geometry(p.A, p.B, p.L_max)
         self.theta_max = max_deflection_angle(p.A, p.B, p.L_max)
+        self.r_min = turn_radius_km(p.speed_kmh / 3.6, p.bank_deg)   # радиус разворота, км
         self.candidates = candidate_grid(p.A, p.B, p.L_max, p.grid_step,
                                          traj_model=p.traj_model)
         self.cache = CoverageCache(self.candidates, p.R, p.L_seg, p.k)
@@ -117,10 +118,24 @@ class SimulationModel:
         sampler = SAMPLERS[p.traj_model]
         return sampler(p.A, p.B, p.L_max, self.rng,
                        sigma_frac=p.sigma_frac, n_points=p.n_points,
-                       theta_max=self.theta_max, profile=p.motion_profile)
+                       theta_max=self.theta_max, profile=p.motion_profile,
+                       r_min=self.r_min, n_cap=p.n_cap)
+
+    def _anchor_idx(self):
+        """Индекс кандидата для «якорного» датчика у цели B (1/3 R заходит за B)."""
+        if len(self.candidates) == 0:
+            return None
+        A = np.asarray(self.p.A, float); B = np.asarray(self.p.B, float)
+        d = B - A; L = float(np.linalg.norm(d))
+        if L < 1e-6:
+            return None
+        P = B - (2.0 / 3.0) * self.p.R * (d / L)
+        return int(np.argmin(np.linalg.norm(self.candidates - P, axis=1)))
 
     def recompute_placement(self):
-        self.sensors = self.cache.greedy(self.p.N, self.weights)
+        self.sensors = self.cache.greedy(self.p.N, self.weights,
+                                         anchor_idx=self._anchor_idx(),
+                                         anchor_sep=1.35 * self.p.R)
         return self.sensors
 
     def add_and_replace(self, traj, feature):
@@ -162,7 +177,8 @@ class SimulationModel:
                                  p.sigma_frac, n=n, n_points=p.n_points)
         if p.traj_model == "maneuver":
             return frequent_maneuvers(p.A, p.B, p.L_max, p.motion_profile,
-                                      p.sigma_frac, n=n, n_points=p.n_points)
+                                      p.sigma_frac, n=n, n_points=p.n_points,
+                                      r_min=self.r_min, n_cap=p.n_cap)
         return frequent_serpentines(p.A, p.B, p.L_max, p.motion_profile,
                                     p.sigma_frac, n=n, n_points=p.n_points)
 
@@ -176,7 +192,7 @@ class SimulationModel:
                            profile=p.motion_profile)
         if p.traj_model == "maneuver":
             return maneuver_fan(p.A, p.B, p.L_max, profile=p.motion_profile,
-                                n_points=p.n_points)
+                                n_points=p.n_points, r_min=self.r_min, n_cap=p.n_cap)
         return serpentine_fan(p.A, p.B, p.L_max, n_points=p.n_points)
 
     def density_field(self, nbins=160):
@@ -223,8 +239,9 @@ class SimulationModel:
     def compare_modes(self):
         saved = self.p.mode
         out = {}
+        ai, asep = self._anchor_idx(), 1.35 * self.p.R
         for m in MODES:
-            S = self.cache.greedy(self.p.N, MODES[m])
+            S = self.cache.greedy(self.p.N, MODES[m], anchor_idx=ai, anchor_sep=asep)
             out[m] = self.evaluate(sensors=S)
         self.p.mode = saved
         self.recompute_placement()

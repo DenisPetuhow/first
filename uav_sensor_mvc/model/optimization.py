@@ -102,11 +102,15 @@ class CoverageCache:
                 mask_row |= (seg_hit.astype(np.uint32) << np.uint32(j))
         self._mask.append(mask_row)
 
-    def greedy(self, N, weights):
+    def greedy(self, N, weights, anchor_idx=None, anchor_sep=0.0):
         """Жадный выбор N позиций. Всегда возвращает min(N, C) датчиков.
 
         Основной ключ — субмодулярный прирост phi; при его насыщении —
         вторичный ключ «распределения» (прирост покрытия по маршрутам).
+
+        anchor_idx — индекс ПРИНУДИТЕЛЬНОГО «якорного» датчика (у цели B): ставится
+        первым; кандидаты ближе anchor_sep к нему исключаются (не дают «кучи» у B).
+        Остальные позиции выбираются обычным жадным алгоритмом.
         """
         T = self.n_traj
         if T == 0 or self.C == 0 or N <= 0:
@@ -125,7 +129,24 @@ class CoverageCache:
         avail = np.ones(self.C, bool)
         chosen = []
 
-        for _ in range(min(N, self.C)):
+        def take(c):
+            nonlocal n_vec, mask_vec, cur_min, cur_pop, cur_cov
+            chosen.append(c)
+            avail[c] = False
+            n_vec = n_vec + H[:, c]
+            mask_vec = mask_vec | M[:, c]
+            cur_min = np.minimum(n_vec, k).astype(float)
+            cur_pop = _popcount(mask_vec).astype(float)
+            cur_cov = np.minimum(cur_cov + Fc[:, c], 1.0)
+
+        # якорный датчик у цели B + исключение близких кандидатов
+        if anchor_idx is not None and 0 <= int(anchor_idx) < self.C:
+            take(int(anchor_idx))
+            if anchor_sep > 0:
+                d = np.linalg.norm(self.cand - self.cand[int(anchor_idx)], axis=1)
+                avail[d < anchor_sep] = False
+
+        while len(chosen) < min(N, self.C):
             new_min = np.minimum(n_vec[:, None] + H, k)
             gain_n = (new_min - cur_min[:, None]) / k
             new_pop = _popcount(mask_vec[:, None] | M)
@@ -136,21 +157,13 @@ class CoverageCache:
             new_cov = np.minimum(cur_cov[:, None] + Fc, 1.0)
             gain_cov = (new_cov - cur_cov[:, None]).mean(axis=0)      # (C,)
 
-            # лексикографика: основной критерий; при его насыщении (всюду ~0) —
-            # вторичный критерий распределения. Сохраняет валидированное поведение
-            # при положительном основном приросте и гарантирует размещение всех N.
+            # лексикографика: основной критерий; при его насыщении — вторичный.
             score = primary if primary.max() > 1e-9 else SPREAD_EPS * gain_cov
             score = np.where(avail, score, -np.inf)
             c = int(np.argmax(score))
             if not np.isfinite(score[c]):
                 break
-            chosen.append(c)
-            avail[c] = False
-            n_vec = n_vec + H[:, c]
-            mask_vec = mask_vec | M[:, c]
-            cur_min = np.minimum(n_vec, k).astype(float)
-            cur_pop = _popcount(mask_vec).astype(float)
-            cur_cov = np.minimum(cur_cov + Fc[:, c], 1.0)
+            take(c)
 
         return self.cand[chosen] if chosen else np.empty((0, 2), float)
 

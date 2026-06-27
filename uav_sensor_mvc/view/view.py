@@ -224,7 +224,7 @@ class SimulationView:
         self._header(0.838, 0.598, "РАЗБРОС")
         self._prof_keys = list(MOTION_LABELS)
         self.radio_prof = RadioButtons(
-            self.fig.add_axes([0.840, 0.508, 0.135, 0.082], facecolor=THEME["panel"]),
+            self.fig.add_axes([0.840, 0.468, 0.135, 0.122], facecolor=THEME["panel"]),
             [MOTION_LABELS[k] for k in self._prof_keys],
             active=self._prof_keys.index(params.motion_profile))
         self._style_radio(self.radio_prof)

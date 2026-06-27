@@ -23,7 +23,8 @@ from config import MODES
 from . import detection
 from .geometry import ellipse_geometry
 from .trajectories import (make_arc_by_angle, max_deflection_angle, _sample_angle,
-                           polyline_length, arc_fan, maneuver_path, polyline_path)
+                           polyline_length, arc_fan, maneuver_path, polyline_path,
+                           turn_radius_km)
 from .optimization import CoverageCache
 
 
@@ -84,16 +85,16 @@ def sample_area_arc(A, B, depth, width, L_max, rng, sigma_frac, n_points, profil
     return make_arc_by_angle(S0, B, theta, n_points), S0
 
 
-def sample_maneuver(A, B, depth, width, L_max, rng, n_points, profile, rmin_frac=0.11):
+def sample_maneuver(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5, n_cap=15):
     """Гладкий манёвр из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро maneuver_path)."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    return maneuver_path(S0, B, L_max, rng, profile, n_points, rmin_frac), S0
+    return maneuver_path(S0, B, L_max, rng, profile, n_points, r_min, n_cap), S0
 
 
-def sample_polyline(A, B, depth, width, L_max, rng, n_points, profile, rmin_frac=0.11):
+def sample_polyline(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5, n_cap=15):
     """Ломаная из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро polyline_path)."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    return polyline_path(S0, B, L_max, rng, profile, n_points, rmin_frac), S0
+    return polyline_path(S0, B, L_max, rng, profile, n_points, r_min, n_cap), S0
 
 
 # ----------------------------------------------------------------------
@@ -109,6 +110,7 @@ class AreaStartModel:
         self.B = np.asarray(params.B, float)
         self.has_route = False
         self.theta_max = 0.0
+        self.r_min = turn_radius_km(params.speed_kmh / 3.6, params.bank_deg)
         self.rng = np.random.default_rng(params.seed)
         self.trajectories, self.features = [], []
         self.sensors = np.empty((0, 2), float)
@@ -183,6 +185,7 @@ class AreaStartModel:
         if seed is not None:
             self.p.seed = seed
         self.rng = np.random.default_rng(self.p.seed)
+        self.r_min = turn_radius_km(self.p.speed_kmh / 3.6, self.p.bank_deg)
         self.trajectories, self.features = [], []
         self.sensors = np.empty((0, 2), float)
         self.iteration = 0
@@ -215,18 +218,32 @@ class AreaStartModel:
         p = self.p
         if self.movement == "maneuver":
             return sample_maneuver(self.A, self.B, p.corridor_depth, p.corridor_width,
-                                   p.L_max, rng, p.n_points, p.motion_profile)
+                                   p.L_max, rng, p.n_points, p.motion_profile,
+                                   self.r_min, p.n_cap)
         if self.movement == "polyline":
             return sample_polyline(self.A, self.B, p.corridor_depth, p.corridor_width,
-                                   p.L_max, rng, p.n_points, p.motion_profile)
+                                   p.L_max, rng, p.n_points, p.motion_profile,
+                                   self.r_min, p.n_cap)
         return sample_area_arc(self.A, self.B, p.corridor_depth, p.corridor_width,
                                p.L_max, rng, p.sigma_frac, p.n_points, p.motion_profile)
 
     def sample_trajectory(self):
         return self._sample(self.rng)
 
+    def _anchor_idx(self):
+        """Индекс кандидата для «якорного» датчика у цели B (1/3 R заходит за B)."""
+        if self.cache is None or len(self.candidates) == 0:
+            return None
+        d = self.B - self.A; L = float(np.linalg.norm(d))
+        if L < 1e-6:
+            return None
+        P = self.B - (2.0 / 3.0) * self.p.R * (d / L)
+        return int(np.argmin(np.linalg.norm(self.candidates - P, axis=1)))
+
     def recompute_placement(self):
-        self.sensors = self.cache.greedy(self.p.N, self.weights)
+        self.sensors = self.cache.greedy(self.p.N, self.weights,
+                                         anchor_idx=self._anchor_idx(),
+                                         anchor_sep=1.35 * self.p.R)
         return self.sensors
 
     def add_and_replace(self, traj, feature):
@@ -313,8 +330,9 @@ class AreaStartModel:
     def compare_modes(self):
         saved = self.p.mode
         out = {}
+        ai, asep = self._anchor_idx(), 1.35 * self.p.R
         for m in MODES:
-            S = self.cache.greedy(self.p.N, MODES[m])
+            S = self.cache.greedy(self.p.N, MODES[m], anchor_idx=ai, anchor_sep=asep)
             out[m] = self.evaluate(sensors=S)
         self.p.mode = saved
         self.recompute_placement()
