@@ -70,6 +70,29 @@ def sample_start_point(A, B, depth, width, rng):
     return A + du * u + dv * nrm
 
 
+def _zone_exit_frac(S0, A, B, depth, width):
+    """Доля пути S0->B, ЗА которой путевые точки гарантированно ВНЕ ЗОНЫ СТАРТА.
+
+    Берётся опорная проекция эллипса зоны (центр A, полуоси depth/2 вдоль оси A->B
+    и width/2 поперёк) на ось S0->B: точка, отстоящая дальше максимальной проекции
+    эллипса, лежит за его опорной плоскостью, поэтому её боковой вынос (перпендикуляр
+    к оси S0->B сохраняет проекцию) уже не может вернуть точку внутрь зоны. Так точки
+    не спавнятся внутри зоны возможного старта — только за её пределами.
+    """
+    S0 = np.asarray(S0, float); A = np.asarray(A, float); B = np.asarray(B, float)
+    u, nrm, _ = _frame(A, B)                          # оси эллипса зоны
+    a = 0.5 * depth; b = 0.5 * width
+    chord = B - S0; D = float(np.linalg.norm(chord))
+    if D < 1e-9:
+        return 0.05
+    e_par = chord / D
+    # max по эллипсу от (P - S0)·e_par  (опорная функция эллипса вдоль оси S0->B)
+    base = float((A - S0) @ e_par)
+    reach = float(np.hypot(a * (u @ e_par), b * (nrm @ e_par)))
+    frac = (base + reach) / D
+    return float(np.clip(frac + 0.02, 0.05, 0.6))     # +небольшой запас наружу
+
+
 # ----------------------------------------------------------------------
 # Генераторы маршрутов (старт из зоны -> цель B)
 # ----------------------------------------------------------------------
@@ -87,16 +110,22 @@ def sample_area_arc(A, B, depth, width, L_max, rng, sigma_frac, n_points, profil
 
 def sample_maneuver(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5,
                     nrange=(2, 5), law="points"):
-    """Манёвр из СЛУЧАЙНОЙ точки старта зоны в B (по точкам или по синусу)."""
+    """Манёвр из СЛУЧАЙНОЙ точки старта зоны в B (по точкам или по синусу).
+    Путевые точки ставятся только ЗА зоной старта (s_min = доля выхода из зоны)."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    return maneuver_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, law), S0
+    s_min = _zone_exit_frac(S0, A, B, depth, width)
+    return maneuver_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, law,
+                         s_min), S0
 
 
 def sample_polyline(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5,
                     nrange=(2, 5), law="points"):
-    """Ломаная из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро polyline_path)."""
+    """Ломаная из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро polyline_path).
+    Точки — только ЗА зоной старта."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    return polyline_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, law), S0
+    s_min = _zone_exit_frac(S0, A, B, depth, width)
+    return polyline_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, law,
+                         s_min), S0
 
 
 # ----------------------------------------------------------------------

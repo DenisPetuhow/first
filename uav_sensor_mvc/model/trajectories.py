@@ -431,10 +431,13 @@ def _resample_polyline(verts, n_points):
                             np.interp(s, cum, verts[:, 1])])
 
 
-def _waypoints(S0, B, rng, mode, r_min, nrange):
+def _waypoints(S0, B, rng, mode, r_min, nrange, s_min=0.05):
     """Путевые точки. Число точек — СЛУЧАЙНО в пользовательском диапазоне nrange
     (со случайным расстоянием между ними); РЕЖИМ задаёт АМПЛИТУДУ отклонения (линзу),
     а не число точек. Сложный -> точки к краям линзы (заход с разных углов).
+
+    s_min — минимальная доля пути S0->B, начиная с которой допускаются точки
+    (во вкладке 2 = доля выхода из зоны старта; точки не спавнятся внутри неё).
 
     Возвращает (centers, offs, turn).
     """
@@ -451,13 +454,16 @@ def _waypoints(S0, B, rng, mode, r_min, nrange):
         signs = [s0 * (-1.0) ** i for i in range(n)]
     else:
         signs = [1.0 if rng.random() < 0.5 else -1.0 for _ in range(n)]
-    slot = D / (n + 1)
+    s_lo = max(0.05, min(float(s_min), 0.6))         # точки только ЗА зоной старта
+    span = max(0.95 - s_lo, 1e-3)
     centers, offs = [], []
     for i in range(n):
-        # случайное расстояние между точками (джиттер слота)
-        s = float(np.clip((i + 1 + rng.uniform(-0.35, 0.35)) * slot, 0.05 * D, 0.95 * D))
+        # стратификация в доступном диапазоне [s_lo, 0.95] со случайным сдвигом
+        frac = float(np.clip(s_lo + span * (i + 1 + rng.uniform(-0.35, 0.35)) / (n + 1),
+                             s_lo, 0.95))
+        s = frac * D
         u = rng.uniform(par["umin"], 1.0)
-        h = signs[i] * u * (rho * D * 4.0 * (s / D) * (1.0 - s / D))   # линза (амплитуда)
+        h = signs[i] * u * (rho * D * 4.0 * frac * (1.0 - frac))   # линза (амплитуда)
         centers.append(S0 + s * e_par); offs.append(h * e_perp)
     return (np.array(centers).reshape(-1, 2), np.array(offs).reshape(-1, 2), par["turn"])
 
@@ -495,17 +501,19 @@ def _round_corners(verts, r_min, turn_frac, n_points):
     return _resample_polyline(np.vstack(pieces), n_points)
 
 
-def _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, rounded):
+def _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, rounded,
+                   s_min=0.05):
     """Путь по точкам с укладкой в запас хода (уменьшение выноса до прямой).
 
     При большом отклонении (сложный) и нехватке хода вынос уменьшается — получается
-    «большой манёвр, затем по остатку хода кратчайшим к B».
+    «большой манёвр, затем по остатку хода кратчайшим к B». s_min ограничивает точки
+    зоной ЗА стартовым эллипсом (вкладка 2).
     """
     S0 = np.asarray(S0, float); B = np.asarray(B, float)
     if float(np.linalg.norm(B - S0)) < 1e-6:
         return np.repeat(S0[None, :], n_points, axis=0)
     centers, offs, turn_frac = _waypoints(S0, B, rng, _pick_mode(profile, rng),
-                                          r_min, nrange)
+                                          r_min, nrange, s_min)
     for scale in (1.0, 0.85, 0.7, 0.55, 0.4, 0.25, 0.1, 0.0):
         if len(centers) == 0 or scale == 0.0:
             verts = np.vstack([S0, B]) if len(centers) == 0 else \
@@ -538,10 +546,16 @@ def _sine_path(S0, B, L_max, rng, profile, n_points, r_min):
     rho = rng.uniform(*par["rho"])
     comps = []
     for j in range(1, lobes + 1):
-        cap = D * D / (max(r_min, 1e-6) * (j * np.pi) ** 2)     # предел по R_min
         a = rho * D / j * rng.uniform(0.5, 1.0)
-        a = min(a, 0.9 * cap) * (1.0 if rng.random() < 0.5 else -1.0)
+        a = a * (1.0 if rng.random() < 0.5 else -1.0)
         comps.append((j, a))
+    # ГАРАНТИЯ радиуса разворота: суммарная кривизна волны <= 1/R_min
+    # (кривизна гармоники a·sin(jπx/D) ~ |a|·(jπ/D)^2; крен/скорость -> R_min).
+    curv = sum(abs(a) * (j * np.pi / D) ** 2 for j, a in comps)
+    kmax = 1.0 / max(r_min, 1e-6)
+    if curv > kmax:
+        f = kmax / curv
+        comps = [(j, a * f) for j, a in comps]
     t = np.linspace(0.0, 1.0, n_points)
     lat = np.zeros_like(t)
     for j, a in comps:
@@ -556,18 +570,20 @@ def _sine_path(S0, B, L_max, rng, profile, n_points, r_min):
 
 
 def maneuver_path(S0, B, L_max, rng, profile="mixed", n_points=140, r_min=0.5,
-                  nrange=(2, 5), law="points"):
+                  nrange=(2, 5), law="points", s_min=0.05):
     """Манёвр БПЛА. law="points" — путь по ТОЧКАМ со скруглением углов (дуги
-    радиуса >= R_min); law="sine" — по СИНУСОИДАЛЬНОМУ закону."""
+    радиуса >= R_min); law="sine" — по СИНУСОИДАЛЬНОМУ закону. s_min — мин. доля
+    пути S0->B с точками (точки не спавнятся внутри зоны старта; вкладка 1 = 0.05)."""
     if law == "sine":
         return _sine_path(S0, B, L_max, rng, profile, n_points, r_min)
-    return _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, True)
+    return _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, True, s_min)
 
 
 def polyline_path(S0, B, L_max, rng, profile="mixed", n_points=140, r_min=0.5,
-                  nrange=(2, 5), law="points"):
-    """Ломаная БПЛА: путь по точкам БЕЗ скругления (угловой манёвр; law не влияет)."""
-    return _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, False)
+                  nrange=(2, 5), law="points", s_min=0.05):
+    """Ломаная БПЛА: путь по точкам БЕЗ скругления (угловой манёвр; law не влияет).
+    s_min исключает точки внутри зоны старта (вкладка 2)."""
+    return _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, False, s_min)
 
 
 def sample_maneuver_trajectory(A, B, L_max, rng, sigma_frac=0.45, n_points=140,
