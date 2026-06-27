@@ -373,10 +373,25 @@ class SimulationView(QtWidgets.QWidget):
         self.ab_scatter.setData([A[0], B[0]], [A[1], B[1]])
         self.lab_A.setPos(A[0], A[1]); self.lab_B.setPos(B[0], B[1])
         # масштаб меняем ТОЛЬКО при смене коридора — иначе зум пользователя сохраняется
-        if bbox != self._last_bbox:
-            x0, x1, y0, y1 = bbox
+        self._apply_range()
+
+    def _apply_range(self, force=False):
+        """Подогнать масштаб под текущий bbox (force=True — даже если bbox не менялся)."""
+        if self._bbox is None:
+            return
+        if force or self._bbox != self._last_bbox:
+            x0, x1, y0, y1 = self._bbox
             self.pi.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=0.06)
-            self._last_bbox = bbox
+            self._last_bbox = self._bbox
+
+    def showEvent(self, e):
+        # на неактивной вкладке размер виджета ещё не задан → пере-подгонка при показе
+        super().showEvent(e)
+        self._apply_range(force=True)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._apply_range(force=True)
 
     # ---- слои ----
     def _render_density(self, density, show):
