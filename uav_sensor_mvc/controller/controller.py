@@ -7,7 +7,7 @@ CONTROLLER · Связующее звено между моделью и пре�
 через блиттинг, запускает пакетный расчёт и сравнение режимов, поддерживает
 панель показателей.
 """
-from config import MODE_LABELS, TRAJ_LABELS, MOTION_LABELS
+from config import MODE_LABELS, TRAJ_LABELS, MOTION_LABELS, MANEUVER_LAW_LABELS
 from view.view import PARAM_SPECS
 
 
@@ -30,7 +30,7 @@ class SimulationController:
             on_start_pause=self.on_start_pause, on_step=self.on_step,
             on_reset=self.on_reset, on_batch=self.on_batch, on_apply=self.on_apply,
             on_mode=self.on_mode, on_traj=self.on_traj, on_profile=self.on_profile,
-            on_speed=self.on_speed, on_toggle=self.on_toggle)
+            on_speed=self.on_speed, on_toggle=self.on_toggle, on_law=self.on_law)
 
         self._sync_geometry()
         self._redraw_idle_or_last()
@@ -90,6 +90,10 @@ class SimulationController:
     def on_profile(self, key):
         self.model.set_profile(key)
         self._restart(f"Профиль разброса: {MOTION_LABELS[key]}. Нажмите «Пуск».")
+
+    def on_law(self, key):
+        self.model.p.maneuver_law = key
+        self._restart(f"Закон манёвра: {MANEUVER_LAW_LABELS[key]}. Нажмите «Пуск».")
 
     def on_speed(self, val):
         self.speed = int(val)

@@ -38,6 +38,9 @@ AREA_TRAJ_LABELS = {
     "maneuver":  "манёвр",
 }
 
+# Закон манёвра (выпадающий список): по точкам / по синусоидальному закону
+MANEUVER_LAW_LABELS = {"points": "по точкам", "sine": "по синусу"}
+
 # Профили РАЗБРОСА = АМПЛИТУДА отклонения от прямой (НЕ число точек!).
 # Число точек задаётся отдельно (Params.n_min..n_max). Порядок = порядок в UI.
 MOTION_PROFILES = ("normal", "mixed", "complex", "balanced")
@@ -75,6 +78,7 @@ class Params:
     bank_deg: float = 25.0         # макс. угол крена, ° (-> радиус разворота R_min)
     n_min: int = 2                 # мин. число путевых точек маршрута (задаёт пользователь)
     n_max: int = 5                 # макс. число путевых точек (рандом в [n_min, n_max])
+    maneuver_law: str = "points"   # закон манёвра: "points" (по точкам) | "sine" (по синусу)
     mode: str = "balanced"         # режим оптимизации
     traj_model: str = "arc"        # модель движения
     motion_profile: str = "mixed"  # профиль разброса маршрутов

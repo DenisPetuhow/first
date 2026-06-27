@@ -22,7 +22,7 @@ from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
                            signed_max_lateral, corridor_bbox, corridor_outline,
                            frequent_arcs, frequent_serpentines, serpentine_fan,
                            frequent_maneuvers, maneuver_fan, turn_radius_km)
-from .optimization import candidate_grid, CoverageCache
+from .optimization import candidate_grid, CoverageCache, filter_not_past_target
 
 
 class SimulationModel:
@@ -55,6 +55,7 @@ class SimulationModel:
         self.r_min = turn_radius_km(p.speed_kmh / 3.6, p.bank_deg)   # радиус разворота, км
         self.candidates = candidate_grid(p.A, p.B, p.L_max, p.grid_step,
                                          traj_model=p.traj_model)
+        self.candidates = filter_not_past_target(self.candidates, p.A, p.B)
         self.cache = CoverageCache(self.candidates, p.R, p.L_seg, p.k)
         self.trajectories = []
         self.features = []
@@ -119,7 +120,7 @@ class SimulationModel:
         return sampler(p.A, p.B, p.L_max, self.rng,
                        sigma_frac=p.sigma_frac, n_points=p.n_points,
                        theta_max=self.theta_max, profile=p.motion_profile,
-                       r_min=self.r_min, nrange=(p.n_min, p.n_max))
+                       r_min=self.r_min, nrange=(p.n_min, p.n_max), law=p.maneuver_law)
 
     def _anchor_idx(self):
         """Индекс кандидата для «якорного» датчика у цели B (1/3 R заходит за B)."""
@@ -178,7 +179,8 @@ class SimulationModel:
         if p.traj_model == "maneuver":
             return frequent_maneuvers(p.A, p.B, p.L_max, p.motion_profile,
                                       p.sigma_frac, n=n, n_points=p.n_points,
-                                      r_min=self.r_min, nrange=(p.n_min, p.n_max))
+                                      r_min=self.r_min, nrange=(p.n_min, p.n_max),
+                                      law=p.maneuver_law)
         return frequent_serpentines(p.A, p.B, p.L_max, p.motion_profile,
                                     p.sigma_frac, n=n, n_points=p.n_points)
 
@@ -193,7 +195,7 @@ class SimulationModel:
         if p.traj_model == "maneuver":
             return maneuver_fan(p.A, p.B, p.L_max, profile=p.motion_profile,
                                 n_points=p.n_points, r_min=self.r_min,
-                                nrange=(p.n_min, p.n_max))
+                                nrange=(p.n_min, p.n_max), law=p.maneuver_law)
         return serpentine_fan(p.A, p.B, p.L_max, n_points=p.n_points)
 
     def density_field(self, nbins=160):

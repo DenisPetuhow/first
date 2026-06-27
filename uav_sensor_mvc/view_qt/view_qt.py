@@ -18,7 +18,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 import matplotlib.cm as cm
 
-from config import MODE_LABELS, TRAJ_LABELS, MOTION_LABELS, THEME
+from config import (MODE_LABELS, TRAJ_LABELS, MOTION_LABELS, MANEUVER_LAW_LABELS, THEME)
 from view.view import PARAM_SPECS          # единый источник списка параметров
 
 # Дополнительные поля Qt-версии: ТТХ БПЛА (-> R_min) и диапазон числа точек маршрута
@@ -76,6 +76,7 @@ class SimulationView(QtWidgets.QWidget):
         self.on_mode = self.on_traj = self.on_profile = lambda key: None
         self.on_speed = lambda v: None
         self.on_toggle = lambda: None
+        self.on_law = lambda key: None
 
         self._fields = {}
         self._suppress = False
@@ -164,6 +165,7 @@ class SimulationView(QtWidgets.QWidget):
         rw = QtWidgets.QWidget(); rw.setLayout(rb)
         two.addWidget(rw, 1)
         col.addLayout(two)
+        self._build_law_combo(col, params)
 
         # слои
         col.addWidget(self._header("ПОКАЗ"))
@@ -213,6 +215,22 @@ class SimulationView(QtWidgets.QWidget):
     def _header(self, text):
         lab = QtWidgets.QLabel(text); lab.setObjectName("header")
         return lab
+
+    def _build_law_combo(self, col, params):
+        """Выпадающий список «Закон манёвра»: по точкам / по синусу."""
+        row = QtWidgets.QHBoxLayout()
+        lab = QtWidgets.QLabel("Закон манёвра:"); lab.setObjectName("muted")
+        self.combo_law = QtWidgets.QComboBox()
+        self._law_keys = list(MANEUVER_LAW_LABELS)
+        for k in self._law_keys:
+            self.combo_law.addItem(MANEUVER_LAW_LABELS[k])
+        cur = getattr(params, "maneuver_law", "points")
+        self.combo_law.setCurrentIndex(self._law_keys.index(cur)
+                                       if cur in self._law_keys else 0)
+        self.combo_law.currentIndexChanged.connect(
+            lambda i: self.on_law(self._law_keys[i]))
+        row.addWidget(lab); row.addWidget(self.combo_law, 1)
+        col.addLayout(row)
 
     def _radio_group(self, _title, labels_map, active_key, slot):
         keys = list(labels_map)

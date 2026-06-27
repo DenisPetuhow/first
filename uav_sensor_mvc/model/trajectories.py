@@ -123,7 +123,8 @@ def _sample_angle(rng, theta_max, sigma, profile):
 
 
 def sample_arc_trajectory(A, B, L_max, rng, sigma_frac=0.45, n_points=140,
-                          theta_max=None, profile="normal", r_min=0.5, nrange=(2, 5)):
+                          theta_max=None, profile="normal", r_min=0.5, nrange=(2, 5),
+                          law="points"):
     """Случайная дуга по профилю. Возвращает (traj, theta_deg)."""
     if theta_max is None:
         theta_max = max_deflection_angle(A, B, L_max)
@@ -277,7 +278,8 @@ def max_serpentine_amplitude(ab_distance, L_max, n_lobes, n_points=140):
 
 
 def sample_serpentine_trajectory(A, B, L_max, rng, sigma_frac=0.45, n_points=140,
-                                 theta_max=None, profile="normal", r_min=0.5, nrange=(2, 5)):
+                                 theta_max=None, profile="normal", r_min=0.5,
+                                 nrange=(2, 5), law="points"):
     """Случайная петляющая траектория по профилю. Возвращает (traj, feature).
 
     Амплитуда выбирается в пределах ДОПУСТИМОЙ по запасу хода (max_serpentine_
@@ -403,8 +405,8 @@ def turn_radius_km(speed_ms, bank_deg):
 # Число точек задаётся ОТДЕЛЬНО диапазоном nrange (поля пользователя).
 _WP_MODE = {
     "normal":  dict(rho=(0.04, 0.10), turn=0.40, alt=False, umin=0.30),
-    "mixed":   dict(rho=(0.16, 0.34), turn=0.30, alt=False, umin=0.55),
-    "complex": dict(rho=(0.60, 1.20), turn=0.22, alt=True,  umin=0.88),
+    "mixed":   dict(rho=(0.18, 0.38), turn=0.30, alt=False, umin=0.60),
+    "complex": dict(rho=(0.75, 1.45), turn=0.22, alt=True,  umin=0.92),
 }
 _BALANCED_P = [("normal", 0.30), ("mixed", 0.40), ("complex", 0.30)]
 
@@ -517,50 +519,89 @@ def _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, rounded)
     return _resample_polyline(np.vstack([S0, B]), n_points)
 
 
+_SINE_LOBES = {"normal": (1, 1), "mixed": (1, 2), "complex": (2, 4)}
+
+
+def _sine_path(S0, B, L_max, rng, profile, n_points, r_min):
+    """Манёвр по СИНУСОИДАЛЬНОМУ закону: боковое отклонение = сумма гармоник
+    sin(jπt) (гладкая волна без прямых участков). Амплитуда по режиму (rho),
+    кривизна ограничена R_min, длина <= L_max. (Как было до перехода на точки.)"""
+    S0 = np.asarray(S0, float); B = np.asarray(B, float)
+    chord = B - S0; D = float(np.linalg.norm(chord))
+    if D < 1e-6:
+        return np.repeat(S0[None, :], n_points, axis=0)
+    mode = _pick_mode(profile, rng)
+    par = _WP_MODE[mode]
+    u = chord / D; nrm = np.array([-u[1], u[0]])
+    lo, hi = _SINE_LOBES.get(mode, (1, 2))
+    lobes = int(rng.integers(lo, hi + 1))
+    rho = rng.uniform(*par["rho"])
+    comps = []
+    for j in range(1, lobes + 1):
+        cap = D * D / (max(r_min, 1e-6) * (j * np.pi) ** 2)     # предел по R_min
+        a = rho * D / j * rng.uniform(0.5, 1.0)
+        a = min(a, 0.9 * cap) * (1.0 if rng.random() < 0.5 else -1.0)
+        comps.append((j, a))
+    t = np.linspace(0.0, 1.0, n_points)
+    lat = np.zeros_like(t)
+    for j, a in comps:
+        lat = lat + a * np.sin(j * np.pi * t)
+    base = S0[None, :] + t[:, None] * chord[None, :]
+    s = 1.0
+    traj = base + (s * lat)[:, None] * nrm[None, :]
+    while polyline_length(traj) > L_max and s > 0.05:
+        s *= 0.85
+        traj = base + (s * lat)[:, None] * nrm[None, :]
+    return traj
+
+
 def maneuver_path(S0, B, L_max, rng, profile="mixed", n_points=140, r_min=0.5,
-                  nrange=(2, 5)):
-    """Манёвр БПЛА: путь по точкам со СКРУГЛЕНИЕМ углов (дуги радиуса R_min)."""
+                  nrange=(2, 5), law="points"):
+    """Манёвр БПЛА. law="points" — путь по ТОЧКАМ со скруглением углов (дуги
+    радиуса >= R_min); law="sine" — по СИНУСОИДАЛЬНОМУ закону."""
+    if law == "sine":
+        return _sine_path(S0, B, L_max, rng, profile, n_points, r_min)
     return _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, True)
 
 
 def polyline_path(S0, B, L_max, rng, profile="mixed", n_points=140, r_min=0.5,
-                  nrange=(2, 5)):
-    """Ломаная БПЛА: путь по точкам БЕЗ скругления (угловой манёвр)."""
+                  nrange=(2, 5), law="points"):
+    """Ломаная БПЛА: путь по точкам БЕЗ скругления (угловой манёвр; law не влияет)."""
     return _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, False)
 
 
 def sample_maneuver_trajectory(A, B, L_max, rng, sigma_frac=0.45, n_points=140,
                                theta_max=None, profile="normal", r_min=0.5,
-                               nrange=(2, 5)):
-    """Случайный манёвр A->B (скругление). Возвращает (traj, feature)."""
-    traj = maneuver_path(A, B, L_max, rng, profile, n_points, r_min, nrange)
+                               nrange=(2, 5), law="points"):
+    """Случайный манёвр A->B (по точкам или по синусу). Возвращает (traj, feature)."""
+    traj = maneuver_path(A, B, L_max, rng, profile, n_points, r_min, nrange, law)
     return traj, signed_max_lateral(traj, A, B)
 
 
 def sample_polyline_trajectory(A, B, L_max, rng, sigma_frac=0.45, n_points=140,
                                theta_max=None, profile="normal", r_min=0.5,
-                               nrange=(2, 5)):
+                               nrange=(2, 5), law="points"):
     """Случайная ломаная A->B. Возвращает (traj, feature)."""
-    traj = polyline_path(A, B, L_max, rng, profile, n_points, r_min, nrange)
+    traj = polyline_path(A, B, L_max, rng, profile, n_points, r_min, nrange, law)
     return traj, signed_max_lateral(traj, A, B)
 
 
 def frequent_maneuvers(A, B, L_max, profile, sigma_frac=0.45, n=10, n_points=140,
-                       kind="maneuver", r_min=0.5, nrange=(2, 5)):
+                       kind="maneuver", r_min=0.5, nrange=(2, 5), law="points"):
     """n представительных манёвров/ломаных (детерминированно)."""
     fn = polyline_path if kind == "polyline" else maneuver_path
     rng = np.random.default_rng(4321)
-    return [dict(traj=fn(A, B, L_max, rng, profile, n_points, r_min, nrange),
+    return [dict(traj=fn(A, B, L_max, rng, profile, n_points, r_min, nrange, law),
                  weight=0.6, is_extreme=False, label=kind)
             for _ in range(n)]
 
 
 def maneuver_fan(A, B, L_max, profile="mixed", n_points=140, k=14, kind="maneuver",
-                 r_min=0.5, nrange=(2, 5)):
+                 r_min=0.5, nrange=(2, 5), law="points"):
     """Веер манёвров/ломаных (геометрия пространства манёвров)."""
     fn = polyline_path if kind == "polyline" else maneuver_path
     rng = np.random.default_rng(321)
-    return [dict(traj=fn(A, B, L_max, rng, profile, n_points, r_min, nrange),
+    return [dict(traj=fn(A, B, L_max, rng, profile, n_points, r_min, nrange, law),
                  weight=0.5, is_extreme=False, label=kind)
             for _ in range(k)]
 

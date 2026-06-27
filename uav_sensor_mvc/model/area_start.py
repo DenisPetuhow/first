@@ -25,7 +25,7 @@ from .geometry import ellipse_geometry
 from .trajectories import (make_arc_by_angle, max_deflection_angle, _sample_angle,
                            polyline_length, arc_fan, maneuver_path, polyline_path,
                            turn_radius_km)
-from .optimization import CoverageCache
+from .optimization import CoverageCache, filter_not_past_target
 
 
 # ----------------------------------------------------------------------
@@ -86,17 +86,17 @@ def sample_area_arc(A, B, depth, width, L_max, rng, sigma_frac, n_points, profil
 
 
 def sample_maneuver(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5,
-                    nrange=(2, 5)):
-    """Гладкий манёвр из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро maneuver_path)."""
+                    nrange=(2, 5), law="points"):
+    """Манёвр из СЛУЧАЙНОЙ точки старта зоны в B (по точкам или по синусу)."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    return maneuver_path(S0, B, L_max, rng, profile, n_points, r_min, nrange), S0
+    return maneuver_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, law), S0
 
 
 def sample_polyline(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5,
-                    nrange=(2, 5)):
+                    nrange=(2, 5), law="points"):
     """Ломаная из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро polyline_path)."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    return polyline_path(S0, B, L_max, rng, profile, n_points, r_min, nrange), S0
+    return polyline_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, law), S0
 
 
 # ----------------------------------------------------------------------
@@ -193,7 +193,7 @@ class AreaStartModel:
         self.iteration = 0
         if not self.has_route:
             return
-        self.candidates = self._build_candidates()
+        self.candidates = filter_not_past_target(self._build_candidates(), self.A, self.B)
         self.cache = CoverageCache(self.candidates, self.p.R, self.p.L_seg, self.p.k)
         zone = self.start_zone()
         reach = reach_ellipse_outline(self.A, self.B, self.p.L_max)
@@ -221,11 +221,11 @@ class AreaStartModel:
         if self.movement == "maneuver":
             return sample_maneuver(self.A, self.B, p.corridor_depth, p.corridor_width,
                                    p.L_max, rng, p.n_points, p.motion_profile,
-                                   self.r_min, (p.n_min, p.n_max))
+                                   self.r_min, (p.n_min, p.n_max), p.maneuver_law)
         if self.movement == "polyline":
             return sample_polyline(self.A, self.B, p.corridor_depth, p.corridor_width,
                                    p.L_max, rng, p.n_points, p.motion_profile,
-                                   self.r_min, (p.n_min, p.n_max))
+                                   self.r_min, (p.n_min, p.n_max), p.maneuver_law)
         return sample_area_arc(self.A, self.B, p.corridor_depth, p.corridor_width,
                                p.L_max, rng, p.sigma_frac, p.n_points, p.motion_profile)
 

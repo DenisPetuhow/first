@@ -95,6 +95,7 @@ class AreaStartView(SimulationView):
         rw = QtWidgets.QWidget(); rw.setLayout(rb)
         two.addWidget(rw, 1)
         col.addLayout(two)
+        self._build_law_combo(col, params)
 
         col.addWidget(self._header("ПОКАЗ"))
         self.chk_heat = QtWidgets.QCheckBox("тепловая карта")
