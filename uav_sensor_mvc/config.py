@@ -88,7 +88,7 @@ class Params:
     n_min: int = 2                 # мин. число путевых точек маршрута (задаёт пользователь)
     n_max: int = 5                 # макс. число путевых точек (рандом в [n_min, n_max])
     maneuver_law: str = "points"   # закон манёвра: "points" (по точкам) | "sine" (по синусу)
-    waypoint_zone: str = "outside" # точки маршрута: "inside" (в зоне старта) | "outside" (только за зоной)
+    waypoint_zone: str = "inside"  # точки маршрута: "inside" (в зоне старта, полный разброс) | "outside" (только за зоной)
     mode: str = "balanced"         # режим оптимизации
     traj_model: str = "arc"        # модель движения
     motion_profile: str = "mixed"  # профиль разброса маршрутов

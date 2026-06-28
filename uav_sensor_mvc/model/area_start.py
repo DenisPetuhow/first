@@ -184,7 +184,10 @@ class AreaStartModel:
     def set_route(self, A, B):
         """Зафиксировать маршрут (центр зоны старта A и цель B) и сбросить выборку."""
         self.A = np.asarray(A, float)
-        self.B = np.asarray(B, float)
+        B = np.asarray(B, float)
+        d = B - self.A; nrm = float(np.linalg.norm(d))
+        self._dir = d / nrm if nrm > 1e-6 else np.array([1.0, 0.0])  # направление A->B
+        self.B = B
         self.has_route = True
         self.reset()
 
@@ -237,10 +240,19 @@ class AreaStartModel:
         self.iteration = 0
         if not self.has_route:
             return
+        # цель B следует за полем |AB|: длина по направлению клика (карта сразу
+        # перерисовывается при изменении расстояния и нажатии «Применить»)
+        if hasattr(self, "_dir"):
+            self.B = self.A + float(self.p.ab_distance) * self._dir
         cand = filter_not_past_target(self._build_candidates(), self.A, self.B)
-        # датчики НЕ ставятся в зоне неопределённости/старта БПЛА — только за ней
-        cand = cand[points_outside_start_zone(cand, self.A, self.B,
-                                              self.p.corridor_depth, self.p.corridor_width)]
+        # датчики НЕ ставятся в зоне старта И НЕ «за спиной» зоны (180° от задней
+        # точки эллипса старта): допустимы только в полупространстве в сторону B.
+        u, _nrm, _ = _frame(self.A, self.B)
+        axial = (cand - self.A) @ u
+        mask = points_outside_start_zone(cand, self.A, self.B,
+                                         self.p.corridor_depth, self.p.corridor_width)
+        mask &= axial >= -0.5 * self.p.corridor_depth     # не за задней кромкой зоны
+        cand = cand[mask]
         self.candidates = cand
         self.cache = CoverageCache(self.candidates, self.p.R, self.p.L_seg, self.p.k)
         zone = self.start_zone()

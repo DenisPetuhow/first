@@ -101,6 +101,13 @@ class AreaStartController(QtSimulationController):
         if self.model.has_route:
             self._restart(f"Точки маршрута: {WAYPOINT_ZONE_LABELS[key]}. «Пуск».")
 
+    def on_apply(self):
+        # после применения параметров (|AB|, L_max, зона) принудительно
+        # перемасштабируем карту — она сразу перерисовывается под новую геометрию
+        super().on_apply()
+        if self.model.has_route:
+            self.view._apply_range(force=True)
+
     # ---- блокировка просмотра до маршрута ----
     def _require_route(self):
         if not self.model.has_route:

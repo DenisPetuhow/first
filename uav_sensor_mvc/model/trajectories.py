@@ -395,18 +395,20 @@ def turn_radius_km(speed_ms, bank_deg):
     return float(speed_ms ** 2 / (GRAVITY * tan) / 1000.0)
 
 
-# Режимы разброса: число точек n, ширина линзы ρ, макс. доворот Δψ (°),
-# чередование знаков (зигзаг), минимальная доля выноса u_min.
-# РАЗБРОС = АМПЛИТУДА отклонения от прямой (НЕ число точек!).
-#   rho  — ширина линзы (доля D): малый жмётся к прямой, сложный — к краям эллипса;
-#   umin — мин. доля выноса (ближе к 1 -> точки у края линзы, заход с разных углов);
+# Режимы разброса: амплитуда выноса ρ, чередование знаков (зигзаг), мин. доля u_min,
+# пологость дуги turn. РАЗБРОС = АМПЛИТУДА отклонения от прямой (НЕ число точек!).
+#   rho  — амплитуда выноса как ДОЛЯ ОТ b (макс. достижимого бокового выноса —
+#          полу-малой оси эллипса достижимости): малый ~0.1·b (жмётся к прямой),
+#          сложный ~b (достаёт до краёв эллипса). База — b, а не хорда D, поэтому
+#          вынос укладывается в запас хода и НЕ схлопывается фитом в прямую.
+#   umin — мин. доля выноса (ближе к 1 -> точки у края, заход с разных углов);
 #   turn — пологость дуги (доля отрезка под скругление);
 #   alt  — чередование знаков (для сложного: уход в разные стороны эллипса).
 # Число точек задаётся ОТДЕЛЬНО диапазоном nrange (поля пользователя).
 _WP_MODE = {
-    "normal":  dict(rho=(0.04, 0.10), turn=0.40, alt=False, umin=0.30),
-    "mixed":   dict(rho=(0.18, 0.38), turn=0.30, alt=False, umin=0.60),
-    "complex": dict(rho=(0.75, 1.45), turn=0.22, alt=True,  umin=0.92),
+    "normal":  dict(rho=(0.08, 0.25), turn=0.40, alt=False, umin=0.45),
+    "mixed":   dict(rho=(0.32, 0.62), turn=0.30, alt=False, umin=0.65),
+    "complex": dict(rho=(0.70, 1.05), turn=0.22, alt=True,  umin=0.90),
 }
 _BALANCED_P = [("normal", 0.30), ("mixed", 0.40), ("complex", 0.30)]
 
@@ -431,10 +433,11 @@ def _resample_polyline(verts, n_points):
                             np.interp(s, cum, verts[:, 1])])
 
 
-def _waypoints(S0, B, rng, mode, r_min, nrange, s_min=0.05):
+def _waypoints(S0, B, L_max, rng, mode, r_min, nrange, s_min=0.05):
     """Путевые точки. Число точек — СЛУЧАЙНО в пользовательском диапазоне nrange
-    (со случайным расстоянием между ними); РЕЖИМ задаёт АМПЛИТУДУ отклонения (линзу),
-    а не число точек. Сложный -> точки к краям линзы (заход с разных углов).
+    (со случайным расстоянием между ними); РЕЖИМ задаёт АМПЛИТУДУ отклонения, а не
+    число точек. Амплитуда отсчитывается от b — макс. достижимого бокового выноса
+    (полу-малой оси эллипса достижимости), поэтому сложный достаёт до краёв эллипса.
 
     s_min — минимальная доля пути S0->B, начиная с которой допускаются точки
     (во вкладке 2 = доля выхода из зоны старта; точки не спавнятся внутри неё).
@@ -443,27 +446,43 @@ def _waypoints(S0, B, rng, mode, r_min, nrange, s_min=0.05):
     """
     chord = B - S0; D = float(np.linalg.norm(chord))
     e_par = chord / D; e_perp = np.array([-e_par[1], e_par[0]])
+    b_lat = ellipse_b(S0, B, L_max)          # макс. боковой вынос (полу-малая ось)
     par = _WP_MODE[mode]
     n_lo = max(0, int(nrange[0])); n_hi = max(n_lo, int(nrange[1]))
     n_phys = max(n_lo, int(D / max(4.0 * r_min, 1e-6)))           # физический предел
     n_hi = min(n_hi, n_phys)
     n = int(rng.integers(n_lo, n_hi + 1)) if n_hi >= n_lo else n_lo
     rho = rng.uniform(*par["rho"])
-    if par["alt"]:                                                # сложный — уход в разные стороны
-        s0 = 1.0 if rng.random() < 0.5 else -1.0
-        signs = [s0 * (-1.0) ** i for i in range(n)]
+    if par["alt"]:
+        # сложный = МАКС. отклонение: 1–2 КРУПНЫХ лепестка к краю эллипса. Точки
+        # одной стороны образуют большой вынос ~b (а не узкий зигзаг, который при
+        # многих точках не успевает уйти от центра в пределах L_max). Разные маршруты
+        # выбирают разную сторону -> огибающая заполняет эллипс с разных направлений.
+        side = 1.0 if rng.random() < 0.5 else -1.0
+        if n <= 1 or rng.random() < 0.6:
+            signs = [side] * n                                    # один крупный лепесток
+        else:
+            cut = int(rng.integers(1, n))                        # смена стороны (S-образно)
+            signs = [side if i < cut else -side for i in range(n)]
     else:
         signs = [1.0 if rng.random() < 0.5 else -1.0 for _ in range(n)]
-    s_lo = max(0.05, min(float(s_min), 0.6))         # точки только ЗА зоной старта
+    # доступный диапазон долей пути: [s_lo, 0.95]. s_lo>0.05 -> точки только ЗА
+    # зоной старта (режим "outside"); s_lo=0.05 -> как раньше (точки по всему пути).
+    s_lo = max(0.05, min(float(s_min), 0.6))
     span = max(0.95 - s_lo, 1e-3)
+    denom = max(1.0 - s_lo, 1e-6)
     centers, offs = [], []
     for i in range(n):
         # стратификация в доступном диапазоне [s_lo, 0.95] со случайным сдвигом
         frac = float(np.clip(s_lo + span * (i + 1 + rng.uniform(-0.35, 0.35)) / (n + 1),
                              s_lo, 0.95))
         s = frac * D
+        # ЛИНЗА якорится на ДОСТУПНОМ диапазоне [s_lo, 1] (а не на всём пути): вынос
+        # = 0 у границы зоны и у B, максимум — посередине доступного диапазона. Это
+        # сохраняет ПОЛНУЮ амплитуду «разброса» даже когда точки сдвинуты за зону.
+        x = (frac - s_lo) / denom
         u = rng.uniform(par["umin"], 1.0)
-        h = signs[i] * u * (rho * D * 4.0 * frac * (1.0 - frac))   # линза (амплитуда)
+        h = signs[i] * u * (rho * b_lat * 4.0 * x * (1.0 - x))   # база — b (см. _WP_MODE)
         centers.append(S0 + s * e_par); offs.append(h * e_perp)
     return (np.array(centers).reshape(-1, 2), np.array(offs).reshape(-1, 2), par["turn"])
 
@@ -512,7 +531,7 @@ def _waypoint_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, rounded,
     S0 = np.asarray(S0, float); B = np.asarray(B, float)
     if float(np.linalg.norm(B - S0)) < 1e-6:
         return np.repeat(S0[None, :], n_points, axis=0)
-    centers, offs, turn_frac = _waypoints(S0, B, rng, _pick_mode(profile, rng),
+    centers, offs, turn_frac = _waypoints(S0, B, L_max, rng, _pick_mode(profile, rng),
                                           r_min, nrange, s_min)
     for scale in (1.0, 0.85, 0.7, 0.55, 0.4, 0.25, 0.1, 0.0):
         if len(centers) == 0 or scale == 0.0:
@@ -540,13 +559,14 @@ def _sine_path(S0, B, L_max, rng, profile, n_points, r_min):
         return np.repeat(S0[None, :], n_points, axis=0)
     mode = _pick_mode(profile, rng)
     par = _WP_MODE[mode]
+    b_lat = ellipse_b(S0, B, L_max)          # макс. боковой вынос (полу-малая ось)
     u = chord / D; nrm = np.array([-u[1], u[0]])
     lo, hi = _SINE_LOBES.get(mode, (1, 2))
     lobes = int(rng.integers(lo, hi + 1))
     rho = rng.uniform(*par["rho"])
     comps = []
     for j in range(1, lobes + 1):
-        a = rho * D / j * rng.uniform(0.5, 1.0)
+        a = rho * b_lat / j * rng.uniform(0.5, 1.0)   # база — b (доля от полу-малой оси)
         a = a * (1.0 if rng.random() < 0.5 else -1.0)
         comps.append((j, a))
     # ГАРАНТИЯ радиуса разворота: суммарная кривизна волны <= 1/R_min
