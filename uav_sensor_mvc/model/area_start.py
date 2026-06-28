@@ -24,7 +24,8 @@ from . import detection
 from .geometry import ellipse_geometry
 from .trajectories import (make_arc_by_angle, max_deflection_angle, _sample_angle,
                            polyline_length, arc_fan, maneuver_path, polyline_path,
-                           turn_radius_km, signed_max_lateral)
+                           turn_radius_km, signed_max_lateral,
+                           representative_trajectories)
 from .optimization import CoverageCache, filter_not_past_target
 
 
@@ -366,11 +367,15 @@ class AreaStartModel:
 
     # ---- слои ----
     def frequent_paths(self, n=10):
-        """n представительных маршрутов, РАВНОМЕРНО по боковому отклонению (обе
-        стороны). Иначе при случайной выборке немногих маршрутов они могли все
-        оказаться с одной стороны, хотя реальное распределение двустороннее."""
+        """10 наиболее вероятных маршрутов.
+
+        ПРЕДИКТИВНО: если выборка накоплена — обобщение ВСЕЙ выборки
+        (кластеризация по форме, медоиды, вес = доля кластера = вероятность). До
+        накопления — представительная выборка, РАВНОМЕРНО по сторонам."""
         if not self.has_route:
             return []
+        if len(self.trajectories) > n:
+            return representative_trajectories(self.trajectories, n=n)
         rng = np.random.default_rng(2024)
         cand = []
         for _ in range(max(n * 6, 60)):

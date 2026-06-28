@@ -21,7 +21,8 @@ from .geometry import ellipse_geometry, geo_to_local_km
 from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
                            signed_max_lateral, corridor_bbox, corridor_outline,
                            frequent_arcs, frequent_serpentines, serpentine_fan,
-                           frequent_maneuvers, maneuver_fan, turn_radius_km)
+                           frequent_maneuvers, maneuver_fan, turn_radius_km,
+                           representative_trajectories)
 from .optimization import candidate_grid, CoverageCache, filter_not_past_target
 
 
@@ -169,9 +170,13 @@ class SimulationModel:
     # Слои вероятных путей (аналитические, данные не требуются)
     # ------------------------------------------------------------------
     def frequent_paths(self, n=10):
-        """10 наиболее вероятных маршрутов (квантили распределения по профилю):
-        дуги — 10 дуг, петли — 10 представительных петель. Сплошные линии,
-        вес = относительная частота (без предельных пунктирных)."""
+        """10 наиболее вероятных маршрутов.
+
+        ПРЕДИКТИВНО: если выборка накоплена — это обобщение ВСЕЙ выборки
+        (кластеризация по форме, медоиды кластеров, вес = доля кластера). До
+        накопления — аналитический набор по профилю (квантили)."""
+        if len(self.trajectories) > n:
+            return representative_trajectories(self.trajectories, n=n)
         p = self.p
         if p.traj_model == "arc":
             return frequent_arcs(p.A, p.B, p.L_max, p.motion_profile,

@@ -410,7 +410,9 @@ _WP_MODE = {
     "mixed":   dict(rho=(0.32, 0.62), turn=0.30, alt=False, umin=0.65),
     "complex": dict(rho=(0.70, 1.05), turn=0.22, alt=True,  umin=0.90),
 }
-_BALANCED_P = [("normal", 0.30), ("mixed", 0.40), ("complex", 0.30)]
+# «смешанный»: сложный (к краям) преобладает, иначе маршруты жмутся к центру,
+# т.к. малый+средний (оба ближе к оси) суммарно перевешивали бы.
+_BALANCED_P = [("normal", 0.25), ("mixed", 0.25), ("complex", 0.50)]
 
 
 def _pick_mode(profile, rng):
@@ -646,6 +648,63 @@ def maneuver_fan(A, B, L_max, profile="mixed", n_points=140, k=14, kind="maneuve
     return [dict(traj=fn(A, B, L_max, rng, profile, n_points, r_min, nrange, law),
                  weight=0.5, is_extreme=False, label=kind)
             for _ in range(k)]
+
+
+# ======================================================================
+# Предиктивный слой «10 наиболее вероятных маршрутов»:
+#   НЕ случайная выборка, а обобщение ВСЕЙ накопленной выборки —
+#   кластеризация маршрутов (k-means по форме) и показ медоида каждого
+#   кластера (реальный маршрут-представитель) с весом = доля кластера
+#   (= вероятность такого пролёта). Чем крупнее кластер, тем вероятнее путь.
+# ======================================================================
+def _kmeans(X, k, iters=30, seed=0):
+    """Простой k-means (numpy, без внешних зависимостей). Возвращает (labels, C)."""
+    rng = np.random.default_rng(seed)
+    n = len(X)
+    C = X[rng.choice(n, size=k, replace=False)].copy()
+    labels = np.zeros(n, int)
+    for _ in range(iters):
+        d = np.linalg.norm(X[:, None, :] - C[None, :, :], axis=2)   # (n, k)
+        new = d.argmin(axis=1)
+        if np.array_equal(new, labels) and _ > 0:
+            break
+        labels = new
+        for j in range(k):
+            m = labels == j
+            if np.any(m):
+                C[j] = X[m].mean(axis=0)
+    return labels, C
+
+
+def representative_trajectories(trajectories, n=10, m=80, seed=0):
+    """10 наиболее вероятных маршрутов как ОБОБЩЕНИЕ накопленной выборки.
+
+    Каждый маршрут пересэмплируется к m точкам и кластеризуется (k-means) по форме;
+    для каждого кластера берётся медоид (реальный маршрут, ближайший к центру
+    кластера), вес = доля выборки в кластере (вероятность). Веса нормируются к [0,1].
+    """
+    T = len(trajectories)
+    if T == 0:
+        return []
+    if T <= n:
+        return [dict(traj=t, weight=1.0, is_extreme=False) for t in trajectories]
+    X = np.array([_resample_polyline(np.asarray(t, float), m) for t in trajectories])
+    Xf = X.reshape(T, -1)
+    labels, C = _kmeans(Xf, n, seed=seed)
+    out = []
+    for j in range(len(C)):
+        ids = np.where(labels == j)[0]
+        if len(ids) == 0:
+            continue
+        dd = np.linalg.norm(Xf[ids] - C[j], axis=1)
+        medoid = int(ids[int(dd.argmin())])
+        out.append(dict(traj=np.asarray(trajectories[medoid], float),
+                        weight=len(ids) / T, is_extreme=False))
+    wmax = max((o["weight"] for o in out), default=1.0) or 1.0
+    for o in out:
+        o["weight"] = o["weight"] / wmax               # нормировка к [0,1] для отрисовки
+    out.sort(key=lambda o: o["weight"], reverse=True)
+    return out
 
 
 SAMPLERS = {
