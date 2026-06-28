@@ -624,12 +624,18 @@ def sample_polyline_trajectory(A, B, L_max, rng, sigma_frac=0.45, n_points=140,
 
 def frequent_maneuvers(A, B, L_max, profile, sigma_frac=0.45, n=10, n_points=140,
                        kind="maneuver", r_min=0.5, nrange=(2, 5), law="points"):
-    """n представительных манёвров/ломаных (детерминированно)."""
+    """n представительных манёвров/ломаных, РАВНОМЕРНО по боковому отклонению (обе
+    стороны), чтобы выборка немногих маршрутов не оказалась односторонней."""
     fn = polyline_path if kind == "polyline" else maneuver_path
     rng = np.random.default_rng(4321)
-    return [dict(traj=fn(A, B, L_max, rng, profile, n_points, r_min, nrange, law),
-                 weight=0.6, is_extreme=False, label=kind)
-            for _ in range(n)]
+    cand = []
+    for _ in range(max(n * 6, 60)):
+        tr = fn(A, B, L_max, rng, profile, n_points, r_min, nrange, law)
+        cand.append((signed_max_lateral(tr, A, B), tr))
+    cand.sort(key=lambda t: t[0])
+    idx = np.linspace(0, len(cand) - 1, n).round().astype(int)
+    return [dict(traj=cand[int(i)][1], weight=0.6, is_extreme=False, label=kind)
+            for i in idx]
 
 
 def maneuver_fan(A, B, L_max, profile="mixed", n_points=140, k=14, kind="maneuver",

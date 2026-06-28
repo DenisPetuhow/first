@@ -24,7 +24,7 @@ from . import detection
 from .geometry import ellipse_geometry
 from .trajectories import (make_arc_by_angle, max_deflection_angle, _sample_angle,
                            polyline_length, arc_fan, maneuver_path, polyline_path,
-                           turn_radius_km)
+                           turn_radius_km, signed_max_lateral)
 from .optimization import CoverageCache, filter_not_past_target
 
 
@@ -58,6 +58,31 @@ def reach_ellipse_outline(A, B, L_max, n=220):
     ca, sa = np.cos(ang), np.sin(ang)
     x = a * np.cos(t); y = b * np.sin(t)
     return np.column_stack([cx + x * ca - y * sa, cy + x * sa + y * ca])
+
+
+def reach_envelope_outline(A, B, depth, width, L_max, n_ang=240):
+    """Огибающая ДОСТИЖИМОСТИ с учётом ЗОНЫ СТАРТА: объединение эллипсов с фокусами
+    (S0, B) и суммой L_max по всем S0 из зоны старта. Любой маршрут (из своей точки
+    старта S0, длиной <= L_max) лежит в эллипсе (S0,B) ⊆ этой огибающей, поэтому НИ
+    ОДИН маршрут не выходит за контур. Строится по самой расширенной области — краям
+    эллипса спавна (а не из одной точки A).
+
+    Множество звёздно относительно B (B — общий фокус, лежит внутри каждого эллипса),
+    поэтому для каждого направления берём МАКС. радиус по S0 на границе зоны через
+    полярное уравнение эллипса из фокуса:  r = (L² − |B−S0|²) / (2·(L + (B−S0)·d̂)).
+    """
+    A = np.asarray(A, float); B = np.asarray(B, float)
+    s0s = np.vstack([start_zone_outline(A, B, depth, width, 72), A[None, :]])
+    dS = B[None, :] - s0s                                   # (S,2) = B − S0
+    dnorm2 = np.sum(dS * dS, axis=1)                        # |B−S0|²
+    th = np.linspace(0.0, 2 * np.pi, n_ang)
+    dhat = np.column_stack([np.cos(th), np.sin(th)])        # (T,2)
+    proj = dS @ dhat.T                                      # (S,T) = (B−S0)·d̂
+    denom = 2.0 * (L_max + proj)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.where(denom > 1e-9, (L_max ** 2 - dnorm2)[:, None] / denom, 0.0)
+    rmax = np.max(np.clip(r, 0.0, None), axis=0)            # (T,)
+    return B[None, :] + rmax[:, None] * dhat
 
 
 def sample_start_point(A, B, depth, width, rng):
@@ -256,7 +281,9 @@ class AreaStartModel:
         self.candidates = cand
         self.cache = CoverageCache(self.candidates, self.p.R, self.p.L_seg, self.p.k)
         zone = self.start_zone()
-        reach = reach_ellipse_outline(self.A, self.B, self.p.L_max)
+        # огибающая достижимости с учётом ЗОНЫ старта (маршруты не выходят за неё)
+        reach = reach_envelope_outline(self.A, self.B, self.p.corridor_depth,
+                                       self.p.corridor_width, self.p.L_max)
         self._corr_outline = (reach, zone)
         allpts = np.vstack([zone, reach, self.A[None, :], self.B[None, :]])
         self._corr_bbox = (float(allpts[:, 0].min()), float(allpts[:, 0].max()),
@@ -339,14 +366,19 @@ class AreaStartModel:
 
     # ---- слои ----
     def frequent_paths(self, n=10):
+        """n представительных маршрутов, РАВНОМЕРНО по боковому отклонению (обе
+        стороны). Иначе при случайной выборке немногих маршрутов они могли все
+        оказаться с одной стороны, хотя реальное распределение двустороннее."""
         if not self.has_route:
             return []
         rng = np.random.default_rng(2024)
-        out = []
-        for _ in range(n):
+        cand = []
+        for _ in range(max(n * 6, 60)):
             tr, _f = self._sample(rng)
-            out.append(dict(traj=tr, weight=0.6, is_extreme=False))
-        return out
+            cand.append((signed_max_lateral(tr, self.A, self.B), tr))
+        cand.sort(key=lambda t: t[0])                    # от крайнего «−» к крайнему «+»
+        idx = np.linspace(0, len(cand) - 1, n).round().astype(int)
+        return [dict(traj=cand[int(i)][1], weight=0.6, is_extreme=False) for i in idx]
 
     def fan_paths(self):
         if not self.has_route:
