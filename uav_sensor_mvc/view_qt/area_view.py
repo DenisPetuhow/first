@@ -14,7 +14,8 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from config import (MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS, THEME)
+from config import (MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS,
+                    WAYPOINT_ZONE_LABELS, THEME)
 from view.view import PARAM_SPECS
 from .view_qt import SimulationView, _qcolor, QT_EXTRA
 
@@ -31,6 +32,7 @@ class AreaStartView(SimulationView):
         self.on_movement = lambda key: None
         self.on_create = lambda: None
         self.on_route_ready = lambda A, dir_pt: None
+        self.on_zone = lambda key: None
         self._click_state = None
         super().__init__(A, B, outline, bbox, params, speed, speed_max)
 
@@ -39,6 +41,22 @@ class AreaStartView(SimulationView):
 
     def _move_changed(self, key):
         self.on_movement(key)
+
+    def _build_zone_combo(self, col, params):
+        """Выпадающий список «Точки маршрута»: в зоне старта / только за зоной."""
+        row = QtWidgets.QHBoxLayout()
+        lab = QtWidgets.QLabel("Точки маршрута:"); lab.setObjectName("muted")
+        self.combo_zone = QtWidgets.QComboBox()
+        self._zone_keys = list(WAYPOINT_ZONE_LABELS)
+        for k in self._zone_keys:
+            self.combo_zone.addItem(WAYPOINT_ZONE_LABELS[k])
+        cur = getattr(params, "waypoint_zone", "outside")
+        self.combo_zone.setCurrentIndex(self._zone_keys.index(cur)
+                                        if cur in self._zone_keys else 0)
+        self.combo_zone.currentIndexChanged.connect(
+            lambda i: self.on_zone(self._zone_keys[i]))
+        row.addWidget(lab); row.addWidget(self.combo_zone, 1)
+        col.addLayout(row)
 
     # ---- панель вкладки 2 ----
     def _build_ui(self, params, speed, speed_max):
@@ -96,6 +114,7 @@ class AreaStartView(SimulationView):
         two.addWidget(rw, 1)
         col.addLayout(two)
         self._build_law_combo(col, params)
+        self._build_zone_combo(col, params)
 
         col.addWidget(self._header("ПОКАЗ"))
         self.chk_heat = QtWidgets.QCheckBox("тепловая карта")

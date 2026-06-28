@@ -93,6 +93,20 @@ def _zone_exit_frac(S0, A, B, depth, width):
     return float(np.clip(frac + 0.02, 0.05, 0.6))     # +небольшой запас наружу
 
 
+def points_outside_start_zone(pts, A, B, depth, width):
+    """Маска точек ВНЕ зоны старта (эллипс с центром A): True = снаружи.
+
+    Используется для КАНДИДАТОВ под датчики: свои датчики нельзя разместить в зоне
+    неопределённости/старта БПЛА — только за её пределами (в коридоре к цели).
+    """
+    A = np.asarray(A, float)
+    u, nrm, _ = _frame(A, B)
+    a = max(0.5 * depth, 1e-6); b = max(0.5 * width, 1e-6)
+    rel = np.asarray(pts, float) - A
+    du = rel @ u; dv = rel @ nrm
+    return (du / a) ** 2 + (dv / b) ** 2 > 1.0
+
+
 # ----------------------------------------------------------------------
 # Генераторы маршрутов (старт из зоны -> цель B)
 # ----------------------------------------------------------------------
@@ -109,21 +123,22 @@ def sample_area_arc(A, B, depth, width, L_max, rng, sigma_frac, n_points, profil
 
 
 def sample_maneuver(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5,
-                    nrange=(2, 5), law="points"):
+                    nrange=(2, 5), law="points", zone_exclude=True):
     """Манёвр из СЛУЧАЙНОЙ точки старта зоны в B (по точкам или по синусу).
-    Путевые точки ставятся только ЗА зоной старта (s_min = доля выхода из зоны)."""
+    zone_exclude=True — путевые точки только ЗА зоной старта (s_min = доля выхода
+    из зоны); False — точки могут появляться и внутри зоны неопределённости."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    s_min = _zone_exit_frac(S0, A, B, depth, width)
+    s_min = _zone_exit_frac(S0, A, B, depth, width) if zone_exclude else 0.05
     return maneuver_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, law,
                          s_min), S0
 
 
 def sample_polyline(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5,
-                    nrange=(2, 5), law="points"):
+                    nrange=(2, 5), law="points", zone_exclude=True):
     """Ломаная из СЛУЧАЙНОЙ точки старта зоны в B (общее ядро polyline_path).
-    Точки — только ЗА зоной старта."""
+    zone_exclude=True — точки только ЗА зоной старта; False — допускаются в зоне."""
     S0 = sample_start_point(A, B, depth, width, rng)
-    s_min = _zone_exit_frac(S0, A, B, depth, width)
+    s_min = _zone_exit_frac(S0, A, B, depth, width) if zone_exclude else 0.05
     return polyline_path(S0, B, L_max, rng, profile, n_points, r_min, nrange, law,
                          s_min), S0
 
@@ -222,7 +237,11 @@ class AreaStartModel:
         self.iteration = 0
         if not self.has_route:
             return
-        self.candidates = filter_not_past_target(self._build_candidates(), self.A, self.B)
+        cand = filter_not_past_target(self._build_candidates(), self.A, self.B)
+        # датчики НЕ ставятся в зоне неопределённости/старта БПЛА — только за ней
+        cand = cand[points_outside_start_zone(cand, self.A, self.B,
+                                              self.p.corridor_depth, self.p.corridor_width)]
+        self.candidates = cand
         self.cache = CoverageCache(self.candidates, self.p.R, self.p.L_seg, self.p.k)
         zone = self.start_zone()
         reach = reach_ellipse_outline(self.A, self.B, self.p.L_max)
@@ -247,14 +266,17 @@ class AreaStartModel:
     # ---- порождение и накопление ----
     def _sample(self, rng):
         p = self.p
+        zone_excl = getattr(p, "waypoint_zone", "outside") == "outside"
         if self.movement == "maneuver":
             return sample_maneuver(self.A, self.B, p.corridor_depth, p.corridor_width,
                                    p.L_max, rng, p.n_points, p.motion_profile,
-                                   self.r_min, (p.n_min, p.n_max), p.maneuver_law)
+                                   self.r_min, (p.n_min, p.n_max), p.maneuver_law,
+                                   zone_excl)
         if self.movement == "polyline":
             return sample_polyline(self.A, self.B, p.corridor_depth, p.corridor_width,
                                    p.L_max, rng, p.n_points, p.motion_profile,
-                                   self.r_min, (p.n_min, p.n_max), p.maneuver_law)
+                                   self.r_min, (p.n_min, p.n_max), p.maneuver_law,
+                                   zone_excl)
         return sample_area_arc(self.A, self.B, p.corridor_depth, p.corridor_width,
                                p.L_max, rng, p.sigma_frac, p.n_points, p.motion_profile)
 

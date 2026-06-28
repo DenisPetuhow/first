@@ -11,7 +11,8 @@ CONTROLLER (Qt) · Вкладка 2 «Зона старта -> цель».
 """
 import numpy as np
 
-from config import MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS
+from config import (MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS,
+                    WAYPOINT_ZONE_LABELS)
 from .controller_qt import QtSimulationController
 
 
@@ -20,7 +21,7 @@ class AreaStartController(QtSimulationController):
     def __init__(self, model, view):
         super().__init__(model, view)
         view.set_callbacks(on_movement=self.on_movement, on_create=self.on_create,
-                           on_route_ready=self.on_route_ready)
+                           on_route_ready=self.on_route_ready, on_zone=self.on_zone)
         self._redraw_idle_or_last()
         self._update_metrics_idle()
 
@@ -94,6 +95,11 @@ class AreaStartController(QtSimulationController):
         self.model.set_movement(key)
         if self.model.has_route:
             self._restart(f"Движение: {AREA_TRAJ_LABELS[key]}. «Пуск».")
+
+    def on_zone(self, key):
+        self.model.p.waypoint_zone = key
+        if self.model.has_route:
+            self._restart(f"Точки маршрута: {WAYPOINT_ZONE_LABELS[key]}. «Пуск».")
 
     # ---- блокировка просмотра до маршрута ----
     def _require_route(self):
