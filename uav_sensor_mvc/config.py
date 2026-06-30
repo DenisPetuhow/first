@@ -89,6 +89,7 @@ class Params:
     n_max: int = 5                 # макс. число путевых точек (рандом в [n_min, n_max])
     maneuver_law: str = "points"   # закон манёвра: "points" (по точкам) | "sine" (по синусу)
     waypoint_zone: str = "inside"  # точки маршрута: "inside" (в зоне старта, полный разброс) | "outside" (только за зоной)
+    map_layer: str = "scheme"      # подложка карты (вкладка 2): scheme/osm/topo/satellite/dark
     mode: str = "balanced"         # режим оптимизации
     traj_model: str = "arc"        # модель движения
     motion_profile: str = "mixed"  # профиль разброса маршрутов

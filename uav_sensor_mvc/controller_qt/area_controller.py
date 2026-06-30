@@ -21,7 +21,8 @@ class AreaStartController(QtSimulationController):
     def __init__(self, model, view):
         super().__init__(model, view)
         view.set_callbacks(on_movement=self.on_movement, on_create=self.on_create,
-                           on_route_ready=self.on_route_ready, on_zone=self.on_zone)
+                           on_route_ready=self.on_route_ready, on_zone=self.on_zone,
+                           on_map_layer=self.on_map_layer)
         self._redraw_idle_or_last()
         self._update_metrics_idle()
 
@@ -79,17 +80,27 @@ class AreaStartController(QtSimulationController):
         self.view.begin_create()
         self._update_metrics_idle()
 
-    def on_route_ready(self, A, dir_pt):
-        A = np.asarray(A, float); v = np.asarray(dir_pt, float) - A
-        nrm = float(np.linalg.norm(v))
-        u = v / nrm if nrm > 1e-6 else np.array([1.0, 0.0])
-        B = A + self.model.p.ab_distance * u
+    def on_route_ready(self, A, B_click):
+        # B — это ВТОРОЙ клик по карте (сама цель); |AB| считается автоматически.
+        A = np.asarray(A, float); B = np.asarray(B_click, float)
+        dist = float(np.linalg.norm(B - A))
+        if dist < 1e-6:                          # вырожденный клик -> по полю |AB|
+            dist = max(float(self.model.p.ab_distance), 1.0)
+            B = A + np.array([dist, 0.0])
+        self.model.p.ab_distance = round(dist, 1)        # |AB| из кликов по карте
+        if self.model.p.L_max <= dist:                   # запас хода должен быть > |AB|
+            self.model.p.L_max = round(dist * 1.4, 1)
         self.model.set_route(tuple(A), tuple(B))
+        self.view.set_param_values(self.model.p)         # обновить поля |AB|, L_max
         self.cur_traj = None; self.j = 0
         self.target_iters = self.model.p.T
         self._sync_geometry()
-        self._redraw_idle_or_last("Маршрут создан. «Пуск» / «Шаг» / «Пакетно».")
+        self._redraw_idle_or_last(
+            f"Маршрут создан: |AB|={dist:.0f} км. «Пуск» / «Шаг» / «Пакетно».")
         self._update_metrics_idle()
+
+    def on_map_layer(self, key):
+        self.model.p.map_layer = key                     # подложка (вид обновит сам)
 
     def on_movement(self, key):
         self.model.set_movement(key)

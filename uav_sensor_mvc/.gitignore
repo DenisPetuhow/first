@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+tile_cache/
+assets/tiles/
 out/
 out_serp/
 _serp/

@@ -18,6 +18,7 @@ from config import (MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS,
                     WAYPOINT_ZONE_LABELS, THEME)
 from view.view import PARAM_SPECS
 from .view_qt import SimulationView, _qcolor, QT_EXTRA
+from . import geomap as gm
 
 AREA_PARAM_SPECS = list(PARAM_SPECS) + QT_EXTRA + [
     ("corridor_depth", "Глубина зоны", float),
@@ -33,7 +34,10 @@ class AreaStartView(SimulationView):
         self.on_create = lambda: None
         self.on_route_ready = lambda A, dir_pt: None
         self.on_zone = lambda key: None
+        self.on_map_layer = lambda key: None
         self._click_state = None
+        self._map_layer = getattr(params, "map_layer", "scheme")
+        self._has_route_view = False
         super().__init__(A, B, outline, bbox, params, speed, speed_max)
 
     def get_param_specs(self):
@@ -57,6 +61,26 @@ class AreaStartView(SimulationView):
             lambda i: self.on_zone(self._zone_keys[i]))
         row.addWidget(lab); row.addWidget(self.combo_zone, 1)
         col.addLayout(row)
+
+    def _build_map_combo(self, col, params):
+        """Выпадающий список «Карта»: схема (оффлайн) / OSM / топо / спутник / тёмная."""
+        row = QtWidgets.QHBoxLayout()
+        lab = QtWidgets.QLabel("Карта:"); lab.setObjectName("muted")
+        self.combo_map = QtWidgets.QComboBox()
+        self._map_keys = list(gm.LAYER_LABELS)
+        for k in self._map_keys:
+            self.combo_map.addItem(gm.LAYER_LABELS[k])
+        cur = getattr(params, "map_layer", "scheme")
+        self.combo_map.setCurrentIndex(self._map_keys.index(cur)
+                                       if cur in self._map_keys else 0)
+        self.combo_map.currentIndexChanged.connect(self._map_changed)
+        row.addWidget(lab); row.addWidget(self.combo_map, 1)
+        col.addLayout(row)
+
+    def _map_changed(self, i):
+        self._map_layer = self._map_keys[i]
+        self.on_map_layer(self._map_layer)
+        self._refresh_basemap(force=True)
 
     # ---- панель вкладки 2 ----
     def _build_ui(self, params, speed, speed_max):
@@ -115,6 +139,7 @@ class AreaStartView(SimulationView):
         col.addLayout(two)
         self._build_law_combo(col, params)
         self._build_zone_combo(col, params)
+        self._build_map_combo(col, params)
 
         col.addWidget(self._header("ПОКАЗ"))
         self.chk_heat = QtWidgets.QCheckBox("тепловая карта")
@@ -154,11 +179,35 @@ class AreaStartView(SimulationView):
         self.metrics.setMinimumHeight(150)
         col.addWidget(self.metrics, stretch=1)
 
-    # ---- сцена: зона старта, ось, клик-постановка ----
+    # ---- сцена: карта-подложка, зона старта, ось, клик-постановка ----
     def _build_scene_items(self):
         super()._build_scene_items()
+        # --- КАРТА-ПОДЛОЖКА (растровые тайлы) и оффлайн-СХЕМА ---
+        self.basemap = pg.ImageItem(); self.basemap.setZValue(-20)
+        self.basemap.setOpts(axisOrder="row-major"); self.basemap.setVisible(False)
+        self.pi.addItem(self.basemap)
+        self.graticule = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["grid"], 150),
+                                                           width=1.0))
+        self.graticule.setZValue(-15)
+        self.oblast = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["accent"], 130),
+                                                        width=1.2, dash=[6, 5]))
+        self.oblast.setZValue(-14)
+        self.cities = pg.ScatterPlotItem(size=6, symbol="o",
+                                         brush=pg.mkBrush(_qcolor(THEME["text"], 200)),
+                                         pen=pg.mkPen(_qcolor(THEME["accent"]), width=0.8))
+        self.cities.setZValue(-13); self.pi.addItem(self.cities)
+        self._city_labels = []
+        for name, x, y in gm.city_points_km():
+            t = pg.TextItem(name, color=THEME["muted"], anchor=(0, 1))
+            t.setPos(x, y); t.setZValue(-12); t.setVisible(False)
+            self.pi.addItem(t); self._city_labels.append((t, x, y))
+        # дебаунс обновления подложки при панораме/зуме
+        self._map_timer = QtCore.QTimer(self); self._map_timer.setSingleShot(True)
+        self._map_timer.timeout.connect(lambda: self._refresh_basemap())
+        self.vb.sigRangeChanged.connect(lambda *a: self._map_timer.start(280))
+
         # зона старта (outline_lo) — отдельным цветом; реах-эллипс (outline_up) — как контур
-        self.outline_lo.setPen(pg.mkPen(_qcolor(THEME["accent2"], 210), width=1.5,
+        self.outline_lo.setPen(pg.mkPen(_qcolor(THEME["accent2"], 230), width=1.7,
                                         dash=[4, 4]))
         self.lab_A.setText("A — зона старта"); self.lab_B.setText("B — цель")
         self.axis_item = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["muted"], 160),
@@ -166,16 +215,82 @@ class AreaStartView(SimulationView):
         self.axis_item.setZValue(1)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
 
+    # ---- карта-подложка: растровые тайлы или оффлайн-схема ----
+    def _refresh_basemap(self, force=False):
+        """Обновить подложку под ТЕКУЩЕЕ окно. «scheme» — оффлайн (сетка+города),
+        иначе — растровые тайлы (кэш/интернет). Любая ошибка -> откат на схему."""
+        try:
+            (kx0, kx1), (ky0, ky1) = self.vb.viewRange()
+        except Exception:
+            return
+        if not (np.isfinite([kx0, kx1, ky0, ky1]).all()):
+            return
+        layer = getattr(self, "_map_layer", "scheme")
+        if layer == "scheme":
+            self.basemap.setVisible(False)
+            self._draw_scheme(kx0, kx1, ky0, ky1)
+            return
+        # растровые тайлы
+        self._set_scheme_visible(False)
+        try:
+            res = gm.build_raster_basemap(kx0, kx1, ky0, ky1, layer=layer,
+                                          allow_net=True)
+        except Exception:
+            res = None
+        if res is None:                                  # нет тайлов -> схема как запас
+            self.basemap.setVisible(False)
+            self._draw_scheme(kx0, kx1, ky0, ky1)
+            return
+        img, (ex0, ex1, ey0, ey1) = res
+        img8 = (np.clip(img, 0.0, 1.0) * 255).astype(np.ubyte)   # uint8 RGBA для pg
+        self.basemap.setImage(img8, autoLevels=False)
+        self.basemap.setRect(QtCore.QRectF(ex0, ey0, ex1 - ex0, ey1 - ey0))
+        self.basemap.setVisible(True)
+
+    def _set_scheme_visible(self, vis):
+        self.graticule.setVisible(vis); self.oblast.setVisible(vis)
+        self.cities.setVisible(vis)
+        for t, _x, _y in self._city_labels:
+            t.setVisible(vis)
+
+    def _draw_scheme(self, kx0, kx1, ky0, ky1):
+        """Оффлайн-схема: сетка широт/долгот, рамка области, города."""
+        xs, ys = [], []
+        for kind, val, _lab in gm.graticule_km(kx0, kx1, ky0, ky1):
+            if kind == "v":
+                xs += [val, val, np.nan]; ys += [ky0, ky1, np.nan]
+            else:
+                xs += [kx0, kx1, np.nan]; ys += [val, val, np.nan]
+        self.graticule.setData(xs, ys)
+        ob = gm.oblast_outline_km()
+        self.oblast.setData(ob[:, 0], ob[:, 1])
+        pts = gm.city_points_km()
+        self.cities.setData([p[1] for p in pts], [p[2] for p in pts])
+        self._set_scheme_visible(True)
+
     def update_geometry(self, A, B, outline, bbox):
+        self._has_route_view = True
         super().update_geometry(A, B, outline, bbox)
         self.axis_item.setData([A[0], B[0]], [A[1], B[1]])
         self.lab_A.setText("A — зона старта"); self.lab_B.setText("B — цель")
 
+    def _set_kursk_view(self, half=130.0):
+        """Начальный вид: Курск в центре, окно ~±half км."""
+        self.pi.setRange(xRange=(-half, half), yRange=(-half, half), padding=0.02)
+
+    def showEvent(self, e):
+        QtWidgets.QWidget.showEvent(self, e)     # range/карту ведём сами (см. ниже)
+        if self._has_route_view:
+            self._apply_range(force=True)
+        else:
+            self._set_kursk_view()
+        self._refresh_basemap(force=True)
+
     # ---- постановка маршрута кликами ----
     def begin_create(self):
         self._click_state = "A"
-        self.hint.setText("Кликните точку A — центр зоны старта.")
-        self._set_title("Кликните A — центр зоны старта")
+        self.hint.setText("Кликните на карте точку A — центр зоны старта.")
+        self._set_title("Кликните A — центр зоны старта (Курск в центре)")
 
     def prompt_create(self):
         t = dict(show_heat=False, show_freq=False, show_fan=False)
@@ -185,8 +300,12 @@ class AreaStartView(SimulationView):
             it.setData([], [])
         self.ab_scatter.setData([], [])
         self.lab_A.setText(""); self.lab_B.setText("")
-        self.hint.setText("Задайте глубину/ширину зоны и |AB|, затем «Создать маршрут».")
-        self._set_title("Вкладка 2 · «Создать маршрут» → кликните A и направление B")
+        self._has_route_view = False
+        self._set_kursk_view()
+        self._refresh_basemap(force=True)          # карта остаётся видимой
+        self.hint.setText("«Создать маршрут» → клик A (центр зоны), затем клик B "
+                          "(цель). Расстояние |AB| посчитается автоматически.")
+        self._set_title("Вкладка 2 · карта Курской области · «Создать маршрут»")
 
     def _on_scene_click(self, ev):
         if self._click_state is None:
@@ -202,8 +321,8 @@ class AreaStartView(SimulationView):
             self._click_A = P
             self._click_state = "B"
             self.ab_scatter.setData([P[0]], [P[1]])
-            self.hint.setText("Кликните направление на цель B.")
-            self._set_title("Кликните направление на цель B")
+            self.hint.setText("Кликните точку цели B — расстояние посчитается само.")
+            self._set_title("Кликните точку цели B")
         elif self._click_state == "B":
             self._click_state = None
             self.on_route_ready(self._click_A, P)
