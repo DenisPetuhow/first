@@ -63,13 +63,19 @@ class AreaStartView(SimulationView):
         col.addLayout(row)
 
     def _build_map_combo(self, col, params):
-        """Выпадающий список «Карта»: схема (оффлайн) / OSM / топо / спутник / тёмная."""
+        """Выпадающий список «Карта»: схема (оффлайн) / OSM / топо / спутник / тёмная
+        + любые ваши локальные кэши, найденные на диске (см. gm.discover_local_layers,
+        например папка 'Sat' с тайлами SAS.Planet — появится автоматически)."""
         row = QtWidgets.QHBoxLayout()
         lab = QtWidgets.QLabel("Карта:"); lab.setObjectName("muted")
         self.combo_map = QtWidgets.QComboBox()
-        self._map_keys = list(gm.LAYER_LABELS)
+        labels = dict(gm.LAYER_LABELS)
+        self._map_keys = list(labels)
+        for name in gm.discover_local_layers():
+            labels[name] = f"{name} (локальный кэш)"
+            self._map_keys.append(name)
         for k in self._map_keys:
-            self.combo_map.addItem(gm.LAYER_LABELS[k])
+            self.combo_map.addItem(labels[k])
         cur = getattr(params, "map_layer", "scheme")
         self.combo_map.setCurrentIndex(self._map_keys.index(cur)
                                        if cur in self._map_keys else 0)

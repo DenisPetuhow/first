@@ -81,9 +81,31 @@ _USER_AGENT = "uav_sensor_mvc/1.0 (educational UAV-detection modeling)"
 ZOOM_MAX = int(os.environ.get("UAV_ZOOM_MAX", "15"))
 ZOOM_MIN = int(os.environ.get("UAV_ZOOM_MIN", str(ZOOM_MAX - 9)))   # 10 уровней
 
-# Раскладка оси Y тайлов: XYZ (как OSM/Esri-online) или TMS (как кэш SAS.Planet,
-# ось Y инвертирована). Для онлайна — XYZ; если кладёте свою папку SAS — TMS.
+# Раскладка оси Y тайлов: XYZ (как OSM/Esri-online) или TMS (как часть экспортов
+# SAS.Planet, ось Y инвертирована: y_TMS = 2^z-1-y_XYZ). Глобальный флажок — для
+# случая, когда ВСЕ ваши локальные слои в одной раскладке; LAYER_TMS_OVERRIDE
+# переопределяет per-слой (например, свой "sat" — TMS, а онлайн-слои — нет).
 TILE_TMS = os.environ.get("UAV_TILE_TMS", "0") == "1"
+# per-слой переопределение: UAV_TMS_LAYERS="Sat,MyLayer" -> TMS только для них,
+# остальные (в т.ч. онлайн-слои) остаются в XYZ независимо от TILE_TMS.
+LAYER_TMS_OVERRIDE = {name: True for name in
+                      os.environ.get("UAV_TMS_LAYERS", "").split(",") if name}
+
+
+def discover_local_layers():
+    """Папки в кэше, не входящие в TILE_LAYERS (например, ваша 'Sat' с тайлами
+    SAS.Planet) — это ОФФЛАЙН-ТОЛЬКО слои: сеть для них не запрашивается, читается
+    только то, что уже лежит на диске по пути <cache_root>/<layer>/{z}/{x}/{y}.ext."""
+    root = cache_root()
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for name in sorted(os.listdir(root)):
+        if name in TILE_LAYERS or name == "scheme":
+            continue
+        if os.path.isdir(os.path.join(root, name)):
+            out.append(name)
+    return out
 
 
 def cache_root():
@@ -99,8 +121,48 @@ def cache_root():
     return os.path.join(here, "tile_cache")
 
 
-def tile_cache_path(layer, z, x, y):
-    return os.path.join(cache_root(), layer, str(z), str(x), f"{y}.png")
+_TILE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _tms_y(z, y):
+    """XYZ <-> TMS: ось Y инвертирована (TMS считает строки снизу вверх)."""
+    return (2 ** int(z)) - 1 - int(y)
+
+
+def tile_cache_path(layer, z, x, y, ext=".png"):
+    """Путь тайла в кэше. y уже в РАСКЛАДКЕ КЭША (если слой TMS — см. _cache_y)."""
+    return os.path.join(cache_root(), layer, str(z), str(x), f"{y}{ext}")
+
+
+def _cache_y(layer, z, y, layer_tms=None):
+    """y из XYZ (как считает вся остальная математика) -> y на диске для этого
+    слоя. layer_tms=None -> берёт глобальный TILE_TMS (применяется к ЛЮБОМУ слою,
+    в т.ч. локальным офлайн-кэшам вроде SAS.Planet); True/False — переопределение
+    для конкретного слоя (см. LAYER_TMS_OVERRIDE)."""
+    tms = LAYER_TMS_OVERRIDE.get(layer, TILE_TMS) if layer_tms is None else layer_tms
+    return _tms_y(z, y) if tms else y
+
+
+def find_cached_tile(layer, z, x, y):
+    """Найти файл тайла в кэше, перебирая известные расширения и XYZ/TMS.
+    Возвращает путь или None."""
+    cy = _cache_y(layer, z, y)
+    for ext in _TILE_EXTS:
+        p = tile_cache_path(layer, z, x, cy, ext)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _sniff_ext(data):
+    """Расширение по магическим байтам (для корректного имени файла в кэше)."""
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
 
 
 def _decode_tile(data):
@@ -124,12 +186,14 @@ def _decode_tile(data):
 
 
 def fetch_tile_bytes(layer, z, x, y, allow_net=True, timeout=15):
-    """Байты тайла: сперва оффлайн-кэш, затем (если разрешено) сеть с кешированием.
-    Возвращает bytes или None."""
-    path = tile_cache_path(layer, z, x, y)
-    if os.path.exists(path):
+    """Байты тайла: сперва оффлайн-кэш (перебор расширений + XYZ/TMS для слоя),
+    затем (если разрешено и слой известен в TILE_LAYERS) сеть с кешированием.
+    Возвращает bytes или None. Слои НЕ из TILE_LAYERS (локальные, например 'Sat')
+    читаются ТОЛЬКО из кэша — сеть для них не запрашивается."""
+    found = find_cached_tile(layer, z, x, y)
+    if found:
         try:
-            with open(path, "rb") as f:
+            with open(found, "rb") as f:
                 return f.read()
         except OSError:
             pass
@@ -145,8 +209,10 @@ def fetch_tile_bytes(layer, z, x, y, allow_net=True, timeout=15):
             ctx.load_verify_locations(ca)
         req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         data = urllib.request.urlopen(req, context=ctx, timeout=timeout).read()
+        cy = _cache_y(layer, z, y)                        # онлайн-источники всегда XYZ,
+        path = tile_cache_path(layer, z, x, cy, _sniff_ext(data))  # но пишем в раскладке слоя
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:                      # кешируем для оффлайна
+        with open(path, "wb") as f:                       # кешируем для оффлайна
             f.write(data)
         return data
     except Exception:
@@ -170,9 +236,10 @@ def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
     Возвращает (rgba (H,W,4) float, (ex0,ex1,ey0,ey1) км-экстент картинки) либо
     None, если ни одного тайла нет (оффлайн и кэш пуст) — тогда рисуется схема.
     Изображение перевёрнуто так, что строка 0 = юг (для setRect с осью Y вверх).
+
+    layer может быть и слоем НЕ из TILE_LAYERS (локальный оффлайн-кэш, например
+    ваша папка 'Sat') — тогда тайлы берутся ТОЛЬКО с диска (см. fetch_tile_bytes).
     """
-    if layer not in TILE_LAYERS:
-        return None
     lon_min, lat_min = (km_to_lonlat(kx0, ky0, lon0, lat0))
     lon_max, lat_max = (km_to_lonlat(kx1, ky1, lon0, lat0))
     lon_min, lon_max = float(min(lon_min, lon_max)), float(max(lon_min, lon_max))
