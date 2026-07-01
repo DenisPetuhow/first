@@ -32,19 +32,22 @@ class _BasemapSignals(QtCore.QObject):
 
 
 class _BasemapTask(QtCore.QRunnable):
-    """Сборка растровой подложки в ФОНОВОМ потоке (чтение/декод/склейка тайлов),
-    чтобы интерфейс не подвисал при панораме/зуме/смене слоя. В UI-поток
-    возвращается уже готовое изображение (uint8) через сигнал done."""
+    """Сборка растровой подложки в ФОНОВОМ потоке (чтение/декод/склейка тайлов,
+    внутри — параллельная загрузка тайлов), чтобы интерфейс не подвисал при
+    панораме/зуме/смене слоя. В UI-поток возвращается готовое изображение (uint8)
+    через сигнал done."""
 
-    def __init__(self, req_id, layer, box, signals):
+    def __init__(self, req_id, layer, box, target_px, allow_net, signals):
         super().__init__()
-        self._req = req_id; self._layer = layer; self._box = box; self._sig = signals
+        self._req = req_id; self._layer = layer; self._box = box
+        self._target_px = target_px; self._allow_net = allow_net; self._sig = signals
 
     def run(self):
         try:
             kx0, kx1, ky0, ky1 = self._box
             res = gm.build_raster_basemap(kx0, kx1, ky0, ky1, layer=self._layer,
-                                          allow_net=True)
+                                          allow_net=self._allow_net,
+                                          target_px=self._target_px)
         except Exception:
             res = None
         try:
@@ -62,8 +65,10 @@ class AreaStartView(SimulationView):
         self.on_route_ready = lambda A, dir_pt: None
         self.on_zone = lambda key: None
         self.on_map_layer = lambda key: None
+        self.on_map_offline = lambda flag: None
         self._click_state = None
         self._map_layer = getattr(params, "map_layer", "scheme")
+        self._map_offline = bool(getattr(params, "map_offline", False))
         self._has_route_view = False
         self._kursk_done = False              # центрируем на Курск только 1 раз (при старте)
         self._map_req = 0                     # id последнего запроса подложки (для отсева устаревших)
@@ -112,9 +117,24 @@ class AreaStartView(SimulationView):
         row.addWidget(lab); row.addWidget(self.combo_map, 1)
         col.addLayout(row)
 
+        self.chk_map_offline = QtWidgets.QCheckBox(
+            "офлайн (только кэш, без сети)")
+        self.chk_map_offline.setChecked(bool(getattr(params, "map_offline", False)))
+        self.chk_map_offline.setToolTip(
+            "Если включено — карта берёт тайлы ТОЛЬКО с диска, ни одного "
+            "сетевого запроса. Быстрее (не ждёт таймаутов недоступной сети), "
+            "но новые/незакэшированные участки останутся пустыми (схема).")
+        self.chk_map_offline.stateChanged.connect(self._map_offline_changed)
+        col.addWidget(self.chk_map_offline)
+
     def _map_changed(self, i):
         self._map_layer = self._map_keys[i]
         self.on_map_layer(self._map_layer)
+        self._refresh_basemap(force=True)
+
+    def _map_offline_changed(self, _state):
+        self._map_offline = self.chk_map_offline.isChecked()
+        self.on_map_offline(self._map_offline)
         self._refresh_basemap(force=True)
 
     # ---- панель вкладки 2 ----
@@ -279,8 +299,11 @@ class AreaStartView(SimulationView):
         # растровые тайлы — в фоне; интерфейс продолжает работать со старой подложкой
         self._set_scheme_visible(False)
         self._map_req += 1
+        target_px = max(self.plot.width(), 256) * self.devicePixelRatioF()
+        allow_net = not getattr(self, "_map_offline", False)
         self._map_pool.start(_BasemapTask(self._map_req, layer,
-                                          (kx0, kx1, ky0, ky1), self._map_signals))
+                                          (kx0, kx1, ky0, ky1), target_px,
+                                          allow_net, self._map_signals))
 
     def _on_basemap_ready(self, payload):
         """Готовая подложка из фонового потока (UI-поток). Устаревшие результаты

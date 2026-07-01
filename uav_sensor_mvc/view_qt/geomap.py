@@ -193,7 +193,7 @@ def _decode_tile(data):
     return arr.astype(np.float32)
 
 
-def fetch_tile_bytes(layer, z, x, y, allow_net=True, timeout=15):
+def fetch_tile_bytes(layer, z, x, y, allow_net=True, timeout=6):
     """Байты тайла: сперва оффлайн-кэш (перебор расширений + XYZ/TMS для слоя),
     затем (если разрешено и слой известен в TILE_LAYERS) сеть с кешированием.
     Возвращает bytes или None. Слои НЕ из TILE_LAYERS (локальные, например 'Sat')
@@ -260,9 +260,22 @@ def _decoded_tile_u8(layer, z, x, y, allow_net):
     return u8
 
 
-def _pick_zoom(lon_min, lon_max, max_tiles_x=6, zmin=4, zmax=13):
-    """Зум, при котором ширина окна ~ max_tiles_x тайлов."""
+def _pick_zoom(lon_min, lon_max, max_tiles_x=6, zmin=ZOOM_MIN, zmax=ZOOM_MAX,
+               target_px=None):
+    """Зум, при котором ширина окна покрывается ~max_tiles_x тайлами.
+
+    Раньше zmin/zmax были захардкожены (4/13) НЕЗАВИСИМО от общего предела
+    ZOOM_MAX=15 — на практике это тихо срезало детализацию (картинка размывалась
+    при растяжении на весь экран, хотя кэш/сеть могли дать более чёткий тайл).
+    Теперь используются те же границы, что и у кэша.
+
+    target_px — фактическая ширина ВИДЖЕТА на экране (пиксели): если задана,
+    бюджет тайлов по ширине поднимается так, чтобы тайловая мозаика была НЕ
+    МЕНЬШЕ экрана (иначе pyqtgraph растягивает картинку — размытие), но не
+    получал избыточно много тайлов на маленьком окне (трафик/время)."""
     span = max(lon_max - lon_min, 1e-6)
+    if target_px:
+        max_tiles_x = max(max_tiles_x, min(16, math.ceil(target_px / 256.0) + 1))
     for z in range(zmax, zmin - 1, -1):
         nx = (deg2num(lon_max, 0, z)[0] - deg2num(lon_min, 0, z)[0])
         if nx <= max_tiles_x:
@@ -271,7 +284,8 @@ def _pick_zoom(lon_min, lon_max, max_tiles_x=6, zmin=4, zmax=13):
 
 
 def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
-                         max_tiles=64, lon0=KURSK_LON, lat0=KURSK_LAT):
+                         max_tiles=96, target_px=None, lon0=KURSK_LON,
+                         lat0=KURSK_LAT):
     """Собрать подложку для км-окна [kx0,kx1]×[ky0,ky1].
 
     Возвращает (rgba (H,W,4) uint8, (ex0,ex1,ey0,ey1) км-экстент картинки) либо
@@ -281,18 +295,23 @@ def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
 
     layer может быть и слоем НЕ из TILE_LAYERS (локальный оффлайн-кэш, например
     ваша папка 'Sat') — тогда тайлы берутся ТОЛЬКО с диска (см. fetch_tile_bytes).
+    target_px — ширина виджета в пикселях (см. _pick_zoom: не даёт картинке быть
+    мельче экрана — иначе она растягивается и выглядит размытой).
+    allow_net=False — читать ТОЛЬКО кэш (чекбокс «офлайн»): ни одного сетевого
+    запроса, отсутствующие тайлы просто пропускаются — быстрый путь без ожидания
+    таймаутов.
     """
     lon_min, lat_min = (km_to_lonlat(kx0, ky0, lon0, lat0))
     lon_max, lat_max = (km_to_lonlat(kx1, ky1, lon0, lat0))
     lon_min, lon_max = float(min(lon_min, lon_max)), float(max(lon_min, lon_max))
     lat_min, lat_max = float(min(lat_min, lat_max)), float(max(lat_min, lat_max))
-    z = _pick_zoom(lon_min, lon_max)
+    z = _pick_zoom(lon_min, lon_max, target_px=target_px)
     x0 = int(math.floor(deg2num(lon_min, lat_max, z)[0]))
     x1 = int(math.floor(deg2num(lon_max, lat_min, z)[0]))
     y0 = int(math.floor(deg2num(lon_min, lat_max, z)[1]))    # верх (макс. широта)
     y1 = int(math.floor(deg2num(lon_max, lat_min, z)[1]))    # низ  (мин. широта)
     nx, ny = x1 - x0 + 1, y1 - y0 + 1
-    while nx * ny > max_tiles and z > 4:                      # не качать слишком много
+    while nx * ny > max_tiles and z > ZOOM_MIN:               # не качать слишком много
         z -= 1
         x0 = int(math.floor(deg2num(lon_min, lat_max, z)[0]))
         x1 = int(math.floor(deg2num(lon_max, lat_min, z)[0]))
@@ -300,10 +319,20 @@ def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
         y1 = int(math.floor(deg2num(lon_max, lat_min, z)[1]))
         nx, ny = x1 - x0 + 1, y1 - y0 + 1
     canvas = np.zeros((ny * 256, nx * 256, 4), np.uint8)
+    # ПАРАЛЛЕЛЬНАЯ загрузка (сеть/диск — I/O-bound): вместо тайла за тайлом
+    # (было секундами при холодном кэше) — до 8 одновременно, как в браузере.
+    import concurrent.futures
+    jobs = [(ix, iy) for ix in range(nx) for iy in range(ny)]
     got = 0
-    for ix in range(nx):
-        for iy in range(ny):
-            u8 = _decoded_tile_u8(layer, z, x0 + ix, y0 + iy, allow_net)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(jobs) or 1)) as pool:
+        fut_map = {pool.submit(_decoded_tile_u8, layer, z, x0 + ix, y0 + iy,
+                               allow_net): (ix, iy) for ix, iy in jobs}
+        for fut in concurrent.futures.as_completed(fut_map):
+            ix, iy = fut_map[fut]
+            try:
+                u8 = fut.result()
+            except Exception:
+                u8 = None
             if u8 is None:
                 continue
             canvas[iy * 256:(iy + 1) * 256, ix * 256:(ix + 1) * 256] = u8

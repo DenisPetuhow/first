@@ -90,6 +90,7 @@ class Params:
     maneuver_law: str = "points"   # закон манёвра: "points" (по точкам) | "sine" (по синусу)
     waypoint_zone: str = "inside"  # точки маршрута: "inside" (в зоне старта, полный разброс) | "outside" (только за зоной)
     map_layer: str = "scheme"      # подложка карты (вкладка 2): scheme/osm/topo/satellite/dark
+    map_offline: bool = False      # True -> карта читает ТОЛЬКО кэш, сеть не запрашивается
     mode: str = "balanced"         # режим оптимизации
     traj_model: str = "arc"        # модель движения
     motion_profile: str = "mixed"  # профиль разброса маршрутов
