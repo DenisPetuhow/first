@@ -1,26 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Точка входа Qt-версии приложения (PyQt5 + pyqtgraph).
+Точка входа Qt-версии приложения (PyQt5 + pyqtgraph) — ОСНОВНОЙ интерфейс.
 
-Альтернатива matplotlib-интерфейсу (main.py --mode gui): плавная анимация,
-зум/панорамирование мышью, гибкая компоновка. Вычислительное ядро (model/) и
-логика контроллера — общие с базовой версией.
+Две вкладки: «Маршрут A→B» и «Зона старта → цель» (с реальной картой). Плавная
+анимация, зум/панорамирование мышью. Все параметры задаются и меняются ТОЛЬКО в
+графическом интерфейсе (панель справа, Enter — пересчёт). Аргументов командной
+строки и консольных режимов нет.
 
-Примеры:
     python main_qt.py
-    python main_qt.py --ab 100 --Lmax 150 --N 6 --R 12 --k 3 --angle 10
-    python main_qt.py --traj serpentine --profile complex
-    python main_qt.py --geo --A 55.75 37.62 --B 56.20 38.40   # широта долгота
 
 Зум — колесо мыши; панорамирование — перетаскивание; авто-вписывание — правый
-клик по карте («View All»). По умолчанию seed случаен (см. --seed).
+клик по карте («View All»).
 """
-import argparse
 import os
 import sys
 
-from config import MODES, MOTION_PROFILES, TRAJ_LABELS
-from main import build_params
+from config import Params, THEME
 
 
 def _ensure_qt_plugin_path():
@@ -56,23 +51,7 @@ def main():
               "  pip uninstall -y opencv-python && pip install opencv-python-headless\n",
               file=sys.stderr)
 
-    ap = argparse.ArgumentParser(description="Размещение датчиков БПЛА — Qt/pyqtgraph.")
-    ap.add_argument("--opt", choices=list(MODES), default="balanced")
-    ap.add_argument("--traj", choices=list(TRAJ_LABELS), default="arc")
-    ap.add_argument("--profile", choices=list(MOTION_PROFILES), default="mixed")
-    ap.add_argument("--ab", type=float); ap.add_argument("--Lmax", type=float)
-    ap.add_argument("--N", type=int); ap.add_argument("--R", type=float)
-    ap.add_argument("--k", type=int); ap.add_argument("--Lseg", type=int)
-    ap.add_argument("--angle", type=float); ap.add_argument("--T", type=int)
-    ap.add_argument("--seed", type=int); ap.add_argument("--speed", type=int, default=4)
-    ap.add_argument("--geo", action="store_true")
-    ap.add_argument("--A", type=float, nargs=2, metavar=("LAT", "LON"))
-    ap.add_argument("--B", type=float, nargs=2, metavar=("LAT", "LON"))
-    args = ap.parse_args()
-    params = build_params(args)
-
     from pyqtgraph.Qt import QtWidgets
-    from config import THEME
     from model import SimulationModel
     from model.area_start import AreaStartModel
     from view_qt import SimulationView
@@ -82,18 +61,18 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
 
-    # Вкладка 1 — маршрут A->B как есть
-    p1 = params
+    # Вкладка 1 — маршрут A->B (параметры по умолчанию, дальше — в интерфейсе)
+    p1 = Params()
     m1 = SimulationModel(p1)
     v1 = SimulationView(p1.A, p1.B, m1.corridor_outline(), m1.corridor_bbox(),
-                        p1, speed=args.speed)
+                        p1, speed=4)
     c1 = QtSimulationController(m1, v1)
 
-    # Вкладка 2 — старт из зоны -> цель
-    p2 = build_params(args)
+    # Вкладка 2 — старт из зоны -> цель (с картой)
+    p2 = Params()
     m2 = AreaStartModel(p2)
     v2 = AreaStartView(p2.A, p2.B, m2.corridor_outline(), m2.corridor_bbox(),
-                       p2, speed=args.speed)
+                       p2, speed=4)
     c2 = AreaStartController(m2, v2)
 
     tabs = QtWidgets.QTabWidget()

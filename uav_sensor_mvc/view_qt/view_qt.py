@@ -128,12 +128,17 @@ class SimulationView(QtWidgets.QWidget):
         self.vb = self.pi.getViewBox()
         root.addWidget(self.plot, stretch=1)
 
-        # --- панель управления ---
+        # --- панель управления (в прокручиваемой области: не сжимается при
+        #     низком окне, появляется вертикальная прокрутка) ---
         panel = QtWidgets.QFrame(); panel.setObjectName("panel")
-        panel.setFixedWidth(372)
+        panel.setMinimumWidth(360)
         col = QtWidgets.QVBoxLayout(panel)
         col.setContentsMargins(12, 12, 12, 12); col.setSpacing(8)
-        root.addWidget(panel)
+        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(394); scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(panel)
+        root.addWidget(scroll)
 
         col.addWidget(self._header("ПАРАМЕТРЫ  (Enter — пересчёт)"))
         grid = QtWidgets.QGridLayout(); grid.setSpacing(6)

@@ -14,6 +14,8 @@
 import io
 import os
 import math
+import threading
+from collections import OrderedDict
 import numpy as np
 
 # ----------------------------------------------------------------------
@@ -62,7 +64,10 @@ def num2deg(xt, yt, z):
 # ----------------------------------------------------------------------
 TILE_LAYERS = {
     "osm":       "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "osm_hot":   "https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
     "topo":      "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+    "cyclosm":   "https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
+    "opnv":      "https://tileserver.memomaps.de/tilegen/{z}/{x}/{y}.png",
     "satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/"
                  "World_Imagery/MapServer/tile/{z}/{y}/{x}",
     "dark":      "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
@@ -70,8 +75,11 @@ TILE_LAYERS = {
 LAYER_LABELS = {
     "scheme":    "схема (оффлайн)",
     "osm":       "OSM (улицы)",
-    "topo":      "топо",
-    "satellite": "спутник",
+    "osm_hot":   "OSM HOT (гуманитарный)",
+    "topo":      "топо (OpenTopoMap)",
+    "cyclosm":   "CyclOSM",
+    "opnv":      "ÖPNVKarte (транспорт)",
+    "satellite": "спутник (Esri)",
     "dark":      "тёмная",
 }
 _USER_AGENT = "uav_sensor_mvc/1.0 (educational UAV-detection modeling)"
@@ -219,6 +227,39 @@ def fetch_tile_bytes(layer, z, x, y, allow_net=True, timeout=15):
         return None
 
 
+# In-memory кэш ДЕКОДИРОВАННЫХ тайлов (uint8), чтобы при панораме/смене зума не
+# перечитывать и не перекодировать одни и те же тайлы (ускорение отрисовки).
+# Потокобезопасен — вызывается из рабочих потоков сборки подложки.
+_TILE_MEM = OrderedDict()
+_TILE_MEM_MAX = 512
+_TILE_MEM_LOCK = threading.Lock()
+
+
+def _decoded_tile_u8(layer, z, x, y, allow_net):
+    """Тайл как uint8 RGBA (256,256,4) из памяти/диска/сети, либо None."""
+    key = (layer, int(z), int(x), int(y))
+    with _TILE_MEM_LOCK:
+        hit = _TILE_MEM.get(key)
+        if hit is not None:
+            _TILE_MEM.move_to_end(key)
+            return hit
+    data = fetch_tile_bytes(layer, z, x, y, allow_net)
+    if data is None:
+        return None
+    try:
+        arr = _decode_tile(data)
+    except Exception:
+        return None
+    if arr.shape[0] < 256 or arr.shape[1] < 256:
+        return None
+    u8 = (np.clip(arr[:256, :256], 0.0, 1.0) * 255).astype(np.uint8)
+    with _TILE_MEM_LOCK:
+        _TILE_MEM[key] = u8
+        if len(_TILE_MEM) > _TILE_MEM_MAX:
+            _TILE_MEM.popitem(last=False)
+    return u8
+
+
 def _pick_zoom(lon_min, lon_max, max_tiles_x=6, zmin=4, zmax=13):
     """Зум, при котором ширина окна ~ max_tiles_x тайлов."""
     span = max(lon_max - lon_min, 1e-6)
@@ -233,8 +274,9 @@ def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
                          max_tiles=64, lon0=KURSK_LON, lat0=KURSK_LAT):
     """Собрать подложку для км-окна [kx0,kx1]×[ky0,ky1].
 
-    Возвращает (rgba (H,W,4) float, (ex0,ex1,ey0,ey1) км-экстент картинки) либо
+    Возвращает (rgba (H,W,4) uint8, (ex0,ex1,ey0,ey1) км-экстент картинки) либо
     None, если ни одного тайла нет (оффлайн и кэш пуст) — тогда рисуется схема.
+    Тяжёлая функция (чтение/декод/склейка) — вызывать в рабочем ПОТОКЕ, не в UI.
     Изображение перевёрнуто так, что строка 0 = юг (для setRect с осью Y вверх).
 
     layer может быть и слоем НЕ из TILE_LAYERS (локальный оффлайн-кэш, например
@@ -257,20 +299,15 @@ def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
         y0 = int(math.floor(deg2num(lon_min, lat_max, z)[1]))
         y1 = int(math.floor(deg2num(lon_max, lat_min, z)[1]))
         nx, ny = x1 - x0 + 1, y1 - y0 + 1
-    canvas = np.zeros((ny * 256, nx * 256, 4), np.float32)
+    canvas = np.zeros((ny * 256, nx * 256, 4), np.uint8)
     got = 0
     for ix in range(nx):
         for iy in range(ny):
-            data = fetch_tile_bytes(layer, z, x0 + ix, y0 + iy, allow_net)
-            if data is None:
+            u8 = _decoded_tile_u8(layer, z, x0 + ix, y0 + iy, allow_net)
+            if u8 is None:
                 continue
-            try:
-                img = _decode_tile(data)
-            except Exception:
-                continue
-            if img.shape[0] >= 256 and img.shape[1] >= 256:
-                canvas[iy * 256:(iy + 1) * 256, ix * 256:(ix + 1) * 256] = img[:256, :256]
-                got += 1
+            canvas[iy * 256:(iy + 1) * 256, ix * 256:(ix + 1) * 256] = u8
+            got += 1
     if got == 0:
         return None
     # геокрая собранной сетки тайлов -> км-экстент

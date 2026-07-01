@@ -26,6 +26,33 @@ AREA_PARAM_SPECS = list(PARAM_SPECS) + QT_EXTRA + [
 ]
 
 
+class _BasemapSignals(QtCore.QObject):
+    """Мост из рабочего потока подложки в поток интерфейса."""
+    done = QtCore.pyqtSignal(object)          # (req_id, layer, res|None)
+
+
+class _BasemapTask(QtCore.QRunnable):
+    """Сборка растровой подложки в ФОНОВОМ потоке (чтение/декод/склейка тайлов),
+    чтобы интерфейс не подвисал при панораме/зуме/смене слоя. В UI-поток
+    возвращается уже готовое изображение (uint8) через сигнал done."""
+
+    def __init__(self, req_id, layer, box, signals):
+        super().__init__()
+        self._req = req_id; self._layer = layer; self._box = box; self._sig = signals
+
+    def run(self):
+        try:
+            kx0, kx1, ky0, ky1 = self._box
+            res = gm.build_raster_basemap(kx0, kx1, ky0, ky1, layer=self._layer,
+                                          allow_net=True)
+        except Exception:
+            res = None
+        try:
+            self._sig.done.emit((self._req, self._layer, res))
+        except RuntimeError:
+            pass                                  # окно закрыто во время сборки — не страшно
+
+
 class AreaStartView(SimulationView):
 
     def __init__(self, A, B, outline, bbox, params, speed=4, speed_max=20):
@@ -38,6 +65,8 @@ class AreaStartView(SimulationView):
         self._click_state = None
         self._map_layer = getattr(params, "map_layer", "scheme")
         self._has_route_view = False
+        self._kursk_done = False              # центрируем на Курск только 1 раз (при старте)
+        self._map_req = 0                     # id последнего запроса подложки (для отсева устаревших)
         super().__init__(A, B, outline, bbox, params, speed, speed_max)
 
     def get_param_specs(self):
@@ -102,10 +131,17 @@ class AreaStartView(SimulationView):
         self.vb = self.pi.getViewBox()
         root.addWidget(self.plot, stretch=1)
 
-        panel = QtWidgets.QFrame(); panel.setObjectName("panel"); panel.setFixedWidth(372)
+        panel = QtWidgets.QFrame(); panel.setObjectName("panel")
+        panel.setMinimumWidth(360)
         col = QtWidgets.QVBoxLayout(panel)
         col.setContentsMargins(12, 12, 12, 12); col.setSpacing(8)
-        root.addWidget(panel)
+        # панель — в прокручиваемой области: при низком окне поля не сжимаются,
+        # а появляется вертикальная прокрутка (динамическое масштабирование UI).
+        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(394); scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(panel)
+        root.addWidget(scroll)
 
         col.addWidget(self._header("ПАРАМЕТРЫ  (Enter — пересчёт)"))
         grid = QtWidgets.QGridLayout(); grid.setSpacing(6)
@@ -207,10 +243,13 @@ class AreaStartView(SimulationView):
             t = pg.TextItem(name, color=THEME["muted"], anchor=(0, 1))
             t.setPos(x, y); t.setZValue(-12); t.setVisible(False)
             self.pi.addItem(t); self._city_labels.append((t, x, y))
-        # дебаунс обновления подложки при панораме/зуме
+        # дебаунс обновления подложки при панораме/зуме + ФОНОВАЯ сборка (не в UI)
+        self._map_pool = QtCore.QThreadPool.globalInstance()
+        self._map_signals = _BasemapSignals()
+        self._map_signals.done.connect(self._on_basemap_ready)
         self._map_timer = QtCore.QTimer(self); self._map_timer.setSingleShot(True)
         self._map_timer.timeout.connect(lambda: self._refresh_basemap())
-        self.vb.sigRangeChanged.connect(lambda *a: self._map_timer.start(280))
+        self.vb.sigRangeChanged.connect(lambda *a: self._map_timer.start(180))
 
         # зона старта (outline_lo) — отдельным цветом; реах-эллипс (outline_up) — как контур
         self.outline_lo.setPen(pg.mkPen(_qcolor(THEME["accent2"], 230), width=1.7,
@@ -221,10 +260,11 @@ class AreaStartView(SimulationView):
         self.axis_item.setZValue(1)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
 
-    # ---- карта-подложка: растровые тайлы или оффлайн-схема ----
+    # ---- карта-подложка: растровые тайлы (в фоне) или оффлайн-схема ----
     def _refresh_basemap(self, force=False):
-        """Обновить подложку под ТЕКУЩЕЕ окно. «scheme» — оффлайн (сетка+города),
-        иначе — растровые тайлы (кэш/интернет). Любая ошибка -> откат на схему."""
+        """Обновить подложку под ТЕКУЩЕЕ окно. «scheme» — оффлайн (сетка+города,
+        рисуется мгновенно в UI); растровые слои — собираются в ФОНОВОМ потоке и
+        применяются по готовности (интерфейс не подвисает)."""
         try:
             (kx0, kx1), (ky0, ky1) = self.vb.viewRange()
         except Exception:
@@ -236,19 +276,27 @@ class AreaStartView(SimulationView):
             self.basemap.setVisible(False)
             self._draw_scheme(kx0, kx1, ky0, ky1)
             return
-        # растровые тайлы
+        # растровые тайлы — в фоне; интерфейс продолжает работать со старой подложкой
         self._set_scheme_visible(False)
-        try:
-            res = gm.build_raster_basemap(kx0, kx1, ky0, ky1, layer=layer,
-                                          allow_net=True)
-        except Exception:
-            res = None
-        if res is None:                                  # нет тайлов -> схема как запас
-            self.basemap.setVisible(False)
-            self._draw_scheme(kx0, kx1, ky0, ky1)
+        self._map_req += 1
+        self._map_pool.start(_BasemapTask(self._map_req, layer,
+                                          (kx0, kx1, ky0, ky1), self._map_signals))
+
+    def _on_basemap_ready(self, payload):
+        """Готовая подложка из фонового потока (UI-поток). Устаревшие результаты
+        (сменилось окно/слой) отбрасываются."""
+        req_id, layer, res = payload
+        if req_id != self._map_req or layer != getattr(self, "_map_layer", "scheme"):
             return
-        img, (ex0, ex1, ey0, ey1) = res
-        img8 = (np.clip(img, 0.0, 1.0) * 255).astype(np.ubyte)   # uint8 RGBA для pg
+        if res is None:                                  # нет тайлов -> схема как запас
+            try:
+                (kx0, kx1), (ky0, ky1) = self.vb.viewRange()
+                self.basemap.setVisible(False)
+                self._draw_scheme(kx0, kx1, ky0, ky1)
+            except Exception:
+                pass
+            return
+        img8, (ex0, ex1, ey0, ey1) = res
         self.basemap.setImage(img8, autoLevels=False)
         self.basemap.setRect(QtCore.QRectF(ex0, ey0, ex1 - ex0, ey1 - ey0))
         self.basemap.setVisible(True)
@@ -274,22 +322,35 @@ class AreaStartView(SimulationView):
         self.cities.setData([p[1] for p in pts], [p[2] for p in pts])
         self._set_scheme_visible(True)
 
+    def _mark_ab(self, pts, kinds):
+        """Красивые маркеры точек: A — зелёный кружок (центр зоны), B — красная
+        звезда (цель); белая обводка, крупнее обычных точек."""
+        sym = ["o" if k == "A" else "star" for k in kinds]
+        size = [15 if k == "A" else 20 for k in kinds]
+        brush = [pg.mkBrush(_qcolor(THEME["ok"])) if k == "A"
+                 else pg.mkBrush(_qcolor(THEME["warn"])) for k in kinds]
+        self.ab_scatter.setData([p[0] for p in pts], [p[1] for p in pts],
+                                symbol=sym, size=size, brush=brush,
+                                pen=pg.mkPen("white", width=1.6))
+
     def update_geometry(self, A, B, outline, bbox):
         self._has_route_view = True
         super().update_geometry(A, B, outline, bbox)
         self.axis_item.setData([A[0], B[0]], [A[1], B[1]])
         self.lab_A.setText("A — зона старта"); self.lab_B.setText("B — цель")
+        self._mark_ab([A, B], ["A", "B"])
 
     def _set_kursk_view(self, half=130.0):
         """Начальный вид: Курск в центре, окно ~±half км."""
         self.pi.setRange(xRange=(-half, half), yRange=(-half, half), padding=0.02)
 
     def showEvent(self, e):
-        QtWidgets.QWidget.showEvent(self, e)     # range/карту ведём сами (см. ниже)
-        if self._has_route_view:
-            self._apply_range(force=True)
-        else:
+        QtWidgets.QWidget.showEvent(self, e)     # range/карту ведём сами
+        # На Курск центрируем ТОЛЬКО один раз — при первом показе. Дальше зум/
+        # панорама и вход в режим постановки сохраняют текущий вид (не прыгаем).
+        if not self._kursk_done:
             self._set_kursk_view()
+            self._kursk_done = True
         self._refresh_basemap(force=True)
 
     # ---- постановка маршрута кликами ----
@@ -307,11 +368,11 @@ class AreaStartView(SimulationView):
         self.ab_scatter.setData([], [])
         self.lab_A.setText(""); self.lab_B.setText("")
         self._has_route_view = False
-        self._set_kursk_view()
+        # НЕ центрируем повторно на Курск — сохраняем текущий вид карты
         self._refresh_basemap(force=True)          # карта остаётся видимой
         self.hint.setText("«Создать маршрут» → клик A (центр зоны), затем клик B "
                           "(цель). Расстояние |AB| посчитается автоматически.")
-        self._set_title("Вкладка 2 · карта Курской области · «Создать маршрут»")
+        self._set_title("Карта · «Создать маршрут» → клик A, затем клик B")
 
     def _on_scene_click(self, ev):
         if self._click_state is None:
@@ -326,7 +387,7 @@ class AreaStartView(SimulationView):
         if self._click_state == "A":
             self._click_A = P
             self._click_state = "B"
-            self.ab_scatter.setData([P[0]], [P[1]])
+            self._mark_ab([P], ["A"])
             self.hint.setText("Кликните точку цели B — расстояние посчитается само.")
             self._set_title("Кликните точку цели B")
         elif self._click_state == "B":
