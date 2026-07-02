@@ -54,10 +54,13 @@ def main():
     from pyqtgraph.Qt import QtWidgets
     from model import SimulationModel
     from model.area_start import AreaStartModel
+    from model.threat_grid import ThreatModel
     from view_qt import SimulationView
     from view_qt.area_view import AreaStartView
+    from view_qt.threat_view import ThreatMapView
     from controller_qt import QtSimulationController
     from controller_qt.area_controller import AreaStartController
+    from controller_qt.threat_controller import ThreatController
 
     app = QtWidgets.QApplication(sys.argv)
 
@@ -75,6 +78,12 @@ def main():
                        p2, speed=4)
     c2 = AreaStartController(m2, v2)
 
+    # Вкладка 3 — цифровая карта угроз (весовая сетка + датчики по весам)
+    p3 = Params()
+    m3 = ThreatModel(p3)
+    v3 = ThreatMapView(m3.bbox_km, m3.lon0, m3.lat0, p3)
+    c3 = ThreatController(m3, v3)
+
     tabs = QtWidgets.QTabWidget()
     tabs.setWindowTitle("Размещение датчиков обнаружения БПЛА — Qt/pyqtgraph")
     tabs.setStyleSheet(
@@ -84,7 +93,8 @@ def main():
         f"QTabBar::tab:selected {{ background: {THEME['accent']}; color: white; }}")
     tabs.addTab(v1, "Маршрут A→B")
     tabs.addTab(v2, "Зона старта → цель")
-    tabs._controllers = (c1, c2)        # удержать от сборки мусора
+    tabs.addTab(v3, "Карта угроз")
+    tabs._controllers = (c1, c2, c3)    # удержать от сборки мусора
     tabs.resize(1380, 800)
     tabs.show()
     sys.exit(app.exec_())

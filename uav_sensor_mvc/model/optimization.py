@@ -92,6 +92,8 @@ class CoverageCache:
         self.L_seg = int(L_seg)
         self.k = int(k)
         self._hit, self._mask, self._cov = [], [], []
+        self._wcov = None                                 # матрица покрытия клеток (вкладка 3)
+        self._wpos = None                                 # веса клеток
 
     @property
     def n_traj(self):
@@ -179,6 +181,66 @@ class CoverageCache:
                 break
             take(c)
 
+        return self.cand[chosen] if chosen else np.empty((0, 2), float)
+
+
+    # ==================================================================
+    # ВЕСОВАЯ карта (вкладка 3): единица покрытия — не маршрут, а КЛЕТКА с весом.
+    # Это обобщение существующего алгоритма (п. 1.4/5 методички «карта угроз»):
+    # тот же жадный субмодулярный выбор с гарантией (1−1/e), только «попадание»
+    # датчика считается по клеткам весовой сетки, а не по точкам траектории. Никаких
+    # T итераций накопления — вес статичен и известен целиком заранее (T=1).
+    # ==================================================================
+    def set_weighted_cells(self, cells_xy, cells_w, block=512):
+        """Задать взвешенные клетки-цели. Строит булеву матрицу покрытия
+        cov[c, j] = (|cand_c − cell_j| ≤ R) блоками, чтобы не держать (C×M) float."""
+        P = np.asarray(cells_xy, float)
+        w = np.asarray(cells_w, float)
+        C = self.cand
+        cov = np.zeros((len(C), len(P)), bool)
+        for i in range(0, len(C), block):
+            d = np.linalg.norm(C[i:i + block, None, :] - P[None, :, :], axis=2)
+            cov[i:i + block] = d <= self.R
+        self._wcov = cov
+        self._wpos = w
+
+    def greedy_weighted(self, N, weights, min_sep=0.0):
+        """Жадная weighted-max-coverage по клеткам. weights=(a1,a2): a1 — кратность
+        (насыщение до k, «пересечение»), a2 — распределённость (охват РАЗНЫХ клеток).
+
+        Аттракторы (w>0) поощряют покрытие (кратно до k и вширь); репеллеры (w<0)
+        штрафуют — датчики от них отталкиваются. min_sep>0 убирает кандидатов ближе
+        min_sep к уже выбранному (жёсткая распределённость по площади)."""
+        cov = self._wcov
+        if cov is None or self.C == 0 or N <= 0 or cov.shape[1] == 0:
+            return np.empty((0, 2), float)
+        a1, a2 = weights
+        w = self._wpos
+        wpos = np.clip(w, 0.0, None)                       # величина аттрактора
+        wneg = np.clip(-w, 0.0, None)                      # величина репеллера
+        k = max(1, int(self.k))
+        cov_f = cov.astype(np.float64)                     # (C, M)
+        cnt = np.zeros(cov.shape[1], np.float64)           # сколько датчиков видят клетку
+        avail = np.ones(self.C, bool)
+        chosen = []
+        while len(chosen) < min(N, self.C):
+            lt_k = cnt < k                                 # ещё не насыщено по кратности
+            lt_1 = cnt < 1                                 # ещё не покрыта вовсе
+            # предельная ценность клетки при добавлении ещё одного покрытия:
+            g_mult = wpos * lt_k / k - wneg * lt_1         # кратность (до k) − штраф
+            g_spread = wpos * lt_1 - wneg * lt_1           # охват новых клеток − штраф
+            gcell = a1 * g_mult + a2 * g_spread            # (M,)
+            gain = cov_f @ gcell                           # (C,) прирост по кандидатам
+            gain = np.where(avail, gain, -np.inf)
+            c = int(np.argmax(gain))
+            if not np.isfinite(gain[c]):
+                break
+            chosen.append(c)
+            avail[c] = False
+            cnt = cnt + cov_f[c]
+            if min_sep > 0:
+                d = np.linalg.norm(self.cand - self.cand[c], axis=1)
+                avail[d < min_sep] = False
         return self.cand[chosen] if chosen else np.empty((0, 2), float)
 
 

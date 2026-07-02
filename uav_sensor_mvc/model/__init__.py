@@ -14,8 +14,10 @@ from .trajectories import (make_arc, make_arc_by_angle, make_serpentine,
 from .detection import (n_detections, continuous_coverage, segment_coverage,
                         utility, avg_utility)
 from .optimization import candidate_grid, greedy_placement, CoverageCache
+from .threat_grid import ThreatGrid, ThreatModel, build_threat_grid, load_layers
 
 __all__ = [
+    "ThreatGrid", "ThreatModel", "build_threat_grid", "load_layers",
     "SimulationModel", "ellipse_geometry", "point_in_ellipse", "points_in_ellipse",
     "auto_axes_limits", "geo_to_local_km", "make_arc", "make_arc_by_angle",
     "make_serpentine", "polyline_length", "max_deflection_angle",

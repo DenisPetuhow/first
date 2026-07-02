@@ -246,7 +246,11 @@ class AreaStartView(SimulationView):
         super()._build_scene_items()
         # --- КАРТА-ПОДЛОЖКА (растровые тайлы) и оффлайн-СХЕМА ---
         self.basemap = pg.ImageItem(); self.basemap.setZValue(-20)
-        self.basemap.setOpts(axisOrder="row-major"); self.basemap.setVisible(False)
+        # autoDownsample=True — pyqtgraph усредняет тайловую мозаику до разрешения
+        # экрана при отрисовке. Вместе с _pick_zoom (мозаика ≥ экрана) это даёт
+        # чёткое УМЕНЬШЕНИЕ вместо мыльного растяжения (устранение размытия карты).
+        self.basemap.setOpts(axisOrder="row-major", autoDownsample=True)
+        self.basemap.setVisible(False)
         self.pi.addItem(self.basemap)
         self.graticule = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["grid"], 150),
                                                            width=1.0))

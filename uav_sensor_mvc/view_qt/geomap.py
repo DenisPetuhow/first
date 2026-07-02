@@ -24,18 +24,26 @@ import numpy as np
 KURSK_LON = 36.1936
 KURSK_LAT = 51.7306
 _KM_PER_DEG_LAT = 110.574
-_KM_PER_DEG_LON = 111.320 * math.cos(math.radians(KURSK_LAT))
+
+
+def _km_per_deg_lon(lat0):
+    """Км на градус долготы на широте lat0. РАНЬШЕ это была модульная константа от
+    KURSK_LAT, из-за чего lonlat_to_km(..., lat0=...) игнорировал переданную широту —
+    для Курска (по умолчанию) верно, но для чужого участка (вкладка 3, ~48.7°) давало
+    ~6% ошибку масштаба по X и рассинхрон векторных слоёв с подложкой. Теперь масштаб
+    считается от фактического якоря."""
+    return 111.320 * math.cos(math.radians(lat0))
 
 
 def km_to_lonlat(x_km, y_km, lon0=KURSK_LON, lat0=KURSK_LAT):
     """Локальные км (восток, север от центра) -> (долгота, широта)."""
-    return (lon0 + np.asarray(x_km) / _KM_PER_DEG_LON,
+    return (lon0 + np.asarray(x_km) / _km_per_deg_lon(lat0),
             lat0 + np.asarray(y_km) / _KM_PER_DEG_LAT)
 
 
 def lonlat_to_km(lon, lat, lon0=KURSK_LON, lat0=KURSK_LAT):
     """(долгота, широта) -> локальные км (восток, север от центра)."""
-    return ((np.asarray(lon) - lon0) * _KM_PER_DEG_LON,
+    return ((np.asarray(lon) - lon0) * _km_per_deg_lon(lat0),
             (np.asarray(lat) - lat0) * _KM_PER_DEG_LAT)
 
 
@@ -260,31 +268,35 @@ def _decoded_tile_u8(layer, z, x, y, allow_net):
     return u8
 
 
-def _pick_zoom(lon_min, lon_max, max_tiles_x=6, zmin=ZOOM_MIN, zmax=ZOOM_MAX,
-               target_px=None):
-    """Зум, при котором ширина окна покрывается ~max_tiles_x тайлами.
+def _pick_zoom(lon_min, lon_max, zmin=ZOOM_MIN, zmax=ZOOM_MAX,
+               target_px=None, min_tiles_x=2.0):
+    """Наименьший зум, при котором тайловая мозаика по ширине НЕ МЕНЬШЕ виджета.
 
-    Раньше zmin/zmax были захардкожены (4/13) НЕЗАВИСИМО от общего предела
-    ZOOM_MAX=15 — на практике это тихо срезало детализацию (картинка размывалась
-    при растяжении на весь экран, хотя кэш/сеть могли дать более чёткий тайл).
-    Теперь используются те же границы, что и у кэша.
+    Причина прошлого размытия: старый вариант искал наибольший z, укладывающийся
+    в ПОТОЛОК тайлов (`nx <= max_tiles_x`). Для широкого окна это возвращало
+    уровень, где мозаика в пикселях оказывалась МЕНЬШЕ виджета (например, 4 тайла
+    ≈ 1024 px на экран 1400 px) — pyqtgraph растягивал её вверх → размытие. При
+    этом следующий, достаточно чёткий уровень (7–8 тайлов) отсекался тем же
+    потолком. Теперь бюджет тайлов — это ПОЛ, а не потолок: берём самый крупный
+    (экономный) z, у которого ширина мозаики уже перекрывает экран, тогда картинку
+    остаётся только УМЕНЬШИТЬ (это резко, без замыла), а не растянуть.
 
-    target_px — фактическая ширина ВИДЖЕТА на экране (пиксели): если задана,
-    бюджет тайлов по ширине поднимается так, чтобы тайловая мозаика была НЕ
-    МЕНЬШЕ экрана (иначе pyqtgraph растягивает картинку — размытие), но не
-    получал избыточно много тайлов на маленьком окне (трафик/время)."""
+    target_px — фактическая ширина ВИДЖЕТА в физических пикселях (с учётом DPR).
+    need — сколько тайлов по 256 px нужно, чтобы покрыть экран.
+    """
     span = max(lon_max - lon_min, 1e-6)
-    if target_px:
-        max_tiles_x = max(max_tiles_x, min(16, math.ceil(target_px / 256.0) + 1))
-    for z in range(zmax, zmin - 1, -1):
-        nx = (deg2num(lon_max, 0, z)[0] - deg2num(lon_min, 0, z)[0])
-        if nx <= max_tiles_x:
+    need = max(min_tiles_x, (target_px / 256.0) if target_px else 4.0)
+    best = zmin
+    for z in range(zmin, zmax + 1):
+        nx = deg2num(lon_max, 0, z)[0] - deg2num(lon_min, 0, z)[0]
+        best = z
+        if nx >= need:                       # мозаика уже не мельче экрана — стоп
             return z
-    return zmin
+    return best                              # даже zmax не дотянул — берём самый чёткий
 
 
 def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
-                         max_tiles=96, target_px=None, lon0=KURSK_LON,
+                         max_tiles=192, target_px=None, lon0=KURSK_LON,
                          lat0=KURSK_LAT):
     """Собрать подложку для км-окна [kx0,kx1]×[ky0,ky1].
 
@@ -382,6 +394,16 @@ def oblast_outline_km(lon0=KURSK_LON, lat0=KURSK_LAT):
         x, y = lonlat_to_km(lon, lat, lon0, lat0)
         xs.append(float(x)); ys.append(float(y))
     return np.column_stack([xs, ys])
+
+
+def bbox_lonlat_to_km(bbox_lonlat, lon0, lat0):
+    """(lon_min, lat_min, lon_max, lat_max) -> (kx0, kx1, ky0, ky1) в локальных км
+    относительно якоря (lon0, lat0). Используется вкладкой 3 (свой участок карты)."""
+    lo, la, ho, ha = bbox_lonlat
+    x0, y0 = lonlat_to_km(lo, la, lon0, lat0)
+    x1, y1 = lonlat_to_km(ho, ha, lon0, lat0)
+    return (float(min(x0, x1)), float(max(x0, x1)),
+            float(min(y0, y1)), float(max(y0, y1)))
 
 
 def graticule_km(kx0, kx1, ky0, ky1, lon0=KURSK_LON, lat0=KURSK_LAT, step_deg=0.5):

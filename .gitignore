@@ -9,4 +9,8 @@ __pycache__/
 out/
 out_serp/
 
+# Кэш геоданных/тайлов (скачивается локально, не версионируется)
+tile_cache/
+geo_cache/
+
 .DS_Store
