@@ -70,8 +70,10 @@ class BasemapMixin:
         self._map_req = 0
 
         self.basemap = pg.ImageItem(); self.basemap.setZValue(-20)
-        # autoDownsample + мозаика ≥ экрана (geomap._pick_zoom) = чёткая карта.
-        self.basemap.setOpts(axisOrder="row-major", autoDownsample=True)
+        # Чёткость обеспечивает _pick_zoom (мозаика ≥ экрана) + гладкое масштабирование
+        # изображения Qt. autoDownsample НЕ включаем: он пересчитывает картинку на КАЖДЫЙ
+        # зум (numpy на CPU) и заметно тормозит интерактив на плотной карте.
+        self.basemap.setOpts(axisOrder="row-major")
         self.basemap.setVisible(False)
         self.pi.addItem(self.basemap)
 

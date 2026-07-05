@@ -100,11 +100,15 @@ class ThreatController:
 
     # ---- выбор цифровых карт (источник + слои) из отдельного окна ----
     def on_choose_data(self, path, enabled):
-        # enabled — набор слоёв из окна (может быть пустым = карта без слоёв); None
-        # приходит только программно и означает «все слои».
+        # Окно ТОЛЬКО задаёт выбор; наложение выполняет кнопка «Построить карту»
+        # (как и просил пользователь). enabled — набор слоёв (пустой = без слоёв);
+        # None приходит только программно и означает «все слои».
         self.model.set_data_source(path)
         self.model.set_enabled_layers(enabled)
-        self.on_build()
+        src = f"файл: {path}" if path else "авто (кэш → демо)"
+        n = "все" if enabled is None else str(len(enabled))
+        self.view.set_source(f"{src} · слоёв: {n} (нажмите «Построить карту»)")
+        self.view.set_title("Выбор сохранён. Нажмите «Построить карту».")
 
     # ---- «указать цель» кликом по карте ----
     def on_set_target(self, x, y):

@@ -353,19 +353,22 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.water_img.setVisible(False)
         self.pi.addItem(self.water_img)
 
-        # векторные слои
+        # векторные слои. antialias=False + connect="finite" — на реальных данных
+        # (сотни тысяч точек) сглаживание линий делает панораму медленной; без него
+        # быстро. Данные ещё и ПРОРЕЖИВАЮТСЯ при отрисовке (см. _polys_to_xy).
         for name in THREAT_LAYER_ORDER:
             if name == "bridge" or name not in LAYER_STYLE:
                 continue
             st = LAYER_STYLE[name]
             pen = pg.mkPen(_qcolor(st["color"], 235), width=st["width"],
                            dash=st["dash"])
-            item = self.pi.plot([], [], pen=pen); item.setZValue(-5)
+            item = self.pi.plot([], [], pen=pen, antialias=False, connect="finite")
+            item.setZValue(-5)
             self._layer_items[name] = item
-        # мосты — точечные маркеры
+        # мосты — точечные маркеры (число ограничено, см. render_layers)
         self.bridge_scatter = pg.ScatterPlotItem(
-            size=13, symbol="t", brush=pg.mkBrush(_qcolor(THEME["warn"])),
-            pen=pg.mkPen("white", width=1.0))
+            size=11, symbol="t", brush=pg.mkBrush(_qcolor(THEME["warn"])),
+            pen=pg.mkPen("white", width=0.8))
         self.bridge_scatter.setZValue(-3); self.pi.addItem(self.bridge_scatter)
 
         # рамка bbox
@@ -441,22 +444,57 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         QtWidgets.QApplication.processEvents()
 
     # ---- отрисовка данных карты ----
+    MAX_LAYER_PTS = 12000     # предел точек на слой при отрисовке (прореживание)
+    MAX_LAYER_POLYS = 1500    # предел числа линий на слой (берём самые длинные)
+    MAX_BRIDGES = 400         # предел маркеров мостов
+
+    @classmethod
+    def _polys_to_xy(cls, polys):
+        """Список ломаных -> массивы X,Y с NaN-разрывами, с ПРОРЕЖИВАНИЕМ (иначе
+        сотни тысяч точек и тысячи мелких линий тормозят отрисовку при панораме):
+        оставляем не более MAX_LAYER_POLYS самых длинных линий и прореживаем точки до
+        ~MAX_LAYER_PTS. Концы линий сохраняются. Полностью на numpy."""
+        arrs = [np.asarray(p, float) for p in polys
+                if np.ndim(p) == 2 and len(p) >= 2]
+        if not arrs:
+            return np.empty(0), np.empty(0)
+        if len(arrs) > cls.MAX_LAYER_POLYS:                # самые длинные (значимые) линии
+            arrs.sort(key=len, reverse=True)
+            arrs = arrs[:cls.MAX_LAYER_POLYS]
+        total = sum(len(p) for p in arrs)
+        step = max(1, int(np.ceil(total / cls.MAX_LAYER_PTS)))
+        nan = np.array([np.nan])
+        xs, ys = [], []
+        for p in arrs:
+            if step > 1 and len(p) > 2:
+                idx = np.arange(0, len(p), step)
+                if idx[-1] != len(p) - 1:
+                    idx = np.append(idx, len(p) - 1)       # сохранить конец линии
+                p = p[idx]
+            xs.append(p[:, 0]); xs.append(nan)
+            ys.append(p[:, 1]); ys.append(nan)
+        return np.concatenate(xs), np.concatenate(ys)
+
     def render_layers(self, layers, bridge_pts, toggles):
+        """Отрисовать векторные слои. Чекбокс «векторные слои» ПОЛНОСТЬЮ скрывает их
+        (данные очищаются -> нулевая стоимость отрисовки)."""
         show = toggles["show_layers"]
         for name, item in self._layer_items.items():
-            polys = layers.get(name, []) if show else []
-            xs, ys = [], []
-            for p in polys:
-                p = np.asarray(p, float)
-                xs += list(p[:, 0]) + [np.nan]
-                ys += list(p[:, 1]) + [np.nan]
-            item.setData(xs, ys)
+            if show:
+                xs, ys = self._polys_to_xy(layers.get(name, []))
+                item.setData(xs, ys, antialias=False, connect="finite")
+            else:
+                item.setData([], [])                     # полностью убрать нагрузку
             item.setVisible(show)
         if show and len(bridge_pts):
             bp = np.asarray(bridge_pts, float)
+            if len(bp) > self.MAX_BRIDGES:               # не заваливать карту маркерами
+                idx = np.linspace(0, len(bp) - 1, self.MAX_BRIDGES).astype(int)
+                bp = bp[idx]
             self.bridge_scatter.setData(bp[:, 0], bp[:, 1])
             self.bridge_scatter.setVisible(True)
         else:
+            self.bridge_scatter.setData([], [])
             self.bridge_scatter.setVisible(False)
 
     def render_threat(self, weight, extent, toggles):
