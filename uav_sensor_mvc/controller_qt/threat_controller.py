@@ -8,8 +8,34 @@ CONTROLLER (Qt) · Вкладка 3 «Цифровая карта угроз».
 считаются одним проходом (без итераций накопления, как и просил пользователь).
 """
 import numpy as np
+from pyqtgraph.Qt import QtCore
 
 from config import MODE_LABELS, THREAT_LAYERS, THREAT_CELL_M
+
+
+class _TaskSignals(QtCore.QObject):
+    done = QtCore.pyqtSignal(object)          # (kind, error|None)
+
+
+class _Task(QtCore.QRunnable):
+    """Тяжёлый расчёт (чтение OSM / наложение слоёв / расстановка) в ФОНОВОМ потоке,
+    чтобы интерфейс не подвисал (на реальных данных это секунды). Работает только с
+    моделью (чистый numpy) — Qt из потока не трогает; результат отдаёт сигналом."""
+
+    def __init__(self, kind, work_fn, sig):
+        super().__init__()
+        self._kind = kind; self._work = work_fn; self._sig = sig
+
+    def run(self):
+        err = None
+        try:
+            self._work()
+        except Exception as e:                 # noqa: BLE001 — донесём текст в UI
+            err = e
+        try:
+            self._sig.done.emit((self._kind, err))
+        except RuntimeError:
+            pass                               # окно закрыто во время расчёта
 
 
 class ThreatController:
@@ -17,6 +43,10 @@ class ThreatController:
     def __init__(self, model, view):
         self.model = model
         self.view = view
+        self._pool = QtCore.QThreadPool.globalInstance()
+        self._sig = _TaskSignals()
+        self._sig.done.connect(self._on_task_done)
+        self._busy = False
         view.set_callbacks(
             on_build=self.on_build, on_place=self.on_place, on_apply=self.on_apply,
             on_reset=self.on_reset, on_reset_view=self.on_reset_view,
@@ -25,20 +55,48 @@ class ThreatController:
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data)
         self._idle_metrics()
 
-    # ---- построение карты ----
-    def on_build(self):
-        self.view.flash_title("Строю весовую карту угроз…")
-        self.view.process_pending()
-        try:
-            self.model.build()
-        except (RuntimeError, ValueError, OSError) as e:
-            self.view.flash_title(f"Не удалось загрузить данные: {e}")
+    # ---- запуск тяжёлого расчёта в фоне ----
+    def _run_async(self, kind, work_fn):
+        if self._busy:
+            self.view.flash_title("Идёт расчёт — подождите…")
             return
-        self.view.set_source(self.model.source)
+        self._busy = True
+        self.view.set_busy(True)
+        self.view.flash_title("Строю весовую карту угроз…" if kind == "build"
+                              else "Расставляю датчики по весам…")
+        self.view.process_pending()
+        self._pool.start(_Task(kind, work_fn, self._sig))
+
+    def _on_task_done(self, payload):
+        kind, err = payload
+        self._busy = False
+        self.view.set_busy(False)
+        if err is not None:
+            self.view.flash_title(f"Ошибка: {err}")
+            return
+        if kind == "build":
+            self.view.set_source(self.model.source)
+            self._render_all()
+            self.view.set_title("Карта угроз построена. «Расставить датчики».")
+            self._full_metrics()
+        elif kind == "place":
+            self._render_all()
+            me = self.model.metrics()
+            self.view.set_title(
+                f"Датчиков {me['n_sensors']} · покрыто веса "
+                f"{me['covered_frac']*100:.0f}% · режим {MODE_LABELS[self.model.p.mode]}")
+            self._full_metrics()
+
+    # ---- построение карты (в фоне) ----
+    def _work_build(self):
+        self.model.build()
         self.model.candidates = self.model.candidate_positions()
-        self._render_all()
-        self.view.set_title("Карта угроз построена. «Расставить датчики».")
-        self._full_metrics()
+
+    def _work_place(self):
+        self.model.place_sensors()
+
+    def on_build(self):
+        self._run_async("build", self._work_build)
 
     # ---- выбор цифровых карт (источник + слои) из отдельного окна ----
     def on_choose_data(self, path, enabled):
@@ -69,17 +127,8 @@ class ThreatController:
             self._full_metrics()
 
     def on_place(self):
-        if self.model.grid is None:
-            self.on_build()
-        self.view.flash_title("Расставляю датчики по весам…")
-        self.view.process_pending()
-        self.model.place_sensors()
-        self._render_all()
-        me = self.model.metrics()
-        self.view.set_title(
-            f"Датчиков {me['n_sensors']} · покрыто веса "
-            f"{me['covered_frac']*100:.0f}% · режим {MODE_LABELS[self.model.p.mode]}")
-        self._full_metrics()
+        # place_sensors сам построит карту, если её ещё нет (в фоновом потоке)
+        self._run_async("place", self._work_place)
 
     # ---- параметры / режим ----
     def on_apply(self):
@@ -96,10 +145,10 @@ class ThreatController:
             return
         if self.model.grid is None:
             self.on_build()
-        self.model.candidates = self.model.candidate_positions()
-        if len(self.model.sensors):
+        elif len(self.model.sensors):
             self.on_place()
-        else:
+        else:                                   # карта есть, датчиков нет — лишь пересетка
+            self.model.candidates = self.model.candidate_positions()
             self._render_all()
             self._full_metrics()
 

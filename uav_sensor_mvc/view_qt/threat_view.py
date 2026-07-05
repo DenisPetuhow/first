@@ -413,6 +413,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         finally:
             self._suppress = False
 
+    def set_busy(self, busy):
+        """Заблокировать кнопки действий на время фонового расчёта (чтобы не запускать
+        второй параллельно) и показать курсор ожидания."""
+        for b in (self.btn_data, self.btn_build, self.btn_target, self.btn_place,
+                  self.btn_apply, self.btn_reset):
+            b.setEnabled(not busy)
+        self.setCursor(QtCore.Qt.WaitCursor if busy else QtCore.Qt.ArrowCursor)
+
     def set_source(self, text):
         self.src_label.setText(f"источник данных: {text}")
 

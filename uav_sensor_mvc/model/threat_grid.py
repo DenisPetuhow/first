@@ -114,11 +114,54 @@ def _accumulate_segment(x0, y0, x1, y1, ox, oy, h, nx, ny, out):
 
 
 def _accumulate_polyline(poly, ox, oy, h, nx, ny, out):
-    """Наложить ломаную (N,2) на сетку: длина в каждой ячейке -> out (накопительно)."""
+    """ТОЧНЫЙ (посегментный) вариант — эталон/для тестов. В рабочем пути (реальные
+    объёмы OSM) используется быстрый ВЕКТОРНЫЙ `_rasterize_polylines`."""
     P = np.asarray(poly, float)
     for i in range(len(P) - 1):
         _accumulate_segment(P[i, 0], P[i, 1], P[i + 1, 0], P[i + 1, 1],
                             ox, oy, h, nx, ny, out)
+
+
+def _rasterize_polylines(polylines, ox, oy, h, nx, ny, step_frac=0.4, chunk=200_000):
+    """БЫСТРАЯ векторная растеризация: приближённая длина линий в каждой ячейке.
+
+    Каждый сегмент дискретизируется точками с шагом ~step_frac·h, длина сегмента
+    раскидывается по ячейкам его точек (`np.add.at`). Полностью на numpy — на порядки
+    быстрее посегментного Python-обхода, поэтому выдерживает реальные объёмы OSM
+    (миллионы сегментов). Приближение по длине (единицы %) для весовой карты
+    несущественно (вклад всё равно нормируется на размер ячейки)."""
+    out = np.zeros((ny, nx), float)
+    flat = out.reshape(-1)
+    segs = []
+    for poly in polylines:
+        P = np.asarray(poly, float)
+        if P.ndim == 2 and len(P) >= 2 and P.shape[1] == 2:
+            segs.append(np.concatenate([P[:-1], P[1:]], axis=1))   # (k,4): x0,y0,x1,y1
+    if not segs:
+        return out
+    S = np.vstack(segs)
+    dx = S[:, 2] - S[:, 0]; dy = S[:, 3] - S[:, 1]
+    seglen = np.hypot(dx, dy)
+    nsamp = np.clip(np.ceil(seglen / (step_frac * h)), 1, 1024).astype(np.int64)
+    for a in range(0, len(S), chunk):
+        b = min(a + chunk, len(S))
+        _splat(S[a:b, 0], S[a:b, 1], dx[a:b], dy[a:b], seglen[a:b], nsamp[a:b],
+               ox, oy, h, nx, ny, flat)
+    return out
+
+
+def _splat(x0, y0, dx, dy, seglen, nsamp, ox, oy, h, nx, ny, flat):
+    """Раскидать длины сегментов по ячейкам (дискретизация + np.add.at). Внутренняя."""
+    seg = np.repeat(np.arange(len(x0)), nsamp)
+    starts = np.repeat(np.cumsum(nsamp) - nsamp, nsamp)
+    frac = (np.arange(len(seg)) - starts + 0.5) / nsamp[seg]        # середина под-интервала
+    xs = x0[seg] + frac * dx[seg]
+    ys = y0[seg] + frac * dy[seg]
+    clen = seglen[seg] / nsamp[seg]
+    ix = np.floor((xs - ox) / h).astype(np.int64)
+    iy = np.floor((ys - oy) / h).astype(np.int64)
+    ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+    np.add.at(flat, iy[ok] * nx + ix[ok], clen[ok])
 
 
 # ----------------------------------------------------------------------
@@ -139,6 +182,8 @@ class ThreatGrid:
         self.layers = {}                       # name -> (ny,nx) вклад слоя
         self._attr_count = np.zeros((self.ny, self.nx), np.int32)
         self._water = np.zeros((self.ny, self.nx), bool)
+        self._present = {}                     # name -> (ny,nx) bool: слой есть в ячейке
+        self._bridge_mask = np.zeros((self.ny, self.nx), bool)
 
     # ---- геометрия ячеек ----
     def cell_centers_km(self):
@@ -157,13 +202,13 @@ class ThreatGrid:
 
         weight — из THREAT_LAYERS (может быть отрицательным для линейного репеллера).
         Нормировка на размер ячейки делает вклад одной «полной» линии сопоставимым
-        между разными слоями по масштабу, а не по частоте данных."""
-        acc = np.zeros((self.ny, self.nx), float)
-        for poly in polylines:
-            _accumulate_polyline(poly, self.ox, self.oy, self.h, self.nx, self.ny, acc)
+        между разными слоями по масштабу, а не по частоте данных. Растеризация —
+        векторная (`_rasterize_polylines`), выдерживает реальные объёмы OSM."""
+        acc = _rasterize_polylines(polylines, self.ox, self.oy, self.h, self.nx, self.ny)
         contrib = weight * (acc / self.h)      # доля «характерной длины» = размера ячейки
         self.weight += contrib
         self.layers[name] = self.layers.get(name, 0.0) + contrib
+        self._present[name] = acc > 0          # для определения мостов по сетке
         if attractor:
             self._attr_count += (acc > 0).astype(np.int32)
 
@@ -179,25 +224,61 @@ class ThreatGrid:
         self.layers[name] = self.layers.get(name, 0.0) + contrib
 
     def add_area_layer(self, name, polygons, weight, attractor=False):
-        """Площадной слой (застройка): вклад ∝ доле ячейки внутри полигона (оценка по
-        сетке под-выборки центра). weight обычно отрицательный (репеллер)."""
+        """Площадной слой (застройка): вклад в ячейки внутри полигона. weight обычно
+        отрицательный (репеллер). Проверка «точка в полигоне» — только по ячейкам
+        bbox каждого полигона (не по всей сетке), поэтому быстро и на многих домах."""
         contrib = np.zeros((self.ny, self.nx), float)
-        gx, gy = self.cell_centers_km()
         for poly in polygons:
-            inside = _points_in_polygon(gx.ravel(), gy.ravel(), np.asarray(poly, float))
-            contrib += weight * inside.reshape(self.ny, self.nx)
+            P = np.asarray(poly, float)
+            if P.ndim != 2 or len(P) < 3:
+                continue
+            ix0 = max(0, int(math.floor((P[:, 0].min() - self.ox) / self.h)))
+            ix1 = min(self.nx - 1, int(math.floor((P[:, 0].max() - self.ox) / self.h)))
+            iy0 = max(0, int(math.floor((P[:, 1].min() - self.oy) / self.h)))
+            iy1 = min(self.ny - 1, int(math.floor((P[:, 1].max() - self.oy) / self.h)))
+            if ix0 > ix1 or iy0 > iy1:
+                continue
+            cx = self.ox + (np.arange(ix0, ix1 + 1) + 0.5) * self.h
+            cy = self.oy + (np.arange(iy0, iy1 + 1) + 0.5) * self.h
+            gx, gy = np.meshgrid(cx, cy)
+            inside = _points_in_polygon(gx.ravel(), gy.ravel(), P).reshape(gy.shape)
+            contrib[iy0:iy1 + 1, ix0:ix1 + 1] += weight * inside
         self.weight += contrib
         self.layers[name] = self.layers.get(name, 0.0) + contrib
         if attractor:
             self._attr_count += (contrib != 0).astype(np.int32)
 
+    def add_bridges_from_grid(self, weight,
+                              road_keys=("road_major", "road_local", "railway")):
+        """Мост = ячейка, где ЕСТЬ река И (дорога или ж/д) — переправа. Считается по
+        сетке (пересечение булевых масок слоёв), O(ячеек) и векторно — вместо прежнего
+        перебора пар ломаных O(N²), который на реальных данных подвешивал приложение."""
+        river = self._present.get("river")
+        if river is None:
+            self._bridge_mask = np.zeros((self.ny, self.nx), bool)
+            return
+        road = np.zeros((self.ny, self.nx), bool)
+        for k in road_keys:
+            m = self._present.get(k)
+            if m is not None:
+                road |= m
+        self._bridge_mask = river & road
+        contrib = weight * self._bridge_mask
+        self.weight += contrib
+        self.layers["bridge"] = contrib.astype(float)
+
+    def bridge_cells_km(self):
+        """Центры ячеек-мостов (для маркеров на карте)."""
+        iy, ix = np.nonzero(self._bridge_mask)
+        x = self.ox + (ix + 0.5) * self.h
+        y = self.oy + (iy + 0.5) * self.h
+        return list(zip(x.tolist(), y.tolist()))
+
     def mark_water(self, polylines, buffer_km):
         """Отметить ячейки воды (по руслам) + буфер — для ЗАПРЕТА датчиков (Задача 1
         из первого исследования). Вода при этом уже дала «плюс» карте как аттрактор —
         двойная роль: маршрут тянется к воде, но свой датчик на воду не ставим."""
-        acc = np.zeros((self.ny, self.nx), float)
-        for poly in polylines:
-            _accumulate_polyline(poly, self.ox, self.oy, self.h, self.nx, self.ny, acc)
+        acc = _rasterize_polylines(polylines, self.ox, self.oy, self.h, self.nx, self.ny)
         wet = acc > 0
         r = int(math.ceil(max(0.0, buffer_km) / self.h))
         self._water |= _dilate(wet, r)
@@ -452,40 +533,6 @@ def _synthetic_layers(lon0, lat0):
     }
 
 
-def _detect_bridges(layers):
-    """Мосты = пересечения дорог/ж-д с рекой (в OSM это тег bridge=yes на линии над
-    водой; здесь, по решению пользователя (1.3), просто добавляем плоский «+» за мост
-    в точке пересечения). Возвращает список точек (x,y) км."""
-    rivers = layers.get("river", [])
-    crossers = []
-    for key in ("road_major", "road_local", "railway"):
-        crossers += layers.get(key, [])
-    pts = []
-    for rv in rivers:
-        for cr in crossers:
-            pts += _polyline_intersections(rv, cr)
-    return pts
-
-
-def _polyline_intersections(a, b):
-    """Точки пересечения двух ломаных (грубо, перебор сегментов)."""
-    out = []
-    A = np.asarray(a, float); B = np.asarray(b, float)
-    for i in range(len(A) - 1):
-        p, r = A[i], A[i + 1] - A[i]
-        for j in range(len(B) - 1):
-            q, s = B[j], B[j + 1] - B[j]
-            rxs = r[0] * s[1] - r[1] * s[0]
-            if abs(rxs) < 1e-12:
-                continue
-            qp = q - p
-            t = (qp[0] * s[1] - qp[1] * s[0]) / rxs
-            u = (qp[0] * r[1] - qp[1] * r[0]) / rxs
-            if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
-                out.append((float(p[0] + t * r[0]), float(p[1] + t * r[1])))
-    return out
-
-
 # ----------------------------------------------------------------------
 # Построение весовой карты из слоёв
 # ----------------------------------------------------------------------
@@ -498,16 +545,13 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None):
     cell_km = (THREAT_CELL_M / 1000.0) if cell_km is None else cell_km
     g = ThreatGrid(bbox_km, cell_km)
     for name in THREAT_LAYER_ORDER:
-        if name not in THREAT_LAYERS:
-            continue
+        if name not in THREAT_LAYERS or name == "bridge":
+            continue                            # мост считается по сетке ниже
         if enabled is not None and name not in enabled:
             continue
         spec = THREAT_LAYERS[name]
         w = spec["weight"]
         attr = spec.get("attractor", True)
-        if name == "bridge":
-            g.add_point_layer("bridge", _detect_bridges(layers), w)
-            continue
         objs = layers.get(name, [])
         if not objs:
             continue
@@ -515,6 +559,9 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None):
             g.add_line_layer(name, objs, w, attractor=attr)
         elif spec["geom"] == "area":
             g.add_area_layer(name, objs, w, attractor=attr)
+    # мост = ячейка «река + дорога/ж-д» (по сетке, быстро)
+    if enabled is None or "bridge" in enabled:
+        g.add_bridges_from_grid(THREAT_LAYERS.get("bridge", {}).get("weight", 0.0))
     # funnel-бонус за пересечения слоёв-аттракторов
     g.add_intersection_bonus(THREAT_INTERSECTION_BONUS)
     # вода -> запрет датчиков (буфер из конфига); только если слой реки включён
@@ -558,9 +605,9 @@ class ThreatModel:
     def build(self):
         self.layers, self.source = load_layers(
             self.lon0, self.lat0, self.data_path, THREAT_BBOX_LONLAT)
-        self.layers["bridge_pts"] = _detect_bridges(self.layers)
         self.grid = build_threat_grid(self.layers, self.bbox_km,
                                       enabled=self.enabled_layers)
+        self.layers["bridge_pts"] = self.grid.bridge_cells_km()   # мосты — из сетки
         self.sensors = np.empty((0, 2), float)
         return self.grid
 

@@ -193,14 +193,17 @@ class CoverageCache:
     # ==================================================================
     def set_weighted_cells(self, cells_xy, cells_w, block=512):
         """Задать взвешенные клетки-цели. Строит булеву матрицу покрытия
-        cov[c, j] = (|cand_c − cell_j| ≤ R) блоками, чтобы не держать (C×M) float."""
+        cov[c, j] = (|cand_c − cell_j| ≤ R) блоками (чтобы не держать (C×M) float).
+        Считаем КВАДРАТ расстояния (без sqrt) и сравниваем с R² — быстрее."""
         P = np.asarray(cells_xy, float)
         w = np.asarray(cells_w, float)
         C = self.cand
+        r2 = self.R * self.R
         cov = np.zeros((len(C), len(P)), bool)
         for i in range(0, len(C), block):
-            d = np.linalg.norm(C[i:i + block, None, :] - P[None, :, :], axis=2)
-            cov[i:i + block] = d <= self.R
+            diff = C[i:i + block, None, :] - P[None, :, :]
+            d2 = np.einsum("ijk,ijk->ij", diff, diff)      # |Δ|², без квадратного корня
+            cov[i:i + block] = d2 <= r2
         self._wcov = cov
         self._wpos = w
 
@@ -219,7 +222,7 @@ class CoverageCache:
         wpos = np.clip(w, 0.0, None)                       # величина аттрактора
         wneg = np.clip(-w, 0.0, None)                      # величина репеллера
         k = max(1, int(self.k))
-        cov_f = cov.astype(np.float64)                     # (C, M)
+        cov_f = cov.astype(np.float32)                     # (C, M) — float32 экономит память
         cnt = np.zeros(cov.shape[1], np.float64)           # сколько датчиков видят клетку
         avail = np.ones(self.C, bool)
         chosen = []
