@@ -288,12 +288,23 @@ def _dilate(mask, r):
 # ----------------------------------------------------------------------
 # Источник геоданных: реальный офлайн-кэш ИЛИ синтетическая схема
 # ----------------------------------------------------------------------
-def load_layers(lon0, lat0):
-    """Слои цифровой карты в локальных км (якорь lon0,lat0).
+def load_layers(lon0, lat0, data_path=None, bbox_lonlat=None):
+    """Слои цифровой карты в локальных км (якорь lon0,lat0). Возвращает (dict, источник).
 
-    Возвращает dict: name -> список ломаных/полигонов/точек (numpy (N,2) в км).
-    Приоритет: geo_cache/threat_layers.npz (реальные OSM-слои, см. tools/
-    build_threat_grid.py) -> синтетическая СХЕМА (офлайн, без внешних данных)."""
+    dict: name -> список ломаных/полигонов/точек (numpy (N,2) в км).
+    data_path — явный источник (из окна «Выбрать цифровые карты»):
+      * .npz  — готовые слои (из tools/build_threat_grid.py);
+      * .osm.pbf / .osm — сырой OSM-экстракт, парсится на месте (нужен pyrosm).
+    Если data_path не задан — приоритет: geo_cache/threat_layers.npz -> синтетическая
+    СХЕМА (офлайн, без внешних данных)."""
+    if data_path:
+        ext = os.path.splitext(data_path)[1].lower()
+        if ext == ".npz":
+            return _load_layers_npz(data_path), f"NPZ: {os.path.basename(data_path)}"
+        if ext in (".pbf", ".osm"):
+            return (layers_from_osm(data_path, lon0, lat0, bbox_lonlat),
+                    f"OSM: {os.path.basename(data_path)}")
+        raise ValueError(f"Неизвестный формат данных: {ext} (нужен .npz или .osm.pbf)")
     path = os.path.join(geo_cache_root(), "threat_layers.npz")
     if os.path.exists(path):
         try:
@@ -301,6 +312,73 @@ def load_layers(lon0, lat0):
         except Exception:
             pass
     return _synthetic_layers(lon0, lat0), "СХЕМА (демо, офлайн)"
+
+
+# Фильтры тегов OSM по слоям (единый источник правды: используют и офлайн-скрипт
+# tools/build_threat_grid.py, и окно выбора карт в интерфейсе).
+OSM_LAYER_FILTERS = {
+    "river":      {"waterway": ["river", "canal", "stream"]},
+    "road_major": {"highway": ["motorway", "trunk", "primary", "secondary"]},
+    "road_local": {"highway": ["tertiary", "unclassified", "residential"]},
+    "railway":    {"railway": ["rail"]},
+    "power":      {"power": ["line"]},
+    "pipeline":   {"man_made": ["pipeline"]},
+    "tree_row":   {"natural": ["tree_row"]},
+    "built_up":   {"landuse": ["residential", "industrial"]},
+}
+
+
+def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
+    """Прочитать локальный .osm.pbf и вернуть слои в км-фрейме (lon0,lat0).
+
+    Требует pyrosm/geopandas (устанавливаются отдельно, см. requirements). Читает
+    только выбранный bbox (по THREAT_BBOX_LONLAT, если не задан), фильтрует объекты
+    по OSM_LAYER_FILTERS. Это единая логика чтения OSM — общая для CLI-скрипта и
+    окна «Выбрать цифровые карты» в интерфейсе (без дублирования)."""
+    try:
+        from pyrosm import OSM
+    except Exception as e:
+        raise RuntimeError(
+            "Для чтения .osm.pbf нужен pyrosm/geopandas:\n"
+            "  pip install pyrosm geopandas shapely pyproj\n"
+            f"(исходная ошибка: {e})")
+    lo, la, ho, ha = bbox_lonlat or THREAT_BBOX_LONLAT
+    osm = OSM(pbf_path, bounding_box=[lo, la, ho, ha])
+    out = {}
+    for layer, flt in OSM_LAYER_FILTERS.items():
+        try:
+            gdf = osm.get_data_by_custom_criteria(
+                custom_filter=flt, filter_type="keep",
+                keep_nodes=False, keep_ways=True, keep_relations=True)
+        except Exception:
+            continue
+        if gdf is None or len(gdf) == 0:
+            continue
+        parts = []
+        for geom in gdf.geometry:
+            if geom is None or geom.is_empty:
+                continue
+            parts += _geom_to_kms(geom, lon0, lat0)
+        if parts:
+            out[layer] = [p for p in parts if len(p) >= 2]
+    return out
+
+
+def _geom_to_kms(geom, lon0, lat0):
+    """shapely-геометрия -> список массивов (N,2) в км (линии и кольца полигонов)."""
+    out = []
+    gt = geom.geom_type
+    if gt == "LineString":
+        out.append(_ll(np.asarray(geom.coords, float), lon0, lat0))
+    elif gt in ("MultiLineString", "GeometryCollection"):
+        for g in geom.geoms:
+            out += _geom_to_kms(g, lon0, lat0)
+    elif gt == "Polygon":
+        out.append(_ll(np.asarray(geom.exterior.coords, float), lon0, lat0))
+    elif gt == "MultiPolygon":
+        for g in geom.geoms:
+            out.append(_ll(np.asarray(g.exterior.coords, float), lon0, lat0))
+    return out
 
 
 def _load_layers_npz(path):
@@ -411,32 +489,37 @@ def _polyline_intersections(a, b):
 # ----------------------------------------------------------------------
 # Построение весовой карты из слоёв
 # ----------------------------------------------------------------------
-def build_threat_grid(layers, bbox_km, cell_km=None):
-    """Собрать ThreatGrid: наложить все слои с весами из THREAT_LAYERS, funnel-бонус,
-    мосты, отметить воду для запрета датчиков."""
+def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None):
+    """Собрать ThreatGrid: наложить слои с весами из THREAT_LAYERS, funnel-бонус,
+    мосты, отметить воду для запрета датчиков.
+
+    enabled — набор имён слоёв для наложения (из окна «Выбрать цифровые карты»);
+    None = все слои. Выключенный слой просто не участвует в сумме весов."""
     cell_km = (THREAT_CELL_M / 1000.0) if cell_km is None else cell_km
     g = ThreatGrid(bbox_km, cell_km)
     for name in THREAT_LAYER_ORDER:
         if name not in THREAT_LAYERS:
             continue
+        if enabled is not None and name not in enabled:
+            continue
         spec = THREAT_LAYERS[name]
-        geom = spec["geom"]
         w = spec["weight"]
         attr = spec.get("attractor", True)
         if name == "bridge":
             g.add_point_layer("bridge", _detect_bridges(layers), w)
             continue
         objs = layers.get(name, [])
-        if not objs and name != "bridge":
+        if not objs:
             continue
-        if geom == "line":
+        if spec["geom"] == "line":
             g.add_line_layer(name, objs, w, attractor=attr)
-        elif geom == "area":
+        elif spec["geom"] == "area":
             g.add_area_layer(name, objs, w, attractor=attr)
     # funnel-бонус за пересечения слоёв-аттракторов
     g.add_intersection_bonus(THREAT_INTERSECTION_BONUS)
-    # вода -> запрет датчиков (буфер из конфига)
-    g.mark_water(layers.get("river", []), THREAT_WATER_BUFFER_M / 1000.0)
+    # вода -> запрет датчиков (буфер из конфига); только если слой реки включён
+    if enabled is None or "river" in enabled:
+        g.mark_water(layers.get("river", []), THREAT_WATER_BUFFER_M / 1000.0)
     return g
 
 
@@ -456,12 +539,28 @@ class ThreatModel:
         self.sensors = np.empty((0, 2), float)
         self.candidates = np.empty((0, 2), float)
         self._metrics = {}
+        self.data_path = None          # явный источник цифровых карт (.npz/.osm.pbf)
+        self.enabled_layers = None     # набор включённых слоёв (None = все)
+        self.target_km = None          # цель, заданная кликом («указать цель»)
 
-    # ---- построение карты ----
+    # ---- источник данных / выбор слоёв ----
+    def set_data_source(self, path):
+        """Задать файл цифровых карт (.npz или .osm.pbf); None -> авто (кэш/схема)."""
+        self.data_path = path or None
+        self.grid = None               # потребуется пересборка
+
+    def set_enabled_layers(self, names):
+        """Ограничить набор накладываемых слоёв (iterable имён); None -> все."""
+        self.enabled_layers = set(names) if names is not None else None
+        self.grid = None
+
+    # ---- построение карты (наложение цифровых слоёв на сетку) ----
     def build(self):
-        self.layers, self.source = load_layers(self.lon0, self.lat0)
+        self.layers, self.source = load_layers(
+            self.lon0, self.lat0, self.data_path, THREAT_BBOX_LONLAT)
         self.layers["bridge_pts"] = _detect_bridges(self.layers)
-        self.grid = build_threat_grid(self.layers, self.bbox_km)
+        self.grid = build_threat_grid(self.layers, self.bbox_km,
+                                      enabled=self.enabled_layers)
         self.sensors = np.empty((0, 2), float)
         return self.grid
 
@@ -534,10 +633,22 @@ class ThreatModel:
     def metrics(self):
         return self._metrics
 
-    # ---- данные для отрисовки ----
-    def entry_target_km(self):
+    # ---- точка входа (фиксирована у реки) и цель (можно задать кликом) ----
+    def set_target(self, x_km, y_km):
+        """Задать целевую точку кликом по карте (режим «указать цель»)."""
+        self.target_km = (float(x_km), float(y_km))
+
+    def entry_km(self):
         _, elon, elat = THREAT_ENTRY
-        _, tlon, tlat = THREAT_TARGET
         ex, ey = lonlat_to_km(elon, elat, self.lon0, self.lat0)
+        return (float(ex), float(ey))
+
+    def entry_target_km(self):
+        """(вход, цель) в км. Вход — фиксированный (Северодонецк, у реки); цель —
+        заданная пользователем, иначе дефолтная метка (Луганск)."""
+        entry = self.entry_km()
+        if self.target_km is not None:
+            return entry, self.target_km
+        _, tlon, tlat = THREAT_TARGET
         tx, ty = lonlat_to_km(tlon, tlat, self.lon0, self.lat0)
-        return (float(ex), float(ey)), (float(tx), float(ty))
+        return entry, (float(tx), float(ty))

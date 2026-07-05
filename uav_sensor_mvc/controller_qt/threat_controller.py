@@ -19,21 +19,54 @@ class ThreatController:
         self.view = view
         view.set_callbacks(
             on_build=self.on_build, on_place=self.on_place, on_apply=self.on_apply,
-            on_reset_view=self.on_reset_view, on_mode=self.on_mode,
-            on_toggle=self.on_toggle, on_map_layer=self.on_map_layer,
-            on_map_offline=self.on_map_offline)
+            on_reset=self.on_reset, on_reset_view=self.on_reset_view,
+            on_mode=self.on_mode, on_toggle=self.on_toggle,
+            on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
+            on_set_target=self.on_set_target, on_choose_data=self.on_choose_data)
         self._idle_metrics()
 
     # ---- построение карты ----
     def on_build(self):
         self.view.flash_title("Строю весовую карту угроз…")
         self.view.process_pending()
-        self.model.build()
+        try:
+            self.model.build()
+        except (RuntimeError, ValueError, OSError) as e:
+            self.view.flash_title(f"Не удалось загрузить данные: {e}")
+            return
         self.view.set_source(self.model.source)
         self.model.candidates = self.model.candidate_positions()
         self._render_all()
         self.view.set_title("Карта угроз построена. «Расставить датчики».")
         self._full_metrics()
+
+    # ---- выбор цифровых карт (источник + слои) из отдельного окна ----
+    def on_choose_data(self, path, enabled):
+        # enabled — набор слоёв из окна (может быть пустым = карта без слоёв); None
+        # приходит только программно и означает «все слои».
+        self.model.set_data_source(path)
+        self.model.set_enabled_layers(enabled)
+        self.on_build()
+
+    # ---- «указать цель» кликом по карте ----
+    def on_set_target(self, x, y):
+        self.model.set_target(x, y)
+        entry, target = self.model.entry_target_km()
+        self.view.render_entry_target(entry, target)
+        self.view.set_title(f"Цель задана: ({x:.0f}, {y:.0f}) км. Вход — у реки "
+                            "(Северодонецк).")
+
+    # ---- сброс: убрать датчики и заданную цель (карта остаётся) ----
+    def on_reset(self):
+        self.model.sensors = np.empty((0, 2), float)
+        self.model.target_km = None
+        self.model._metrics = {}
+        self._render_all()
+        self.view.set_title("Сброшено: датчики и цель убраны. Карта сохранена.")
+        if self.model.grid is None:
+            self._idle_metrics()
+        else:
+            self._full_metrics()
 
     def on_place(self):
         if self.model.grid is None:

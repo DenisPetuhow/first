@@ -54,11 +54,19 @@ class _BasemapTask(QtCore.QRunnable):
 class BasemapMixin:
     """Подмешивается к QWidget-представлению карты. Ожидает self.plot/self.pi/self.vb."""
 
-    def _init_basemap(self, lon0, lat0, get_layer, get_offline, scheme_points=None):
-        """scheme_points — список (имя, lon, lat) опорных точек для офлайн-схемы."""
+    def _init_basemap(self, lon0, lat0, get_layer, get_offline, scheme_points=None,
+                      step_deg=0.2):
+        """Инициализация тайловой подложки и офлайн-схемы.
+
+        lon0/lat0 — якорь км-фрейма; get_layer/get_offline — колбэки текущего слоя и
+        офлайн-флага (инверсия зависимостей: миксин не знает, откуда их брать);
+        scheme_points — список (имя, lon, lat) ориентиров для схемы; step_deg — шаг
+        сетки широт/долгот. Подклассы могут доопределить `_draw_scheme_extra` и
+        `_set_scheme_extra_visible` (напр. вкладка 2 — рамка области)."""
         self._geo_lon0 = float(lon0); self._geo_lat0 = float(lat0)
         self._get_layer = get_layer            # callable -> ключ слоя
         self._get_offline = get_offline        # callable -> bool
+        self._scheme_step_deg = float(step_deg)
         self._map_req = 0
 
         self.basemap = pg.ImageItem(); self.basemap.setZValue(-20)
@@ -142,12 +150,13 @@ class BasemapMixin:
         self.graticule.setVisible(vis); self._scheme_scatter.setVisible(vis)
         for t, _x, _y in self._scheme_labels:
             t.setVisible(vis)
+        self._set_scheme_extra_visible(vis)
 
     def _draw_scheme(self, kx0, kx1, ky0, ky1):
         xs, ys = [], []
         for kind, val, _lab in gm.graticule_km(kx0, kx1, ky0, ky1,
                                                self._geo_lon0, self._geo_lat0,
-                                               step_deg=0.2):
+                                               step_deg=self._scheme_step_deg):
             if kind == "v":
                 xs += [val, val, np.nan]; ys += [ky0, ky1, np.nan]
             else:
@@ -156,7 +165,15 @@ class BasemapMixin:
         if self._scheme_labels:
             self._scheme_scatter.setData([x for _t, x, _y in self._scheme_labels],
                                          [y for _t, _x, y in self._scheme_labels])
+        self._draw_scheme_extra(kx0, kx1, ky0, ky1)
         self._set_scheme_visible(True)
+
+    # хуки для подклассов (по умолчанию — пусто); напр. вкладка 2 рисует рамку области
+    def _draw_scheme_extra(self, kx0, kx1, ky0, ky1):
+        pass
+
+    def _set_scheme_extra_visible(self, vis):
+        pass
 
 
 def gm_qcolor(hex_or_rgba, alpha=None):

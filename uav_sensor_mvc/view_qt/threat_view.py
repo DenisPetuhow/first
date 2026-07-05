@@ -56,8 +56,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         ("threat_N", "Датчиков N", int),
         ("threat_R", "Радиус R, км", float),
         ("threat_k", "Кратность k", int),
-        ("threat_cand_step_km", "Шаг кандид., км", float),
+        ("threat_cand_step_km", "Шаг сетки датчиков, км", float),
     ]
+    # подсказки к полям (всплывают при наведении) — поясняют смысл параметров
+    FIELD_TIPS = {
+        "threat_N": "Сколько датчиков расставить по весовой карте.",
+        "threat_R": "Радиус обнаружения одного датчика (круг покрытия), км.",
+        "threat_k": "Насыщение по кратности: перекрывать одну ячейку более чем k "
+                    "датчиками уже невыгодно — так они не сваливаются в одну точку.",
+        "threat_cand_step_km":
+            "ШАГ СЕТКИ КАНДИДАТНЫХ ПОЗИЦИЙ, км. Датчик можно поставить только в узел "
+            "воображаемой сетки с этим шагом (перебор возможных мест). Меньше шаг — "
+            "точнее размещение, но больше вариантов и дольше счёт; больше — грубее и "
+            "быстрее.",
+    }
 
     def __init__(self, model_bbox_km, lon0, lat0, params):
         super().__init__()
@@ -72,15 +84,22 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._sensor_items = []
         self._framed = False
 
+        self._target_mode = False
+        self._data_path = None            # текущий источник (для префилла окна выбора)
+        self._enabled_layers = None       # текущий набор слоёв (None = все)
+
         # callbacks (контроллер переопределит)
         self.on_build = lambda: None
         self.on_place = lambda: None
         self.on_apply = lambda: None
+        self.on_reset = lambda: None
         self.on_reset_view = lambda: None
         self.on_mode = lambda key: None
         self.on_toggle = lambda: None
         self.on_map_layer = lambda key: None
         self.on_map_offline = lambda flag: None
+        self.on_set_target = lambda x, y: None
+        self.on_choose_data = lambda path, layers: None
 
         self.setWindowTitle("Цифровая карта угроз — вкладка 3")
         self._apply_stylesheet()
@@ -90,6 +109,31 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                            lambda: self._map_offline,
                            scheme_points=self._orient_points())
         self._set_view_limits(self.bbox_km)
+        self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
+
+    # ---- режим «указать цель» (клик по карте) ----
+    def _begin_target(self):
+        self._target_mode = True
+        self.set_title("Кликните точку ЦЕЛИ на карте (вход — фиксирован у реки)")
+
+    def _on_scene_click(self, ev):
+        if not self._target_mode:
+            return
+        try:
+            if ev.button() != QtCore.Qt.LeftButton:
+                return
+        except Exception:
+            pass
+        pt = self.vb.mapSceneToView(ev.scenePos())
+        self._target_mode = False
+        self.on_set_target(float(pt.x()), float(pt.y()))
+
+    # ---- окно выбора цифровых карт (источник + слои) ----
+    def _open_data_dialog(self):
+        dlg = DigitalMapsDialog(self, self._data_path, self._enabled_layers)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self._data_path, self._enabled_layers = dlg.result_choices()
+            self.on_choose_data(self._data_path, self._enabled_layers)
 
     # ---- опорные точки-ориентиры для схемы/подписей ----
     def _orient_points(self):
@@ -163,20 +207,43 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             lab = QtWidgets.QLabel(label); lab.setObjectName("muted")
             edit = QtWidgets.QLineEdit(str(getattr(params, name)))
             edit.returnPressed.connect(self._on_field_submit)
+            tip = self.FIELD_TIPS.get(name, "")
+            lab.setToolTip(tip); edit.setToolTip(tip)
             self._fields[name] = edit
             cell.addWidget(lab); cell.addWidget(edit)
             grid.addLayout(cell, r, c)
         col.addLayout(grid)
 
         col.addWidget(self._header("КАРТА УГРОЗ"))
+        self.btn_data = QtWidgets.QPushButton("Выбрать цифровые карты…")
+        self.btn_data.setToolTip(
+            "Отдельное окно: выбрать источник данных (файл .npz / .osm.pbf либо "
+            "авто) и какие слои (реки/дороги/…) накладывать на сетку.")
+        self.btn_data.clicked.connect(self._open_data_dialog)
+        col.addWidget(self.btn_data)
+
         self.btn_build = QtWidgets.QPushButton("Построить карту")
+        self.btn_build.setToolTip(
+            "Наложить выбранные цифровые слои на сетку 500 м и посчитать веса ячеек.")
         self._tint(self.btn_build, THEME["accent"])
         self.btn_build.clicked.connect(lambda: self.on_build())
         col.addWidget(self.btn_build)
+
+        self.btn_target = QtWidgets.QPushButton("Указать цель")
+        self.btn_target.setToolTip(
+            "Кликните точку ЦЕЛИ на карте. Точка входа фиксирована (Северодонецк, "
+            "у реки). Цель — задел для построения маршрутов (Этап 3).")
+        self.btn_target.clicked.connect(self._begin_target)
+        col.addWidget(self.btn_target)
+
         self.btn_place = QtWidgets.QPushButton("Расставить датчики")
+        self.btn_place.setToolTip(
+            "Разместить N датчиков по весам карты (макс. покрытого веса + разнос), "
+            "не ставя их на воду.")
         self._tint(self.btn_place, THEME["ok"])
         self.btn_place.clicked.connect(lambda: self.on_place())
         col.addWidget(self.btn_place)
+
         self.src_label = QtWidgets.QLabel("источник данных: —")
         self.src_label.setObjectName("muted"); self.src_label.setWordWrap(True)
         col.addWidget(self.src_label)
@@ -212,11 +279,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         b1 = QtWidgets.QHBoxLayout()
         self.btn_apply = QtWidgets.QPushButton("Применить")
-        self.btn_reset = QtWidgets.QPushButton("Весь участок")
+        self.btn_apply.setToolTip("Применить параметры (N/R/k/шаг) и пересчитать.")
+        self.btn_reset = QtWidgets.QPushButton("Сброс")
+        self.btn_reset.setToolTip("Убрать датчики и заданную цель (карта остаётся).")
+        self.btn_view = QtWidgets.QPushButton("Весь участок")
+        self.btn_view.setToolTip("Вернуть камеру к полному участку (bbox).")
         self._tint(self.btn_apply, THEME["accent2"])
         self.btn_apply.clicked.connect(lambda: self.on_apply())
-        self.btn_reset.clicked.connect(lambda: self.on_reset_view())
+        self.btn_reset.clicked.connect(lambda: self.on_reset())
+        self.btn_view.clicked.connect(lambda: self.on_reset_view())
         b1.addWidget(self.btn_apply); b1.addWidget(self.btn_reset)
+        b1.addWidget(self.btn_view)
         col.addLayout(b1)
 
         col.addWidget(self._header("ПОКАЗАТЕЛИ"))
@@ -433,3 +506,75 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.frame_bbox()
             self._framed = True
         self._refresh_basemap(force=True)
+
+
+class DigitalMapsDialog(QtWidgets.QDialog):
+    """Отдельное окно: выбор ИСТОЧНИКА цифровых карт и набора накладываемых СЛОЁВ.
+
+    Источник: файл .npz (готовые слои) / .osm.pbf (сырой OSM-экстракт) либо «авто»
+    (кэш geo_cache/ → иначе демо-схема). Слои: чекбоксы по THREAT_LAYERS с их весами.
+    Возвращает выбор через result_choices(); саму загрузку делает контроллер."""
+
+    def __init__(self, parent, data_path, enabled_layers):
+        super().__init__(parent)
+        self.setWindowTitle("Выбор цифровых карт (слоёв) для наложения")
+        self.setMinimumWidth(440)
+        self._data_path = data_path
+        lay = QtWidgets.QVBoxLayout(self)
+
+        lay.addWidget(QtWidgets.QLabel("<b>1. Источник данных</b>"))
+        self.src_lbl = QtWidgets.QLabel(self._src_text())
+        self.src_lbl.setWordWrap(True)
+        self.src_lbl.setStyleSheet(f"color: {THEME['muted']};")
+        lay.addWidget(self.src_lbl)
+        row = QtWidgets.QHBoxLayout()
+        btn_file = QtWidgets.QPushButton("Загрузить файл (.npz / .osm.pbf)…")
+        btn_file.clicked.connect(self._pick_file)
+        btn_auto = QtWidgets.QPushButton("Авто (кэш → демо)")
+        btn_auto.clicked.connect(self._use_auto)
+        row.addWidget(btn_file); row.addWidget(btn_auto)
+        lay.addLayout(row)
+        hint = QtWidgets.QLabel(
+            "Где взять .osm.pbf — см. теория/МЕТОДИЧКА_ЗАГРУЗКА_КАРТ.md "
+            "(BBBike/Geofabrik). .npz готовит tools/build_threat_grid.py.")
+        hint.setWordWrap(True); hint.setStyleSheet(f"color: {THEME['muted']};")
+        lay.addWidget(hint)
+
+        lay.addWidget(QtWidgets.QLabel("<b>2. Слои для наложения</b> (вес ячейки)"))
+        self._checks = {}
+        for name in THREAT_LAYER_ORDER:
+            spec = THREAT_LAYERS.get(name)
+            if not spec:
+                continue
+            role = "репеллер" if not spec.get("attractor", True) else "аттрактор"
+            chk = QtWidgets.QCheckBox(f"{spec['label']}  ·  вес {spec['weight']:+g}  ·  {role}")
+            chk.setChecked(enabled_layers is None or name in enabled_layers)
+            self._checks[name] = chk
+            lay.addWidget(chk)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _src_text(self):
+        return (f"файл: {self._data_path}" if self._data_path
+                else "авто: geo_cache/threat_layers.npz → иначе демо-схема")
+
+    def _pick_file(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Файл цифровых карт", "",
+            "Гео-данные (*.npz *.pbf *.osm);;Все файлы (*)")
+        if fn:
+            self._data_path = fn
+            self.src_lbl.setText(self._src_text())
+
+    def _use_auto(self):
+        self._data_path = None
+        self.src_lbl.setText(self._src_text())
+
+    def result_choices(self):
+        """(data_path|None, enabled_layers_set). Все галочки сняты -> пустой набор
+        (карта без слоёв); чтобы «все слои» — просто отметить все."""
+        enabled = {n for n, c in self._checks.items() if c.isChecked()}
+        return self._data_path, enabled

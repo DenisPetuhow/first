@@ -18,6 +18,7 @@ from config import (MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS,
                     WAYPOINT_ZONE_LABELS, THEME)
 from view.view import PARAM_SPECS
 from .view_qt import SimulationView, _qcolor, QT_EXTRA
+from .basemap_mixin import BasemapMixin
 from . import geomap as gm
 
 AREA_PARAM_SPECS = list(PARAM_SPECS) + QT_EXTRA + [
@@ -26,37 +27,7 @@ AREA_PARAM_SPECS = list(PARAM_SPECS) + QT_EXTRA + [
 ]
 
 
-class _BasemapSignals(QtCore.QObject):
-    """Мост из рабочего потока подложки в поток интерфейса."""
-    done = QtCore.pyqtSignal(object)          # (req_id, layer, res|None)
-
-
-class _BasemapTask(QtCore.QRunnable):
-    """Сборка растровой подложки в ФОНОВОМ потоке (чтение/декод/склейка тайлов,
-    внутри — параллельная загрузка тайлов), чтобы интерфейс не подвисал при
-    панораме/зуме/смене слоя. В UI-поток возвращается готовое изображение (uint8)
-    через сигнал done."""
-
-    def __init__(self, req_id, layer, box, target_px, allow_net, signals):
-        super().__init__()
-        self._req = req_id; self._layer = layer; self._box = box
-        self._target_px = target_px; self._allow_net = allow_net; self._sig = signals
-
-    def run(self):
-        try:
-            kx0, kx1, ky0, ky1 = self._box
-            res = gm.build_raster_basemap(kx0, kx1, ky0, ky1, layer=self._layer,
-                                          allow_net=self._allow_net,
-                                          target_px=self._target_px)
-        except Exception:
-            res = None
-        try:
-            self._sig.done.emit((self._req, self._layer, res))
-        except RuntimeError:
-            pass                                  # окно закрыто во время сборки — не страшно
-
-
-class AreaStartView(SimulationView):
+class AreaStartView(SimulationView, BasemapMixin):
 
     def __init__(self, A, B, outline, bbox, params, speed=4, speed_max=20):
         # дополнительные callbacks и состояние постановки точек (до super().__init__)
@@ -71,7 +42,6 @@ class AreaStartView(SimulationView):
         self._map_offline = bool(getattr(params, "map_offline", False))
         self._has_route_view = False
         self._kursk_done = False              # центрируем на Курск только 1 раз (при старте)
-        self._map_req = 0                     # id последнего запроса подложки (для отсева устаревших)
         super().__init__(A, B, outline, bbox, params, speed, speed_max)
 
     def get_param_specs(self):
@@ -241,41 +211,21 @@ class AreaStartView(SimulationView):
         self.metrics.setMinimumHeight(150)
         col.addWidget(self.metrics, stretch=1)
 
-    # ---- сцена: карта-подложка, зона старта, ось, клик-постановка ----
+    # ---- сцена: карта-подложка (общий BasemapMixin), зона старта, ось, клик ----
     def _build_scene_items(self):
         super()._build_scene_items()
-        # --- КАРТА-ПОДЛОЖКА (растровые тайлы) и оффлайн-СХЕМА ---
-        self.basemap = pg.ImageItem(); self.basemap.setZValue(-20)
-        # autoDownsample=True — pyqtgraph усредняет тайловую мозаику до разрешения
-        # экрана при отрисовке. Вместе с _pick_zoom (мозаика ≥ экрана) это даёт
-        # чёткое УМЕНЬШЕНИЕ вместо мыльного растяжения (устранение размытия карты).
-        self.basemap.setOpts(axisOrder="row-major", autoDownsample=True)
-        self.basemap.setVisible(False)
-        self.pi.addItem(self.basemap)
-        self.graticule = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["grid"], 150),
-                                                           width=1.0))
-        self.graticule.setZValue(-15)
+        # рамка Курской области — «доп.» элемент схемы (рисуется хуком миксина)
         self.oblast = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["accent"], 130),
                                                         width=1.2, dash=[6, 5]))
         self.oblast.setZValue(-14)
-        self.cities = pg.ScatterPlotItem(size=6, symbol="o",
-                                         brush=pg.mkBrush(_qcolor(THEME["text"], 200)),
-                                         pen=pg.mkPen(_qcolor(THEME["accent"]), width=0.8))
-        self.cities.setZValue(-13); self.pi.addItem(self.cities)
-        self._city_labels = []
-        for name, x, y in gm.city_points_km():
-            t = pg.TextItem(name, color=THEME["muted"], anchor=(0, 1))
-            t.setPos(x, y); t.setZValue(-12); t.setVisible(False)
-            self.pi.addItem(t); self._city_labels.append((t, x, y))
-        # дебаунс обновления подложки при панораме/зуме + ФОНОВАЯ сборка (не в UI)
-        self._map_pool = QtCore.QThreadPool.globalInstance()
-        self._map_signals = _BasemapSignals()
-        self._map_signals.done.connect(self._on_basemap_ready)
-        self._map_timer = QtCore.QTimer(self); self._map_timer.setSingleShot(True)
-        self._map_timer.timeout.connect(lambda: self._refresh_basemap())
-        self.vb.sigRangeChanged.connect(lambda *a: self._map_timer.start(180))
+        # тайловая подложка + оффлайн-схема (сетка + города) — из общего миксина,
+        # якорь — Курск; города области как опорные точки схемы.
+        self._init_basemap(gm.KURSK_LON, gm.KURSK_LAT,
+                           lambda: getattr(self, "_map_layer", "scheme"),
+                           lambda: getattr(self, "_map_offline", False),
+                           scheme_points=gm.KURSK_CITIES, step_deg=0.5)
 
-        # зона старта (outline_lo) — отдельным цветом; реах-эллипс (outline_up) — как контур
+        # зона старта (outline_lo) — отдельным цветом; реах-эллипс (outline_up) — контур
         self.outline_lo.setPen(pg.mkPen(_qcolor(THEME["accent2"], 230), width=1.7,
                                         dash=[4, 4]))
         self.lab_A.setText("A — зона старта"); self.lab_B.setText("B — цель")
@@ -284,70 +234,13 @@ class AreaStartView(SimulationView):
         self.axis_item.setZValue(1)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
 
-    # ---- карта-подложка: растровые тайлы (в фоне) или оффлайн-схема ----
-    def _refresh_basemap(self, force=False):
-        """Обновить подложку под ТЕКУЩЕЕ окно. «scheme» — оффлайн (сетка+города,
-        рисуется мгновенно в UI); растровые слои — собираются в ФОНОВОМ потоке и
-        применяются по готовности (интерфейс не подвисает)."""
-        try:
-            (kx0, kx1), (ky0, ky1) = self.vb.viewRange()
-        except Exception:
-            return
-        if not (np.isfinite([kx0, kx1, ky0, ky1]).all()):
-            return
-        layer = getattr(self, "_map_layer", "scheme")
-        if layer == "scheme":
-            self.basemap.setVisible(False)
-            self._draw_scheme(kx0, kx1, ky0, ky1)
-            return
-        # растровые тайлы — в фоне; интерфейс продолжает работать со старой подложкой
-        self._set_scheme_visible(False)
-        self._map_req += 1
-        target_px = max(self.plot.width(), 256) * self.devicePixelRatioF()
-        allow_net = not getattr(self, "_map_offline", False)
-        self._map_pool.start(_BasemapTask(self._map_req, layer,
-                                          (kx0, kx1, ky0, ky1), target_px,
-                                          allow_net, self._map_signals))
-
-    def _on_basemap_ready(self, payload):
-        """Готовая подложка из фонового потока (UI-поток). Устаревшие результаты
-        (сменилось окно/слой) отбрасываются."""
-        req_id, layer, res = payload
-        if req_id != self._map_req or layer != getattr(self, "_map_layer", "scheme"):
-            return
-        if res is None:                                  # нет тайлов -> схема как запас
-            try:
-                (kx0, kx1), (ky0, ky1) = self.vb.viewRange()
-                self.basemap.setVisible(False)
-                self._draw_scheme(kx0, kx1, ky0, ky1)
-            except Exception:
-                pass
-            return
-        img8, (ex0, ex1, ey0, ey1) = res
-        self.basemap.setImage(img8, autoLevels=False)
-        self.basemap.setRect(QtCore.QRectF(ex0, ey0, ex1 - ex0, ey1 - ey0))
-        self.basemap.setVisible(True)
-
-    def _set_scheme_visible(self, vis):
-        self.graticule.setVisible(vis); self.oblast.setVisible(vis)
-        self.cities.setVisible(vis)
-        for t, _x, _y in self._city_labels:
-            t.setVisible(vis)
-
-    def _draw_scheme(self, kx0, kx1, ky0, ky1):
-        """Оффлайн-схема: сетка широт/долгот, рамка области, города."""
-        xs, ys = [], []
-        for kind, val, _lab in gm.graticule_km(kx0, kx1, ky0, ky1):
-            if kind == "v":
-                xs += [val, val, np.nan]; ys += [ky0, ky1, np.nan]
-            else:
-                xs += [kx0, kx1, np.nan]; ys += [val, val, np.nan]
-        self.graticule.setData(xs, ys)
+    # рамка области — «доп.» слой офлайн-схемы (хуки BasemapMixin)
+    def _draw_scheme_extra(self, kx0, kx1, ky0, ky1):
         ob = gm.oblast_outline_km()
         self.oblast.setData(ob[:, 0], ob[:, 1])
-        pts = gm.city_points_km()
-        self.cities.setData([p[1] for p in pts], [p[2] for p in pts])
-        self._set_scheme_visible(True)
+
+    def _set_scheme_extra_visible(self, vis):
+        self.oblast.setVisible(vis)
 
     def _mark_ab(self, pts, kinds):
         """Красивые маркеры точек: A — зелёный кружок (центр зоны), B — красная
