@@ -124,7 +124,9 @@ class BasemapMixin:
             return
         self._set_scheme_visible(False)
         self._map_req += 1
-        target_px = max(self.plot.width(), 256) * self.devicePixelRatioF()
+        # ЛОГИЧЕСКАЯ ширина (без DPR): даёт зум ~1:1 и родной размер подписей, как в
+        # обычном OSM. С домножением на DPR брался зум на уровень выше -> подписи мельче.
+        target_px = max(self.plot.width(), 256)
         allow_net = not self._get_offline()
         self._map_pool.start(_BasemapTask(self._map_req, layer,
                                           (kx0, kx1, ky0, ky1), target_px, allow_net,

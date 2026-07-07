@@ -62,8 +62,10 @@ class ThreatController:
             return
         self._busy = True
         self.view.set_busy(True)
-        self.view.flash_title("Строю весовую карту угроз…" if kind == "build"
-                              else "Расставляю датчики по весам…")
+        titles = {"build": "Строю весовую карту угроз…",
+                  "place": "Расставляю датчики по весам…",
+                  "routes": "Строю маршруты пролёта…"}
+        self.view.flash_title(titles.get(kind, "Расчёт…"))
         self.view.process_pending()
         self._pool.start(_Task(kind, work_fn, self._sig))
 
@@ -79,6 +81,8 @@ class ThreatController:
             self._render_all()
             self.view.set_title("Карта угроз построена. «Расставить датчики».")
             self._full_metrics()
+            if self.view.get_toggles()["show_routes"]:   # маршруты были включены — обновить
+                self._run_async("routes", self.model.plan_routes)
         elif kind == "place":
             self._render_all()
             me = self.model.metrics()
@@ -86,6 +90,10 @@ class ThreatController:
                 f"Датчиков {me['n_sensors']} · покрыто веса "
                 f"{me['covered_frac']*100:.0f}% · режим {MODE_LABELS[self.model.p.mode]}")
             self._full_metrics()
+        elif kind == "routes":
+            self._render_all()
+            self.view.set_title(f"Построено маршрутов: {len(self.model.routes)} "
+                                "(вход у реки → цель, обход городов).")
 
     # ---- построение карты (в фоне) ----
     def _work_build(self):
@@ -162,6 +170,11 @@ class ThreatController:
             self.on_place()
 
     def on_toggle(self):
+        # маршруты включили, а их ещё нет -> посчитать в фоне (Дейкстра, ~1 с)
+        if (self.view.get_toggles()["show_routes"] and self.model.grid is not None
+                and not self.model.routes and not self._busy):
+            self._run_async("routes", self.model.plan_routes)
+            return
         self._render_all()
 
     def on_map_layer(self, key):
@@ -183,12 +196,13 @@ class ThreatController:
             return
         extent = g.extent_km()
         self.view.render_threat(g.weight, extent, t)
-        self.view.render_water(g.water_mask(), extent, t)
+        self.view.render_exclusions(g.water_mask(), g.urban_mask(), extent, t)
         self.view.render_layers(self.model.layers,
                                 self.model.layers.get("bridge_pts", []), t)
         if t["show_cand"] and len(self.model.candidates) == 0:
             self.model.candidates = self.model.candidate_positions()
         self.view.render_candidates(self.model.candidates, t)
+        self.view.render_routes(self.model.routes, t)
         self.view.render_sensors(self.model.sensors, self.model.p.threat_R)
 
     # ---- показатели ----

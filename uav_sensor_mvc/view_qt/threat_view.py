@@ -146,6 +146,25 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         for name, fn in cbs.items():
             setattr(self, name, fn)
 
+    def _legend_html(self):
+        """HTML-легенда: какой цвет какой объект (что чем отображается)."""
+        rows = ['<div style="background:#172033cc;padding:4px 6px;border-radius:4px;'
+                'font-size:9pt;color:#e6edf3;">']
+        rows.append('<b>Слои цифровой карты</b><br>')
+        from config import THREAT_LAYERS as _TL
+        for name in THREAT_LAYER_ORDER:
+            st = LAYER_STYLE.get(name)
+            if not st:
+                continue
+            lab = _TL.get(name, {}).get("label", name)
+            rows.append(f'<span style="color:{st["color"]};">&#9644;&#9644;</span> {lab}<br>')
+        rows.append('<span style="color:#ff5d6c;">&#9650;</span> мост &nbsp; '
+                    '<span style="color:#ff4dff;">&#9644;&#9644;</span> маршрут<br>')
+        rows.append('<span style="color:#3ddc97;">&#9733;</span> вход &nbsp; '
+                    '<span style="color:#ff5d6c;">&#10005;</span> цель')
+        rows.append('</div>')
+        return "".join(rows)
+
     # ==================================================================
     def _apply_stylesheet(self):
         self.setStyleSheet(f"""
@@ -271,9 +290,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_threat.setChecked(True)
         self.chk_layers = QtWidgets.QCheckBox("векторные слои (реки/дороги/…)")
         self.chk_layers.setChecked(True)
-        self.chk_water = QtWidgets.QCheckBox("запрет воды (для датчиков)")
+        self.chk_water = QtWidgets.QCheckBox("исключения (вода/город)")
+        self.chk_water.setToolTip("Синим — вода (запрет датчика), красным — населённые "
+                                  "пункты (исключены из пролёта и из веса).")
         self.chk_cand = QtWidgets.QCheckBox("кандидатные позиции")
-        for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand):
+        self.chk_routes = QtWidgets.QCheckBox("маршруты (вход→цель)")
+        self.chk_routes.setToolTip("Построить вероятные коридоры пролёта от точки входа "
+                                   "(у реки) к цели по весовой карте (обходя города).")
+        for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand,
+                    self.chk_routes):
             chk.stateChanged.connect(lambda _s: self.on_toggle())
             col.addWidget(chk)
 
@@ -371,6 +396,16 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             pen=pg.mkPen("white", width=0.8))
         self.bridge_scatter.setZValue(-3); self.pi.addItem(self.bridge_scatter)
 
+        # маршруты вход->цель (коридоры пролёта)
+        self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
+                                       pen=pg.mkPen(_qcolor("#ff4dff", 235), width=2.4))
+        self.route_item.setZValue(3)
+
+        # легенда векторных слоёв (цвет -> объект) — что чем отображается
+        self.legend = pg.TextItem(anchor=(0, 0))
+        self.legend.setZValue(20); self.legend.setHtml(self._legend_html())
+        self.pi.addItem(self.legend); self.legend.setVisible(False)
+
         # рамка bbox
         self.bbox_item = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["accent"], 180),
                                                            width=1.6, dash=[8, 5]))
@@ -399,7 +434,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         return dict(show_threat=self.chk_threat.isChecked(),
                     show_layers=self.chk_layers.isChecked(),
                     show_water=self.chk_water.isChecked(),
-                    show_cand=self.chk_cand.isChecked())
+                    show_cand=self.chk_cand.isChecked(),
+                    show_routes=self.chk_routes.isChecked())
 
     def get_param_values(self):
         out = {}
@@ -496,6 +532,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         else:
             self.bridge_scatter.setData([], [])
             self.bridge_scatter.setVisible(False)
+        # легенда — в левом верхнем углу текущего вида
+        if show:
+            try:
+                (x0, x1), (y0, y1) = self.vb.viewRange()
+                self.legend.setPos(x0, y1)
+            except Exception:
+                pass
+        self.legend.setVisible(show)
 
     def render_threat(self, weight, extent, toggles):
         if not toggles["show_threat"] or weight is None:
@@ -508,15 +552,34 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.threat_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.threat_img.setVisible(True); self.cbar.setVisible(True)
 
-    def render_water(self, mask, extent, toggles):
-        if not toggles["show_water"] or mask is None:
+    def render_exclusions(self, water_mask, urban_mask, extent, toggles):
+        """Показать зоны-исключения: вода (синий — запрет датчика) и населённые пункты
+        (красный — исключены из пролёта и обнулены в весе)."""
+        if not toggles["show_water"] or (water_mask is None and urban_mask is None):
             self.water_img.setVisible(False); return
-        rgba = np.zeros(mask.shape + (4,), np.ubyte)
-        rgba[mask] = (58, 160, 255, 150)               # синий там, где запрет датчика
+        shape = (water_mask if water_mask is not None else urban_mask).shape
+        rgba = np.zeros(shape + (4,), np.ubyte)
+        if urban_mask is not None:
+            rgba[urban_mask] = (255, 93, 108, 120)     # красный — город (исключён)
+        if water_mask is not None:
+            rgba[water_mask] = (58, 160, 255, 150)     # синий — вода (запрет датчика)
         self.water_img.setImage(rgba, autoLevels=False)
         x0, x1, y0, y1 = extent
         self.water_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.water_img.setVisible(True)
+
+    def render_routes(self, routes, toggles):
+        """Коридоры пролёта вход->цель (список (M,2) км) — одной линией с разрывами."""
+        if not toggles["show_routes"] or not routes:
+            self.route_item.setData([], []); self.route_item.setVisible(False); return
+        nan = np.array([np.nan])
+        xs, ys = [], []
+        for r in routes:
+            r = np.asarray(r, float)
+            xs.append(r[:, 0]); xs.append(nan)
+            ys.append(r[:, 1]); ys.append(nan)
+        self.route_item.setData(np.concatenate(xs), np.concatenate(ys), connect="finite")
+        self.route_item.setVisible(True)
 
     def render_candidates(self, cand, toggles):
         if not toggles["show_cand"] or cand is None or len(cand) == 0:

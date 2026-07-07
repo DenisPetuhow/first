@@ -30,7 +30,9 @@ import numpy as np
 
 from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
                     THREAT_LAYER_ORDER, THREAT_INTERSECTION_BONUS,
-                    THREAT_WATER_BUFFER_M, THREAT_ENTRY, THREAT_TARGET)
+                    THREAT_WATER_BUFFER_M, THREAT_ENTRY, THREAT_TARGET,
+                    THREAT_URBAN_NEIGHBORHOOD_KM, THREAT_URBAN_DENSITY_FRAC,
+                    THREAT_URBAN_PENALTY)
 
 
 # ----------------------------------------------------------------------
@@ -184,6 +186,8 @@ class ThreatGrid:
         self._water = np.zeros((self.ny, self.nx), bool)
         self._present = {}                     # name -> (ny,nx) bool: слой есть в ячейке
         self._bridge_mask = np.zeros((self.ny, self.nx), bool)
+        self._built_cells = np.zeros((self.ny, self.nx), bool)   # ячейка в застройке
+        self._urban = np.zeros((self.ny, self.nx), bool)         # исключено (нас. пункт)
 
     # ---- геометрия ячеек ----
     def cell_centers_km(self):
@@ -223,10 +227,12 @@ class ThreatGrid:
         self.weight += contrib
         self.layers[name] = self.layers.get(name, 0.0) + contrib
 
-    def add_area_layer(self, name, polygons, weight, attractor=False):
+    def add_area_layer(self, name, polygons, weight, attractor=False, mark_urban=False):
         """Площадной слой (застройка): вклад в ячейки внутри полигона. weight обычно
         отрицательный (репеллер). Проверка «точка в полигоне» — только по ячейкам
-        bbox каждого полигона (не по всей сетке), поэтому быстро и на многих домах."""
+        bbox каждого полигона (не по всей сетке), поэтому быстро и на многих домах.
+        mark_urban=True — дополнительно помечает ячейки как «застроенные» (для
+        последующего исключения населённых пунктов, apply_urban_exclusion)."""
         contrib = np.zeros((self.ny, self.nx), float)
         for poly in polygons:
             P = np.asarray(poly, float)
@@ -243,10 +249,27 @@ class ThreatGrid:
             gx, gy = np.meshgrid(cx, cy)
             inside = _points_in_polygon(gx.ravel(), gy.ravel(), P).reshape(gy.shape)
             contrib[iy0:iy1 + 1, ix0:ix1 + 1] += weight * inside
+            if mark_urban:
+                self._built_cells[iy0:iy1 + 1, ix0:ix1 + 1] |= inside
         self.weight += contrib
         self.layers[name] = self.layers.get(name, 0.0) + contrib
         if attractor:
             self._attr_count += (contrib != 0).astype(np.int32)
+
+    def apply_urban_exclusion(self, neighborhood_km, density_frac, penalty):
+        """Исключить НАСЕЛЁННЫЕ ПУНКТЫ из зоны пролёта: где плотность застройки в окне
+        neighborhood_km превышает density_frac — ячейка получает штрафной вес penalty
+        (город становится «холодным», а не «горячим» из-за перекрёстков) и блокируется
+        для построения маршрута. Одиночный хутор (низкая плотность в окне) — НЕ
+        блокируется. Плотность считается box-фильтром (через интегральное изображение,
+        O(ячеек))."""
+        if not self._built_cells.any():
+            return
+        r = max(1, int(round(0.5 * neighborhood_km / self.h)))     # полуокно в ячейках
+        dens = _box_mean(self._built_cells.astype(np.float64), r)
+        self._urban = dens >= density_frac
+        self.weight[self._urban] = penalty                          # перекрывает вклад дорог/funnel
+        self.layers["urban_excl"] = np.where(self._urban, penalty, 0.0)
 
     def add_bridges_from_grid(self, weight,
                               road_keys=("road_major", "railway")):
@@ -301,6 +324,16 @@ class ThreatGrid:
     def water_mask(self):
         return self._water
 
+    def urban_mask(self):
+        return self._urban
+
+    def urban_cells_km(self):
+        """Центры исключённых (городских) ячеек — для показа на карте."""
+        iy, ix = np.nonzero(self._urban)
+        x = self.ox + (ix + 0.5) * self.h
+        y = self.oy + (iy + 0.5) * self.h
+        return np.column_stack([x, y]) if len(ix) else np.empty((0, 2))
+
     def flat_cells(self, positive_only=False):
         """Центры ячеек (M,2) и веса (M,). positive_only — только аттракторные (w>0):
         нулевые/отрицательные не дают полезного покрытия, их можно не подавать в
@@ -336,8 +369,24 @@ class ThreatGrid:
 
 
 # ----------------------------------------------------------------------
-# Вспомогательное: точка в полигоне, дилатация булевой маски
+# Вспомогательное: точка в полигоне, дилатация, box-фильтр (плотность)
 # ----------------------------------------------------------------------
+def _box_mean(a, r):
+    """Среднее по квадратному окну (2r+1)² вокруг каждой ячейки — через интегральное
+    изображение (O(ячеек)). Для оценки плотности застройки в окрестности."""
+    if r <= 0:
+        return a
+    ny, nx = a.shape
+    ii = np.zeros((ny + 1, nx + 1), np.float64)
+    ii[1:, 1:] = np.cumsum(np.cumsum(a, axis=0), axis=1)
+    y0 = np.clip(np.arange(ny) - r, 0, ny); y1 = np.clip(np.arange(ny) + r + 1, 0, ny)
+    x0 = np.clip(np.arange(nx) - r, 0, nx); x1 = np.clip(np.arange(nx) + r + 1, 0, nx)
+    Y0, X0 = np.meshgrid(y0, x0, indexing="ij"); Y1, X1 = np.meshgrid(y1, x1, indexing="ij")
+    total = ii[Y1, X1] - ii[Y0, X1] - ii[Y1, X0] + ii[Y0, X0]
+    area = (Y1 - Y0) * (X1 - X0)
+    return total / np.maximum(area, 1)
+
+
 def _points_in_polygon(px, py, poly):
     """Векторный ray-casting: маска точек (px,py) внутри замкнутого полигона poly."""
     px = np.asarray(px, float); py = np.asarray(py, float)
@@ -563,12 +612,18 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None):
         if spec["geom"] == "line":
             g.add_line_layer(name, objs, w, attractor=attr)
         elif spec["geom"] == "area":
-            g.add_area_layer(name, objs, w, attractor=attr)
+            g.add_area_layer(name, objs, w, attractor=attr,
+                             mark_urban=(name == "built_up"))
     # мост = ячейка «река + дорога/ж-д» (по сетке, быстро)
     if enabled is None or "bridge" in enabled:
         g.add_bridges_from_grid(THREAT_LAYERS.get("bridge", {}).get("weight", 0.0))
     # funnel-бонус за пересечения слоёв-аттракторов
     g.add_intersection_bonus(THREAT_INTERSECTION_BONUS)
+    # исключение населённых пунктов (после всех слоёв — перекрывает вес дорог/funnel
+    # в городе; см. apply_urban_exclusion). Только если слой застройки включён.
+    if enabled is None or "built_up" in enabled:
+        g.apply_urban_exclusion(THREAT_URBAN_NEIGHBORHOOD_KM,
+                                THREAT_URBAN_DENSITY_FRAC, THREAT_URBAN_PENALTY)
     # вода -> запрет датчиков (буфер из конфига); только если слой реки включён
     if enabled is None or "river" in enabled:
         g.mark_water(layers.get("river", []), THREAT_WATER_BUFFER_M / 1000.0)
@@ -594,6 +649,7 @@ class ThreatModel:
         self.data_path = None          # явный источник цифровых карт (.npz/.osm.pbf)
         self.enabled_layers = None     # набор включённых слоёв (None = все)
         self.target_km = None          # цель, заданная кликом («указать цель»)
+        self.routes = []               # маршруты вход->цель (список (M,2) км)
 
     # ---- источник данных / выбор слоёв ----
     def set_data_source(self, path):
@@ -614,7 +670,20 @@ class ThreatModel:
                                       enabled=self.enabled_layers)
         self.layers["bridge_pts"] = self.grid.bridge_cells_km()   # мосты — из сетки
         self.sensors = np.empty((0, 2), float)
+        self.routes = []
         return self.grid
+
+    # ---- маршруты пролёта вход->цель по весовой карте ----
+    def plan_routes(self):
+        from .threat_routes import plan_routes
+        from config import (THREAT_ROUTE_BASE_COST, THREAT_ROUTE_WEIGHT_SCALE,
+                            THREAT_ROUTE_URBAN_COST, THREAT_ROUTE_COUNT)
+        g = self.ensure_built()
+        entry, target = self.entry_target_km()
+        self.routes = plan_routes(g, entry, target, THREAT_ROUTE_COUNT,
+                                  THREAT_ROUTE_BASE_COST, THREAT_ROUTE_WEIGHT_SCALE,
+                                  THREAT_ROUTE_URBAN_COST)
+        return self.routes
 
     def ensure_built(self):
         if self.grid is None:
