@@ -147,19 +147,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             setattr(self, name, fn)
 
     def _legend_html(self):
-        """HTML-легенда: какой цвет какой объект (что чем отображается)."""
-        rows = ['<div style="background:#172033cc;padding:4px 6px;border-radius:4px;'
-                'font-size:9pt;color:#e6edf3;">']
-        rows.append('<b>Слои цифровой карты</b><br>')
+        """HTML-легенда: какой цвет какой объект. Яркий фон + крупный шрифт."""
+        rows = ['<div style="background:#0f1623f2;padding:6px 9px;border:1px solid '
+                '#36c5f0;border-radius:5px;font-size:10pt;color:#ffffff;line-height:150%;">']
+        rows.append('<b style="color:#36c5f0;">ЛЕГЕНДА · слои цифровой карты</b><br>')
         from config import THREAT_LAYERS as _TL
         for name in THREAT_LAYER_ORDER:
             st = LAYER_STYLE.get(name)
             if not st:
                 continue
             lab = _TL.get(name, {}).get("label", name)
-            rows.append(f'<span style="color:{st["color"]};">&#9644;&#9644;</span> {lab}<br>')
+            rows.append(f'<span style="color:{st["color"]};font-size:13pt;">&#9644;&#9644;</span> {lab}<br>')
         rows.append('<span style="color:#ff5d6c;">&#9650;</span> мост &nbsp; '
-                    '<span style="color:#ff4dff;">&#9644;&#9644;</span> маршрут<br>')
+                    '<span style="color:#ff4dff;font-size:13pt;">&#9644;&#9644;</span> маршрут<br>')
         rows.append('<span style="color:#3ddc97;">&#9733;</span> вход &nbsp; '
                     '<span style="color:#ff5d6c;">&#10005;</span> цель')
         rows.append('</div>')
@@ -297,8 +297,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_routes = QtWidgets.QCheckBox("маршруты (вход→цель)")
         self.chk_routes.setToolTip("Построить вероятные коридоры пролёта от точки входа "
                                    "(у реки) к цели по весовой карте (обходя города).")
+        self.chk_legend = QtWidgets.QCheckBox("легенда")
+        self.chk_legend.setChecked(True)
+        self.chk_legend.setToolTip("Легенда (какой цвет какой объект) — в левом нижнем углу.")
         for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand,
-                    self.chk_routes):
+                    self.chk_routes, self.chk_legend):
             chk.stateChanged.connect(lambda _s: self.on_toggle())
             col.addWidget(chk)
 
@@ -401,8 +404,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                                        pen=pg.mkPen(_qcolor("#ff4dff", 235), width=2.4))
         self.route_item.setZValue(3)
 
-        # легенда векторных слоёв (цвет -> объект) — что чем отображается
-        self.legend = pg.TextItem(anchor=(0, 0))
+        # легенда векторных слоёв (цвет -> объект) — что чем отображается.
+        # anchor (0,1) — точка привязки = НИЖНИЙ-левый угол текста (легенда в левом
+        # нижнем углу вида); включается отдельным чекбоксом «легенда».
+        self.legend = pg.TextItem(anchor=(0, 1))
         self.legend.setZValue(20); self.legend.setHtml(self._legend_html())
         self.pi.addItem(self.legend); self.legend.setVisible(False)
 
@@ -435,7 +440,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_layers=self.chk_layers.isChecked(),
                     show_water=self.chk_water.isChecked(),
                     show_cand=self.chk_cand.isChecked(),
-                    show_routes=self.chk_routes.isChecked())
+                    show_routes=self.chk_routes.isChecked(),
+                    show_legend=self.chk_legend.isChecked())
 
     def get_param_values(self):
         out = {}
@@ -482,7 +488,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # ---- отрисовка данных карты ----
     MAX_LAYER_PTS = 12000     # предел точек на слой при отрисовке (прореживание)
     MAX_LAYER_POLYS = 1500    # предел числа линий на слой (берём самые длинные)
-    MAX_BRIDGES = 400         # предел маркеров мостов
+    MAX_BRIDGES = 150         # предел маркеров мостов (чтобы не засорять карту)
 
     @classmethod
     def _polys_to_xy(cls, polys):
@@ -532,14 +538,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         else:
             self.bridge_scatter.setData([], [])
             self.bridge_scatter.setVisible(False)
-        # легенда — в левом верхнем углу текущего вида
-        if show:
+        # легенда — в левом НИЖНЕМ углу вида, по своему чекбоксу (независимо от слоёв)
+        show_legend = toggles.get("show_legend", False)
+        if show_legend:
             try:
                 (x0, x1), (y0, y1) = self.vb.viewRange()
-                self.legend.setPos(x0, y1)
+                self.legend.setPos(x0 + (x1 - x0) * 0.005, y0 + (y1 - y0) * 0.02)
             except Exception:
                 pass
-        self.legend.setVisible(show)
+        self.legend.setVisible(show_legend)
 
     def render_threat(self, weight, extent, toggles):
         if not toggles["show_threat"] or weight is None:
