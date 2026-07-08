@@ -103,6 +103,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_choose_data = lambda path, layers: None
         self.on_input_apply = lambda vals: None
         self.on_iter_mode = lambda key: None
+        self.on_run_iter = lambda: None
         self._params_ref = params         # для префилла окна входных данных
         self._input_dlg = None
 
@@ -156,6 +157,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         """Обновить поля окна «Входные данные» под текущие параметры (авто-L_max и пр.)."""
         if self._input_dlg is not None and self._input_dlg.isVisible():
             self._input_dlg.refresh(self._params_ref)
+
+    def set_iter_checked(self, on):
+        """Включить/выключить чекбокс «итерации» без повторного запуска расчёта."""
+        self.chk_iter.blockSignals(True)
+        self.chk_iter.setChecked(bool(on))
+        self.chk_iter.blockSignals(False)
 
     # ---- опорные точки-ориентиры для схемы/подписей ----
     def _orient_points(self):
@@ -359,6 +366,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.combo_iter.currentIndexChanged.connect(self._iter_mode_changed)
         row_it.addWidget(self.combo_iter, 1)
         col.addLayout(row_it)
+        self.btn_iter = QtWidgets.QPushButton("▶ Запустить итерации (симуляция)")
+        self.btn_iter.setToolTip("Сгенерировать МНОЖЕСТВО маршрутов (стохастика по "
+                                 "коридорам) и показать поштучной анимацией. Требуется "
+                                 "построенная карта; цель — «Указать цель» (иначе цель по умолчанию).")
+        self._tint(self.btn_iter, THEME["accent"])
+        self.btn_iter.clicked.connect(lambda: self.on_run_iter())
+        col.addWidget(self.btn_iter)
 
         b1 = QtWidgets.QHBoxLayout()
         self.btn_apply = QtWidgets.QPushButton("Применить")
@@ -556,8 +570,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.pi.setTitle(text, color=THEME["text"], size="10pt")
 
     def frame_bbox(self):
+        """Показать ВЕСЬ участок целиком (кнопка «Весь участок»). Небольшой отступ, чтобы
+        рамка bbox не липла к краям; при широком экране участок помещается полностью
+        (пределы вида это теперь допускают, см. _set_view_limits)."""
         kx0, kx1, ky0, ky1 = self.bbox_km
-        self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.02)
+        self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.06)
 
     def process_pending(self):
         QtWidgets.QApplication.processEvents()
@@ -658,7 +675,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # слой «возможные места пролёта» (полупрозрачные ячейки)
         if show and route_area is not None and route_area.any():
             rgba = np.zeros(route_area.shape + (4,), np.ubyte)
-            rgba[route_area] = (255, 77, 255, 70)          # розовый — куда БПЛА может дойти
+            rgba[route_area] = (255, 77, 255, 45)          # розовый — куда БПЛА может дойти (полупрозр.)
             self.route_area_img.setImage(rgba, autoLevels=False)
             x0, x1, y0, y1 = extent
             self.route_area_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))

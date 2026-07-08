@@ -99,8 +99,11 @@ class BasemapMixin:
         self._map_timer.timeout.connect(lambda: self._refresh_basemap())
         self.vb.sigRangeChanged.connect(lambda *a: self._map_timer.start(180))
 
-    def _set_view_limits(self, bbox_km, out_margin=1.05):
-        """Жёсткий предел пана/зума пределами bbox (нельзя утащить/отдалить за участок)."""
+    def _set_view_limits(self, bbox_km, out_margin=1.4):
+        """Предел пана/зума. out_margin>1 даёт «ещё один зум мельче»: можно отдалить так,
+        что ВЕСЬ прямоугольник участка виден сразу (по краям — чёрные поля, т.к. тайлы
+        есть только внутри bbox). При жёстком пределе ==bbox широкий экран из-за фиксации
+        соотношения сторон подрезал участок сверху/снизу — теперь помещается целиком."""
         kx0, kx1, ky0, ky1 = bbox_km
         cx, cy = 0.5 * (kx0 + kx1), 0.5 * (ky0 + ky1)
         w = (kx1 - kx0) * out_margin; h = (ky1 - ky0) * out_margin

@@ -256,11 +256,16 @@ class ThreatGrid:
         if attractor:
             self._attr_count += (contrib != 0).astype(np.int32)
 
-    def apply_urban_exclusion(self, neighborhood_km, density_frac, penalty):
-        """Исключить КРУПНЫЕ населённые пункты из зоны пролёта: где плотность застройки
-        в окне neighborhood_km превышает density_frac (это ГОРОД, не деревня) — ячейка
-        получает штрафной вес penalty (город «холодный», не «горячий» из-за перекрёстков)
-        и блокируется для маршрута.
+    def apply_urban_exclusion(self, neighborhood_km, density_frac, penalty,
+                              in_weight=False):
+        """Отметить КРУПНЫЕ населённые пункты (плотность застройки в окне neighborhood_km
+        выше density_frac — это ГОРОД, не деревня). Маска `_urban` блокирует МАРШРУТ (БПЛА
+        не летит над плотной застройкой).
+
+        `in_weight`: вносить ли штраф `penalty` в ВЕСОВУЮ карту (датчики/тепло). По
+        умолчанию НЕТ — иначе город становится «-40-пустыней», и датчики, максимизируя
+        положительный вес, разбегаются от городов (покрытие падает). Маршрут обходит
+        город независимо от веса — через маску `_urban`.
 
         ВАЖНО: ячейки с РЕКОЙ из города НЕ исключаются — БПЛА идёт по руслу даже сквозь
         город (реки/ручьи остаются коридором). Одиночный хутор (низкая плотность в окне)
@@ -273,9 +278,12 @@ class ThreatGrid:
         river = self._present.get("river")
         if river is not None:
             urban = urban & (~river)                               # река в городе — оставляем коридором
-        self._urban = urban
-        self.weight[urban] = penalty                               # перекрывает вклад дорог/funnel
-        self.layers["urban_excl"] = np.where(urban, penalty, 0.0)
+        self._urban = urban                                        # маска для маршрута (всегда)
+        if in_weight:
+            self.weight[urban] = penalty                           # перекрывает вклад дорог/funnel
+            self.layers["urban_excl"] = np.where(urban, penalty, 0.0)
+        else:
+            self.layers["urban_excl"] = np.zeros_like(self.weight)  # в вес не вносим
 
     def add_bridges_from_grid(self, weight,
                               road_keys=("road_major", "railway")):
@@ -638,8 +646,10 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None):
     # исключение населённых пунктов (после всех слоёв — перекрывает вес дорог/funnel
     # в городе; см. apply_urban_exclusion). Только если слой застройки включён.
     if enabled is None or "built_up" in enabled:
+        from config import THREAT_URBAN_IN_WEIGHT
         g.apply_urban_exclusion(THREAT_URBAN_NEIGHBORHOOD_KM,
-                                THREAT_URBAN_DENSITY_FRAC, THREAT_URBAN_PENALTY)
+                                THREAT_URBAN_DENSITY_FRAC, THREAT_URBAN_PENALTY,
+                                in_weight=THREAT_URBAN_IN_WEIGHT)
     # вода -> запрет датчиков (буфер из конфига); только если слой реки включён
     if enabled is None or "river" in enabled:
         g.mark_water(layers.get("river", []), THREAT_WATER_BUFFER_M / 1000.0)

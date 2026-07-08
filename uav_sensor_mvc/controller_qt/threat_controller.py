@@ -54,8 +54,20 @@ class ThreatController:
             on_mode=self.on_mode, on_toggle=self.on_toggle,
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
-            on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode)
+            on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
+            on_run_iter=self.on_run_iter)
         self._idle_metrics()
+
+    # ---- кнопка «Запустить итерации (симуляция)» ----
+    def on_run_iter(self):
+        if self._busy:
+            self.view.flash_title("Идёт расчёт — подождите…")
+            return
+        if self.model.grid is None:                       # карта нужна для коридоров
+            self.view.flash_title("Сначала «Построить карту».")
+            return
+        self.view.set_iter_checked(True)                  # показать слой итераций
+        self._run_async("iter", self.model.iterate_routes)
 
     # ---- окно «Входные данные»: применить сразу (не блокирует программу) ----
     def on_input_apply(self, vals):
