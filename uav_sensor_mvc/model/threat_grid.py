@@ -32,7 +32,7 @@ from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
                     THREAT_LAYER_ORDER, THREAT_INTERSECTION_BONUS,
                     THREAT_WATER_BUFFER_M, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_URBAN_NEIGHBORHOOD_KM, THREAT_URBAN_DENSITY_FRAC,
-                    THREAT_URBAN_PENALTY)
+                    THREAT_URBAN_PENALTY, THREAT_LMAX_AUTO_FRAC)
 
 
 # ----------------------------------------------------------------------
@@ -666,6 +666,7 @@ class ThreatModel:
         self.enabled_layers = None     # набор включённых слоёв (None = все)
         self.target_km = None          # цель, заданная кликом («указать цель»)
         self.routes = []               # примеры коридоров-центров (список (M,2) км)
+        self.iter_routes = []          # итерационные (стохастические) маршруты — много
         self.route_area = None         # маска ВСЕХ возможных мест пролёта (в пределах L_max)
         self.route_min_len = float("inf")   # мин. длина пути вход->цель, км
 
@@ -696,18 +697,57 @@ class ThreatModel:
         """ВСЕ возможные места пролёта (envelope, ограничение — запас хода L_max) +
         примеры коридоров-центров. envelope — маска ячеек, через которые вообще может
         пройти маршрут вход→цель в пределах запаса хода (с прямыми мостиками ≤ 2 км)."""
-        from .threat_routes import plan_routes, flight_envelope
+        from .threat_routes import plan_routes
         from config import (THREAT_ROUTE_BASE_COST, THREAT_ROUTE_WEIGHT_SCALE,
-                            THREAT_ROUTE_URBAN_COST, THREAT_ROUTE_COUNT,
-                            THREAT_ROUTE_MAX_GAP_KM)
+                            THREAT_ROUTE_URBAN_COST, THREAT_ROUTE_COUNT)
         g = self.ensure_built()
-        entry, target = self.entry_target_km()
-        self.route_area, self.route_min_len = flight_envelope(
-            g, entry, target, self.p.threat_L_max, THREAT_ROUTE_MAX_GAP_KM)
+        entry, target = self._refresh_envelope()
         self.routes = plan_routes(g, entry, target, THREAT_ROUTE_COUNT,
                                   THREAT_ROUTE_BASE_COST, THREAT_ROUTE_WEIGHT_SCALE,
                                   THREAT_ROUTE_URBAN_COST)
         return self.routes
+
+    # ---- ИТЕРАЦИОННЫЕ маршруты (много стохастических путей по коридорам) ----
+    def iterate_routes(self):
+        """Сгенерировать МНОЖЕСТВО вероятных маршрутов (итерационная модель, §4.5):
+        стохастические развилки по коридорам, режим p.threat_iter_mode, ограничение —
+        запас хода L_max (авто |AB|+25% или заданный руками). Обновляет и огибающую."""
+        from .threat_routes import iterate_routes
+        from config import THREAT_ROUTE_MAX_GAP_KM
+        g = self.ensure_built()
+        entry, target = self._refresh_envelope()
+        self.iter_routes = iterate_routes(
+            g, entry, target, self.p.threat_iter_routes, self.p.threat_iter_mode,
+            self.p.threat_L_max, self.p.threat_turn_interval_km, THREAT_ROUTE_MAX_GAP_KM)
+        return self.iter_routes
+
+    def _refresh_envelope(self):
+        """Пересчитать авто-запас хода и огибающую мест пролёта. Возвращает (вход, цель).
+        Авто-L_max = |AB|+25 %, НО не меньше кратчайшего коридорного пути +20 % (иначе на
+        «узкой» местности маршрут не уместился бы вовсе). Ручной L_max не трогаем."""
+        from .threat_routes import flight_envelope
+        from config import THREAT_ROUTE_MAX_GAP_KM
+        g = self.grid
+        entry, target = self.entry_target_km()
+        self.sync_auto_L_max()                                 # предварительно |AB|+25 %
+        _, self.route_min_len = flight_envelope(               # кратчайший путь (от L_max не зависит)
+            g, entry, target, self.p.threat_L_max, THREAT_ROUTE_MAX_GAP_KM)
+        self.sync_auto_L_max(self.route_min_len)               # поднять до «кратчайший+20 %», если авто
+        self.route_area, self.route_min_len = flight_envelope(
+            g, entry, target, self.p.threat_L_max, THREAT_ROUTE_MAX_GAP_KM)
+        return entry, target
+
+    def sync_auto_L_max(self, min_corridor_km=None):
+        """Если запас хода НЕ задан руками — авто: |AB|·(1+25 %), но не меньше
+        min_corridor_km·1.20 (кратчайший коридорный путь + запас). Возвращает L_max, км."""
+        if not getattr(self.p, "threat_L_max_manual", False):
+            entry, target = self.entry_target_km()
+            ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
+            lmax = ab * (1.0 + THREAT_LMAX_AUTO_FRAC)
+            if min_corridor_km is not None and np.isfinite(min_corridor_km):
+                lmax = max(lmax, min_corridor_km * 1.20)
+            self.p.threat_L_max = round(lmax, 1)
+        return self.p.threat_L_max
 
     def ensure_built(self):
         if self.grid is None:
@@ -780,8 +820,12 @@ class ThreatModel:
 
     # ---- точка входа (фиксирована у реки) и цель (можно задать кликом) ----
     def set_target(self, x_km, y_km):
-        """Задать целевую точку кликом по карте (режим «указать цель»)."""
+        """Задать целевую точку кликом по карте (режим «указать цель»). Запас хода
+        (если не задан руками) пересчитывается авто под новое |AB|; маршруты сбросятся."""
         self.target_km = (float(x_km), float(y_km))
+        self.routes = []
+        self.iter_routes = []
+        self.sync_auto_L_max()
 
     def entry_km(self):
         _, elon, elat = THREAT_ENTRY

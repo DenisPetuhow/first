@@ -18,7 +18,8 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 import matplotlib.cm as cm
 
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
-                    THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET)
+                    THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
+                    THREAT_ITER_MODE_LABELS)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from . import geomap as gm
 
@@ -101,6 +102,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_set_target = lambda x, y: None
         self.on_choose_data = lambda path, layers: None
         self.on_input_apply = lambda vals: None
+        self.on_iter_mode = lambda key: None
         self._params_ref = params         # для префилла окна входных данных
         self._input_dlg = None
 
@@ -149,6 +151,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def set_ab_distance(self, km):
         if self._input_dlg is not None:
             self._input_dlg.set_ab(km)
+
+    def refresh_input_dialog(self):
+        """Обновить поля окна «Входные данные» под текущие параметры (авто-L_max и пр.)."""
+        if self._input_dlg is not None and self._input_dlg.isVisible():
+            self._input_dlg.refresh(self._params_ref)
 
     # ---- опорные точки-ориентиры для схемы/подписей ----
     def _orient_points(self):
@@ -325,13 +332,33 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_cross = QtWidgets.QCheckBox("пересечения (перекрёстки)")
         self.chk_cross.setToolTip("Узлы, где сходятся ≥2 разных слоёв (дорога×река=мост, "
                                   "дорога×ЛЭП и т.д.) — точки развилок. Скрыто по умолчанию.")
+        self.chk_iter = QtWidgets.QCheckBox("итерации (много маршрутов)")
+        self.chk_iter.setToolTip("Стохастическая генерация МНОЖЕСТВА маршрутов вход→цель по "
+                                 "коридорам: развилки выбираются случайно по весу соседей. "
+                                 "Главное ограничение — запас хода. Показ — поштучной анимацией.")
         self.chk_legend = QtWidgets.QCheckBox("легенда")
         self.chk_legend.setChecked(True)
         self.chk_legend.setToolTip("Легенда (какой цвет какой объект) — в левом нижнем углу.")
         for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand,
-                    self.chk_routes, self.chk_cross, self.chk_legend):
+                    self.chk_routes, self.chk_cross, self.chk_iter, self.chk_legend):
             chk.stateChanged.connect(lambda _s: self.on_toggle())
             col.addWidget(chk)
+        # режим стохастического выбора развилки (для «итераций»)
+        row_it = QtWidgets.QHBoxLayout()
+        row_it.addWidget(QtWidgets.QLabel("режим итераций:"))
+        self.combo_iter = QtWidgets.QComboBox()
+        self._iter_keys = list(THREAT_ITER_MODE_LABELS)
+        for k in self._iter_keys:
+            self.combo_iter.addItem(THREAT_ITER_MODE_LABELS[k])
+        cur = getattr(params, "threat_iter_mode", "mix")
+        self.combo_iter.setCurrentIndex(self._iter_keys.index(cur)
+                                        if cur in self._iter_keys else 0)
+        self.combo_iter.setToolTip("Как выбирается развилка на перекрёстке: приоритет "
+                                   "тяжёлых коридоров (реки/дороги) / сбалансированно / "
+                                   "приоритет лёгких (прятаться) / смесь.")
+        self.combo_iter.currentIndexChanged.connect(self._iter_mode_changed)
+        row_it.addWidget(self.combo_iter, 1)
+        col.addLayout(row_it)
 
         b1 = QtWidgets.QHBoxLayout()
         self.btn_apply = QtWidgets.QPushButton("Применить")
@@ -382,6 +409,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._map_offline = self.chk_offline.isChecked()
         self.on_map_offline(self._map_offline)
         self._refresh_basemap(force=True)
+
+    def _iter_mode_changed(self, i):
+        self.on_iter_mode(self._iter_keys[i])
 
     def _on_field_submit(self):
         if not self._suppress:
@@ -435,6 +465,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
                                        pen=pg.mkPen(_qcolor("#ff4dff", 235), width=2.4))
         self.route_item.setZValue(3)
+        # ИТЕРАЦИОННЫЕ маршруты — много тонких полупрозрачных путей (показ анимацией)
+        self.route_iter_item = self.pi.plot([], [], antialias=True, connect="finite",
+                                            pen=pg.mkPen(_qcolor("#36c5f0", 85), width=1.2))
+        self.route_iter_item.setZValue(1)
+        self._iter_routes = []; self._iter_shown = 0
+        self._iter_timer = QtCore.QTimer(self)
+        self._iter_timer.timeout.connect(self._iter_tick)
         # пересечения (перекрёстки дорог/рек/ЛЭП) — узлы развилок, скрыто по умолчанию
         self.crossing_scatter = pg.ScatterPlotItem(
             size=7, symbol="d", brush=pg.mkBrush(_qcolor("#ffd166", 220)),
@@ -479,6 +516,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_cand=self.chk_cand.isChecked(),
                     show_routes=self.chk_routes.isChecked(),
                     show_cross=self.chk_cross.isChecked(),
+                    show_iter=self.chk_iter.isChecked(),
+                    iter_mode=self._iter_keys[self.combo_iter.currentIndex()],
                     show_legend=self.chk_legend.isChecked())
 
     def get_param_values(self):
@@ -639,6 +678,36 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         else:
             self.route_item.setData([], []); self.route_item.setVisible(False)
 
+    def render_iter_routes(self, routes, toggles):
+        """Множество ИТЕРАЦИОННЫХ маршрутов — показ ПОШТУЧНОЙ анимацией (как вкладка 2):
+        пути «прорисовываются» по одному. Без итераций/при выключенном чекбоксе — очистить."""
+        if self._iter_timer.isActive():
+            self._iter_timer.stop()
+        self._iter_routes = list(routes) if (toggles.get("show_iter") and routes) else []
+        self._iter_shown = 0
+        if not self._iter_routes:
+            self.route_iter_item.setData([], []); self.route_iter_item.setVisible(False)
+            return
+        self.route_iter_item.setVisible(True)
+        self._redraw_iter(1)                       # первый путь — сразу (виден и без цикла событий)
+        self._iter_shown = 1
+        if len(self._iter_routes) > 1:
+            self._iter_timer.start(45)             # ~22 пути/сек — «наматывание» веера
+
+    def _iter_tick(self):
+        self._iter_shown += 1
+        self._redraw_iter(self._iter_shown)
+        if self._iter_shown >= len(self._iter_routes):
+            self._iter_timer.stop()
+
+    def _redraw_iter(self, n):
+        nan = np.array([np.nan]); xs, ys = [], []
+        for r in self._iter_routes[:n]:
+            r = np.asarray(r, float)
+            xs.append(r[:, 0]); xs.append(nan)
+            ys.append(r[:, 1]); ys.append(nan)
+        self.route_iter_item.setData(np.concatenate(xs), np.concatenate(ys), connect="finite")
+
     def render_crossings(self, crossings, toggles):
         """Пересечения (перекрёстки дорог/рек/ЛЭП) — узлы развилок. Скрыто по умолчанию."""
         if not toggles.get("show_cross") or crossings is None or len(crossings) == 0:
@@ -776,11 +845,19 @@ class InputDataDialog(QtWidgets.QDialog):
         lay = QtWidgets.QFormLayout(self)
         self.ab_lbl = QtWidgets.QLabel("—")
         lay.addRow("|AB| (вход→цель), км:", self.ab_lbl)
+        # запас хода: авто = |AB| + 25 % (галочка) либо руками (снять галочку)
+        self.chk_auto = QtWidgets.QCheckBox("авто: |AB| + 25 %")
+        self.chk_auto.setChecked(not getattr(params, "threat_L_max_manual", False))
+        self.chk_auto.setToolTip("Запас хода = расстояние вход→цель +25 % (не меньше "
+                                 "кратчайшего коридора). Снимите галочку — задать L_max руками.")
+        self.chk_auto.stateChanged.connect(self._auto_changed)
+        lay.addRow(self.chk_auto)
         for name, label in self.FIELDS:
             e = QtWidgets.QLineEdit(str(getattr(params, name)))
             e.returnPressed.connect(self._apply)
             self._edits[name] = e
             lay.addRow(label, e)
+        self._auto_changed()                       # выставить доступность поля L_max
         row = QtWidgets.QHBoxLayout()
         btn = QtWidgets.QPushButton("Применить (Enter)")
         btn.clicked.connect(self._apply)
@@ -792,11 +869,21 @@ class InputDataDialog(QtWidgets.QDialog):
         lay.addRow(hint)
 
     def refresh(self, params):
+        self.chk_auto.setChecked(not getattr(params, "threat_L_max_manual", False))
         for name, e in self._edits.items():
             e.setText(str(getattr(params, name)))
+        self._auto_changed()
 
     def set_ab(self, km):
         self.ab_lbl.setText(f"{km:.0f}")
+
+    def _auto_changed(self, *_):
+        """Авто-запас: поле L_max только для чтения (значение считает модель)."""
+        auto = self.chk_auto.isChecked()
+        e = self._edits.get("threat_L_max")
+        if e is not None:
+            e.setReadOnly(auto)
+            e.setStyleSheet("color:%s;" % (THEME["muted"] if auto else THEME["text"]))
 
     def _apply(self):
         vals = {}
@@ -805,4 +892,8 @@ class InputDataDialog(QtWidgets.QDialog):
                 vals[name] = float(e.text().strip().replace(",", "."))
             except ValueError:
                 return
+        auto = self.chk_auto.isChecked()
+        vals["threat_L_max_manual"] = (not auto)
+        if auto:
+            vals.pop("threat_L_max", None)         # авто — L_max посчитает модель (|AB|+25%)
         self._on_apply(vals)

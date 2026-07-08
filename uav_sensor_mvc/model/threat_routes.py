@@ -137,6 +137,16 @@ def passable_mask(grid, max_gap_km):
     return pas
 
 
+def _open_endpoints(pas, cells_yx, grid, radius_km=3.0):
+    """Открыть проходимость в окрестности ~radius_km вокруг заданных ячеек (вход/цель),
+    чтобы они «дотянулись» до коридорной сети (БПЛА проходит несколько км над полем до
+    реки/дороги на входе/выходе). Меняет pas на месте, возвращает его же."""
+    rc = max(1, int(round(radius_km / grid.h)))
+    for cy, cx in cells_yx:
+        pas[max(0, cy - rc):cy + rc + 1, max(0, cx - rc):cx + rc + 1] = True
+    return pas
+
+
 def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km):
     """ВСЕ ВОЗМОЖНЫЕ МЕСТА ПРОЛЁТА при запасе хода L_max. Ячейка попадает в «возможные
     места», если существует путь вход→ячейка→цель по коридорам (с мостиками ≤ max_gap)
@@ -146,20 +156,158 @@ def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km):
 
     Так учитываются и ДЛИННЫЕ обходы (зайти с другой стороны) — лишь бы уложиться в
     запас хода. Возвращает (mask_возможных_ячеек, min_длина_вход→цель)."""
-    pas = passable_mask(grid, max_gap_km)
     start = _cell_of(grid, entry_km)
     goal = _cell_of(grid, target_km)
-    # вход/цель «дотягиваются» до коридорной сети: вокруг них открываем окрестность
-    # ~3 км (БПЛА может пройти несколько км над полем до реки/дороги на входе/выходе).
-    rc = max(1, int(round(3.0 / grid.h)))
-    for cy, cx in (start, goal):
-        pas[max(0, cy - rc):cy + rc + 1, max(0, cx - rc):cx + rc + 1] = True
+    pas = _open_endpoints(passable_mask(grid, max_gap_km), (start, goal), grid)
     ge = _dijkstra_dist(pas, start, grid.h)
     gt = _dijkstra_dist(pas, goal, grid.h)
     total = ge + gt
     env = np.isfinite(total) & (total <= L_max)
     dmin = float(ge[goal]) if np.isfinite(ge[goal]) else float("inf")
     return env, dmin
+
+
+# --- ИТЕРАЦИОННАЯ (стохастическая) генерация множества маршрутов ---------------
+# 8 единичных векторов направлений (в порядке _NEIGHBORS) — для «держания курса».
+_NB_UNIT = [(dy / mul, dx / mul) for dy, dx, mul in _NEIGHBORS]
+
+
+def _mode_corridor_pref(wnorm, mode):
+    """Предпочтение соседа по ВЕСУ его коридора, зависящее от режима (методичка §4.5).
+    Небольшой «пол» у каждого режима не даёт вероятности занулиться (маршрут не
+    вырождается в один и тот же коридор — например, только реки)."""
+    if mode == "heavy":                       # тянемся к тяжёлым коридорам (реки/дороги)
+        return 0.10 + 1.6 * wnorm
+    if mode == "light":                       # прячемся в «пустошах» (низкий вес)
+        return 0.10 + 1.6 * (1.0 - wnorm)
+    return 0.30 + 0.8 * wnorm                 # balanced: вероятность ∝ весу коридора
+
+
+def _chaikin(poly, iters=2):
+    """Сглаживание углов (Chaikin): острые повороты сетки → плавные довороты. Служит
+    приближением манёвра по радиусу разворота R_min (истинная кинематика — задел)."""
+    p = np.asarray(poly, float)
+    for _ in range(iters):
+        if len(p) < 3:
+            break
+        q = [p[0]]
+        for i in range(len(p) - 1):
+            a, b = p[i], p[i + 1]
+            q.append(0.75 * a + 0.25 * b)
+            q.append(0.25 * a + 0.75 * b)
+        q.append(p[-1])
+        p = np.array(q)
+    return p
+
+
+def _poly_len_km(poly):
+    d = np.diff(np.asarray(poly, float), axis=0)
+    return float(np.hypot(d[:, 0], d[:, 1]).sum())
+
+
+def _cells_yx_to_km(grid, cells_yx):
+    """Список ячеек (y,x) -> точки-центры (M,2) в км."""
+    a = np.asarray(cells_yx, float)
+    xs = grid.ox + (a[:, 1] + 0.5) * grid.h
+    ys = grid.oy + (a[:, 0] + 0.5) * grid.h
+    return np.column_stack([xs, ys])
+
+
+def _walk_once(grid, pas, gt, wnorm, start, goal, mode, L_max, turn_interval_km, rng):
+    """Один стохастический маршрут вход→цель: жадно-случайный спуск по полю расстояний
+    до цели gt (гарантирует приход к цели), развилки выбираются по весу коридора соседа
+    (режим), курс держится ≥ turn_interval_km между доворотами. Возвращает список ячеек
+    (y,x) или None, если не уложились в запас хода / зашли в тупик."""
+    ny, nx = gt.shape
+    h = grid.h
+    step_cap = int(6 * gt[start] / h + 80) if np.isfinite(gt[start]) else 0
+    if step_cap <= 0:
+        return None                                    # цель недостижима по коридорам
+    cur = start
+    path = [cur]
+    heading = None                                     # текущее направление (dy,dx единич.)
+    dist_since_turn = 0.0
+    route_len = 0.0
+    for _ in range(step_cap):
+        if cur == goal or gt[cur] <= h:                # дошли (в пределах ячейки)
+            break
+        cy, cx = cur
+        cand, score = [], []
+        for k, (dy, dx, mul) in enumerate(_NEIGHBORS):
+            vy, vx = cy + dy, cx + dx
+            if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not pas[vy, vx]:
+                continue
+            gj = gt[vy, vx]
+            if not np.isfinite(gj) or gj > gt[cur] + 1.2:   # назад — не дальше 1.2 км (не убегаем)
+                continue
+            uy, ux = _NB_UNIT[k]
+            if heading is None:
+                hf = 1.0
+            else:
+                dot = uy * heading[0] + ux * heading[1]
+                if dot < -0.2:                          # разворот назад почти запрещён
+                    hf = 0.02
+                elif dist_since_turn < turn_interval_km:   # рано поворачивать — держим курс
+                    hf = 8.0 if dot > 0.85 else (1.0 if dot > 0.3 else 0.05)
+                else:
+                    hf = 1.0 + 2.0 * max(dot, 0.0)      # можно доворачивать, прямо — чуть охотнее
+            # ТЯГА к цели экспоненциальна по прогрессу: шаг к цели много вероятнее шага в
+            # сторону/назад -> маршрут держится близко к кратчайшему (укладывается в L_max),
+            # а РАЗНООБРАЗИЕ даёт выбор РАЗНЫХ коридоров, а не длинные крюки.
+            prog = gt[cur] - gj                         # >0 — ближе к цели, <0 — дальше
+            corr = _mode_corridor_pref(wnorm[vy, vx], mode)
+            s = float(np.exp(prog / 0.5)) * corr * hf
+            cand.append((vy, vx, mul, (uy, ux)))
+            score.append(s)
+        if not cand:                                    # тупик
+            return None
+        score = np.asarray(score, float)
+        j = int(rng.choice(len(cand), p=score / score.sum()))
+        vy, vx, mul, unit = cand[j]
+        step = mul * h
+        route_len += step
+        if route_len > L_max:                           # не уложились в запас хода
+            return None
+        new_head = (round(unit[0], 3), round(unit[1], 3))
+        dist_since_turn = (dist_since_turn + step
+                           if heading is not None and new_head == heading else step)
+        heading = new_head
+        cur = (vy, vx)
+        path.append(cur)
+    return path if (cur == goal or gt[cur] <= h) else None
+
+
+def iterate_routes(grid, entry_km, target_km, n_routes, mode, L_max,
+                   turn_interval_km, max_gap_km, seed=None):
+    """МНОЖЕСТВО вероятных маршрутов (итерационная модель, методичка §4.5). Каждый —
+    стохастический проход вход→цель по коридорам: развилки выбираются случайно с
+    вероятностью по весу коридора соседа (режим heavy/balanced/light), курс держится
+    между доворотами, длина ограничена запасом хода L_max (главное ограничение). В режиме
+    "mix" у каждого маршрута свой случайный режим из трёх. Возвращает список (M,2) км."""
+    start = _cell_of(grid, entry_km)
+    goal = _cell_of(grid, target_km)
+    pas = _open_endpoints(passable_mask(grid, max_gap_km), (start, goal), grid)
+    gt = _dijkstra_dist(pas, goal, grid.h)              # поле расстояний до цели (тяга)
+    if not np.isfinite(gt[start]):
+        return []                                       # цели не достичь по коридорам
+    w = np.clip(grid.weight, 0.0, None)                 # нормировка веса по p90 (как в стоимости)
+    pos = w[w > 0]
+    ref = float(np.percentile(pos, 90)) if pos.size else 1.0
+    wnorm = np.clip(w / max(ref, 1e-6), 0.0, 1.0)
+    rng = np.random.default_rng(seed)
+    modes = ("heavy", "balanced", "light")
+    routes, tries, cap = [], 0, max(1, int(n_routes)) * 6
+    while len(routes) < int(n_routes) and tries < cap:
+        tries += 1
+        m = modes[rng.integers(3)] if mode == "mix" else mode
+        path = _walk_once(grid, pas, gt, wnorm, start, goal, m, L_max,
+                          turn_interval_km, rng)
+        if path is None or len(path) < 2:
+            continue
+        poly = _chaikin(_cells_yx_to_km(grid, path), iters=2)
+        if _poly_len_km(poly) <= L_max * 1.05:          # сглаживание чуть меняет длину
+            routes.append(poly)
+    return routes
 
 
 def plan_routes(grid, entry_km, target_km, n_routes, base_cost, weight_scale,

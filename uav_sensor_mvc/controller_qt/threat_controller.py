@@ -10,7 +10,8 @@ CONTROLLER (Qt) · Вкладка 3 «Цифровая карта угроз».
 import numpy as np
 from pyqtgraph.Qt import QtCore
 
-from config import MODE_LABELS, THREAT_LAYERS, THREAT_CELL_M
+from config import (MODE_LABELS, THREAT_LAYERS, THREAT_CELL_M,
+                    THREAT_ITER_MODE_LABELS)
 
 
 class _TaskSignals(QtCore.QObject):
@@ -53,20 +54,30 @@ class ThreatController:
             on_mode=self.on_mode, on_toggle=self.on_toggle,
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
-            on_input_apply=self.on_input_apply)
+            on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode)
         self._idle_metrics()
 
     # ---- окно «Входные данные»: применить сразу (не блокирует программу) ----
     def on_input_apply(self, vals):
         for n, v in vals.items():
             setattr(self.model.p, n, v)
-        # маршруты зависят от запаса хода — пересчитать, если показаны
-        if self.model.grid is not None and self.view.get_toggles()["show_routes"]:
+        # маршруты/итерации зависят от запаса хода — пересчитать показанное
+        t = self.view.get_toggles()
+        if self.model.grid is not None and t.get("show_iter"):
+            self._run_async("iter", self.model.iterate_routes)
+        elif self.model.grid is not None and t["show_routes"]:
             self.model.routes = []
             self._run_async("routes", self.model.plan_routes)
         else:
             self._render_all()
         self.view.set_title("Входные данные применены.")
+
+    # ---- смена режима итераций (heavy/balanced/light/mix) ----
+    def on_iter_mode(self, key):
+        self.model.p.threat_iter_mode = key
+        if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
+                and not self._busy):
+            self._run_async("iter", self.model.iterate_routes)
 
     # ---- запуск тяжёлого расчёта в фоне ----
     def _run_async(self, kind, work_fn):
@@ -77,7 +88,8 @@ class ThreatController:
         self.view.set_busy(True)
         titles = {"build": "Строю весовую карту угроз…",
                   "place": "Расставляю датчики по весам…",
-                  "routes": "Строю маршруты пролёта…"}
+                  "routes": "Строю маршруты пролёта…",
+                  "iter": "Генерирую маршруты (итерации)…"}
         self.view.flash_title(titles.get(kind, "Расчёт…"))
         self.view.process_pending()
         self._pool.start(_Task(kind, work_fn, self._sig))
@@ -94,7 +106,10 @@ class ThreatController:
             self._render_all()
             self.view.set_title("Карта угроз построена. «Расставить датчики».")
             self._full_metrics()
-            if self.view.get_toggles()["show_routes"]:   # маршруты были включены — обновить
+            tg = self.view.get_toggles()
+            if tg.get("show_iter"):                      # итерации были включены — обновить
+                self._run_async("iter", self.model.iterate_routes)
+            elif tg["show_routes"]:                      # маршруты были включены — обновить
                 self._run_async("routes", self.model.plan_routes)
         elif kind == "place":
             self._render_all()
@@ -107,6 +122,13 @@ class ThreatController:
             self._render_all()
             self.view.set_title(f"Построено маршрутов: {len(self.model.routes)} "
                                 "(вход у реки → цель, обход городов).")
+        elif kind == "iter":
+            self._render_all()
+            lab = THREAT_ITER_MODE_LABELS.get(self.model.p.threat_iter_mode,
+                                              self.model.p.threat_iter_mode)
+            self.view.set_title(
+                f"Итерации: {len(self.model.iter_routes)} маршрутов · режим «{lab}» · "
+                f"L_max={self.model.p.threat_L_max:g} км (запас хода).")
 
     # ---- построение карты (в фоне) ----
     def _work_build(self):
@@ -133,16 +155,28 @@ class ThreatController:
 
     # ---- «указать цель» кликом по карте ----
     def on_set_target(self, x, y):
-        self.model.set_target(x, y)
+        self.model.set_target(x, y)                       # пересчитает авто-запас хода
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, target)
-        self.view.set_title(f"Цель задана: ({x:.0f}, {y:.0f}) км. Вход — у реки "
-                            "(Северодонецк).")
+        ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
+        self.view.set_ab_distance(ab)
+        self.view.refresh_input_dialog()                  # окно покажет новый L_max
+        t = self.view.get_toggles()                       # маршруты/итерации зависят от цели
+        if self.model.grid is not None and t.get("show_iter"):
+            self._run_async("iter", self.model.iterate_routes)
+        elif self.model.grid is not None and t["show_routes"]:
+            self._run_async("routes", self.model.plan_routes)
+        else:
+            self.view.set_title(f"Цель задана: ({x:.0f}, {y:.0f}) км. Вход — у реки "
+                                "(Северодонецк).")
 
     # ---- сброс: убрать датчики и заданную цель (карта остаётся) ----
     def on_reset(self):
         self.model.sensors = np.empty((0, 2), float)
         self.model.target_km = None
+        self.model.routes = []
+        self.model.iter_routes = []
+        self.model.route_area = None
         self.model._metrics = {}
         self._render_all()
         self.view.set_title("Сброшено: датчики и цель убраны. Карта сохранена.")
@@ -183,8 +217,14 @@ class ThreatController:
             self.on_place()
 
     def on_toggle(self):
+        t = self.view.get_toggles()
+        # итерации включили, а их ещё нет -> сгенерировать в фоне (стохастика, ~1 с)
+        if (t.get("show_iter") and self.model.grid is not None
+                and not self.model.iter_routes and not self._busy):
+            self._run_async("iter", self.model.iterate_routes)
+            return
         # маршруты включили, а их ещё нет -> посчитать в фоне (Дейкстра, ~1 с)
-        if (self.view.get_toggles()["show_routes"] and self.model.grid is not None
+        if (t["show_routes"] and self.model.grid is not None
                 and not self.model.routes and not self._busy):
             self._run_async("routes", self.model.plan_routes)
             return
@@ -209,6 +249,7 @@ class ThreatController:
         ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
         self.model.p.ab_distance = round(ab, 1)
         self.view.set_ab_distance(ab)
+        self.view.refresh_input_dialog()                  # окно «Входные данные» — актуальный L_max
         if g is None:
             return
         extent = g.extent_km()
@@ -220,6 +261,7 @@ class ThreatController:
             self.model.candidates = self.model.candidate_positions()
         self.view.render_candidates(self.model.candidates, t)
         self.view.render_routes(self.model.routes, self.model.route_area, extent, t)
+        self.view.render_iter_routes(self.model.iter_routes, t)
         if t.get("show_cross"):
             self.view.render_crossings(g.crossing_cells_km(), t)
         else:
