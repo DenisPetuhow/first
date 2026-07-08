@@ -52,8 +52,21 @@ class ThreatController:
             on_reset=self.on_reset, on_reset_view=self.on_reset_view,
             on_mode=self.on_mode, on_toggle=self.on_toggle,
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
-            on_set_target=self.on_set_target, on_choose_data=self.on_choose_data)
+            on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
+            on_input_apply=self.on_input_apply)
         self._idle_metrics()
+
+    # ---- окно «Входные данные»: применить сразу (не блокирует программу) ----
+    def on_input_apply(self, vals):
+        for n, v in vals.items():
+            setattr(self.model.p, n, v)
+        # маршруты зависят от запаса хода — пересчитать, если показаны
+        if self.model.grid is not None and self.view.get_toggles()["show_routes"]:
+            self.model.routes = []
+            self._run_async("routes", self.model.plan_routes)
+        else:
+            self._render_all()
+        self.view.set_title("Входные данные применены.")
 
     # ---- запуск тяжёлого расчёта в фоне ----
     def _run_async(self, kind, work_fn):
@@ -192,6 +205,10 @@ class ThreatController:
         g = self.model.grid
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, target)
+        # |AB| вход->цель (для окна входных данных)
+        ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
+        self.model.p.ab_distance = round(ab, 1)
+        self.view.set_ab_distance(ab)
         if g is None:
             return
         extent = g.extent_km()
@@ -202,7 +219,11 @@ class ThreatController:
         if t["show_cand"] and len(self.model.candidates) == 0:
             self.model.candidates = self.model.candidate_positions()
         self.view.render_candidates(self.model.candidates, t)
-        self.view.render_routes(self.model.routes, t)
+        self.view.render_routes(self.model.routes, self.model.route_area, extent, t)
+        if t.get("show_cross"):
+            self.view.render_crossings(g.crossing_cells_km(), t)
+        else:
+            self.view.render_crossings(None, t)
         self.view.render_sensors(self.model.sensors, self.model.p.threat_R)
 
     # ---- показатели ----

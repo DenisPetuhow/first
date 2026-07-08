@@ -257,19 +257,25 @@ class ThreatGrid:
             self._attr_count += (contrib != 0).astype(np.int32)
 
     def apply_urban_exclusion(self, neighborhood_km, density_frac, penalty):
-        """Исключить НАСЕЛЁННЫЕ ПУНКТЫ из зоны пролёта: где плотность застройки в окне
-        neighborhood_km превышает density_frac — ячейка получает штрафной вес penalty
-        (город становится «холодным», а не «горячим» из-за перекрёстков) и блокируется
-        для построения маршрута. Одиночный хутор (низкая плотность в окне) — НЕ
-        блокируется. Плотность считается box-фильтром (через интегральное изображение,
-        O(ячеек))."""
+        """Исключить КРУПНЫЕ населённые пункты из зоны пролёта: где плотность застройки
+        в окне neighborhood_km превышает density_frac (это ГОРОД, не деревня) — ячейка
+        получает штрафной вес penalty (город «холодный», не «горячий» из-за перекрёстков)
+        и блокируется для маршрута.
+
+        ВАЖНО: ячейки с РЕКОЙ из города НЕ исключаются — БПЛА идёт по руслу даже сквозь
+        город (реки/ручьи остаются коридором). Одиночный хутор (низкая плотность в окне)
+        тоже не блокируется. Плотность — box-фильтром (интегральное изображение)."""
         if not self._built_cells.any():
             return
         r = max(1, int(round(0.5 * neighborhood_km / self.h)))     # полуокно в ячейках
         dens = _box_mean(self._built_cells.astype(np.float64), r)
-        self._urban = dens >= density_frac
-        self.weight[self._urban] = penalty                          # перекрывает вклад дорог/funnel
-        self.layers["urban_excl"] = np.where(self._urban, penalty, 0.0)
+        urban = dens >= density_frac
+        river = self._present.get("river")
+        if river is not None:
+            urban = urban & (~river)                               # река в городе — оставляем коридором
+        self._urban = urban
+        self.weight[urban] = penalty                               # перекрывает вклад дорог/funnel
+        self.layers["urban_excl"] = np.where(urban, penalty, 0.0)
 
     def add_bridges_from_grid(self, weight,
                               road_keys=("road_major", "railway")):
@@ -301,6 +307,16 @@ class ThreatGrid:
         x = self.ox + (ix + 0.5) * self.h
         y = self.oy + (iy + 0.5) * self.h
         return list(zip(x.tolist(), y.tolist()))
+
+    def crossing_cells_km(self, min_layers=2):
+        """Центры ячеек-ПЕРЕСЕЧЕНИЙ: где сходятся ≥ min_layers РАЗНЫХ слоёв-аттракторов
+        (дорога×река=мост, дорога×ЛЭП, ЛЭП×трубопровод и т.д.) — узлы, где маршрут
+        может свернуть на другой коридор. Используем уже посчитанный `_attr_count`
+        (число разных слоёв в ячейке). Это точки развилок для будущих итераций."""
+        iy, ix = np.nonzero(self._attr_count >= int(min_layers))
+        x = self.ox + (ix + 0.5) * self.h
+        y = self.oy + (iy + 0.5) * self.h
+        return np.column_stack([x, y]) if len(ix) else np.empty((0, 2))
 
     def mark_water(self, polylines, buffer_km):
         """Отметить ячейки воды (по руслам) + буфер — для ЗАПРЕТА датчиков (Задача 1
@@ -649,7 +665,9 @@ class ThreatModel:
         self.data_path = None          # явный источник цифровых карт (.npz/.osm.pbf)
         self.enabled_layers = None     # набор включённых слоёв (None = все)
         self.target_km = None          # цель, заданная кликом («указать цель»)
-        self.routes = []               # маршруты вход->цель (список (M,2) км)
+        self.routes = []               # примеры коридоров-центров (список (M,2) км)
+        self.route_area = None         # маска ВСЕХ возможных мест пролёта (в пределах L_max)
+        self.route_min_len = float("inf")   # мин. длина пути вход->цель, км
 
     # ---- источник данных / выбор слоёв ----
     def set_data_source(self, path):
@@ -675,11 +693,17 @@ class ThreatModel:
 
     # ---- маршруты пролёта вход->цель по весовой карте ----
     def plan_routes(self):
-        from .threat_routes import plan_routes
+        """ВСЕ возможные места пролёта (envelope, ограничение — запас хода L_max) +
+        примеры коридоров-центров. envelope — маска ячеек, через которые вообще может
+        пройти маршрут вход→цель в пределах запаса хода (с прямыми мостиками ≤ 2 км)."""
+        from .threat_routes import plan_routes, flight_envelope
         from config import (THREAT_ROUTE_BASE_COST, THREAT_ROUTE_WEIGHT_SCALE,
-                            THREAT_ROUTE_URBAN_COST, THREAT_ROUTE_COUNT)
+                            THREAT_ROUTE_URBAN_COST, THREAT_ROUTE_COUNT,
+                            THREAT_ROUTE_MAX_GAP_KM)
         g = self.ensure_built()
         entry, target = self.entry_target_km()
+        self.route_area, self.route_min_len = flight_envelope(
+            g, entry, target, self.p.threat_L_max, THREAT_ROUTE_MAX_GAP_KM)
         self.routes = plan_routes(g, entry, target, THREAT_ROUTE_COUNT,
                                   THREAT_ROUTE_BASE_COST, THREAT_ROUTE_WEIGHT_SCALE,
                                   THREAT_ROUTE_URBAN_COST)

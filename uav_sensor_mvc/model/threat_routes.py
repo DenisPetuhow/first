@@ -86,6 +86,82 @@ def _path_to_km(grid, path):
     return np.column_stack([xs, ys])
 
 
+def _step_cost(grid, base_cost, weight_scale, urban_cost):
+    """Стоимость прохода ячейки: тем меньше, чем больше вес. Нормировка по 90-му
+    ПЕРЦЕНТИЛЮ (а не по максимуму): иначе один сверх-тяжёлый узел делает вес всех
+    остальных ≈0, стоимость почти одинаковой -> путь идёт ПО ПРЯМОЙ, игнорируя
+    коридоры. По p90 коридоры дёшевы, пустоши дороги -> путь идёт по тепловой карте."""
+    w = np.clip(grid.weight, 0.0, None)
+    pos = w[w > 0]
+    ref = float(np.percentile(pos, 90)) if pos.size else 1.0
+    wnorm = np.clip(w / max(ref, 1e-6), 0.0, 1.0)
+    return (base_cost + weight_scale * (1.0 - wnorm)
+            + urban_cost * grid.urban_mask())
+
+
+def _dijkstra_dist(passable, start, h):
+    """Поле ГЕОМЕТРИЧЕСКИХ расстояний (км) от start по проходимым ячейкам (8-связно).
+    Шаг = h (орт.) или h·√2 (диаг.). Непроходимые (passable=False) не посещаются."""
+    ny, nx = passable.shape
+    dist = np.full(ny * nx, np.inf)
+    si = start[0] * nx + start[1]
+    dist[si] = 0.0
+    pq = [(0.0, si)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist[u]:
+            continue
+        uy, ux = divmod(u, nx)
+        for dy, dx, mul in _NEIGHBORS:
+            vy, vx = uy + dy, ux + dx
+            if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not passable[vy, vx]:
+                continue
+            nd = d + mul * h
+            v = vy * nx + vx
+            if nd < dist[v]:
+                dist[v] = nd
+                heapq.heappush(pq, (nd, v))
+    return dist.reshape(ny, nx)
+
+
+def passable_mask(grid, max_gap_km):
+    """Проходимые ячейки для маршрута: коридоры (вес>0) + короткие ПРЯМЫЕ мостики через
+    провалы ≤ max_gap_km (дилатация коридоров на пол-провала), МИНУС город (кроме рек).
+    Провал > max_gap_km не перекрывается -> коридор там разорван (маршрут невозможен
+    напрямую, идёт в обход или не строится)."""
+    from .threat_grid import _dilate
+    corridor = grid.weight > 0
+    r = max(0, int(round(0.5 * max_gap_km / grid.h)))          # мостик ≤ 2r ячеек
+    pas = _dilate(corridor, r) if r > 0 else corridor.copy()
+    pas &= ~grid.urban_mask()                                  # город (кроме рек) непроходим
+    return pas
+
+
+def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km):
+    """ВСЕ ВОЗМОЖНЫЕ МЕСТА ПРОЛЁТА при запасе хода L_max. Ячейка попадает в «возможные
+    места», если существует путь вход→ячейка→цель по коридорам (с мостиками ≤ max_gap)
+    суммарной длиной ≤ L_max:
+
+        envelope = { ячейка : glen_вход(ячейка) + glen_цель(ячейка) ≤ L_max }
+
+    Так учитываются и ДЛИННЫЕ обходы (зайти с другой стороны) — лишь бы уложиться в
+    запас хода. Возвращает (mask_возможных_ячеек, min_длина_вход→цель)."""
+    pas = passable_mask(grid, max_gap_km)
+    start = _cell_of(grid, entry_km)
+    goal = _cell_of(grid, target_km)
+    # вход/цель «дотягиваются» до коридорной сети: вокруг них открываем окрестность
+    # ~3 км (БПЛА может пройти несколько км над полем до реки/дороги на входе/выходе).
+    rc = max(1, int(round(3.0 / grid.h)))
+    for cy, cx in (start, goal):
+        pas[max(0, cy - rc):cy + rc + 1, max(0, cx - rc):cx + rc + 1] = True
+    ge = _dijkstra_dist(pas, start, grid.h)
+    gt = _dijkstra_dist(pas, goal, grid.h)
+    total = ge + gt
+    env = np.isfinite(total) & (total <= L_max)
+    dmin = float(ge[goal]) if np.isfinite(ge[goal]) else float("inf")
+    return env, dmin
+
+
 def plan_routes(grid, entry_km, target_km, n_routes, base_cost, weight_scale,
                 urban_cost=200.0):
     """Список маршрутов (каждый — (M,2) км) от входа к цели. Первый — самый «тяжёлый»
@@ -94,11 +170,7 @@ def plan_routes(grid, entry_km, target_km, n_routes, base_cost, weight_scale,
     Город — не жёсткий запрет, а БОЛЬШАЯ доп. стоимость (urban_cost): маршрут сильно
     обходит населённые пункты, но если вход/цель заданы В городе — путь всё равно
     существует (иначе, окружив старт застройкой, мы получили бы «маршрут не найден»)."""
-    w = np.clip(grid.weight, 0.0, None)
-    wmax = float(w.max()) if w.size else 0.0
-    wnorm = w / wmax if wmax > 0 else np.zeros_like(w)
-    base = base_cost + weight_scale * (1.0 - wnorm)            # (ny,nx) базовая стоимость
-    base = base + urban_cost * grid.urban_mask()              # мягкий обход городов
+    base = _step_cost(grid, base_cost, weight_scale, urban_cost)
     blocked = np.zeros(grid.weight.shape, bool)               # жёстких запретов нет
 
     start = _cell_of(grid, entry_km)

@@ -100,6 +100,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_map_offline = lambda flag: None
         self.on_set_target = lambda x, y: None
         self.on_choose_data = lambda path, layers: None
+        self.on_input_apply = lambda vals: None
+        self._params_ref = params         # для префилла окна входных данных
+        self._input_dlg = None
 
         self.setWindowTitle("Цифровая карта угроз — вкладка 3")
         self._apply_stylesheet()
@@ -135,6 +138,18 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self._data_path, self._enabled_layers = dlg.result_choices()
             self.on_choose_data(self._data_path, self._enabled_layers)
 
+    # ---- окно «Входные данные» (не блокирует программу) ----
+    def _open_input_dialog(self):
+        if self._input_dlg is None:
+            self._input_dlg = InputDataDialog(self, self._params_ref,
+                                              self.on_input_apply)
+        self._input_dlg.refresh(self._params_ref)
+        self._input_dlg.show(); self._input_dlg.raise_()
+
+    def set_ab_distance(self, km):
+        if self._input_dlg is not None:
+            self._input_dlg.set_ab(km)
+
     # ---- опорные точки-ориентиры для схемы/подписей ----
     def _orient_points(self):
         pts = [(name, lon, lat) for name, (lon, lat) in THREAT_BBOX_POINTS.items()]
@@ -159,7 +174,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             lab = _TL.get(name, {}).get("label", name)
             rows.append(f'<span style="color:{st["color"]};font-size:13pt;">&#9644;&#9644;</span> {lab}<br>')
         rows.append('<span style="color:#ff5d6c;">&#9650;</span> мост &nbsp; '
-                    '<span style="color:#ff4dff;font-size:13pt;">&#9644;&#9644;</span> маршрут<br>')
+                    '<span style="color:#ffd166;">&#9670;</span> пересечение (развилка)<br>')
+        rows.append('<span style="color:#ff4dff;font-size:13pt;">&#9644;&#9644;</span> коридор '
+                    '&nbsp; <span style="color:#ff4dff;">&#9632;</span> места пролёта<br>')
         rows.append('<span style="color:#3ddc97;">&#9733;</span> вход &nbsp; '
                     '<span style="color:#ff5d6c;">&#10005;</span> цель')
         rows.append('</div>')
@@ -233,6 +250,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             grid.addLayout(cell, r, c)
         col.addLayout(grid)
 
+        self.btn_input = QtWidgets.QPushButton("Входные данные…")
+        self.btn_input.setToolTip("Отдельное окно (не блокирует программу): запас хода, "
+                                  "скорость, крен, интервал смены направления; |AB| "
+                                  "считается между входом и целью. Enter — сразу применить.")
+        self.btn_input.clicked.connect(self._open_input_dialog)
+        col.addWidget(self.btn_input)
+
         col.addWidget(self._header("КАРТА УГРОЗ"))
         self.btn_data = QtWidgets.QPushButton("Выбрать цифровые карты…")
         self.btn_data.setToolTip(
@@ -294,14 +318,18 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_water.setToolTip("Синим — вода (запрет датчика), красным — населённые "
                                   "пункты (исключены из пролёта и из веса).")
         self.chk_cand = QtWidgets.QCheckBox("кандидатные позиции")
-        self.chk_routes = QtWidgets.QCheckBox("маршруты (вход→цель)")
-        self.chk_routes.setToolTip("Построить вероятные коридоры пролёта от точки входа "
-                                   "(у реки) к цели по весовой карте (обходя города).")
+        self.chk_routes = QtWidgets.QCheckBox("маршруты (все места пролёта)")
+        self.chk_routes.setToolTip("Все возможные места пролёта вход→цель по коридорам "
+                                   "тепловой карты в пределах запаса хода (окно «Входные "
+                                   "данные») + примеры коридоров.")
+        self.chk_cross = QtWidgets.QCheckBox("пересечения (перекрёстки)")
+        self.chk_cross.setToolTip("Узлы, где сходятся ≥2 разных слоёв (дорога×река=мост, "
+                                  "дорога×ЛЭП и т.д.) — точки развилок. Скрыто по умолчанию.")
         self.chk_legend = QtWidgets.QCheckBox("легенда")
         self.chk_legend.setChecked(True)
         self.chk_legend.setToolTip("Легенда (какой цвет какой объект) — в левом нижнем углу.")
         for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand,
-                    self.chk_routes, self.chk_legend):
+                    self.chk_routes, self.chk_cross, self.chk_legend):
             chk.stateChanged.connect(lambda _s: self.on_toggle())
             col.addWidget(chk)
 
@@ -399,10 +427,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             pen=pg.mkPen("white", width=0.8))
         self.bridge_scatter.setZValue(-3); self.pi.addItem(self.bridge_scatter)
 
-        # маршруты вход->цель (коридоры пролёта)
+        # ВСЕ возможные места пролёта (envelope) — полупрозрачный слой ячеек
+        self.route_area_img = pg.ImageItem(); self.route_area_img.setOpts(axisOrder="row-major")
+        self.route_area_img.setZValue(-6); self.route_area_img.setVisible(False)
+        self.pi.addItem(self.route_area_img)
+        # примеры коридоров-центров вход->цель
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
                                        pen=pg.mkPen(_qcolor("#ff4dff", 235), width=2.4))
         self.route_item.setZValue(3)
+        # пересечения (перекрёстки дорог/рек/ЛЭП) — узлы развилок, скрыто по умолчанию
+        self.crossing_scatter = pg.ScatterPlotItem(
+            size=7, symbol="d", brush=pg.mkBrush(_qcolor("#ffd166", 220)),
+            pen=pg.mkPen("#7a5c00", width=0.6))
+        self.crossing_scatter.setZValue(-2); self.pi.addItem(self.crossing_scatter)
 
         # легенда векторных слоёв (цвет -> объект) — что чем отображается.
         # anchor (0,1) — точка привязки = НИЖНИЙ-левый угол текста (легенда в левом
@@ -441,6 +478,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_water=self.chk_water.isChecked(),
                     show_cand=self.chk_cand.isChecked(),
                     show_routes=self.chk_routes.isChecked(),
+                    show_cross=self.chk_cross.isChecked(),
                     show_legend=self.chk_legend.isChecked())
 
     def get_param_values(self):
@@ -575,18 +613,39 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.water_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.water_img.setVisible(True)
 
-    def render_routes(self, routes, toggles):
-        """Коридоры пролёта вход->цель (список (M,2) км) — одной линией с разрывами."""
-        if not toggles["show_routes"] or not routes:
-            self.route_item.setData([], []); self.route_item.setVisible(False); return
-        nan = np.array([np.nan])
-        xs, ys = [], []
-        for r in routes:
-            r = np.asarray(r, float)
-            xs.append(r[:, 0]); xs.append(nan)
-            ys.append(r[:, 1]); ys.append(nan)
-        self.route_item.setData(np.concatenate(xs), np.concatenate(ys), connect="finite")
-        self.route_item.setVisible(True)
+    def render_routes(self, routes, route_area, extent, toggles):
+        """ВСЕ возможные места пролёта (route_area — маска ячеек) + примеры коридоров."""
+        show = toggles["show_routes"]
+        # слой «возможные места пролёта» (полупрозрачные ячейки)
+        if show and route_area is not None and route_area.any():
+            rgba = np.zeros(route_area.shape + (4,), np.ubyte)
+            rgba[route_area] = (255, 77, 255, 70)          # розовый — куда БПЛА может дойти
+            self.route_area_img.setImage(rgba, autoLevels=False)
+            x0, x1, y0, y1 = extent
+            self.route_area_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+            self.route_area_img.setVisible(True)
+        else:
+            self.route_area_img.setVisible(False)
+        # примеры коридоров-центров
+        if show and routes:
+            nan = np.array([np.nan])
+            xs, ys = [], []
+            for r in routes:
+                r = np.asarray(r, float)
+                xs.append(r[:, 0]); xs.append(nan)
+                ys.append(r[:, 1]); ys.append(nan)
+            self.route_item.setData(np.concatenate(xs), np.concatenate(ys), connect="finite")
+            self.route_item.setVisible(True)
+        else:
+            self.route_item.setData([], []); self.route_item.setVisible(False)
+
+    def render_crossings(self, crossings, toggles):
+        """Пересечения (перекрёстки дорог/рек/ЛЭП) — узлы развилок. Скрыто по умолчанию."""
+        if not toggles.get("show_cross") or crossings is None or len(crossings) == 0:
+            self.crossing_scatter.setVisible(False); return
+        c = np.asarray(crossings, float)
+        self.crossing_scatter.setData(c[:, 0], c[:, 1])
+        self.crossing_scatter.setVisible(True)
 
     def render_candidates(self, cand, toggles):
         if not toggles["show_cand"] or cand is None or len(cand) == 0:
@@ -694,3 +753,56 @@ class DigitalMapsDialog(QtWidgets.QDialog):
         (карта без слоёв); чтобы «все слои» — просто отметить все."""
         enabled = {n for n, c in self._checks.items() if c.isChecked()}
         return self._data_path, enabled
+
+
+class InputDataDialog(QtWidgets.QDialog):
+    """НЕмодальное окно «Входные данные» маршрута: запас хода, скорость, крен, интервал
+    смены направления. |AB| считается между входом и целью (только показ). Enter в любом
+    поле СРАЗУ применяет к основной карте (не блокирует программу — окно остаётся открытым).
+    """
+    FIELDS = [
+        ("threat_L_max", "Запас хода L_max, км"),
+        ("threat_speed_kmh", "Скорость, км/ч"),
+        ("threat_bank_deg", "Крен, °"),
+        ("threat_turn_interval_km", "Смена направления, км"),
+    ]
+
+    def __init__(self, parent, params, on_apply):
+        super().__init__(parent)
+        self.setWindowTitle("Входные данные маршрута")
+        self.setModal(False)                      # НЕ блокирует основное окно
+        self._on_apply = on_apply
+        self._edits = {}
+        lay = QtWidgets.QFormLayout(self)
+        self.ab_lbl = QtWidgets.QLabel("—")
+        lay.addRow("|AB| (вход→цель), км:", self.ab_lbl)
+        for name, label in self.FIELDS:
+            e = QtWidgets.QLineEdit(str(getattr(params, name)))
+            e.returnPressed.connect(self._apply)
+            self._edits[name] = e
+            lay.addRow(label, e)
+        row = QtWidgets.QHBoxLayout()
+        btn = QtWidgets.QPushButton("Применить (Enter)")
+        btn.clicked.connect(self._apply)
+        row.addWidget(btn)
+        lay.addRow(row)
+        hint = QtWidgets.QLabel("Enter в поле — сразу применяется к карте. Окно можно "
+                                "держать открытым.")
+        hint.setWordWrap(True); hint.setStyleSheet(f"color:{THEME['muted']};")
+        lay.addRow(hint)
+
+    def refresh(self, params):
+        for name, e in self._edits.items():
+            e.setText(str(getattr(params, name)))
+
+    def set_ab(self, km):
+        self.ab_lbl.setText(f"{km:.0f}")
+
+    def _apply(self):
+        vals = {}
+        for name, e in self._edits.items():
+            try:
+                vals[name] = float(e.text().strip().replace(",", "."))
+            except ValueError:
+                return
+        self._on_apply(vals)
