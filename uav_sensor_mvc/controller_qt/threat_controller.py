@@ -48,6 +48,14 @@ class ThreatController:
         self._sig = _TaskSignals()
         self._sig.done.connect(self._on_task_done)
         self._busy = False
+        # анимация итераций (как во вкладке 2): таймер прорисовки полёта БПЛА
+        self._anim = QtCore.QTimer()
+        self._anim.setInterval(33)
+        self._anim.timeout.connect(self._anim_tick)
+        self._anim_running = False
+        self._cur_route = None            # маршрут, который сейчас «летит»
+        self._cur_j = 0                   # индекс точки анимации
+        self._speed = 6                   # скорость анимации (точек за кадр)
         view.set_callbacks(
             on_build=self.on_build, on_place=self.on_place, on_apply=self.on_apply,
             on_reset=self.on_reset, on_reset_view=self.on_reset_view,
@@ -55,19 +63,105 @@ class ThreatController:
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
             on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
-            on_run_iter=self.on_run_iter)
+            on_iter_play=self.on_iter_play, on_iter_step=self.on_iter_step,
+            on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed)
         self._idle_metrics()
 
-    # ---- кнопка «Запустить итерации (симуляция)» ----
-    def on_run_iter(self):
+    # ================= ИТЕРАЦИИ (симуляция как во вкладке 2) =================
+    def _iter_ready(self):
         if self._busy:
-            self.view.flash_title("Идёт расчёт — подождите…")
+            self.view.flash_title("Идёт расчёт — подождите…"); return False
+        if self.model.grid is None:
+            self.view.flash_title("Сначала «Построить карту»."); return False
+        return True
+
+    def on_iter_speed(self, v):
+        self._speed = max(1, int(v))
+
+    def _iter_title(self):
+        lab = THREAT_ITER_MODE_LABELS.get(self.model.p.threat_iter_mode,
+                                          self.model.p.threat_iter_mode)
+        T = int(self.model.p.threat_iter_routes)
+        return (f"Итерация {self.model.iter_iteration}/{T}  |  маршрутов "
+                f"{len(self.model.iter_routes)}  |  режим «{lab}»  |  "
+                f"L_max={self.model.p.threat_L_max:g} км")
+
+    # ▶ Пуск / ⏸ Пауза — пошаговая анимация с движением БПЛА
+    def on_iter_play(self):
+        if self._anim_running:                            # пауза
+            self._anim_stop(); return
+        if not self._iter_ready():
             return
-        if self.model.grid is None:                       # карта нужна для коридоров
-            self.view.flash_title("Сначала «Построить карту».")
+        self.view.set_iter_checked(True)
+        self.model.p.threat_iter_routes = self.view.get_iter_T()
+        if self.model.iter_iteration == 0 or self._iter_finished():
+            if not self.model.iter_reset():
+                self.view.flash_title("Цель недостижима по коридорам (проверьте L_max/цель).")
+                return
+            self.view.iter_show_accumulated([])
+        self._anim_running = True
+        self.view.set_iter_running(True)
+        self._anim.start()
+
+    def _iter_finished(self):
+        return self.model.iter_iteration >= int(self.model.p.threat_iter_routes)
+
+    def _anim_stop(self):
+        self._anim.stop()
+        self._anim_running = False
+        self.view.set_iter_running(False)
+
+    def _anim_tick(self):
+        # начать новый маршрут, если предыдущий долетел
+        if self._cur_route is None:
+            if self._iter_finished():
+                self._anim_stop()
+                self.view.set_title(self._iter_title() + " — готово.")
+                return
+            route = self.model.iter_step()
+            if route is None:                             # редкая неудачная итерация — пропустить кадр
+                return
+            self._cur_route = route
+            self._cur_j = 0
+            self.view.iter_show_accumulated(self.model.iter_routes)
+            self.view.iter_setup_flight(route)
+            self.view.set_title(self._iter_title())
+        # двигать БПЛА по текущему маршруту. Шаг ~ пропорционален длине пути, чтобы любой
+        # маршрут пролетался за одинаковое число кадров (иначе длинные — очень медленно).
+        self._cur_j += max(1, int(len(self._cur_route) * self._speed / 120))
+        end = len(self._cur_route) - 1
+        if self._cur_j >= end:
+            self._cur_j = end
+        self.view.iter_update_flight(self._cur_route, self._cur_j)
+        if self._cur_j >= end:                            # долетел -> следующая итерация
+            self._cur_route = None
+
+    # Шаг — одна итерация без анимации (сразу весь маршрут)
+    def on_iter_step(self):
+        if not self._iter_ready():
             return
-        self.view.set_iter_checked(True)                  # показать слой итераций
-        self._run_async("iter", self.model.iterate_routes)
+        self._anim_stop()
+        self.view.set_iter_checked(True)
+        self.model.p.threat_iter_routes = self.view.get_iter_T()
+        if self.model.iter_iteration == 0:
+            if not self.model.iter_reset():
+                self.view.flash_title("Цель недостижима по коридорам.")
+                return
+        route = self.model.iter_step()
+        self.view.iter_show_accumulated(self.model.iter_routes)
+        if route is not None:
+            self.view.iter_update_flight(route, len(route) - 1)   # весь маршрут + БПЛА в цели
+        self.view.set_title(self._iter_title())
+
+    # Пакетно — все T итераций сразу (в фоне), без анимации
+    def on_iter_batch(self):
+        if not self._iter_ready():
+            return
+        self._anim_stop()
+        self.view.iter_clear_current()
+        self.view.set_iter_checked(True)
+        self.model.p.threat_iter_routes = self.view.get_iter_T()
+        self._run_async("iter", self.model.iter_batch)
 
     # ---- окно «Входные данные»: применить сразу (не блокирует программу) ----
     def on_input_apply(self, vals):
@@ -135,12 +229,9 @@ class ThreatController:
             self.view.set_title(f"Построено маршрутов: {len(self.model.routes)} "
                                 "(вход у реки → цель, обход городов).")
         elif kind == "iter":
+            self.view.iter_clear_current()               # пакетно — без летящего маркера
             self._render_all()
-            lab = THREAT_ITER_MODE_LABELS.get(self.model.p.threat_iter_mode,
-                                              self.model.p.threat_iter_mode)
-            self.view.set_title(
-                f"Итерации: {len(self.model.iter_routes)} маршрутов · режим «{lab}» · "
-                f"L_max={self.model.p.threat_L_max:g} км (запас хода).")
+            self.view.set_title(self._iter_title() + " (пакетно).")
 
     # ---- построение карты (в фоне) ----
     def _work_build(self):
@@ -184,12 +275,17 @@ class ThreatController:
 
     # ---- сброс: убрать датчики и заданную цель (карта остаётся) ----
     def on_reset(self):
+        self._anim_stop()
+        self.view.iter_clear_current()
         self.model.sensors = np.empty((0, 2), float)
         self.model.target_km = None
         self.model.routes = []
         self.model.iter_routes = []
+        self.model.iter_iteration = 0
+        self.model._iter_ctx = None
         self.model.route_area = None
         self.model._metrics = {}
+        self._cur_route = None
         self._render_all()
         self.view.set_title("Сброшено: датчики и цель убраны. Карта сохранена.")
         if self.model.grid is None:

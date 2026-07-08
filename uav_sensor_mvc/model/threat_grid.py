@@ -676,7 +676,10 @@ class ThreatModel:
         self.enabled_layers = None     # набор включённых слоёв (None = все)
         self.target_km = None          # цель, заданная кликом («указать цель»)
         self.routes = []               # примеры коридоров-центров (список (M,2) км)
-        self.iter_routes = []          # итерационные (стохастические) маршруты — много
+        self.iter_routes = []          # итерационные (стохастические) маршруты — накопление
+        self.iter_iteration = 0        # номер текущей итерации (как t во вкладке 2)
+        self._iter_ctx = None          # контекст выборки (проходимость/поле расстояний/вес)
+        self._iter_rng = None          # ГПСЧ выборки
         self.route_area = None         # маска ВСЕХ возможных мест пролёта (в пределах L_max)
         self.route_min_len = float("inf")   # мин. длина пути вход->цель, км
 
@@ -700,6 +703,9 @@ class ThreatModel:
         self.layers["bridge_pts"] = self.grid.bridge_cells_km()   # мосты — из сетки
         self.sensors = np.empty((0, 2), float)
         self.routes = []
+        self.iter_routes = []
+        self.iter_iteration = 0
+        self._iter_ctx = None                          # карта пересобрана — контекст устарел
         return self.grid
 
     # ---- маршруты пролёта вход->цель по весовой карте ----
@@ -717,19 +723,52 @@ class ThreatModel:
                                   THREAT_ROUTE_URBAN_COST)
         return self.routes
 
-    # ---- ИТЕРАЦИОННЫЕ маршруты (много стохастических путей по коридорам) ----
-    def iterate_routes(self):
-        """Сгенерировать МНОЖЕСТВО вероятных маршрутов (итерационная модель, §4.5):
-        стохастические развилки по коридорам, режим p.threat_iter_mode, ограничение —
-        запас хода L_max (авто |AB|+25% или заданный руками). Обновляет и огибающую."""
-        from .threat_routes import iterate_routes
+    # ---- ИТЕРАЦИОННЫЕ маршруты (стохастические пути по коридорам) ----
+    # Пошаговая модель как во вкладке 2: iter_reset -> iter_step (××T) / iter_batch.
+    def iter_reset(self):
+        """Начать выборку заново: пересчитать авто-запас хода и огибающую, подготовить
+        контекст выборки, обнулить счётчик. Возвращает True, если цель достижима."""
+        from .threat_routes import build_iter_context
         from config import THREAT_ROUTE_MAX_GAP_KM
-        g = self.ensure_built()
-        entry, target = self._refresh_envelope()
-        self.iter_routes = iterate_routes(
-            g, entry, target, self.p.threat_iter_routes, self.p.threat_iter_mode,
-            self.p.threat_L_max, self.p.threat_turn_interval_km, THREAT_ROUTE_MAX_GAP_KM)
+        self.ensure_built()
+        entry, target = self._refresh_envelope()       # авто-L_max + огибающая
+        self._iter_ctx = build_iter_context(self.grid, entry, target,
+                                            THREAT_ROUTE_MAX_GAP_KM)
+        self._iter_rng = np.random.default_rng()
+        self.iter_routes = []
+        self.iter_iteration = 0
+        return self._iter_ctx["reachable"]
+
+    def iter_step(self):
+        """Одна итерация: сгенерировать ОДИН маршрут (несколько попыток) и добавить его в
+        накопление. Возвращает маршрут (M,2) для анимации или None (не удалось)."""
+        from .threat_routes import sample_one_route
+        if self._iter_ctx is None and not self.iter_reset():
+            return None
+        self.iter_iteration += 1
+        route = None
+        for _ in range(40):                             # попытки на итерацию (стохастика)
+            route = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
+                                     self.p.threat_L_max,
+                                     self.p.threat_turn_interval_km, self._iter_rng)
+            if route is not None:
+                break
+        if route is not None:
+            self.iter_routes.append(route)
+        return route
+
+    def iter_batch(self):
+        """Прогнать все T итераций сразу (без анимации). T = p.threat_iter_routes."""
+        if not self.iter_reset():
+            return []
+        T = max(1, int(self.p.threat_iter_routes))
+        while self.iter_iteration < T:
+            self.iter_step()
         return self.iter_routes
+
+    # обратная совместимость: пакетная генерация в один вызов (кнопка/чекбокс)
+    def iterate_routes(self):
+        return self.iter_batch()
 
     def _refresh_envelope(self):
         """Пересчитать авто-запас хода и огибающую мест пролёта. Возвращает (вход, цель).
@@ -835,6 +874,8 @@ class ThreatModel:
         self.target_km = (float(x_km), float(y_km))
         self.routes = []
         self.iter_routes = []
+        self.iter_iteration = 0
+        self._iter_ctx = None                          # цель сменилась — контекст устарел
         self.sync_auto_L_max()
 
     def entry_km(self):

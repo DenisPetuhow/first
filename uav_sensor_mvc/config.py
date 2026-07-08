@@ -199,7 +199,7 @@ class Params:
     threat_turn_interval_km: float = 2.5  # смена направления не чаще, чем раз в N км (итерации)
     threat_L_max_manual: bool = False  # False -> запас хода авто (|AB|+25%); True -> задан руками
     threat_iter_mode: str = "mix"  # режим стохастического выбора развилки (см. THREAT_ITER_MODE_LABELS)
-    threat_iter_routes: int = 60   # сколько маршрутов генерировать за итерацию
+    threat_iter_routes: int = 150  # число итераций T (сколько маршрутов сгенерировать)
     map_layer3: str = "osm"        # подложка карты (вкладка 3)
     map_offline3: bool = False     # офлайн-режим подложки (вкладка 3)
     mode: str = "balanced"         # режим оптимизации

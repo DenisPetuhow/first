@@ -238,7 +238,7 @@ def _walk_once(grid, pas, gt, wnorm, start, goal, mode, L_max, turn_interval_km,
             if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not pas[vy, vx]:
                 continue
             gj = gt[vy, vx]
-            if not np.isfinite(gj) or gj > gt[cur] + 1.2:   # назад — не дальше 1.2 км (не убегаем)
+            if not np.isfinite(gj) or gj > gt[cur] + 0.8:   # назад — не дальше 0.8 км (не убегаем)
                 continue
             uy, ux = _NB_UNIT[k]
             if heading is None:
@@ -256,7 +256,7 @@ def _walk_once(grid, pas, gt, wnorm, start, goal, mode, L_max, turn_interval_km,
             # а РАЗНООБРАЗИЕ даёт выбор РАЗНЫХ коридоров, а не длинные крюки.
             prog = gt[cur] - gj                         # >0 — ближе к цели, <0 — дальше
             corr = _mode_corridor_pref(wnorm[vy, vx], mode)
-            s = float(np.exp(prog / 0.5)) * corr * hf
+            s = float(np.exp(prog / 0.4)) * corr * hf
             cand.append((vy, vx, mul, (uy, ux)))
             score.append(s)
         if not cand:                                    # тупик
@@ -277,36 +277,54 @@ def _walk_once(grid, pas, gt, wnorm, start, goal, mode, L_max, turn_interval_km,
     return path if (cur == goal or gt[cur] <= h) else None
 
 
-def iterate_routes(grid, entry_km, target_km, n_routes, mode, L_max,
-                   turn_interval_km, max_gap_km, seed=None):
-    """МНОЖЕСТВО вероятных маршрутов (итерационная модель, методичка §4.5). Каждый —
-    стохастический проход вход→цель по коридорам: развилки выбираются случайно с
-    вероятностью по весу коридора соседа (режим heavy/balanced/light), курс держится
-    между доворотами, длина ограничена запасом хода L_max (главное ограничение). В режиме
-    "mix" у каждого маршрута свой случайный режим из трёх. Возвращает список (M,2) км."""
+def build_iter_context(grid, entry_km, target_km, max_gap_km):
+    """Подготовить (один раз) контекст для стохастической выборки маршрутов: проходимость,
+    поле расстояний до цели `gt` (тяга), нормированный вес `wnorm`. Не зависит от L_max —
+    можно менять запас хода между итерациями без пересборки. `reachable` — достижима ли
+    цель по коридорам из входа вообще."""
     start = _cell_of(grid, entry_km)
     goal = _cell_of(grid, target_km)
     pas = _open_endpoints(passable_mask(grid, max_gap_km), (start, goal), grid)
     gt = _dijkstra_dist(pas, goal, grid.h)              # поле расстояний до цели (тяга)
-    if not np.isfinite(gt[start]):
-        return []                                       # цели не достичь по коридорам
     w = np.clip(grid.weight, 0.0, None)                 # нормировка веса по p90 (как в стоимости)
     pos = w[w > 0]
     ref = float(np.percentile(pos, 90)) if pos.size else 1.0
     wnorm = np.clip(w / max(ref, 1e-6), 0.0, 1.0)
+    return dict(grid=grid, pas=pas, gt=gt, wnorm=wnorm, start=start, goal=goal,
+                reachable=bool(np.isfinite(gt[start])))
+
+
+def sample_one_route(ctx, mode, L_max, turn_interval_km, rng):
+    """ОДИН стохастический маршрут вход→цель по контексту ctx (для пошаговой итерации/
+    анимации). В режиме "mix" — случайный из трёх режимов. Возвращает (M,2) км или None
+    (тупик / длиннее запаса хода)."""
+    if not ctx["reachable"]:
+        return None
+    m = ("heavy", "balanced", "light")[rng.integers(3)] if mode == "mix" else mode
+    path = _walk_once(ctx["grid"], ctx["pas"], ctx["gt"], ctx["wnorm"],
+                      ctx["start"], ctx["goal"], m, L_max, turn_interval_km, rng)
+    if path is None or len(path) < 2:
+        return None
+    poly = _chaikin(_cells_yx_to_km(ctx["grid"], path), iters=2)
+    return poly if _poly_len_km(poly) <= L_max * 1.05 else None
+
+
+def iterate_routes(grid, entry_km, target_km, n_routes, mode, L_max,
+                   turn_interval_km, max_gap_km, seed=None):
+    """МНОЖЕСТВО вероятных маршрутов (итерационная модель, методичка §4.5) — пакетно.
+    Каждый — стохастический проход вход→цель по коридорам: развилки выбираются случайно
+    по весу коридора соседа (режим heavy/balanced/light/mix), курс держится между
+    доворотами, длина ограничена запасом хода L_max. Возвращает список (M,2) км."""
+    ctx = build_iter_context(grid, entry_km, target_km, max_gap_km)
+    if not ctx["reachable"]:
+        return []
     rng = np.random.default_rng(seed)
-    modes = ("heavy", "balanced", "light")
     routes, tries, cap = [], 0, max(1, int(n_routes)) * 6
     while len(routes) < int(n_routes) and tries < cap:
         tries += 1
-        m = modes[rng.integers(3)] if mode == "mix" else mode
-        path = _walk_once(grid, pas, gt, wnorm, start, goal, m, L_max,
-                          turn_interval_km, rng)
-        if path is None or len(path) < 2:
-            continue
-        poly = _chaikin(_cells_yx_to_km(grid, path), iters=2)
-        if _poly_len_km(poly) <= L_max * 1.05:          # сглаживание чуть меняет длину
-            routes.append(poly)
+        r = sample_one_route(ctx, mode, L_max, turn_interval_km, rng)
+        if r is not None:
+            routes.append(r)
     return routes
 
 

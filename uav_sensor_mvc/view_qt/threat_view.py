@@ -103,7 +103,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_choose_data = lambda path, layers: None
         self.on_input_apply = lambda vals: None
         self.on_iter_mode = lambda key: None
-        self.on_run_iter = lambda: None
+        self.on_iter_play = lambda: None
+        self.on_iter_step = lambda: None
+        self.on_iter_batch = lambda: None
+        self.on_iter_speed = lambda v: None
         self._params_ref = params         # для префилла окна входных данных
         self._input_dlg = None
 
@@ -366,13 +369,41 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.combo_iter.currentIndexChanged.connect(self._iter_mode_changed)
         row_it.addWidget(self.combo_iter, 1)
         col.addLayout(row_it)
-        self.btn_iter = QtWidgets.QPushButton("▶ Запустить итерации (симуляция)")
-        self.btn_iter.setToolTip("Сгенерировать МНОЖЕСТВО маршрутов (стохастика по "
-                                 "коридорам) и показать поштучной анимацией. Требуется "
-                                 "построенная карта; цель — «Указать цель» (иначе цель по умолчанию).")
-        self._tint(self.btn_iter, THEME["accent"])
-        self.btn_iter.clicked.connect(lambda: self.on_run_iter())
-        col.addWidget(self.btn_iter)
+        # число итераций T (как во вкладке 2)
+        row_t = QtWidgets.QHBoxLayout()
+        row_t.addWidget(QtWidgets.QLabel("число итераций:"))
+        self.ed_iter_T = QtWidgets.QLineEdit(str(getattr(params, "threat_iter_routes", 150)))
+        self.ed_iter_T.setToolTip("Сколько маршрутов сгенерировать (аналог T во вкладке 2). "
+                                  "«Пуск» строит их по одному с анимацией полёта БПЛА.")
+        self.ed_iter_T.returnPressed.connect(lambda: self.on_iter_batch())
+        row_t.addWidget(self.ed_iter_T, 1)
+        col.addLayout(row_t)
+        # скорость анимации полёта
+        row_sp = QtWidgets.QHBoxLayout()
+        row_sp.addWidget(QtWidgets.QLabel("скорость:"))
+        self.slider_speed = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_speed.setMinimum(1); self.slider_speed.setMaximum(20)
+        self.slider_speed.setValue(6)
+        self.slider_speed.valueChanged.connect(lambda v: self.on_iter_speed(int(v)))
+        row_sp.addWidget(self.slider_speed, 1)
+        col.addLayout(row_sp)
+        # Пуск / Шаг / Пакетно — как во вкладке 2
+        row_run = QtWidgets.QHBoxLayout()
+        self.btn_iter_play = QtWidgets.QPushButton("▶ Пуск")
+        self.btn_iter_step = QtWidgets.QPushButton("Шаг")
+        self.btn_iter_batch = QtWidgets.QPushButton("Пакетно")
+        self._tint(self.btn_iter_play, THEME["ok"])
+        self._tint(self.btn_iter_batch, THEME["accent2"])
+        self.btn_iter_play.setToolTip("Анимация: итерация за итерацией строит маршрут и "
+                                      "показывает движение БПЛА по нему (Пуск/Пауза).")
+        self.btn_iter_step.setToolTip("Одна итерация — добавить один маршрут.")
+        self.btn_iter_batch.setToolTip("Сразу все T итераций (без анимации) — весь набор мест пролёта.")
+        self.btn_iter_play.clicked.connect(lambda: self.on_iter_play())
+        self.btn_iter_step.clicked.connect(lambda: self.on_iter_step())
+        self.btn_iter_batch.clicked.connect(lambda: self.on_iter_batch())
+        row_run.addWidget(self.btn_iter_play); row_run.addWidget(self.btn_iter_step)
+        row_run.addWidget(self.btn_iter_batch)
+        col.addLayout(row_run)
 
         b1 = QtWidgets.QHBoxLayout()
         self.btn_apply = QtWidgets.QPushButton("Применить")
@@ -479,13 +510,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
                                        pen=pg.mkPen(_qcolor("#ff4dff", 235), width=2.4))
         self.route_item.setZValue(3)
-        # ИТЕРАЦИОННЫЕ маршруты — много тонких полупрозрачных путей (показ анимацией)
+        # ИТЕРАЦИИ: накопленные маршруты (тонкие) + текущий (ярче) + маркер БПЛА.
+        # Анимацию ведёт контроллер (iter_setup_flight/iter_update_flight) — как вкладка 2.
         self.route_iter_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                            pen=pg.mkPen(_qcolor("#36c5f0", 85), width=1.2))
+                                            pen=pg.mkPen(_qcolor("#36c5f0", 80), width=1.1))
         self.route_iter_item.setZValue(1)
-        self._iter_routes = []; self._iter_shown = 0
-        self._iter_timer = QtCore.QTimer(self)
-        self._iter_timer.timeout.connect(self._iter_tick)
+        self.route_cur_item = self.pi.plot([], [], antialias=True, connect="finite",
+                                           pen=pg.mkPen(_qcolor("#ffe066", 240), width=2.4))
+        self.route_cur_item.setZValue(5); self.route_cur_item.setVisible(False)
+        self.uav_marker = pg.ScatterPlotItem(
+            size=14, symbol="t1", brush=pg.mkBrush(_qcolor("#ff4dff")),
+            pen=pg.mkPen("white", width=1.3))
+        self.uav_marker.setZValue(6); self.uav_marker.setVisible(False)
+        self.pi.addItem(self.uav_marker)
         # пересечения (перекрёстки дорог/рек/ЛЭП) — узлы развилок, скрыто по умолчанию
         self.crossing_scatter = pg.ScatterPlotItem(
             size=7, symbol="d", brush=pg.mkBrush(_qcolor("#ffd166", 220)),
@@ -696,34 +733,51 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.route_item.setData([], []); self.route_item.setVisible(False)
 
     def render_iter_routes(self, routes, toggles):
-        """Множество ИТЕРАЦИОННЫХ маршрутов — показ ПОШТУЧНОЙ анимацией (как вкладка 2):
-        пути «прорисовываются» по одному. Без итераций/при выключенном чекбоксе — очистить."""
-        if self._iter_timer.isActive():
-            self._iter_timer.stop()
-        self._iter_routes = list(routes) if (toggles.get("show_iter") and routes) else []
-        self._iter_shown = 0
-        if not self._iter_routes:
+        """Показать НАКОПЛЕННЫЕ итерационные маршруты (статично). Пошаговую анимацию полёта
+        ведёт контроллер через iter_setup_flight/iter_update_flight."""
+        show = bool(toggles.get("show_iter")) and bool(routes)
+        self.iter_show_accumulated(routes if show else [])
+
+    def iter_show_accumulated(self, routes):
+        """Отрисовать все накопленные маршруты тонкими линиями (одним item, через NaN)."""
+        if not routes:
             self.route_iter_item.setData([], []); self.route_iter_item.setVisible(False)
             return
-        self.route_iter_item.setVisible(True)
-        self._redraw_iter(1)                       # первый путь — сразу (виден и без цикла событий)
-        self._iter_shown = 1
-        if len(self._iter_routes) > 1:
-            self._iter_timer.start(45)             # ~22 пути/сек — «наматывание» веера
-
-    def _iter_tick(self):
-        self._iter_shown += 1
-        self._redraw_iter(self._iter_shown)
-        if self._iter_shown >= len(self._iter_routes):
-            self._iter_timer.stop()
-
-    def _redraw_iter(self, n):
         nan = np.array([np.nan]); xs, ys = [], []
-        for r in self._iter_routes[:n]:
+        for r in routes:
             r = np.asarray(r, float)
             xs.append(r[:, 0]); xs.append(nan)
             ys.append(r[:, 1]); ys.append(nan)
         self.route_iter_item.setData(np.concatenate(xs), np.concatenate(ys), connect="finite")
+        self.route_iter_item.setVisible(True)
+
+    def iter_setup_flight(self, route):
+        """Начать анимацию полёта по маршруту: текущий путь и маркер БПЛА — в старте."""
+        r = np.asarray(route, float)
+        self.route_cur_item.setData([r[0, 0]], [r[0, 1]]); self.route_cur_item.setVisible(True)
+        self.uav_marker.setData([r[0, 0]], [r[0, 1]]); self.uav_marker.setVisible(True)
+
+    def iter_update_flight(self, route, j):
+        """Прорисовать текущий маршрут до точки j и передвинуть маркер БПЛА в неё."""
+        r = np.asarray(route, float); j = int(max(0, min(j, len(r) - 1)))
+        self.route_cur_item.setData(r[:j + 1, 0], r[:j + 1, 1])
+        self.uav_marker.setData([r[j, 0]], [r[j, 1]])
+
+    def iter_clear_current(self):
+        """Убрать текущий (летящий) маршрут и маркер БПЛА (накопленные остаются)."""
+        self.route_cur_item.setData([], []); self.route_cur_item.setVisible(False)
+        self.uav_marker.setData([], []); self.uav_marker.setVisible(False)
+
+    def get_iter_T(self):
+        """Число итераций (T) из поля ввода; при ошибке — прежнее из params."""
+        try:
+            return max(1, int(float(self.ed_iter_T.text().strip().replace(",", "."))))
+        except (ValueError, AttributeError):
+            return int(getattr(self._params_ref, "threat_iter_routes", 150))
+
+    def set_iter_running(self, running):
+        """Текст кнопки «Пуск»/«Пауза» (как во вкладке 2)."""
+        self.btn_iter_play.setText("⏸ Пауза" if running else "▶ Пуск")
 
     def render_crossings(self, crossings, toggles):
         """Пересечения (перекрёстки дорог/рек/ЛЭП) — узлы развилок. Скрыто по умолчанию."""
@@ -858,6 +912,7 @@ class InputDataDialog(QtWidgets.QDialog):
         self.setWindowTitle("Входные данные маршрута")
         self.setModal(False)                      # НЕ блокирует основное окно
         self._on_apply = on_apply
+        self._params = params
         self._edits = {}
         lay = QtWidgets.QFormLayout(self)
         self.ab_lbl = QtWidgets.QLabel("—")
@@ -886,31 +941,41 @@ class InputDataDialog(QtWidgets.QDialog):
         lay.addRow(hint)
 
     def refresh(self, params):
+        self._params = params
+        self.chk_auto.blockSignals(True)
         self.chk_auto.setChecked(not getattr(params, "threat_L_max_manual", False))
+        self.chk_auto.blockSignals(False)
         for name, e in self._edits.items():
-            e.setText(str(getattr(params, name)))
+            e.setText(f"{float(getattr(params, name)):g}")
         self._auto_changed()
 
     def set_ab(self, km):
         self.ab_lbl.setText(f"{km:.0f}")
 
     def _auto_changed(self, *_):
-        """Авто-запас: поле L_max только для чтения (значение считает модель)."""
+        """Авто-запас: поле L_max только для чтения (считает модель), но ВСЕГДА показывает
+        текущее значение (чтобы не оставалось пустым). В ручном режиме — редактируемо."""
         auto = self.chk_auto.isChecked()
         e = self._edits.get("threat_L_max")
-        if e is not None:
-            e.setReadOnly(auto)
-            e.setStyleSheet("color:%s;" % (THEME["muted"] if auto else THEME["text"]))
+        if e is None:
+            return
+        if auto or not e.text().strip():
+            e.setText(f"{float(getattr(self._params, 'threat_L_max', 0.0)):g}")
+        e.setReadOnly(auto)
+        e.setStyleSheet("color:%s;" % (THEME["muted"] if auto else THEME["text"]))
 
     def _apply(self):
+        """Применить поля. Нечисловое поле берётся из текущих параметров (не роняем ввод).
+        В авто-режиме L_max не передаём — его считает модель (|AB|+25 %)."""
         vals = {}
         for name, e in self._edits.items():
+            txt = e.text().strip().replace(",", ".")
             try:
-                vals[name] = float(e.text().strip().replace(",", "."))
+                vals[name] = float(txt)
             except ValueError:
-                return
+                vals[name] = float(getattr(self._params, name))
         auto = self.chk_auto.isChecked()
         vals["threat_L_max_manual"] = (not auto)
         if auto:
-            vals.pop("threat_L_max", None)         # авто — L_max посчитает модель (|AB|+25%)
+            vals.pop("threat_L_max", None)
         self._on_apply(vals)
