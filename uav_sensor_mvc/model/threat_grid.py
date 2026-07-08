@@ -708,19 +708,29 @@ class ThreatModel:
         self._iter_ctx = None                          # карта пересобрана — контекст устарел
         return self.grid
 
-    # ---- маршруты пролёта вход->цель по весовой карте ----
+    # ---- маршруты пролёта вход->цель ----
     def plan_routes(self):
-        """ВСЕ возможные места пролёта (envelope, ограничение — запас хода L_max) +
-        примеры коридоров-центров. envelope — маска ячеек, через которые вообще может
-        пройти маршрут вход→цель в пределах запаса хода (с прямыми мостиками ≤ 2 км)."""
-        from .threat_routes import plan_routes
-        from config import (THREAT_ROUTE_BASE_COST, THREAT_ROUTE_WEIGHT_SCALE,
-                            THREAT_ROUTE_URBAN_COST, THREAT_ROUTE_COUNT)
+        """ВСЕ возможные маршруты вход→цель (не 14!): большой стохастический набор по
+        коридорам с учётом веса тепловой карты, развилок и запаса хода. Сколько уместится
+        — зависит от L_max (больше запас → больше и разнообразнее маршрутов, хоть 100–200).
+        Плюс envelope — маска всех достижимых мест пролёта. Контекст выборки кэшируется."""
+        from .threat_routes import build_iter_context, sample_one_route
+        from config import THREAT_ROUTE_MAX_GAP_KM, THREAT_ROUTE_COUNT
         g = self.ensure_built()
-        entry, target = self._refresh_envelope()
-        self.routes = plan_routes(g, entry, target, THREAT_ROUTE_COUNT,
-                                  THREAT_ROUTE_BASE_COST, THREAT_ROUTE_WEIGHT_SCALE,
-                                  THREAT_ROUTE_URBAN_COST)
+        entry, target = self._refresh_envelope()       # авто-L_max + огибающая
+        if self._iter_ctx is None:                     # общий контекст с итерациями (кэш)
+            self._iter_ctx = build_iter_context(g, entry, target, THREAT_ROUTE_MAX_GAP_KM)
+        ctx = self._iter_ctx
+        rng = np.random.default_rng()
+        want = max(1, int(THREAT_ROUTE_COUNT))
+        routes, tries, cap = [], 0, want * 5
+        while len(routes) < want and tries < cap:
+            tries += 1
+            r = sample_one_route(ctx, "mix", self.p.threat_L_max,
+                                 self.p.threat_turn_interval_km, rng)
+            if r is not None:
+                routes.append(r)
+        self.routes = routes
         return self.routes
 
     # ---- ИТЕРАЦИОННЫЕ маршруты (стохастические пути по коридорам) ----

@@ -341,10 +341,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_water.setToolTip("Синим — вода (запрет датчика), красным — населённые "
                                   "пункты (исключены из пролёта и из веса).")
         self.chk_cand = QtWidgets.QCheckBox("кандидатные позиции")
-        self.chk_routes = QtWidgets.QCheckBox("маршруты (все места пролёта)")
-        self.chk_routes.setToolTip("Все возможные места пролёта вход→цель по коридорам "
-                                   "тепловой карты в пределах запаса хода (окно «Входные "
-                                   "данные») + примеры коридоров.")
+        self.chk_routes = QtWidgets.QCheckBox("маршруты (все возможные)")
+        self.chk_routes.setToolTip("ВСЕ возможные маршруты вход→цель (розовым) по коридорам "
+                                   "тепловой карты в пределах запаса хода — не 14, а сколько "
+                                   "уместится (зависит от L_max). Плюс огибающая мест пролёта.")
         self.chk_cross = QtWidgets.QCheckBox("пересечения (перекрёстки)")
         self.chk_cross.setToolTip("Узлы, где сходятся ≥2 разных слоёв (дорога×река=мост, "
                                   "дорога×ЛЭП и т.д.) — точки развилок. Скрыто по умолчанию.")
@@ -515,9 +515,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_area_img = pg.ImageItem(); self.route_area_img.setOpts(axisOrder="row-major")
         self.route_area_img.setZValue(-6); self.route_area_img.setVisible(False)
         self.pi.addItem(self.route_area_img)
-        # примеры коридоров-центров вход->цель
+        # ВСЕ возможные маршруты вход->цель (розовым)
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                       pen=pg.mkPen(_qcolor("#ff4dff", 235), width=2.4))
+                                       pen=pg.mkPen(_qcolor("#ff4dff", 150), width=1.4))
         self.route_item.setZValue(3)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
