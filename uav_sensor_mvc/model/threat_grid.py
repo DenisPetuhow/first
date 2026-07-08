@@ -732,8 +732,9 @@ class ThreatModel:
         from config import THREAT_ROUTE_MAX_GAP_KM
         self.ensure_built()
         entry, target = self._refresh_envelope()       # авто-L_max + огибающая
-        self._iter_ctx = build_iter_context(self.grid, entry, target,
-                                            THREAT_ROUTE_MAX_GAP_KM)
+        if self._iter_ctx is None:                     # веер VIA-полей считаем ОДИН раз на цель
+            self._iter_ctx = build_iter_context(self.grid, entry, target,
+                                                THREAT_ROUTE_MAX_GAP_KM)
         self._iter_rng = np.random.default_rng()
         self.iter_routes = []
         self.iter_iteration = 0
@@ -741,13 +742,13 @@ class ThreatModel:
 
     def iter_step(self):
         """Одна итерация: сгенерировать ОДИН маршрут (несколько попыток) и добавить его в
-        накопление. Возвращает маршрут (M,2) для анимации или None (не удалось)."""
+        накопление. Счётчик iter_iteration = число накопленных маршрутов. Возвращает
+        маршрут (M,2) для анимации или None (не удалось за отведённые попытки)."""
         from .threat_routes import sample_one_route
         if self._iter_ctx is None and not self.iter_reset():
             return None
-        self.iter_iteration += 1
         route = None
-        for _ in range(40):                             # попытки на итерацию (стохастика)
+        for _ in range(12):                             # попытки на итерацию (стохастика)
             route = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
                                      self.p.threat_L_max,
                                      self.p.threat_turn_interval_km, self._iter_rng)
@@ -755,15 +756,24 @@ class ThreatModel:
                 break
         if route is not None:
             self.iter_routes.append(route)
+            self.iter_iteration = len(self.iter_routes)
         return route
 
     def iter_batch(self):
-        """Прогнать все T итераций сразу (без анимации). T = p.threat_iter_routes."""
+        """Сгенерировать T маршрутов сразу (без анимации). T = p.threat_iter_routes."""
+        from .threat_routes import sample_one_route
         if not self.iter_reset():
             return []
         T = max(1, int(self.p.threat_iter_routes))
-        while self.iter_iteration < T:
-            self.iter_step()
+        tries, cap = 0, T * 5
+        while len(self.iter_routes) < T and tries < cap:
+            tries += 1
+            r = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
+                                 self.p.threat_L_max, self.p.threat_turn_interval_km,
+                                 self._iter_rng)
+            if r is not None:
+                self.iter_routes.append(r)
+        self.iter_iteration = len(self.iter_routes)
         return self.iter_routes
 
     # обратная совместимость: пакетная генерация в один вызов (кнопка/чекбокс)
@@ -794,7 +804,7 @@ class ThreatModel:
             ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
             lmax = ab * (1.0 + THREAT_LMAX_AUTO_FRAC)
             if min_corridor_km is not None and np.isfinite(min_corridor_km):
-                lmax = max(lmax, min_corridor_km * 1.20)
+                lmax = max(lmax, min_corridor_km * 1.35)   # запас на боковой разброс маршрутов
             self.p.threat_L_max = round(lmax, 1)
         return self.p.threat_L_max
 
@@ -829,23 +839,72 @@ class ThreatModel:
 
     # ---- расстановка датчиков по весовой карте ----
     def place_sensors(self):
+        """Расставить датчики. Если есть выборка ИТЕРАЦИОННЫХ маршрутов — по НЕЙ (частота
+        пролёта БПЛА, как во вкладке 2: якорь у цели + жадный + разнос). Иначе — по
+        статической весовой карте (как раньше)."""
+        g = self.ensure_built()
+        self.candidates = self.candidate_positions()
+        if len(self.iter_routes) >= 5:
+            self.sensors = self._place_by_routes(self.candidates)
+        else:
+            self.sensors = self._place_by_weight(self.candidates)
+        cells_xy, cells_w = g.flat_cells(positive_only=False)
+        keep = cells_w != 0.0
+        self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
+        return self.sensors
+
+    def _place_by_weight(self, cand):
+        """Расстановка по СТАТИЧЕСКОЙ весовой карте (единица покрытия — клетка веса)."""
         from .optimization import CoverageCache
         from config import MODES
-        g = self.ensure_built()
-        cand = self.candidate_positions()
-        self.candidates = cand
-        cells_xy, cells_w = g.flat_cells(positive_only=False)
-        keep = cells_w != 0.0                      # только значимые ячейки (быстрее)
+        cells_xy, cells_w = self.grid.flat_cells(positive_only=False)
+        keep = cells_w != 0.0
         cells_xy, cells_w = cells_xy[keep], cells_w[keep]
         cache = CoverageCache(cand, self.p.threat_R, 1, self.p.threat_k)
         cache.set_weighted_cells(cells_xy, cells_w)
-        mode = getattr(self.p, "mode", "balanced")
-        weights = MODES.get(mode, MODES["balanced"])
-        self.sensors = cache.greedy_weighted(
-            self.p.threat_N, weights,
-            min_sep=self.p.threat_min_sep_frac * self.p.threat_R)
-        self._metrics = self._evaluate(cells_xy, cells_w)
-        return self.sensors
+        weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
+        return cache.greedy_weighted(
+            self.p.threat_N, weights, min_sep=self.p.threat_min_sep_frac * self.p.threat_R)
+
+    def _place_by_routes(self, cand):
+        """Расстановка по ВЫБОРКЕ маршрутов БПЛА (частота пролёта), как во вкладке 2:
+        1-й датчик — ЯКОРЬ у цели B (из кандидатов рядом с B — тот, что накрывает больше
+        всего маршрутов); остальные датчики не ставятся ближе min_sep к нему и друг к
+        другу (не кучкуются) — далее обычный жадный субмодулярный выбор по выборке."""
+        from .optimization import CoverageCache
+        from config import MODES
+        if len(cand) == 0:
+            return np.empty((0, 2), float)
+        cache = CoverageCache(cand, self.p.threat_R, self.p.L_seg, self.p.threat_k)
+        for r in self.iter_routes:
+            cache.add_trajectory(r)
+        _, target = self.entry_target_km()
+        tgt = np.asarray(target, float)
+        dist_b = np.linalg.norm(cand - tgt, axis=1)
+        covsum = np.asarray(cache._hit, dtype=np.int64).sum(axis=0)   # покрытие маршрутов кандидатом
+        near = dist_b < 1.5 * self.p.threat_R                         # кандидаты у цели B
+        if near.any():                                                # якорь — лучший из них
+            idxs = np.nonzero(near)[0]
+            anchor = int(idxs[np.argmax(covsum[idxs])])
+        else:
+            anchor = int(np.argmin(dist_b))
+        weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
+        sep = self.p.threat_min_sep_frac * self.p.threat_R
+        return cache.greedy(self.p.threat_N, weights, anchor_idx=anchor, anchor_sep=sep)
+
+    def route_density_field(self):
+        """2-я ТЕПЛОВАЯ КАРТА — частота пролёта БПЛА: сколько итерационных маршрутов
+        проходит через каждую клетку сетки (норм. 0..1). None, если маршрутов нет."""
+        if not self.iter_routes or self.grid is None:
+            return None
+        g = self.grid
+        dens = np.zeros(g.ny * g.nx, np.float64)
+        for r in self.iter_routes:
+            ix = np.clip(((r[:, 0] - g.ox) / g.h).astype(int), 0, g.nx - 1)
+            iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(int), 0, g.ny - 1)
+            dens[np.unique(iy * g.nx + ix)] += 1.0        # клетка учитывается раз на маршрут
+        mx = dens.max()
+        return (dens / mx if mx > 0 else dens).reshape(g.ny, g.nx)
 
     def _evaluate(self, cells_xy, cells_w):
         """Показатели: суммарный вес карты, покрытый вес, доля, разбивка по слоям."""

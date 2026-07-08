@@ -51,6 +51,12 @@ def _threat_lut():
     return cols
 
 
+def _iter_heat_lut():
+    """LUT для 2-й карты (частота пролёта БПЛА) — magma, отличается от turbo весов."""
+    stops = np.linspace(0, 1, 256)
+    return (cm.magma(stops) * 255).astype(np.ubyte)
+
+
 class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     THREAT_PARAM_SPECS = [
@@ -342,15 +348,18 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_cross = QtWidgets.QCheckBox("пересечения (перекрёстки)")
         self.chk_cross.setToolTip("Узлы, где сходятся ≥2 разных слоёв (дорога×река=мост, "
                                   "дорога×ЛЭП и т.д.) — точки развилок. Скрыто по умолчанию.")
-        self.chk_iter = QtWidgets.QCheckBox("итерации (много маршрутов)")
-        self.chk_iter.setToolTip("Стохастическая генерация МНОЖЕСТВА маршрутов вход→цель по "
-                                 "коридорам: развилки выбираются случайно по весу соседей. "
-                                 "Главное ограничение — запас хода. Показ — поштучной анимацией.")
+        self.chk_iter = QtWidgets.QCheckBox("итерационные маршруты (все)")
+        self.chk_iter.setToolTip("Показ ВСЕХ сгенерированных итерационных маршрутов БПЛА "
+                                 "(накопленная выборка). Генерация — кнопки Пуск/Шаг/Пакетно.")
+        self.chk_iter_heat = QtWidgets.QCheckBox("тепловая карта итераций (частота пролёта)")
+        self.chk_iter_heat.setToolTip("2-я тепловая карта: как часто маршруты БПЛА проходят "
+                                      "над клеткой. По ней и расставляются датчики.")
         self.chk_legend = QtWidgets.QCheckBox("легенда")
         self.chk_legend.setChecked(True)
         self.chk_legend.setToolTip("Легенда (какой цвет какой объект) — в левом нижнем углу.")
         for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand,
-                    self.chk_routes, self.chk_cross, self.chk_iter, self.chk_legend):
+                    self.chk_routes, self.chk_cross, self.chk_iter, self.chk_iter_heat,
+                    self.chk_legend):
             chk.stateChanged.connect(lambda _s: self.on_toggle())
             col.addWidget(chk)
         # режим стохастического выбора развилки (для «итераций»)
@@ -510,6 +519,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
                                        pen=pg.mkPen(_qcolor("#ff4dff", 235), width=2.4))
         self.route_item.setZValue(3)
+        # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
+        self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
+        self.iter_heat_img.setZValue(-7); self.iter_heat_img.setOpacity(0.62)
+        self.iter_heat_img.setVisible(False)
+        self.pi.addItem(self.iter_heat_img)
         # ИТЕРАЦИИ: накопленные маршруты (тонкие) + текущий (ярче) + маркер БПЛА.
         # Анимацию ведёт контроллер (iter_setup_flight/iter_update_flight) — как вкладка 2.
         self.route_iter_item = self.pi.plot([], [], antialias=True, connect="finite",
@@ -568,6 +582,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_routes=self.chk_routes.isChecked(),
                     show_cross=self.chk_cross.isChecked(),
                     show_iter=self.chk_iter.isChecked(),
+                    show_iter_heat=self.chk_iter_heat.isChecked(),
                     iter_mode=self._iter_keys[self.combo_iter.currentIndex()],
                     show_legend=self.chk_legend.isChecked())
 
@@ -737,6 +752,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         ведёт контроллер через iter_setup_flight/iter_update_flight."""
         show = bool(toggles.get("show_iter")) and bool(routes)
         self.iter_show_accumulated(routes if show else [])
+
+    def render_iter_heat(self, density, extent, toggles):
+        """2-я тепловая карта — частота пролёта БПЛА (плотность маршрутов), LUT magma."""
+        if not toggles.get("show_iter_heat") or density is None:
+            self.iter_heat_img.setVisible(False); return
+        d = np.asarray(density, float)
+        ds = np.sqrt(np.clip(d, 0.0, 1.0))              # √ поднимает редкие пролёты (виднее)
+        lut = _iter_heat_lut()
+        rgba = lut[np.clip((ds * 255).astype(int), 0, 255)].copy()
+        rgba[..., 3] = np.where(d > 0.005, 220, 0).astype(np.ubyte)  # прозрачно, где не летали
+        self.iter_heat_img.setImage(rgba, autoLevels=False)
+        x0, x1, y0, y1 = extent
+        self.iter_heat_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+        self.iter_heat_img.setVisible(True)
 
     def iter_show_accumulated(self, routes):
         """Отрисовать все накопленные маршруты тонкими линиями (одним item, через NaN)."""

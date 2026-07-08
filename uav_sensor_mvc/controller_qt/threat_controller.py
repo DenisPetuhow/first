@@ -82,8 +82,8 @@ class ThreatController:
         lab = THREAT_ITER_MODE_LABELS.get(self.model.p.threat_iter_mode,
                                           self.model.p.threat_iter_mode)
         T = int(self.model.p.threat_iter_routes)
-        return (f"Итерация {self.model.iter_iteration}/{T}  |  маршрутов "
-                f"{len(self.model.iter_routes)}  |  режим «{lab}»  |  "
+        return (f"Итерация {len(self.model.iter_routes)}/{T}  |  режим «{lab}»  |  "
+                f"датчиков {len(self.model.sensors)}/{self.model.p.threat_N}  |  "
                 f"L_max={self.model.p.threat_L_max:g} км")
 
     # ▶ Пуск / ⏸ Пауза — пошаговая анимация с движением БПЛА
@@ -116,11 +116,20 @@ class ThreatController:
         if self._cur_route is None:
             if self._iter_finished():
                 self._anim_stop()
-                self.view.set_title(self._iter_title() + " — готово.")
+                if len(self.model.iter_routes) >= 5:       # датчики по выборке маршрутов
+                    self.model.place_sensors()
+                self._render_all()
+                self._full_metrics()
+                self.view.set_title(self._iter_title() + " — готово. Датчики по выборке пролётов.")
                 return
             route = self.model.iter_step()
-            if route is None:                             # редкая неудачная итерация — пропустить кадр
+            if route is None:                             # неудачная итерация
+                self._anim_fails = getattr(self, "_anim_fails", 0) + 1
+                if self._anim_fails > 40:                 # выборка иссякла — остановиться
+                    self._anim_stop()
+                    self.view.set_title(self._iter_title() + " — выборка исчерпана.")
                 return
+            self._anim_fails = 0
             self._cur_route = route
             self._cur_j = 0
             self.view.iter_show_accumulated(self.model.iter_routes)
@@ -230,8 +239,11 @@ class ThreatController:
                                 "(вход у реки → цель, обход городов).")
         elif kind == "iter":
             self.view.iter_clear_current()               # пакетно — без летящего маркера
+            if len(self.model.iter_routes) >= 5:         # датчики по выборке маршрутов
+                self.model.place_sensors()
             self._render_all()
-            self.view.set_title(self._iter_title() + " (пакетно).")
+            self._full_metrics()
+            self.view.set_title(self._iter_title() + " (пакетно). Датчики по выборке пролётов.")
 
     # ---- построение карты (в фоне) ----
     def _work_build(self):
@@ -370,6 +382,8 @@ class ThreatController:
         self.view.render_candidates(self.model.candidates, t)
         self.view.render_routes(self.model.routes, self.model.route_area, extent, t)
         self.view.render_iter_routes(self.model.iter_routes, t)
+        self.view.render_iter_heat(
+            self.model.route_density_field() if t.get("show_iter_heat") else None, extent, t)
         if t.get("show_cross"):
             self.view.render_crossings(g.crossing_cells_km(), t)
         else:
