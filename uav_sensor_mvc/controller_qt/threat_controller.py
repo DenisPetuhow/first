@@ -65,7 +65,8 @@ class ThreatController:
             on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
             on_iter_spread=self.on_iter_spread,
             on_iter_play=self.on_iter_play, on_iter_step=self.on_iter_step,
-            on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed)
+            on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed,
+            on_iter_gen_frac=self.on_iter_gen_frac)
         self._idle_metrics()
 
     # ================= ИТЕРАЦИИ (симуляция как во вкладке 2) =================
@@ -407,12 +408,22 @@ class ThreatController:
             self.view.render_crossings(None, t)
         self.view.render_sensors(self.model.sensors, self.model.p.threat_R)
 
+    def on_iter_gen_frac(self, frac):
+        """Пользователь сменил долю обобщённой выборки (поле «обобщ. %»). Запоминаем и, если
+        слой включён, сразу перерисовываем."""
+        self.model.p.threat_iter_gen_frac = float(frac)
+        if self.view.get_toggles().get("show_iter_gen"):
+            self._refresh_generalized()
+
     def _refresh_generalized(self, toggles=None):
-        """Обновить слой ОБОБЩЁННОЙ выборки (~10 % итераций): считаем подмножество в модели
-        только когда чекбокс включён (иначе слой очищается). Дёшево — вызываем и по ходу
-        анимации (на завершении каждого пролёта), чтобы 10 % пересчитывались «на этот момент»."""
+        """Обновить слой ОБОБЩЁННОЙ выборки (доля задаётся полем «обобщ. %», по умолч. 10 %):
+        считаем подмножество в модели только когда чекбокс включён (иначе слой очищается).
+        Долю берём из поля -> меняется без перезапуска. Дёшево — вызываем и по ходу анимации
+        (на завершении каждого пролёта), чтобы доля пересчитывалась «на этот момент»."""
         t = toggles or self.view.get_toggles()
-        gen = self.model.generalized_sample() if t.get("show_iter_gen") else []
+        frac = self.view.get_iter_gen_frac()
+        self.model.p.threat_iter_gen_frac = frac
+        gen = self.model.generalized_sample(frac) if t.get("show_iter_gen") else []
         self.view.render_generalized(gen, t)
 
     # ---- показатели ----

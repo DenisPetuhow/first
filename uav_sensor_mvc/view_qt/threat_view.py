@@ -114,6 +114,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_iter_step = lambda: None
         self.on_iter_batch = lambda: None
         self.on_iter_speed = lambda v: None
+        self.on_iter_gen_frac = lambda v: None
         self._params_ref = params         # для префилла окна входных данных
         self._input_dlg = None
 
@@ -406,7 +407,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.combo_spread.currentIndexChanged.connect(self._spread_changed)
         row_sp2.addWidget(self.combo_spread, 1)
         col.addLayout(row_sp2)
-        # число итераций T (как во вкладке 2)
+        # число итераций T (как во вкладке 2) + доля обобщённой выборки, %
         row_t = QtWidgets.QHBoxLayout()
         row_t.addWidget(QtWidgets.QLabel("число итераций:"))
         self.ed_iter_T = QtWidgets.QLineEdit(str(getattr(params, "threat_iter_routes", 150)))
@@ -414,6 +415,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                                   "«Пуск» строит их по одному с анимацией полёта БПЛА.")
         self.ed_iter_T.returnPressed.connect(lambda: self.on_iter_batch())
         row_t.addWidget(self.ed_iter_T, 1)
+        row_t.addWidget(QtWidgets.QLabel("обобщ. %:"))
+        self.ed_iter_gen_frac = QtWidgets.QLineEdit(
+            f"{getattr(params, 'threat_iter_gen_frac', 0.10) * 100:g}")
+        self.ed_iter_gen_frac.setFixedWidth(56)
+        self.ed_iter_gen_frac.setToolTip("Доля «обобщённой выборки», % от ПРОЙДЕННЫХ итераций "
+                                         "(по умолчанию 10%). Прошло 500, доля 10% → 50 "
+                                         "маршрутов; доля 20% → 100. Enter — применить.")
+        self.ed_iter_gen_frac.returnPressed.connect(self._gen_frac_changed)
+        row_t.addWidget(self.ed_iter_gen_frac)
         col.addLayout(row_t)
         # скорость анимации полёта
         row_sp = QtWidgets.QHBoxLayout()
@@ -494,6 +504,18 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     def _iter_mode_changed(self, i):
         self.on_iter_mode(self._iter_keys[i])
+
+    def _gen_frac_changed(self):
+        self.on_iter_gen_frac(self.get_iter_gen_frac())
+
+    def get_iter_gen_frac(self):
+        """Доля обобщённой выборки как число 0..1 (поле задаётся в процентах). При ошибке —
+        текущее значение из параметров. Ограничено диапазоном [1%, 100%]."""
+        try:
+            v = float(self.ed_iter_gen_frac.text().strip().replace(",", ".").rstrip("% "))
+        except (ValueError, AttributeError):
+            return float(getattr(self._params_ref, "threat_iter_gen_frac", 0.10))
+        return min(1.0, max(0.01, v / 100.0))
 
     def _spread_changed(self, i):
         self.on_iter_spread(self._spread_keys[i])

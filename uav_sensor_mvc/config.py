@@ -220,6 +220,7 @@ class Params:
     threat_iter_mode: str = "mix"  # приоритет выбора клетки по ВЕСУ (THREAT_ITER_MODE_LABELS)
     threat_iter_spread: str = "mix"  # РАЗБРОС маршрута по карте (THREAT_ITER_SPREAD_LABELS)
     threat_iter_routes: int = 150  # число итераций T (сколько маршрутов сгенерировать)
+    threat_iter_gen_frac: float = 0.10  # доля обобщённой выборки (0.10 = 10% пройденных итераций)
     map_layer3: str = "osm"        # подложка карты (вкладка 3)
     map_offline3: bool = False     # офлайн-режим подложки (вкладка 3)
     mode: str = "balanced"         # режим оптимизации
