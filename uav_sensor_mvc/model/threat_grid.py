@@ -899,9 +899,9 @@ class ThreatModel:
     def _place_by_routes(self, cand, routes):
         """Расстановка по ВЫБОРКЕ маршрутов (частота пролёта). Правила (как просил):
         * кандидаты — только МЕЖДУ входом A и целью B по оси (не ЗА B и не ПЕРЕД A);
-        * 1-й датчик (ЯКОРЬ) — в ~0.45·R от цели B в сторону A, из ближних — тот, что
-          накрывает больше всего маршрутов (не «залипает» в самой B);
-        * остальные датчики не ближе ~1.45·R к любому уже стоящему (перекрытие зон ≤ ~10 %,
+        * ДВА якоря — у входа A и у цели B, каждый в ~0.45·R от точки внутрь коридора, из
+          ближних — тот, что накрывает больше всего маршрутов (не «залипают» в самих A/B);
+        * остальные датчики не ближе ~1.6·R к любому уже стоящему (перекрытие зон ≤ ~10 %,
           не кучкуются) — далее обычный жадный субмодулярный выбор по выборке."""
         from .optimization import CoverageCache
         from config import MODES
@@ -921,15 +921,19 @@ class ThreatModel:
             cache.add_trajectory(r)
         covsum = np.asarray(cache._hit, dtype=np.int64).sum(axis=0)   # покрытие маршрутов кандидатом
         u = d / np.sqrt(D2) if D2 > 1e-9 else np.array([1.0, 0.0])
-        anchor_pt = B - 0.45 * R * u                                  # ~0.45R от B в сторону A
-        near = np.linalg.norm(cand - anchor_pt, axis=1) < 0.7 * R
-        if near.any():
-            idxs = np.nonzero(near)[0]; anchor = int(idxs[np.argmax(covsum[idxs])])
-        else:
-            anchor = int(np.argmin(np.linalg.norm(cand - anchor_pt, axis=1)))
+
+        def anchor_near(pt):                           # кандидат у точки, max покрытия маршрутов
+            near = np.linalg.norm(cand - pt, axis=1) < 0.7 * R
+            if near.any():
+                idxs = np.nonzero(near)[0]; return int(idxs[np.argmax(covsum[idxs])])
+            return int(np.argmin(np.linalg.norm(cand - pt, axis=1)))
+
+        anchor_b = anchor_near(B - 0.45 * R * u)       # у цели B (внутрь, к A)
+        anchor_a = anchor_near(A + 0.45 * R * u)       # у входа A (внутрь, к B)
+        anchors = [anchor_b] + ([anchor_a] if anchor_a != anchor_b else [])
         weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
         sep = 1.6 * R                                  # расстояние центров -> перекрытие зон ≤ ~10 %
-        return cache.greedy(self.p.threat_N, weights, anchor_idx=anchor,
+        return cache.greedy(self.p.threat_N, weights, anchors=anchors,
                             anchor_sep=sep, min_sep=sep)
 
     def route_density_field(self):

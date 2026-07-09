@@ -534,9 +534,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_area_img = pg.ImageItem(); self.route_area_img.setOpts(axisOrder="row-major")
         self.route_area_img.setZValue(-6); self.route_area_img.setVisible(False)
         self.pi.addItem(self.route_area_img)
-        # ВСЕ возможные маршруты вход->цель (розовым)
+        # ВСЕ возможные маршруты вход->цель (розовым, тонко/полупрозрачно — плотность видна
+        # как градиент: где путей больше, там ярче, а не сплошной «фон»)
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                       pen=pg.mkPen(_qcolor("#ff4dff", 150), width=1.4))
+                                       pen=pg.mkPen(_qcolor("#ff4dff", 70), width=0.9))
         self.route_item.setZValue(3)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
@@ -741,19 +742,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.water_img.setVisible(True)
 
     def render_routes(self, routes, route_area, extent, toggles):
-        """ВСЕ возможные места пролёта (route_area — маска ячеек) + примеры коридоров."""
+        """ВСЕ возможные маршруты вход→цель (розовые ЛИНИИ). Огибающую-«фон» (route_area)
+        НЕ рисуем — она путала («розовый фон»); сами линии показывают достижимую область."""
         show = toggles["show_routes"]
-        # слой «возможные места пролёта» (полупрозрачные ячейки)
-        if show and route_area is not None and route_area.any():
-            rgba = np.zeros(route_area.shape + (4,), np.ubyte)
-            rgba[route_area] = (255, 77, 255, 45)          # розовый — куда БПЛА может дойти (полупрозр.)
-            self.route_area_img.setImage(rgba, autoLevels=False)
-            x0, x1, y0, y1 = extent
-            self.route_area_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
-            self.route_area_img.setVisible(True)
-        else:
-            self.route_area_img.setVisible(False)
-        # примеры коридоров-центров
+        self.route_area_img.setVisible(False)              # без заливки-фона — только линии
+        # ВСЕ возможные маршруты (розовыми линиями)
         if show and routes:
             nan = np.array([np.nan])
             xs, ys = [], []

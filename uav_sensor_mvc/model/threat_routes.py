@@ -199,6 +199,34 @@ def _chaikin(poly, iters=2):
     return p
 
 
+def _rdp(points, eps):
+    """Упрощение ломаной (Ramer–Douglas–Peucker): убирает точки ближе eps к хорде — снимает
+    мелкие зигзаги «на месте». Итеративно (без рекурсии), на numpy."""
+    pts = np.asarray(points, float)
+    n = len(pts)
+    if n < 3:
+        return pts
+    keep = np.zeros(n, bool); keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i0, i1 = stack.pop()
+        if i1 <= i0 + 1:
+            continue
+        a = pts[i0]; b = pts[i1]; ab = b - a; L2 = float(ab @ ab)
+        seg = pts[i0 + 1:i1]
+        if L2 < 1e-9:
+            dd = np.hypot(seg[:, 0] - a[0], seg[:, 1] - a[1])
+        else:
+            t = np.clip(((seg - a) @ ab) / L2, 0.0, 1.0)
+            proj = a + t[:, None] * ab
+            dd = np.hypot(seg[:, 0] - proj[:, 0], seg[:, 1] - proj[:, 1])
+        k = int(np.argmax(dd))
+        if dd[k] > eps:
+            idx = i0 + 1 + k; keep[idx] = True
+            stack.append((i0, idx)); stack.append((idx, i1))
+    return pts[keep]
+
+
 def _poly_len_km(poly):
     d = np.diff(np.asarray(poly, float), axis=0)
     return float(np.hypot(d[:, 0], d[:, 1]).sum())
@@ -384,7 +412,8 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix"):
         cells = r1[0] + r2[0][1:]                        # склейка без дубля via
     if cells is None or len(cells) < 2:
         return None
-    poly = _chaikin(_cells_yx_to_km(grid, cells), iters=2)
+    # RDP убирает мелкие зигзаги «на месте», затем Chaikin слегка сглаживает углы
+    poly = _chaikin(_rdp(_cells_yx_to_km(grid, cells), eps=grid.h * 1.6), iters=1)
     return poly if _poly_len_km(poly) <= L_max * 1.05 else None
 
 

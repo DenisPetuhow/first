@@ -229,12 +229,12 @@ class ThreatController:
         if kind == "build":
             self.view.set_source(self.model.source)
             self._render_all()
-            self.view.set_title("Карта угроз построена. «Расставить датчики».")
+            self.view.set_title("Карта построена. Считаю все возможные маршруты…")
             self._full_metrics()
             tg = self.view.get_toggles()
-            if tg.get("show_iter"):                      # итерации были включены — обновить
+            if tg.get("show_iter"):                      # идут итерации — их и обновить
                 self._run_async("iter", self.model.iterate_routes)
-            elif tg["show_routes"]:                      # маршруты были включены — обновить
+            else:                                        # ВСЕГДА считаем все возможные маршруты
                 self._run_async("routes", self.model.plan_routes)
         elif kind == "place":
             self._render_all()
@@ -245,8 +245,10 @@ class ThreatController:
             self._full_metrics()
         elif kind == "routes":
             self._render_all()
-            self.view.set_title(f"Построено маршрутов: {len(self.model.routes)} "
-                                "(вход у реки → цель, обход городов).")
+            self._full_metrics()
+            self.view.set_title(
+                f"Возможных маршрутов А→Б: {len(self.model.routes)} · "
+                f"L_max={self.model.p.threat_L_max:g} км (заход с любой стороны).")
         elif kind == "iter":
             self.view.iter_clear_current()               # пакетно — без летящего маркера
             if len(self.model.iter_routes) >= 5:         # датчики по выборке маршрутов
@@ -286,14 +288,13 @@ class ThreatController:
         ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
         self.view.set_ab_distance(ab)
         self.view.refresh_input_dialog()                  # окно покажет новый L_max
-        t = self.view.get_toggles()                       # маршруты/итерации зависят от цели
-        if self.model.grid is not None and t.get("show_iter"):
+        t = self.view.get_toggles()                       # цель сменилась — пересчитать
+        if self.model.grid is None:
+            self.view.set_title(f"Цель задана: ({x:.0f}, {y:.0f}) км. «Построить карту».")
+        elif t.get("show_iter"):
             self._run_async("iter", self.model.iterate_routes)
-        elif self.model.grid is not None and t["show_routes"]:
+        else:                                             # ВСЕГДА обновляем все возможные маршруты
             self._run_async("routes", self.model.plan_routes)
-        else:
-            self.view.set_title(f"Цель задана: ({x:.0f}, {y:.0f}) км. Вход — у реки "
-                                "(Северодонецк).")
 
     # ---- сброс: убрать датчики и заданную цель (карта остаётся) ----
     def on_reset(self):
