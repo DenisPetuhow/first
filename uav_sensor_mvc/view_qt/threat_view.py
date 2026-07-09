@@ -25,14 +25,14 @@ from . import geomap as gm
 
 # Цвета векторных слоёв цифровой карты (различимые на тёмной подложке/спутнике)
 LAYER_STYLE = {
-    "river":      dict(color="#3aa0ff", width=2.6, dash=None),
-    "road_major": dict(color="#ff9f43", width=2.4, dash=None),
-    "road_local": dict(color="#ffd18c", width=1.4, dash=None),
-    "railway":    dict(color="#e6edf3", width=1.6, dash=[6, 5]),
-    "power":      dict(color="#f6e05e", width=1.3, dash=[2, 3]),
-    "pipeline":   dict(color="#b794f6", width=1.4, dash=[8, 4]),
-    "tree_row":   dict(color="#4fd18b", width=1.6, dash=[1, 3]),
-    "built_up":   dict(color="#8aa0b6", width=1.2, dash=None),
+    "river":      dict(color="#3aa0ff", width=3.4, dash=None),
+    "road_major": dict(color="#ff9f43", width=3.2, dash=None),
+    "road_local": dict(color="#ffd18c", width=2.1, dash=None),
+    "railway":    dict(color="#e6edf3", width=2.3, dash=[6, 5]),
+    "power":      dict(color="#f6e05e", width=2.0, dash=[2, 3]),
+    "pipeline":   dict(color="#b794f6", width=2.2, dash=[8, 4]),
+    "tree_row":   dict(color="#4fd18b", width=2.2, dash=[1, 3]),
+    "built_up":   dict(color="#8aa0b6", width=1.7, dash=None),
 }
 
 
@@ -199,10 +199,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             rows.append(f'<span style="color:{st["color"]};font-size:13pt;">&#9644;&#9644;</span> {lab}<br>')
         rows.append('<span style="color:#ff5d6c;">&#9650;</span> мост &nbsp; '
                     '<span style="color:#ffd166;">&#9670;</span> пересечение (развилка)<br>')
-        rows.append('<span style="color:#ff4dff;font-size:13pt;">&#9644;&#9644;</span> коридор '
-                    '&nbsp; <span style="color:#ff4dff;">&#9632;</span> места пролёта<br>')
-        rows.append('<span style="color:#3ddc97;">&#9733;</span> вход &nbsp; '
-                    '<span style="color:#ff5d6c;">&#10005;</span> цель')
+        rows.append('<span style="color:#ff4dff;">&#9632;</span> места пролёта (огибающая) '
+                    '&nbsp; <span style="color:#00e5ff;font-size:13pt;">&#9644;&#9644;</span> '
+                    'возможные маршруты<br>')
+        rows.append('<span style="color:#36c5f0;font-size:13pt;">&#9644;&#9644;</span> итерации '
+                    '&nbsp; <span style="color:#ff8c1a;">&#9679;</span> датчик<br>')
+        rows.append('<span style="color:#3ddc97;">&#9733;</span> вход (A) &nbsp; '
+                    '<span style="color:#ff5d6c;">&#10005;</span> цель (B)')
         rows.append('</div>')
         return "".join(rows)
 
@@ -536,9 +539,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_area_img = pg.ImageItem(); self.route_area_img.setOpts(axisOrder="row-major")
         self.route_area_img.setZValue(-6); self.route_area_img.setVisible(False)
         self.pi.addItem(self.route_area_img)
-        # линии-примеры маршрутов поверх фона-огибающей (потолще, ярче)
+        # линии-примеры маршрутов поверх фона-огибающей: ЯРКИЙ КОНТРАСТНЫЙ цвет
+        # (бирюзовый) — чтобы линии чётко читались на розовом фоне огибающей.
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                       pen=pg.mkPen(_qcolor("#ff4dff", 130), width=1.6))
+                                       pen=pg.mkPen(_qcolor("#00e5ff", 210), width=2.0))
         self.route_item.setZValue(3)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
@@ -548,10 +552,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # ИТЕРАЦИИ: накопленные маршруты (тонкие) + текущий (ярче) + маркер БПЛА.
         # Анимацию ведёт контроллер (iter_setup_flight/iter_update_flight) — как вкладка 2.
         self.route_iter_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                            pen=pg.mkPen(_qcolor("#36c5f0", 80), width=1.1))
+                                            pen=pg.mkPen(_qcolor("#36c5f0", 190), width=2.1))
         self.route_iter_item.setZValue(1)
         self.route_cur_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                           pen=pg.mkPen(_qcolor("#ffe066", 240), width=2.4))
+                                           pen=pg.mkPen(_qcolor("#ffe066", 255), width=3.2))
         self.route_cur_item.setZValue(5); self.route_cur_item.setVisible(False)
         self.uav_marker = pg.ScatterPlotItem(
             size=14, symbol="t1", brush=pg.mkBrush(_qcolor("#ff4dff")),
@@ -584,13 +588,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             pen=None)
         self.cand_scatter.setZValue(-2); self.pi.addItem(self.cand_scatter)
 
-        # вход/цель
-        self.entry_scatter = pg.ScatterPlotItem(size=16, symbol="star",
-            brush=pg.mkBrush(_qcolor(THEME["ok"])), pen=pg.mkPen("white", width=1.2))
-        self.entry_scatter.setZValue(4); self.pi.addItem(self.entry_scatter)
-        self.target_scatter = pg.ScatterPlotItem(size=16, symbol="x",
-            brush=pg.mkBrush(_qcolor(THEME["warn"])), pen=pg.mkPen("white", width=1.2))
-        self.target_scatter.setZValue(4); self.pi.addItem(self.target_scatter)
+        # вход/цель — крупные контрастные значки (A — зелёная звезда, B — красный крест)
+        self.entry_scatter = pg.ScatterPlotItem(size=26, symbol="star",
+            brush=pg.mkBrush(_qcolor(THEME["ok"])), pen=pg.mkPen("white", width=2.2))
+        self.entry_scatter.setZValue(7); self.pi.addItem(self.entry_scatter)
+        self.target_scatter = pg.ScatterPlotItem(size=24, symbol="x",
+            brush=pg.mkBrush(_qcolor(THEME["warn"])), pen=pg.mkPen("white", width=2.6))
+        self.target_scatter.setZValue(7); self.pi.addItem(self.target_scatter)
 
     # ==================================================================
     # API для контроллера
@@ -750,7 +754,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if show and route_area is not None and np.asarray(route_area).any():
             ra = np.asarray(route_area)
             rgba = np.zeros(ra.shape + (4,), np.ubyte)
-            rgba[ra] = (255, 77, 255, 60)                  # розовый фон — все достижимые места
+            rgba[ra] = (255, 77, 255, 80)                  # розовый фон — все достижимые места
             self.route_area_img.setImage(rgba, autoLevels=False)
             x0, x1, y0, y1 = extent
             self.route_area_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
@@ -845,22 +849,24 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.cand_scatter.setData(cand[:, 0], cand[:, 1])
         self.cand_scatter.setVisible(True)
 
+    SENSOR_COLOR = "#ff8c1a"      # оранжевый — датчики хорошо видны на карте
+
     def render_sensors(self, sensors, R):
         for it in self._sensor_items:
             self.pi.removeItem(it)
         self._sensor_items.clear()
         for i, s in enumerate(sensors, 1):
             e = QtWidgets.QGraphicsEllipseItem(s[0] - R, s[1] - R, 2 * R, 2 * R)
-            e.setPen(pg.mkPen(_qcolor(THEME["ok"]), width=1.2))
-            e.setBrush(pg.mkBrush(_qcolor(THEME["ok"], 30)))
+            e.setPen(pg.mkPen(_qcolor(self.SENSOR_COLOR, 235), width=2.0))
+            e.setBrush(pg.mkBrush(_qcolor(self.SENSOR_COLOR, 70)))   # залитая зона обзора
             e.setZValue(2)
             self.pi.addItem(e, ignoreBounds=True)
             self._sensor_items.append(e)
         if len(sensors):
             dots = pg.ScatterPlotItem(
-                [p[0] for p in sensors], [p[1] for p in sensors], size=9, symbol="o",
-                brush=pg.mkBrush(_qcolor(THEME["ok"])), pen=pg.mkPen("white", width=0.9))
-            dots.setZValue(3); self.pi.addItem(dots)
+                [p[0] for p in sensors], [p[1] for p in sensors], size=15, symbol="o",
+                brush=pg.mkBrush(_qcolor(self.SENSOR_COLOR)), pen=pg.mkPen("white", width=1.6))
+            dots.setZValue(8); self.pi.addItem(dots)
             self._sensor_items.append(dots)
 
     def render_entry_target(self, entry, target):
