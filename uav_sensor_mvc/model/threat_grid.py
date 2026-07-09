@@ -947,6 +947,48 @@ class ThreatModel:
             return self.iter_routes
         return self.routes
 
+    def generalized_sample(self, frac=0.10):
+        """ОБОБЩЁННАЯ выборка итерационных маршрутов для показа: ~frac (10 %) от УЖЕ
+        пройденных итераций — не весь веер (напр. 500), а только ~50; если прошло 150 —
+        покажет 15. Отбираются НАИБОЛЕЕ ЧАСТЫЕ маршруты (по тепловой карте частоты
+        пролёта), но РАСПРЕДЕЛЁННО по всей карте, а не кучкой в одном месте.
+
+        Алгоритм — жадный СУБМОДУЛЯРНЫЙ отбор (как у датчиков) по полю частоты пролёта:
+        каждый шаг берём маршрут с максимальным покрытием ещё «непокрытой» частоты, затем
+        ГАСИМ покрытые им клетки (×0.15) — поэтому следующий маршрут тяготеет к ДРУГОМУ
+        загруженному коридору. Итог: представительно (частые пути) и равномерно (разные
+        коридоры), без скучивания."""
+        src = self.iter_routes
+        if not src or self.grid is None:
+            return []
+        n = len(src)
+        k = max(1, int(round(frac * n)))
+        if k >= n:
+            return list(src)
+        g = self.grid
+        cells, dens = [], np.zeros(g.ny * g.nx, np.float64)
+        for r in src:                                       # клетки маршрута + поле частоты
+            ix = np.clip(((r[:, 0] - g.ox) / g.h).astype(int), 0, g.nx - 1)
+            iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(int), 0, g.ny - 1)
+            idx = np.unique(iy * g.nx + ix)
+            cells.append(idx); dens[idx] += 1.0
+        remaining = dens.copy()
+        chosen, used = [], np.zeros(n, bool)
+        for _ in range(k):
+            best, best_gain = -1, -1.0
+            for i in range(n):
+                if used[i]:
+                    continue
+                gain = float(remaining[cells[i]].sum())     # покрытие ещё «непокрытой» частоты
+                if gain > best_gain:
+                    best_gain, best = gain, i
+            if best < 0:
+                break
+            used[best] = True
+            chosen.append(src[best])
+            remaining[cells[best]] *= 0.15                  # гасим коридор -> следующий в др. месте
+        return chosen
+
     def route_density_field(self):
         """2-я ТЕПЛОВАЯ КАРТА — частота пролёта БПЛА: сколько маршрутов проходит через
         каждую клетку (норм. 0..1). ДО итераций — по всем возможным путям, ПРИ итерациях —

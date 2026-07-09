@@ -147,6 +147,8 @@ class ThreatController:
         self.view.iter_update_flight(self._cur_route, self._cur_j)
         if self._cur_j >= end:                            # долетел -> следующая итерация
             self._cur_route = None
+            if self.view.get_toggles().get("show_iter_gen"):   # 10 % «на этот момент»
+                self._refresh_generalized()
 
     # Шаг — одна итерация без анимации (сразу весь маршрут)
     def on_iter_step(self):
@@ -163,6 +165,7 @@ class ThreatController:
         self.view.iter_show_accumulated(self.model.iter_routes)
         if route is not None:
             self.view.iter_update_flight(route, len(route) - 1)   # весь маршрут + БПЛА в цели
+        self._refresh_generalized()                              # 10 % «на этот момент»
         self.view.set_title(self._iter_title())
 
     # Пакетно — все T итераций сразу (в фоне), без анимации
@@ -350,8 +353,9 @@ class ThreatController:
 
     def on_toggle(self):
         t = self.view.get_toggles()
-        # итерации включили, а их ещё нет -> сгенерировать в фоне (стохастика, ~1 с)
-        if (t.get("show_iter") and self.model.grid is not None
+        # итерации (веер ИЛИ обобщённая выборка) включили, а их ещё нет -> сгенерировать
+        # в фоне (стохастика, ~1 с). Обобщённая выборка тоже строится из этих маршрутов.
+        if ((t.get("show_iter") or t.get("show_iter_gen")) and self.model.grid is not None
                 and not self.model.iter_routes and not self._busy):
             self._run_async("iter", self.model.iterate_routes)
             return
@@ -394,6 +398,7 @@ class ThreatController:
         self.view.render_candidates(self.model.candidates, t)
         self.view.render_routes(self.model.routes, self.model.route_area, extent, t)
         self.view.render_iter_routes(self.model.iter_routes, t)
+        self._refresh_generalized(t)
         self.view.render_iter_heat(
             self.model.route_density_field() if t.get("show_iter_heat") else None, extent, t)
         if t.get("show_cross"):
@@ -401,6 +406,14 @@ class ThreatController:
         else:
             self.view.render_crossings(None, t)
         self.view.render_sensors(self.model.sensors, self.model.p.threat_R)
+
+    def _refresh_generalized(self, toggles=None):
+        """Обновить слой ОБОБЩЁННОЙ выборки (~10 % итераций): считаем подмножество в модели
+        только когда чекбокс включён (иначе слой очищается). Дёшево — вызываем и по ходу
+        анимации (на завершении каждого пролёта), чтобы 10 % пересчитывались «на этот момент»."""
+        t = toggles or self.view.get_toggles()
+        gen = self.model.generalized_sample() if t.get("show_iter_gen") else []
+        self.view.render_generalized(gen, t)
 
     # ---- показатели ----
     def _idle_metrics(self):

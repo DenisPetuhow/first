@@ -203,7 +203,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     '&nbsp; <span style="color:#00e5ff;font-size:13pt;">&#9644;&#9644;</span> '
                     'возможные маршруты<br>')
         rows.append('<span style="color:#36c5f0;font-size:13pt;">&#9644;&#9644;</span> итерации '
-                    '&nbsp; <span style="color:#ff8c1a;">&#9679;</span> датчик<br>')
+                    '&nbsp; <span style="color:#c6ff00;font-size:13pt;">&#9644;&#9644;</span> '
+                    'обобщённая (10%)<br>')
+        rows.append('<span style="color:#ff8c1a;">&#9679;</span> датчик<br>')
         rows.append('<span style="color:#3ddc97;">&#9733;</span> вход (A) &nbsp; '
                     '<span style="color:#ff5d6c;">&#10005;</span> цель (B)')
         rows.append('</div>')
@@ -360,12 +362,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_iter_heat = QtWidgets.QCheckBox("тепловая карта итераций (частота пролёта)")
         self.chk_iter_heat.setToolTip("2-я тепловая карта: как часто маршруты БПЛА проходят "
                                       "над клеткой. По ней и расставляются датчики.")
+        self.chk_iter_gen = QtWidgets.QCheckBox("обобщённая выборка (10% маршрутов)")
+        self.chk_iter_gen.setToolTip("Показать НЕ весь веер, а ~10 % пройденных итерационных "
+                                     "маршрутов: самые ЧАСТЫЕ (по тепловой карте), но "
+                                     "РАСПРЕДЕЛЁННО по всей карте, не кучкой. Прошло 150 из "
+                                     "500 → покажет 15. Обобщает тепловую карту пролётов.")
         self.chk_legend = QtWidgets.QCheckBox("легенда")
         self.chk_legend.setChecked(True)
         self.chk_legend.setToolTip("Легенда (какой цвет какой объект) — в левом нижнем углу.")
         for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand,
                     self.chk_routes, self.chk_cross, self.chk_iter, self.chk_iter_heat,
-                    self.chk_legend):
+                    self.chk_iter_gen, self.chk_legend):
             chk.stateChanged.connect(lambda _s: self.on_toggle())
             col.addWidget(chk)
         # режим стохастического выбора развилки (для «итераций»)
@@ -542,7 +549,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # линии-примеры маршрутов поверх фона-огибающей: ЯРКИЙ КОНТРАСТНЫЙ цвет
         # (бирюзовый) — чтобы линии чётко читались на розовом фоне огибающей.
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                       pen=pg.mkPen(_qcolor("#00e5ff", 210), width=2.0))
+                                       pen=pg.mkPen(_qcolor("#00e5ff", 235), width=2.4))
         self.route_item.setZValue(3)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
@@ -554,6 +561,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_iter_item = self.pi.plot([], [], antialias=True, connect="finite",
                                             pen=pg.mkPen(_qcolor("#36c5f0", 190), width=2.1))
         self.route_iter_item.setZValue(1)
+        # ОБОБЩЁННАЯ выборка (~10 % итераций): частые, но распределённые маршруты.
+        # Яркий контрастный лайм, толще накопленных — читаются поверх веера/тепла.
+        self.route_gen_item = self.pi.plot([], [], antialias=True, connect="finite",
+                                           pen=pg.mkPen(_qcolor("#c6ff00", 230), width=2.7))
+        self.route_gen_item.setZValue(4); self.route_gen_item.setVisible(False)
         self.route_cur_item = self.pi.plot([], [], antialias=True, connect="finite",
                                            pen=pg.mkPen(_qcolor("#ffe066", 255), width=3.2))
         self.route_cur_item.setZValue(5); self.route_cur_item.setVisible(False)
@@ -608,6 +620,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_cross=self.chk_cross.isChecked(),
                     show_iter=self.chk_iter.isChecked(),
                     show_iter_heat=self.chk_iter_heat.isChecked(),
+                    show_iter_gen=self.chk_iter_gen.isChecked(),
                     iter_mode=self._iter_keys[self.combo_iter.currentIndex()],
                     show_legend=self.chk_legend.isChecked())
 
@@ -754,7 +767,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if show and route_area is not None and np.asarray(route_area).any():
             ra = np.asarray(route_area)
             rgba = np.zeros(ra.shape + (4,), np.ubyte)
-            rgba[ra] = (255, 77, 255, 80)                  # розовый фон — все достижимые места
+            rgba[ra] = (255, 70, 245, 120)                 # розовый фон — все достижимые места (плотнее/контрастнее)
             self.route_area_img.setImage(rgba, autoLevels=False)
             x0, x1, y0, y1 = extent
             self.route_area_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
@@ -779,6 +792,21 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         ведёт контроллер через iter_setup_flight/iter_update_flight."""
         show = bool(toggles.get("show_iter")) and bool(routes)
         self.iter_show_accumulated(routes if show else [])
+
+    def render_generalized(self, routes, toggles):
+        """ОБОБЩЁННАЯ выборка (~10 % итераций): частые, но распределённые маршруты —
+        отдельный ярко-лаймовый слой поверх веера. routes уже отобраны моделью."""
+        show = bool(toggles.get("show_iter_gen")) and bool(routes)
+        if not show:
+            self.route_gen_item.setData([], []); self.route_gen_item.setVisible(False)
+            return
+        nan = np.array([np.nan]); xs, ys = [], []
+        for r in routes:
+            r = np.asarray(r, float)
+            xs.append(r[:, 0]); xs.append(nan)
+            ys.append(r[:, 1]); ys.append(nan)
+        self.route_gen_item.setData(np.concatenate(xs), np.concatenate(ys), connect="finite")
+        self.route_gen_item.setVisible(True)
 
     def render_iter_heat(self, density, extent, toggles):
         """2-я тепловая карта — частота пролёта БПЛА (плотность маршрутов), LUT magma."""
