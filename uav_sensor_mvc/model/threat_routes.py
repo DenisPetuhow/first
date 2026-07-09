@@ -199,6 +199,37 @@ def _chaikin(poly, iters=2):
     return p
 
 
+def _catmull_rom(points, seg_km=1.5, alpha=0.5):
+    """ИНТЕРПОЛЯЦИЯ ломаной гладкой кривой (центростремительный сплайн Катмулла–Рома):
+    кривая ПРОХОДИТ через опорные точки, острые углы сетки становятся плавными ДУГАМИ, а
+    прямые участки (коллинеарные точки) остаются ПРЯМЫМИ. Центростремительная параметризация
+    (alpha=0.5) не даёт «петель»/выбросов на резких поворотах — то, что нужно для трасс БПЛА
+    (плавно «дугами и прямыми», приближение манёвра по R_min)."""
+    P = np.asarray(points, float)
+    if len(P) < 3:
+        return P
+    pts = np.vstack([P[0], P, P[-1]])                # дублируем концы (для крайних сегментов)
+    out = [P[0]]
+    for i in range(1, len(pts) - 2):
+        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
+
+        def _t(ti, a, b):
+            return ti + max(float(np.hypot(*(b - a))), 1e-6) ** alpha
+
+        t0 = 0.0; t1 = _t(t0, p0, p1); t2 = _t(t1, p1, p2); t3 = _t(t2, p2, p3)
+        seg_len = float(np.hypot(*(p2 - p1)))
+        n = int(np.clip(seg_len / seg_km, 2, 24))    # число точек на сегмент ∝ его длине
+        for t in np.linspace(t1, t2, n, endpoint=False):
+            a1 = (t1 - t) / (t1 - t0) * p0 + (t - t0) / (t1 - t0) * p1
+            a2 = (t2 - t) / (t2 - t1) * p1 + (t - t1) / (t2 - t1) * p2
+            a3 = (t3 - t) / (t3 - t2) * p2 + (t - t2) / (t3 - t2) * p3
+            b1 = (t2 - t) / (t2 - t0) * a1 + (t - t0) / (t2 - t0) * a2
+            b2 = (t3 - t) / (t3 - t1) * a2 + (t - t1) / (t3 - t1) * a3
+            out.append((t2 - t) / (t2 - t1) * b1 + (t - t1) / (t2 - t1) * b2)
+    out.append(P[-1])
+    return np.asarray(out)
+
+
 def _rdp(points, eps):
     """Упрощение ломаной (Ramer–Douglas–Peucker): убирает точки ближе eps к хорде — снимает
     мелкие зигзаги «на месте». Итеративно (без рекурсии), на numpy."""
@@ -241,21 +272,37 @@ def _cells_yx_to_km(grid, cells_yx):
 
 
 def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
-                heading0=None, wmode="medium"):
+                heading0=None, wmode="medium", visited=None):
     """Стохастический спуск по полю расстояний dfield от start к goal (надёжно приходит):
-    выбор коридора — по ВЕСУ соседа (тепловая карта, приоритет по режиму wmode) и развилкам,
-    курс держится ≥ turn_interval_km. Годится и для промежуточной цели (via) — отсюда обход.
+    выбор коридора — по ВЕСУ соседа (тепловая карта, приоритет по режиму wmode) и развилкам.
+
+    ПРЯМОЛИНЕЙНОСТЬ: `turn_interval_km` теперь трактуется как ЦЕЛЕВАЯ длина ПРЯМОГО участка —
+    маршрут держит курс, пока не пролетит ~столько км, и только потом доворачивает (БПЛА
+    стремится лететь прямыми отрезками этой длины). БЕЗ «КРУЖЕНИЯ»: посещённые ячейки не
+    выбираются повторно (кроме тупика), «назад» по полю разрешено чуть-чуть — петли уходят.
+
+    `visited` — общий набор пройденных ячеек (flat-индексы); для маршрута через VIA
+    передаётся сквозь оба участка, чтобы они не наматывались друг на друга.
     Возвращает (список ячеек (y,x), длина_км, курс) или None (тупик / вышли за budget)."""
     grid = ctx["grid"]; pas = ctx["pas"]; wnorm = ctx["wnorm"]
     ny, nx = dfield.shape
     h = grid.h
     if not np.isfinite(dfield[start]):
         return None
+    # ЦЕЛЕВАЯ длина прямого участка задаётся пользователем, но в самом блуждании «держим
+    # курс» лишь мягко и не дольше L_hold (жёсткая длинная прямая роняет доходимость до цели,
+    # особенно на маршрутах через VIA). Итоговую ПРЯМОЛИНЕЙНОСТЬ даёт пост-обработка
+    # (упрощение линии с допуском ∝ длине участка + сглаживание), см. sample_one_route.
+    L_hold = min(max(1.0, float(turn_interval_km)), 6.0)
+    back_allow = 0.8                                   # км «назад» по полю (иначе тупики у стенок)
+    if visited is None:
+        visited = set()
     step_cap = int(6 * dfield[start] / h + 80)
     cur = start
+    visited.add(cur[0] * nx + cur[1])
     path = [cur]
     heading = heading0
-    dist_since_turn = turn_interval_km
+    dist_since_turn = L_hold                            # на старте курс можно выбрать свободно
     route_len = 0.0
     for _ in range(step_cap):
         if cur == goal or dfield[cur] <= h:
@@ -267,29 +314,33 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
             if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not pas[vy, vx]:
                 continue
             dj = dfield[vy, vx]
-            if not np.isfinite(dj) or dj > dfield[cur] + 0.8:   # назад — не дальше 0.8 км
+            if not np.isfinite(dj) or dj > dfield[cur] + back_allow:   # к цели, почти без «назад»
                 continue
             uy, ux = _NB_UNIT[k]
             if heading is None:
                 hf = 1.0
             else:
                 dot = uy * heading[0] + ux * heading[1]
-                if dot < -0.2:
-                    hf = 0.02
-                elif dist_since_turn < turn_interval_km:   # держим курс СТРОГО (меньше зигзагов):
-                    hf = 12.0 if dot > 0.9 else (0.4 if dot > 0.6 else 0.02)
-                else:
-                    hf = 1.0 + 2.5 * max(dot, 0.0)      # можно доворачивать, но прямо охотнее
+                if dist_since_turn < L_hold:            # держим курс (мягко — меньше зигзагов)
+                    if dot > 0.9:    hf = 14.0          # прямо — сильнее всего
+                    elif dot > 0.7:  hf = 2.5           # небольшой доворот — можно
+                    elif dot > 0.4:  hf = 0.5           # 45° — если нужно объехать
+                    else:            hf = 0.05          # резкий поворот — редко
+                else:                                   # прошли прямой участок — можно менять курс
+                    hf = (0.05 if dot < -0.2            # назад почти не разворачиваемся
+                          else 1.0 + 2.5 * max(dot, 0.0))   # но прямо всё равно охотнее
             prog = dfield[cur] - dj
             corr = _mode_corridor_pref(wnorm[vy, vx], wmode)   # приоритет по весу (режим)
             s = float(np.exp(prog / 0.4)) * corr * hf
-            cand.append((vy, vx, mul, (uy, ux)))
-            score.append(s)
+            if vy * nx + vx in visited:                 # штраф за повторный заход — гасит петли,
+                s *= 0.12                               # но не запрещает (иначе тупики)
+            if s <= 0.0:
+                continue
+            cand.append((vy, vx, mul, (uy, ux))); score.append(s)
         if not cand:
             return None
         cum = np.cumsum(np.asarray(score, float))       # быстрый выбор ∝ весу (без rng.choice(p=))
-        j = int(np.searchsorted(cum, rng.random() * cum[-1]))
-        j = min(j, len(cand) - 1)
+        j = min(int(np.searchsorted(cum, rng.random() * cum[-1])), len(cand) - 1)
         vy, vx, mul, unit = cand[j]
         step = mul * h
         route_len += step
@@ -300,6 +351,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                            if heading is not None and new_head == heading else step)
         heading = new_head
         cur = (vy, vx)
+        visited.add(vy * nx + vx)
         path.append(cur)
     return (path, route_len, heading) if (cur == goal or dfield[cur] <= h) else None
 
@@ -402,7 +454,7 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix"):
     else:                                               # через VIA (обход/заход со стороны)
         via = ctx["via_cell"][j]
         r1 = _walk_field(ctx, ctx["via_gv"][j], ctx["start"], via, L_max,
-                         turn_interval_km, rng, wmode=wmode)
+                         turn_interval_km, rng, wmode=wmode)   # каждый участок — свой набор visited
         if r1 is None:
             return None
         r2 = _walk_field(ctx, ctx["gt"], via, ctx["goal"], L_max - r1[1],
@@ -412,9 +464,12 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix"):
         cells = r1[0] + r2[0][1:]                        # склейка без дубля via
     if cells is None or len(cells) < 2:
         return None
-    # RDP убирает мелкие зигзаги «на месте», затем Chaikin слегка сглаживает углы
-    poly = _chaikin(_rdp(_cells_yx_to_km(grid, cells), eps=grid.h * 1.6), iters=1)
-    return poly if _poly_len_km(poly) <= L_max * 1.05 else None
+    # ПРЯМОЛИНЕЙНОСТЬ ∝ «длине прямого участка»: чем она больше, тем крупнее допуск упрощения
+    # (RDP) -> тем длиннее прямые звенья и тем прямее маршрут. Затем интерполяция Катмулла–Рома
+    # делает повороты плавными ДУГАМИ, а прямые оставляет прямыми (плавно «дугами и прямыми»).
+    eps = float(np.clip(turn_interval_km * 0.18, grid.h * 1.2, 8.0))
+    poly = _catmull_rom(_rdp(_cells_yx_to_km(grid, cells), eps=eps))
+    return poly if _poly_len_km(poly) <= L_max * 1.15 else None
 
 
 def iterate_routes(grid, entry_km, target_km, n_routes, mode, L_max,

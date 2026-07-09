@@ -737,17 +737,20 @@ class ThreatModel:
         want = max(1, int(THREAT_ROUTE_COUNT))
         # ОБОБЩЁННАЯ выборка: вес «medium» (вероятность ∝ сумме весов тепловой карты —
         # «наиболее вероятные» пути) + разброс «mix» (распределённо по всей карте).
-        routes, seen, tries, cap = [], set(), 0, want * 6
-        while len(routes) < want and tries < cap:
+        routes, seen, tries, cap = [], set(), 0, min(want * 6, 800)   # предел попыток ~ по времени
+        since_new = 0                                  # ранняя остановка: набор уникальных исчерпан
+        while len(routes) < want and tries < cap and since_new < 350:
             tries += 1
             r = sample_one_route(ctx, "medium", self.p.threat_L_max,
                                  self.p.threat_turn_interval_km, rng, spread="mix")
             if r is None:
+                since_new += 1
                 continue
             sig = self._route_sig(r)
             if sig in seen:                            # уже есть почти такой же маршрут
+                since_new += 1
                 continue
-            seen.add(sig); routes.append(r)
+            seen.add(sig); routes.append(r); since_new = 0
         self.routes = routes
         return self.routes
 
@@ -792,18 +795,20 @@ class ThreatModel:
         if not self.iter_reset():
             return []
         T = max(1, int(self.p.threat_iter_routes))
-        seen, tries, cap = set(), 0, T * 6
-        while len(self.iter_routes) < T and tries < cap:
+        seen, tries, cap, since_new = set(), 0, min(T * 6, 800), 0
+        while len(self.iter_routes) < T and tries < cap and since_new < 350:
             tries += 1
             r = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
                                  self.p.threat_L_max, self.p.threat_turn_interval_km,
                                  self._iter_rng, spread=self.p.threat_iter_spread)
             if r is None:
+                since_new += 1
                 continue
             sig = self._route_sig(r)
             if sig in seen:                            # дедуп почти одинаковых
+                since_new += 1
                 continue
-            seen.add(sig); self.iter_routes.append(r)
+            seen.add(sig); self.iter_routes.append(r); since_new = 0
         self.iter_iteration = len(self.iter_routes)
         return self.iter_routes
 
