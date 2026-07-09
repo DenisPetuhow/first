@@ -847,15 +847,16 @@ class ThreatModel:
         out[ok] = wm[iy[ok], ix[ok]]
         return out
 
-    # ---- расстановка датчиков по весовой карте ----
+    # ---- расстановка датчиков ----
     def place_sensors(self):
-        """Расставить датчики. Если есть выборка ИТЕРАЦИОННЫХ маршрутов — по НЕЙ (частота
-        пролёта БПЛА, как во вкладке 2: якорь у цели + жадный + разнос). Иначе — по
-        статической весовой карте (как раньше)."""
+        """Расставить датчики. Если идут ИТЕРАЦИИ — по ИХ ВЫБОРКЕ (частота пролёта БПЛА, с
+        правилами A/B и разносом, как во вкладке 2). Иначе — по статической весовой карте.
+        (Расстановка по «всем возможным маршрутам» до итераций — задел §4.6, реализуем
+        позже вместе с минусом городам.)"""
         g = self.ensure_built()
         self.candidates = self.candidate_positions()
         if len(self.iter_routes) >= 5:
-            self.sensors = self._place_by_routes(self.candidates)
+            self.sensors = self._place_by_routes(self.candidates, self.iter_routes)
         else:
             self.sensors = self._place_by_weight(self.candidates)
         cells_xy, cells_w = g.flat_cells(positive_only=False)
@@ -876,31 +877,41 @@ class ThreatModel:
         return cache.greedy_weighted(
             self.p.threat_N, weights, min_sep=self.p.threat_min_sep_frac * self.p.threat_R)
 
-    def _place_by_routes(self, cand):
-        """Расстановка по ВЫБОРКЕ маршрутов БПЛА (частота пролёта), как во вкладке 2:
-        1-й датчик — ЯКОРЬ у цели B (из кандидатов рядом с B — тот, что накрывает больше
-        всего маршрутов); остальные датчики не ставятся ближе min_sep к нему и друг к
-        другу (не кучкуются) — далее обычный жадный субмодулярный выбор по выборке."""
+    def _place_by_routes(self, cand, routes):
+        """Расстановка по ВЫБОРКЕ маршрутов (частота пролёта). Правила (как просил):
+        * кандидаты — только МЕЖДУ входом A и целью B по оси (не ЗА B и не ПЕРЕД A);
+        * 1-й датчик (ЯКОРЬ) — в ~0.45·R от цели B в сторону A, из ближних — тот, что
+          накрывает больше всего маршрутов (не «залипает» в самой B);
+        * остальные датчики не ближе ~1.45·R к любому уже стоящему (перекрытие зон ≤ ~10 %,
+          не кучкуются) — далее обычный жадный субмодулярный выбор по выборке."""
         from .optimization import CoverageCache
         from config import MODES
+        if len(cand) == 0 or not routes:
+            return np.empty((0, 2), float)
+        entry, target = self.entry_target_km()
+        A = np.asarray(entry, float); B = np.asarray(target, float)
+        R = self.p.threat_R
+        d = B - A; D2 = float(d @ d)
+        if D2 > 1e-9:                                  # оставить кандидатов между A и B (0≤s≤1)
+            s = ((cand - A) @ d) / D2
+            cand = cand[(s >= 0.0) & (s <= 1.0)]
         if len(cand) == 0:
             return np.empty((0, 2), float)
-        cache = CoverageCache(cand, self.p.threat_R, self.p.L_seg, self.p.threat_k)
-        for r in self.iter_routes:
+        cache = CoverageCache(cand, R, self.p.L_seg, self.p.threat_k)
+        for r in routes:
             cache.add_trajectory(r)
-        _, target = self.entry_target_km()
-        tgt = np.asarray(target, float)
-        dist_b = np.linalg.norm(cand - tgt, axis=1)
         covsum = np.asarray(cache._hit, dtype=np.int64).sum(axis=0)   # покрытие маршрутов кандидатом
-        near = dist_b < 1.5 * self.p.threat_R                         # кандидаты у цели B
-        if near.any():                                                # якорь — лучший из них
-            idxs = np.nonzero(near)[0]
-            anchor = int(idxs[np.argmax(covsum[idxs])])
+        u = d / np.sqrt(D2) if D2 > 1e-9 else np.array([1.0, 0.0])
+        anchor_pt = B - 0.45 * R * u                                  # ~0.45R от B в сторону A
+        near = np.linalg.norm(cand - anchor_pt, axis=1) < 0.7 * R
+        if near.any():
+            idxs = np.nonzero(near)[0]; anchor = int(idxs[np.argmax(covsum[idxs])])
         else:
-            anchor = int(np.argmin(dist_b))
+            anchor = int(np.argmin(np.linalg.norm(cand - anchor_pt, axis=1)))
         weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
-        sep = self.p.threat_min_sep_frac * self.p.threat_R
-        return cache.greedy(self.p.threat_N, weights, anchor_idx=anchor, anchor_sep=sep)
+        sep = 1.6 * R                                  # расстояние центров -> перекрытие зон ≤ ~10 %
+        return cache.greedy(self.p.threat_N, weights, anchor_idx=anchor,
+                            anchor_sep=sep, min_sep=sep)
 
     def route_density_field(self):
         """2-я ТЕПЛОВАЯ КАРТА — частота пролёта БПЛА: сколько итерационных маршрутов

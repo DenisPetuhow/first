@@ -118,7 +118,7 @@ class CoverageCache:
                 mask_row |= (seg_hit.astype(np.uint32) << np.uint32(j))
         self._mask.append(mask_row)
 
-    def greedy(self, N, weights, anchor_idx=None, anchor_sep=0.0):
+    def greedy(self, N, weights, anchor_idx=None, anchor_sep=0.0, min_sep=0.0):
         """Жадный выбор N позиций. Всегда возвращает min(N, C) датчиков.
 
         Основной ключ — субмодулярный прирост phi; при его насыщении —
@@ -126,7 +126,8 @@ class CoverageCache:
 
         anchor_idx — индекс ПРИНУДИТЕЛЬНОГО «якорного» датчика (у цели B): ставится
         первым; кандидаты ближе anchor_sep к нему исключаются (не дают «кучи» у B).
-        Остальные позиции выбираются обычным жадным алгоритмом.
+        min_sep>0 — кандидаты ближе min_sep к ЛЮБОМУ уже выбранному тоже исключаются
+        (перекрытие зон ограничено, датчики не кучкуются). Остальное — обычный жадный.
         """
         T = self.n_traj
         if T == 0 or self.C == 0 or N <= 0:
@@ -155,12 +156,15 @@ class CoverageCache:
             cur_pop = _popcount(mask_vec).astype(float)
             cur_cov = np.minimum(cur_cov + Fc[:, c], 1.0)
 
+        def exclude_near(idx, sep):
+            if sep > 0:
+                dd = np.linalg.norm(self.cand - self.cand[idx], axis=1)
+                avail[dd < sep] = False
+
         # якорный датчик у цели B + исключение близких кандидатов
         if anchor_idx is not None and 0 <= int(anchor_idx) < self.C:
             take(int(anchor_idx))
-            if anchor_sep > 0:
-                d = np.linalg.norm(self.cand - self.cand[int(anchor_idx)], axis=1)
-                avail[d < anchor_sep] = False
+            exclude_near(int(anchor_idx), max(anchor_sep, min_sep))
 
         while len(chosen) < min(N, self.C):
             new_min = np.minimum(n_vec[:, None] + H, k)
@@ -180,6 +184,7 @@ class CoverageCache:
             if not np.isfinite(score[c]):
                 break
             take(c)
+            exclude_near(c, min_sep)                       # датчики не ближе min_sep друг к другу
 
         return self.cand[chosen] if chosen else np.empty((0, 2), float)
 

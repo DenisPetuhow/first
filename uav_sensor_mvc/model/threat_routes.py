@@ -27,8 +27,6 @@ MODEL · Построение маршрутов пролёта БПЛА по в
 import heapq
 import numpy as np
 
-from config import THREAT_ITER_MODE_SPREAD
-
 # 8 соседей: (dy, dx, множитель длины шага)
 _NEIGHBORS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
               (-1, -1, 1.41421356), (-1, 1, 1.41421356),
@@ -174,6 +172,16 @@ def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km):
 _NB_UNIT = [(dy / mul, dx / mul) for dy, dx, mul in _NEIGHBORS]
 
 
+def _mode_corridor_pref(wnorm, wmode):
+    """Предпочтение соседа по ВЕСУ клетки (тепловая карта), зависит от РЕЖИМА. «Пол» у
+    каждого режима не даёт вероятности занулиться (маршрут не вырождается в один коридор)."""
+    if wmode == "max":                        # приоритет тяжёлых коридоров (реки/дороги)
+        return 0.10 + 1.6 * wnorm
+    if wmode == "min":                        # приоритет лёгких («пустоши», одинокая река)
+        return 0.10 + 1.6 * (1.0 - wnorm)
+    return 0.30 + 0.8 * wnorm                 # medium: вероятность ∝ весу
+
+
 def _chaikin(poly, iters=2):
     """Сглаживание углов (Chaikin): острые повороты сетки → плавные довороты. Служит
     приближением манёвра по радиусу разворота R_min (истинная кинематика — задел)."""
@@ -204,11 +212,12 @@ def _cells_yx_to_km(grid, cells_yx):
     return np.column_stack([xs, ys])
 
 
-def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng, heading0=None):
+def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
+                heading0=None, wmode="medium"):
     """Стохастический спуск по полю расстояний dfield от start к goal (надёжно приходит):
-    выбор коридора — по ВЕСУ соседа (тепловая карта) и развилкам, курс держится
-    ≥ turn_interval_km. Годится и для промежуточной цели (via) — отсюда обход. Возвращает
-    (список ячеек (y,x), длина_км, курс) или None (тупик / вышли за budget)."""
+    выбор коридора — по ВЕСУ соседа (тепловая карта, приоритет по режиму wmode) и развилкам,
+    курс держится ≥ turn_interval_km. Годится и для промежуточной цели (via) — отсюда обход.
+    Возвращает (список ячеек (y,x), длина_км, курс) или None (тупик / вышли за budget)."""
     grid = ctx["grid"]; pas = ctx["pas"]; wnorm = ctx["wnorm"]
     ny, nx = dfield.shape
     h = grid.h
@@ -244,7 +253,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng, heading
                 else:
                     hf = 1.0 + 2.0 * max(dot, 0.0)
             prog = dfield[cur] - dj
-            corr = 0.30 + 0.8 * wnorm[vy, vx]           # выбор коридора ∝ весу (тепловая карта)
+            corr = _mode_corridor_pref(wnorm[vy, vx], wmode)   # приоритет по весу (режим)
             s = float(np.exp(prog / 0.4)) * corr * hf
             cand.append((vy, vx, mul, (uy, ux)))
             score.append(s)
@@ -314,35 +323,33 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_via=7):
 
 
 def sample_one_route(ctx, mode, L_max, turn_interval_km, rng):
-    """ОДИН стохастический маршрут вход→цель через боковую VIA-точку. Режим задаёт величину
-    БОКОВОГО отклонения d (км): доля запаса хода (сверх кратчайшего) — center мало, edge
-    максимум; знак случаен. Так режимы разводят пути от центра к краям. Внутри — выбор
-    коридора по ВЕСУ и развилкам. None, если не уложились в запас хода."""
+    """ОДИН стохастический маршрут вход→цель. РЕЖИМ (mode) = приоритет выбора клетки по
+    ВЕСУ (max/medium/min/mix). РАЗБРОС по карте — отдельно и случайно: с вероятностью 20 %
+    маршрут идёт прямо (через центр), иначе — через СЛУЧАЙНУЮ боковую VIA-точку из веера
+    (покрытие всей карты в любом режиме). None, если не уложились в запас хода."""
     if not ctx["reachable"]:
         return None
-    m = ("center", "middle", "edge")[rng.integers(3)] if mode == "mix" else mode
-    frac = THREAT_ITER_MODE_SPREAD.get(m, 0.5)
-    half = ctx["ab"] / 2.0
-    slack = max(0.0, L_max * 0.98 - ctx["gt_start"])    # запас сверх кратчайшего пути
-    added = slack * frac * float(rng.uniform(0.3, 1.0)) # длина, отдаваемая под обход
-    d = float(np.sqrt(max(0.0, (half + added / 2.0) ** 2 - half ** 2)))  # боковое отклонение, км
-    target_off = d * (1.0 if rng.integers(2) else -1.0)
+    wmode = ("max", "medium", "min")[rng.integers(3)] if mode == "mix" else mode
     grid = ctx["grid"]
-    if d < grid.h or len(ctx["via_gv"]) == 0:           # прямой маршрут (без обхода)
-        r = _walk_field(ctx, ctx["gt"], ctx["start"], ctx["goal"], L_max, turn_interval_km, rng)
+    straight = (len(ctx["via_gv"]) == 0) or (rng.random() < 0.2)   # часть путей — через центр
+    if straight:
+        r = _walk_field(ctx, ctx["gt"], ctx["start"], ctx["goal"], L_max,
+                        turn_interval_km, rng, wmode=wmode)
         cells = r[0] if r else None
-    else:                                               # через ближайшую предвычисленную VIA
-        j = int(np.argmin(np.abs(ctx["via_off"] - target_off)))
+    else:                                               # через СЛУЧАЙНУЮ VIA (разброс по карте)
+        j = int(rng.integers(len(ctx["via_gv"])))
         via = ctx["via_cell"][j]
         if via == ctx["goal"] or via == ctx["start"]:
-            r = _walk_field(ctx, ctx["gt"], ctx["start"], ctx["goal"], L_max, turn_interval_km, rng)
+            r = _walk_field(ctx, ctx["gt"], ctx["start"], ctx["goal"], L_max,
+                            turn_interval_km, rng, wmode=wmode)
             cells = r[0] if r else None
         else:
-            r1 = _walk_field(ctx, ctx["via_gv"][j], ctx["start"], via, L_max, turn_interval_km, rng)
+            r1 = _walk_field(ctx, ctx["via_gv"][j], ctx["start"], via, L_max,
+                             turn_interval_km, rng, wmode=wmode)
             if r1 is None:
                 return None
             r2 = _walk_field(ctx, ctx["gt"], via, ctx["goal"], L_max - r1[1],
-                             turn_interval_km, rng, heading0=r1[2])
+                             turn_interval_km, rng, heading0=r1[2], wmode=wmode)
             if r2 is None:
                 return None
             cells = r1[0] + r2[0][1:]                    # склейка без дубля via

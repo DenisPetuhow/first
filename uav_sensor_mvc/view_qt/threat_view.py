@@ -186,8 +186,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     def _legend_html(self):
         """HTML-легенда: какой цвет какой объект. Яркий фон + крупный шрифт."""
-        rows = ['<div style="background:#0f1623f2;padding:6px 9px;border:1px solid '
-                '#36c5f0;border-radius:5px;font-size:10pt;color:#ffffff;line-height:150%;">']
+        rows = ['<div style="background:#0b111c;padding:8px 12px;border:2px solid '
+                '#36c5f0;border-radius:6px;font-size:10pt;color:#ffffff;line-height:155%;">']
         rows.append('<b style="color:#36c5f0;">ЛЕГЕНДА · слои цифровой карты</b><br>')
         from config import THREAT_LAYERS as _TL
         for name in THREAT_LAYER_ORDER:
@@ -546,7 +546,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # легенда векторных слоёв (цвет -> объект) — что чем отображается.
         # anchor (0,1) — точка привязки = НИЖНИЙ-левый угол текста (легенда в левом
         # нижнем углу вида); включается отдельным чекбоксом «легенда».
-        self.legend = pg.TextItem(anchor=(0, 1))
+        self.legend = pg.TextItem(anchor=(0, 1), fill=pg.mkBrush("#0b111c"))
         self.legend.setZValue(20); self.legend.setHtml(self._legend_html())
         self.pi.addItem(self.legend); self.legend.setVisible(False)
 
@@ -982,14 +982,13 @@ class InputDataDialog(QtWidgets.QDialog):
         self.ab_lbl.setText(f"{km:.0f}")
 
     def _auto_changed(self, *_):
-        """Авто-запас: поле L_max только для чтения (считает модель), но ВСЕГДА показывает
-        текущее значение (чтобы не оставалось пустым). В ручном режиме — редактируемо."""
+        """Авто-запас: поле L_max ВСЕГДА показывает текущее значение (и при снятии галочки
+        оно не пропадает — просто становится редактируемым). В авто — только для чтения."""
         auto = self.chk_auto.isChecked()
         e = self._edits.get("threat_L_max")
         if e is None:
             return
-        if auto or not e.text().strip():
-            e.setText(f"{float(getattr(self._params, 'threat_L_max', 0.0)):g}")
+        e.setText(f"{float(getattr(self._params, 'threat_L_max', 0.0)):g}")  # всегда заполнено
         e.setReadOnly(auto)
         e.setStyleSheet("color:%s;" % (THEME["muted"] if auto else THEME["text"]))
 

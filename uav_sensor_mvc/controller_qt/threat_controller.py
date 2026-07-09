@@ -132,7 +132,9 @@ class ThreatController:
             self._anim_fails = 0
             self._cur_route = route
             self._cur_j = 0
-            self.view.iter_show_accumulated(self.model.iter_routes)
+            # «итерационные маршруты» выкл -> на карте только ТЕКУЩИЙ пролёт (не весь веер)
+            show_acc = self.view.get_toggles().get("show_iter")
+            self.view.iter_show_accumulated(self.model.iter_routes if show_acc else [])
             self.view.iter_setup_flight(route)
             self.view.set_title(self._iter_title())
         # двигать БПЛА по текущему маршруту. Шаг ~ пропорционален длине пути, чтобы любой
@@ -418,6 +420,10 @@ class ThreatController:
             f"  участок {kx1-kx0:.0f}×{ky1-ky0:.0f} км",
             f"  ячейка {cell*1000:.0f} м",
             f"  источник: {self.model.source}", "",
+            "МАРШРУТЫ",
+            f"  возможных путей А→Б: {len(self.model.routes)}",
+            f"  итерационных (выборка): {len(self.model.iter_routes)}",
+            f"  запас хода L_max: {p.threat_L_max:g} км", "",
             "РЕСУРС",
             f"  N={p.threat_N}  R={p.threat_R:g} км  k={p.threat_k}",
             f"  режим: {MODE_LABELS[p.mode]}",
