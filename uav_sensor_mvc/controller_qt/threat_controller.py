@@ -63,6 +63,7 @@ class ThreatController:
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
             on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
+            on_iter_spread=self.on_iter_spread,
             on_iter_play=self.on_iter_play, on_iter_step=self.on_iter_step,
             on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed)
         self._idle_metrics()
@@ -189,9 +190,16 @@ class ThreatController:
             self._render_all()
         self.view.set_title("Входные данные применены.")
 
-    # ---- смена режима итераций (heavy/balanced/light/mix) ----
+    # ---- смена приоритета по весу (max/medium/min/mix) ----
     def on_iter_mode(self, key):
         self.model.p.threat_iter_mode = key
+        if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
+                and not self._busy):
+            self._run_async("iter", self.model.iterate_routes)
+
+    # ---- смена разброса по карте (center/middle/edge/mix) ----
+    def on_iter_spread(self, key):
+        self.model.p.threat_iter_spread = key
         if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
                 and not self._busy):
             self._run_async("iter", self.model.iterate_routes)

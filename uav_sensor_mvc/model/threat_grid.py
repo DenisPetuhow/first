@@ -708,28 +708,44 @@ class ThreatModel:
         self._iter_ctx = None                          # карта пересобрана — контекст устарел
         return self.grid
 
+    def _route_gap_km(self):
+        """Порог «мостика» через провал = ШАГ СЕТКИ ДАТЧИКА (как определил пользователь:
+        если разрыв < шага сетки датчика — маршрут можно проложить), но не меньше 2 км."""
+        return max(2.0, float(self.p.threat_cand_step_km))
+
+    def _route_sig(self, poly):
+        """Огрублённая подпись маршрута (для дедупликации почти одинаковых путей)."""
+        g = self.grid
+        ix = (((poly[:, 0] - g.ox) / g.h) // 4).astype(np.int64)
+        iy = (((poly[:, 1] - g.oy) / g.h) // 4).astype(np.int64)
+        return hash(frozenset(zip(ix.tolist(), iy.tolist())))
+
     # ---- маршруты пролёта вход->цель ----
     def plan_routes(self):
-        """ВСЕ возможные маршруты вход→цель (не 14!): большой стохастический набор по
-        коридорам с учётом веса тепловой карты, развилок и запаса хода. Сколько уместится
-        — зависит от L_max (больше запас → больше и разнообразнее маршрутов, хоть 100–200).
-        Плюс envelope — маска всех достижимых мест пролёта. Контекст выборки кэшируется."""
+        """ВСЕ возможные маршруты вход→цель (не 14): большая РАЗНООБРАЗНАЯ выборка путей по
+        коридорам (вес>0 или разрыв < шага сетки датчика) с учётом запаса хода — все режимы
+        веса и разброса, заход в цель с любой стороны. Дедуп почти одинаковых. Строго «все»
+        перечислить нельзя (их экспоненциально много). Контекст выборки кэшируется."""
         from .threat_routes import build_iter_context, sample_one_route
-        from config import THREAT_ROUTE_MAX_GAP_KM, THREAT_ROUTE_COUNT
+        from config import THREAT_ROUTE_COUNT
         g = self.ensure_built()
         entry, target = self._refresh_envelope()       # авто-L_max + огибающая
         if self._iter_ctx is None:                     # общий контекст с итерациями (кэш)
-            self._iter_ctx = build_iter_context(g, entry, target, THREAT_ROUTE_MAX_GAP_KM)
+            self._iter_ctx = build_iter_context(g, entry, target, self._route_gap_km())
         ctx = self._iter_ctx
         rng = np.random.default_rng()
         want = max(1, int(THREAT_ROUTE_COUNT))
-        routes, tries, cap = [], 0, want * 5
+        routes, seen, tries, cap = [], set(), 0, want * 6
         while len(routes) < want and tries < cap:
             tries += 1
             r = sample_one_route(ctx, "mix", self.p.threat_L_max,
-                                 self.p.threat_turn_interval_km, rng)
-            if r is not None:
-                routes.append(r)
+                                 self.p.threat_turn_interval_km, rng, spread="mix")
+            if r is None:
+                continue
+            sig = self._route_sig(r)
+            if sig in seen:                            # уже есть почти такой же маршрут
+                continue
+            seen.add(sig); routes.append(r)
         self.routes = routes
         return self.routes
 
@@ -739,12 +755,11 @@ class ThreatModel:
         """Начать выборку заново: пересчитать авто-запас хода и огибающую, подготовить
         контекст выборки, обнулить счётчик. Возвращает True, если цель достижима."""
         from .threat_routes import build_iter_context
-        from config import THREAT_ROUTE_MAX_GAP_KM
         self.ensure_built()
         entry, target = self._refresh_envelope()       # авто-L_max + огибающая
         if self._iter_ctx is None:                     # веер VIA-полей считаем ОДИН раз на цель
             self._iter_ctx = build_iter_context(self.grid, entry, target,
-                                                THREAT_ROUTE_MAX_GAP_KM)
+                                                self._route_gap_km())
         self._iter_rng = np.random.default_rng()
         self.iter_routes = []
         self.iter_iteration = 0
@@ -760,8 +775,8 @@ class ThreatModel:
         route = None
         for _ in range(12):                             # попытки на итерацию (стохастика)
             route = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
-                                     self.p.threat_L_max,
-                                     self.p.threat_turn_interval_km, self._iter_rng)
+                                     self.p.threat_L_max, self.p.threat_turn_interval_km,
+                                     self._iter_rng, spread=self.p.threat_iter_spread)
             if route is not None:
                 break
         if route is not None:
@@ -775,14 +790,18 @@ class ThreatModel:
         if not self.iter_reset():
             return []
         T = max(1, int(self.p.threat_iter_routes))
-        tries, cap = 0, T * 5
+        seen, tries, cap = set(), 0, T * 6
         while len(self.iter_routes) < T and tries < cap:
             tries += 1
             r = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
                                  self.p.threat_L_max, self.p.threat_turn_interval_km,
-                                 self._iter_rng)
-            if r is not None:
-                self.iter_routes.append(r)
+                                 self._iter_rng, spread=self.p.threat_iter_spread)
+            if r is None:
+                continue
+            sig = self._route_sig(r)
+            if sig in seen:                            # дедуп почти одинаковых
+                continue
+            seen.add(sig); self.iter_routes.append(r)
         self.iter_iteration = len(self.iter_routes)
         return self.iter_routes
 
@@ -795,15 +814,15 @@ class ThreatModel:
         Авто-L_max = |AB|+25 %, НО не меньше кратчайшего коридорного пути +20 % (иначе на
         «узкой» местности маршрут не уместился бы вовсе). Ручной L_max не трогаем."""
         from .threat_routes import flight_envelope
-        from config import THREAT_ROUTE_MAX_GAP_KM
         g = self.grid
+        gap = self._route_gap_km()                             # тот же порог, что у маршрутов
         entry, target = self.entry_target_km()
         self.sync_auto_L_max()                                 # предварительно |AB|+25 %
         _, self.route_min_len = flight_envelope(               # кратчайший путь (от L_max не зависит)
-            g, entry, target, self.p.threat_L_max, THREAT_ROUTE_MAX_GAP_KM)
+            g, entry, target, self.p.threat_L_max, gap)
         self.sync_auto_L_max(self.route_min_len)               # поднять до «кратчайший+20 %», если авто
         self.route_area, self.route_min_len = flight_envelope(
-            g, entry, target, self.p.threat_L_max, THREAT_ROUTE_MAX_GAP_KM)
+            g, entry, target, self.p.threat_L_max, gap)
         return entry, target
 
     def sync_auto_L_max(self, min_corridor_km=None):

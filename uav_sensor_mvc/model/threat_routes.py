@@ -248,10 +248,10 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                 dot = uy * heading[0] + ux * heading[1]
                 if dot < -0.2:
                     hf = 0.02
-                elif dist_since_turn < turn_interval_km:
-                    hf = 8.0 if dot > 0.85 else (1.0 if dot > 0.3 else 0.05)
+                elif dist_since_turn < turn_interval_km:   # держим курс СТРОГО (меньше зигзагов):
+                    hf = 12.0 if dot > 0.9 else (0.4 if dot > 0.6 else 0.02)
                 else:
-                    hf = 1.0 + 2.0 * max(dot, 0.0)
+                    hf = 1.0 + 2.5 * max(dot, 0.0)      # можно доворачивать, но прямо охотнее
             prog = dfield[cur] - dj
             corr = _mode_corridor_pref(wnorm[vy, vx], wmode)   # приоритет по весу (режим)
             s = float(np.exp(prog / 0.4)) * corr * hf
@@ -291,11 +291,20 @@ def _nearest_passable_cell(pas, grid, y_km, x_km, max_km=12.0):
     return (int(ys[j]), int(xs[j])) if d2[j] <= r * r else None
 
 
-def build_iter_context(grid, entry_km, target_km, max_gap_km, n_via=7):
-    """Подготовить (один раз, кэшируется) контекст выборки: проходимость, поле расстояний
-    до цели gt, норм.вес wnorm, геометрию прямой вход→цель и ВЕЕР из n_via боковых VIA-точек
-    в середине прямой с ПРЕДвычисленными полями расстояний (маршрут потом лишь выбирает
-    ближайшую по боковому отклонению — без Дейкстры на маршрут). Не зависит от L_max."""
+def _seg_dist_km(pt, a, b):
+    """Расстояние от точки pt до ОТРЕЗКА a-b (км). Для сортировки via по «дальности обхода»."""
+    p = np.asarray(pt, float); a = np.asarray(a, float); b = np.asarray(b, float)
+    ab = b - a; L2 = float(ab @ ab)
+    t = 0.0 if L2 < 1e-9 else float(np.clip(((p - a) @ ab) / L2, 0.0, 1.0))
+    return float(np.hypot(*(p - (a + t * ab))))
+
+
+def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5)):
+    """Подготовить (один раз, кэшируется) контекст выборки. VIA-точки — СЕТКА по всей
+    проходимой области (все стороны, включая юг/восток и «за целью» — заход в Б с ЛЮБОГО
+    направления, если хватает хода), с предвычисленными полями расстояний. Каждой via
+    сопоставлена «дальность обхода» (расстояние до отрезка вход→цель) — для режима разброса.
+    Порог мостика через провал = ШАГ СЕТКИ ДАТЧИКА (passable_mask). Не зависит от L_max."""
     start = _cell_of(grid, entry_km)
     goal = _cell_of(grid, target_km)
     pas = _open_endpoints(passable_mask(grid, max_gap_km), (start, goal), grid)
@@ -304,55 +313,75 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_via=7):
     pos = w[w > 0]
     ref = float(np.percentile(pos, 90)) if pos.size else 1.0
     wnorm = np.clip(w / max(ref, 1e-6), 0.0, 1.0)
-    ex, ey = entry_km; tx, ty = target_km               # геометрия для бокового обхода
-    ab = float(np.hypot(tx - ex, ty - ey)) or 1.0
-    ux, uy = (tx - ex) / ab, (ty - ey) / ab             # вдоль прямой
-    px, py = -uy, ux                                    # перпендикуляр
-    mx0, my0 = ex + ux * ab / 2.0, ey + uy * ab / 2.0   # середина прямой
-    via_off, via_cell, via_gv = [], [], []
+    A = np.asarray(entry_km, float); B = np.asarray(target_km, float)
+    ab = float(np.hypot(*(B - A))) or 1.0
+    via_cell, via_gv, via_segd = [], [], []
     if np.isfinite(gt[start]):
-        for off in np.linspace(-ab * 0.6, ab * 0.6, n_via):
-            vc = _nearest_passable_cell(pas, grid, my0 + py * off, mx0 + px * off)
-            if vc is None or vc in via_cell:            # пропустить дубли (разрежённые коридоры)
-                continue
-            via_off.append(float(off)); via_cell.append(vc)
-            via_gv.append(_dijkstra_dist(pas, vc, grid.h))
+        ys, xs = np.nonzero(pas & np.isfinite(gt))     # достижимые проходимые ячейки
+        if len(ys):
+            gy = np.linspace(ys.min(), ys.max(), n_grid[0])
+            gx = np.linspace(xs.min(), xs.max(), n_grid[1])
+            for cy in gy:
+                for cx in gx:
+                    vc = _nearest_passable_cell(pas, grid,
+                                                grid.oy + (cy + 0.5) * grid.h,
+                                                grid.ox + (cx + 0.5) * grid.h, max_km=18.0)
+                    if vc is None or vc in via_cell or vc == goal or vc == start:
+                        continue
+                    vxk = grid.ox + (vc[1] + 0.5) * grid.h
+                    vyk = grid.oy + (vc[0] + 0.5) * grid.h
+                    via_cell.append(vc)
+                    via_segd.append(_seg_dist_km((vxk, vyk), A, B))
+                    via_gv.append(_dijkstra_dist(pas, vc, grid.h))
     return dict(grid=grid, pas=pas, gt=gt, wnorm=wnorm, start=start, goal=goal, ab=ab,
-                via_off=np.asarray(via_off), via_cell=via_cell, via_gv=via_gv,
+                via_cell=via_cell, via_gv=via_gv, via_segd=np.asarray(via_segd),
                 gt_start=float(gt[start]), reachable=bool(np.isfinite(gt[start])))
 
 
-def sample_one_route(ctx, mode, L_max, turn_interval_km, rng):
-    """ОДИН стохастический маршрут вход→цель. РЕЖИМ (mode) = приоритет выбора клетки по
-    ВЕСУ (max/medium/min/mix). РАЗБРОС по карте — отдельно и случайно: с вероятностью 20 %
-    маршрут идёт прямо (через центр), иначе — через СЛУЧАЙНУЮ боковую VIA-точку из веера
-    (покрытие всей карты в любом режиме). None, если не уложились в запас хода."""
+def _pick_via(ctx, spread, rng):
+    """Выбрать индекс VIA по режиму РАЗБРОСА (по дальности обхода segd): center — близкие к
+    прямой, edge — дальние (юг/восток/за целью), middle — средние, mix — любая. None = прямо."""
+    segd = ctx["via_segd"]
+    n = len(segd)
+    if n == 0:
+        return None
+    sp = ("center", "middle", "edge")[rng.integers(3)] if spread == "mix" else spread
+    order = np.argsort(segd)                           # от близких к прямой к дальним
+    if sp == "center":
+        pool = order[:max(1, n // 3)]
+    elif sp == "edge":
+        pool = order[-max(1, n // 2):]                 # дальние (включая юг/восток/за B)
+    else:                                              # middle
+        lo, hi = n // 4, max(n // 4 + 1, 3 * n // 4)
+        pool = order[lo:hi]
+    return int(pool[rng.integers(len(pool))])
+
+
+def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix"):
+    """ОДИН стохастический маршрут вход→цель. mode = приоритет клетки по ВЕСУ
+    (max/medium/min/mix). spread = РАЗБРОС по карте (center/middle/edge/mix) — через какую
+    VIA-точку строить (center — вдоль прямой, edge — дальний обход/заход с любой стороны).
+    None, если не уложились в запас хода."""
     if not ctx["reachable"]:
         return None
     wmode = ("max", "medium", "min")[rng.integers(3)] if mode == "mix" else mode
     grid = ctx["grid"]
-    straight = (len(ctx["via_gv"]) == 0) or (rng.random() < 0.2)   # часть путей — через центр
-    if straight:
+    j = None if (spread == "center" and rng.random() < 0.5) else _pick_via(ctx, spread, rng)
+    if j is None:                                       # прямой маршрут (через центр)
         r = _walk_field(ctx, ctx["gt"], ctx["start"], ctx["goal"], L_max,
                         turn_interval_km, rng, wmode=wmode)
         cells = r[0] if r else None
-    else:                                               # через СЛУЧАЙНУЮ VIA (разброс по карте)
-        j = int(rng.integers(len(ctx["via_gv"])))
+    else:                                               # через VIA (обход/заход со стороны)
         via = ctx["via_cell"][j]
-        if via == ctx["goal"] or via == ctx["start"]:
-            r = _walk_field(ctx, ctx["gt"], ctx["start"], ctx["goal"], L_max,
-                            turn_interval_km, rng, wmode=wmode)
-            cells = r[0] if r else None
-        else:
-            r1 = _walk_field(ctx, ctx["via_gv"][j], ctx["start"], via, L_max,
-                             turn_interval_km, rng, wmode=wmode)
-            if r1 is None:
-                return None
-            r2 = _walk_field(ctx, ctx["gt"], via, ctx["goal"], L_max - r1[1],
-                             turn_interval_km, rng, heading0=r1[2], wmode=wmode)
-            if r2 is None:
-                return None
-            cells = r1[0] + r2[0][1:]                    # склейка без дубля via
+        r1 = _walk_field(ctx, ctx["via_gv"][j], ctx["start"], via, L_max,
+                         turn_interval_km, rng, wmode=wmode)
+        if r1 is None:
+            return None
+        r2 = _walk_field(ctx, ctx["gt"], via, ctx["goal"], L_max - r1[1],
+                         turn_interval_km, rng, heading0=r1[2], wmode=wmode)
+        if r2 is None:
+            return None
+        cells = r1[0] + r2[0][1:]                        # склейка без дубля via
     if cells is None or len(cells) < 2:
         return None
     poly = _chaikin(_cells_yx_to_km(grid, cells), iters=2)

@@ -19,7 +19,7 @@ import matplotlib.cm as cm
 
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
-                    THREAT_ITER_MODE_LABELS)
+                    THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from . import geomap as gm
 
@@ -109,6 +109,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_choose_data = lambda path, layers: None
         self.on_input_apply = lambda vals: None
         self.on_iter_mode = lambda key: None
+        self.on_iter_spread = lambda key: None
         self.on_iter_play = lambda: None
         self.on_iter_step = lambda: None
         self.on_iter_batch = lambda: None
@@ -372,12 +373,27 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         cur = getattr(params, "threat_iter_mode", "mix")
         self.combo_iter.setCurrentIndex(self._iter_keys.index(cur)
                                         if cur in self._iter_keys else 0)
-        self.combo_iter.setToolTip("Как выбирается развилка на перекрёстке: приоритет "
-                                   "тяжёлых коридоров (реки/дороги) / сбалансированно / "
-                                   "приоритет лёгких (прятаться) / смесь.")
+        self.combo_iter.setToolTip("ПРИОРИТЕТ выбора клетки по ВЕСУ сетки: макс. (реки/"
+                                   "дороги) / средний / мин. (пустоши, одинокая река) / смесь.")
         self.combo_iter.currentIndexChanged.connect(self._iter_mode_changed)
         row_it.addWidget(self.combo_iter, 1)
         col.addLayout(row_it)
+        # 2-й список: РАЗБРОС маршрута по карте (отдельно от приоритета веса)
+        row_sp2 = QtWidgets.QHBoxLayout()
+        row_sp2.addWidget(QtWidgets.QLabel("разброс по карте:"))
+        self.combo_spread = QtWidgets.QComboBox()
+        self._spread_keys = list(THREAT_ITER_SPREAD_LABELS)
+        for k in self._spread_keys:
+            self.combo_spread.addItem(THREAT_ITER_SPREAD_LABELS[k])
+        cur = getattr(params, "threat_iter_spread", "mix")
+        self.combo_spread.setCurrentIndex(self._spread_keys.index(cur)
+                                          if cur in self._spread_keys else 0)
+        self.combo_spread.setToolTip("Насколько далеко маршрут уходит от прямой вход→цель: "
+                                     "центр (вдоль) / середина / края карты (дальний обход, "
+                                     "заход с любой стороны) / смесь. Комбинируется с весом.")
+        self.combo_spread.currentIndexChanged.connect(self._spread_changed)
+        row_sp2.addWidget(self.combo_spread, 1)
+        col.addLayout(row_sp2)
         # число итераций T (как во вкладке 2)
         row_t = QtWidgets.QHBoxLayout()
         row_t.addWidget(QtWidgets.QLabel("число итераций:"))
@@ -466,6 +482,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     def _iter_mode_changed(self, i):
         self.on_iter_mode(self._iter_keys[i])
+
+    def _spread_changed(self, i):
+        self.on_iter_spread(self._spread_keys[i])
 
     def _on_field_submit(self):
         if not self._suppress:
