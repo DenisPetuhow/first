@@ -735,10 +735,12 @@ class ThreatModel:
         ctx = self._iter_ctx
         rng = np.random.default_rng()
         want = max(1, int(THREAT_ROUTE_COUNT))
+        # ОБОБЩЁННАЯ выборка: вес «medium» (вероятность ∝ сумме весов тепловой карты —
+        # «наиболее вероятные» пути) + разброс «mix» (распределённо по всей карте).
         routes, seen, tries, cap = [], set(), 0, want * 6
         while len(routes) < want and tries < cap:
             tries += 1
-            r = sample_one_route(ctx, "mix", self.p.threat_L_max,
+            r = sample_one_route(ctx, "medium", self.p.threat_L_max,
                                  self.p.threat_turn_interval_km, rng, spread="mix")
             if r is None:
                 continue
@@ -866,16 +868,18 @@ class ThreatModel:
         out[ok] = wm[iy[ok], ix[ok]]
         return out
 
-    # ---- расстановка датчиков ----
+    # ---- расстановка датчиков (ЭТАП 4: по тепловой карте МАРШРУТОВ, §4.6) ----
     def place_sensors(self):
-        """Расставить датчики. Если идут ИТЕРАЦИИ — по ИХ ВЫБОРКЕ (частота пролёта БПЛА, с
-        правилами A/B и разносом, как во вкладке 2). Иначе — по статической весовой карте.
-        (Расстановка по «всем возможным маршрутам» до итераций — задел §4.6, реализуем
-        позже вместе с минусом городам.)"""
+        """Расставить датчики по тепловой карте МАРШРУТОВ (где реально/вероятно летает БПЛА),
+        а не по сырому весу — поэтому минус-города датчикам не мешают. Выборка: идут ИТЕРАЦИИ
+        → их пролёты; иначе → ВСЕ возможные пути (строятся, если их нет). Правила A/B и разнос."""
         g = self.ensure_built()
         self.candidates = self.candidate_positions()
-        if len(self.iter_routes) >= 5:
-            self.sensors = self._place_by_routes(self.candidates, self.iter_routes)
+        if len(self.iter_routes) < 5 and len(self.routes) < 5:
+            self.plan_routes()                         # до итераций — по всем возможным путям
+        sample = self._sample_for_sensors()
+        if sample and len(sample) >= 5:
+            self.sensors = self._place_by_routes(self.candidates, sample)
         else:
             self.sensors = self._place_by_weight(self.candidates)
         cells_xy, cells_w = g.flat_cells(positive_only=False)
@@ -936,14 +940,23 @@ class ThreatModel:
         return cache.greedy(self.p.threat_N, weights, anchors=anchors,
                             anchor_sep=sep, min_sep=sep)
 
+    def _sample_for_sensors(self):
+        """Выборка маршрутов, по которой считаются датчики и 2-я тепловая карта (§4.6):
+        идут ИТЕРАЦИИ → их выборка; иначе → ВСЕ возможные пути (наиболее вероятные)."""
+        if len(self.iter_routes) >= 5:
+            return self.iter_routes
+        return self.routes
+
     def route_density_field(self):
-        """2-я ТЕПЛОВАЯ КАРТА — частота пролёта БПЛА: сколько итерационных маршрутов
-        проходит через каждую клетку сетки (норм. 0..1). None, если маршрутов нет."""
-        if not self.iter_routes or self.grid is None:
+        """2-я ТЕПЛОВАЯ КАРТА — частота пролёта БПЛА: сколько маршрутов проходит через
+        каждую клетку (норм. 0..1). ДО итераций — по всем возможным путям, ПРИ итерациях —
+        по выборке пролётов (§4.6). None, если маршрутов нет."""
+        src = self._sample_for_sensors()
+        if not src or self.grid is None:
             return None
         g = self.grid
         dens = np.zeros(g.ny * g.nx, np.float64)
-        for r in self.iter_routes:
+        for r in src:
             ix = np.clip(((r[:, 0] - g.ox) / g.h).astype(int), 0, g.nx - 1)
             iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(int), 0, g.ny - 1)
             dens[np.unique(iy * g.nx + ix)] += 1.0        # клетка учитывается раз на маршрут
