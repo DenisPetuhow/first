@@ -2,101 +2,44 @@
 """
 MODEL · Построение маршрутов пролёта БПЛА по весовой карте угроз (вкладка 3).
 
-Идея (запрос пользователя, п. 3в): по готовой весовой карте построить вероятные
-линии пролёта от точки ВХОДА (у реки) к ЦЕЛИ, тяготеющие к «тяжёлым» коридорам
-(реки/дороги/ЛЭП). Реализация — поиск путей минимальной СТОИМОСТИ по сетке, где
-стоимость прохода ячейки тем МЕНЬШЕ, чем БОЛЬШЕ её вес:
+НАЗНАЧЕНИЕ. По готовой весовой (тепловой) карте построить: (1) ОГИБАЮЩУЮ — все места,
+куда БПЛА в принципе может залететь по пути вход→цель в пределах запаса хода; (2) набор
+ВЕРОЯТНЫХ маршрутов вход→цель, тяготеющих к «тяжёлым» коридорам (реки/дороги/ЛЭП) и
+обходящих города.
 
-    cost(ячейка) = base_cost + weight_scale × (1 − вес_норм)
+ДВА РАЗНЫХ ВОПРОСА — ДВА РАЗНЫХ МЕТОДА:
 
-  * `base_cost` (>0) даёт «мостик через провалы»: даже цепочка НУЛЕВЫХ ячеек между
-    двумя тяжёлыми коридорами проходима, поэтому маршрут НЕ рвётся, если пара
-    квадратов оказалась с нулевым весом (как и просил пользователь);
-  * `weight_scale` задаёт, насколько сильно высокий вес удешевляет путь (притягивает
-    маршрут к рекам/дорогам);
-  * НАСЕЛЁННЫЕ ПУНКТЫ (urban_mask) для маршрута ЗАБЛОКИРОВАНЫ (над плотной застройкой
-    не летят).
+  * «Куда ВООБЩЕ можно долететь» — детерминированно, точно. Через два поля расстояний
+    (алгоритм Дейкстры от входа и от цели): ячейка достижима, если
+    `путь_от_входа + путь_до_цели ≤ запас_хода`  (см. `flight_envelope`).
+  * «Как ВЕРОЯТНО летит» — случайные прогоны (метод Монте-Карло). Стохастическое
+    блуждание по полю расстояний к цели: на каждом шаге сосед выбирается с вероятностью
+    ∝ (приближение к цели × привлекательность по весу × удержание курса), развилка
+    разыгрывается «рулеткой» (см. `_walk_field`, `sample_one_route`).
 
-Несколько АЛЬТЕРНАТИВНЫХ коридоров получаем итеративно: найдя путь, штрафуем его
-ячейки и ищем следующий — так набор путей получается разнообразным (это же — задел
-под будущую рандомную генерацию маршрутов, см. методичку, Этап 3).
+ПОСТ-ОБРАБОТКА линии: упрощение (RDP) убирает лишние точки, интерполяция Катмулла–Рома
+делает повороты плавными дугами, а прямые — прямыми («дугами и прямыми»).
 
-Алгоритм — Дейкстра на 8-связной сетке (heapq). Сетка ~28k ячеек, путей единицы —
-доли секунды; тяжёлый расчёт всё равно идёт в фоновом потоке контроллера.
+ЕДИНИЦЫ. Всё в километрах (локальный км-фрейм сетки). Ячейки адресуются как (iy, ix) или
+плоским индексом `iy*nx + ix`. Тяжёлый расчёт идёт в фоновом потоке контроллера.
+
+ПУБЛИЧНЫЙ API (используется в model/threat_grid.py):
+  flight_envelope · build_iter_context · sample_one_route · passable_mask
 """
-import heapq
+import heapq                      # двоичная куча для Дейкстры (_dijkstra_dist)
 import numpy as np
 
-# 8 соседей: (dy, dx, множитель длины шага)
+# 8 соседей ячейки: (dy, dx, множитель длины шага). Орт. сосед — шаг h, диагональный — h·√2.
 _NEIGHBORS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
               (-1, -1, 1.41421356), (-1, 1, 1.41421356),
               (1, -1, 1.41421356), (1, 1, 1.41421356)]
 
 
 def _cell_of(grid, xy):
+    """Точка (x, y) в км -> индекс ячейки (iy, ix), обрезанный по границам сетки."""
     ix = int(np.floor((xy[0] - grid.ox) / grid.h))
     iy = int(np.floor((xy[1] - grid.oy) / grid.h))
     return (min(max(iy, 0), grid.ny - 1), min(max(ix, 0), grid.nx - 1))
-
-
-def _dijkstra(cost, blocked, start, goal):
-    """Кратчайший (по стоимости) путь на 8-связной сетке. Возвращает список индексов
-    ячеек (flat) или None, если цель недостижима."""
-    ny, nx = cost.shape
-    n = ny * nx
-    dist = np.full(n, np.inf)
-    prev = np.full(n, -1, np.int64)
-    si = start[0] * nx + start[1]
-    gi = goal[0] * nx + goal[1]
-    dist[si] = 0.0
-    pq = [(0.0, si)]
-    while pq:
-        d, u = heapq.heappop(pq)
-        if d > dist[u]:
-            continue
-        if u == gi:
-            break
-        uy, ux = divmod(u, nx)
-        for dy, dx, mul in _NEIGHBORS:
-            vy, vx = uy + dy, ux + dx
-            if vy < 0 or vy >= ny or vx < 0 or vx >= nx or blocked[vy, vx]:
-                continue
-            nd = d + mul * cost[vy, vx]
-            v = vy * nx + vx
-            if nd < dist[v]:
-                dist[v] = nd
-                prev[v] = u
-                heapq.heappush(pq, (nd, v))
-    if not np.isfinite(dist[gi]):
-        return None
-    path, c = [], gi
-    while c != -1:
-        path.append(c)
-        c = int(prev[c])
-    path.reverse()
-    return path
-
-
-def _path_to_km(grid, path):
-    xs, ys = [], []
-    for c in path:
-        iy, ix = divmod(c, grid.nx)
-        xs.append(grid.ox + (ix + 0.5) * grid.h)
-        ys.append(grid.oy + (iy + 0.5) * grid.h)
-    return np.column_stack([xs, ys])
-
-
-def _step_cost(grid, base_cost, weight_scale, urban_cost):
-    """Стоимость прохода ячейки: тем меньше, чем больше вес. Нормировка по 90-му
-    ПЕРЦЕНТИЛЮ (а не по максимуму): иначе один сверх-тяжёлый узел делает вес всех
-    остальных ≈0, стоимость почти одинаковой -> путь идёт ПО ПРЯМОЙ, игнорируя
-    коридоры. По p90 коридоры дёшевы, пустоши дороги -> путь идёт по тепловой карте."""
-    w = np.clip(grid.weight, 0.0, None)
-    pos = w[w > 0]
-    ref = float(np.percentile(pos, 90)) if pos.size else 1.0
-    wnorm = np.clip(w / max(ref, 1e-6), 0.0, 1.0)
-    return (base_cost + weight_scale * (1.0 - wnorm)
-            + urban_cost * grid.urban_mask())
 
 
 def _dijkstra_dist(passable, start, h):
@@ -182,23 +125,6 @@ def _mode_corridor_pref(wnorm, wmode):
     return 0.30 + 0.8 * wnorm                 # medium: вероятность ∝ весу
 
 
-def _chaikin(poly, iters=2):
-    """Сглаживание углов (Chaikin): острые повороты сетки → плавные довороты. Служит
-    приближением манёвра по радиусу разворота R_min (истинная кинематика — задел)."""
-    p = np.asarray(poly, float)
-    for _ in range(iters):
-        if len(p) < 3:
-            break
-        q = [p[0]]
-        for i in range(len(p) - 1):
-            a, b = p[i], p[i + 1]
-            q.append(0.75 * a + 0.25 * b)
-            q.append(0.25 * a + 0.75 * b)
-        q.append(p[-1])
-        p = np.array(q)
-    return p
-
-
 def _catmull_rom(points, seg_km=1.5, alpha=0.5):
     """ИНТЕРПОЛЯЦИЯ ломаной гладкой кривой (центростремительный сплайн Катмулла–Рома):
     кривая ПРОХОДИТ через опорные точки, острые углы сетки становятся плавными ДУГАМИ, а
@@ -259,6 +185,7 @@ def _rdp(points, eps):
 
 
 def _poly_len_km(poly):
+    """Длина ломаной (км) — сумма длин звеньев. Нужна для проверки «уложились в запас хода»."""
     d = np.diff(np.asarray(poly, float), axis=0)
     return float(np.hypot(d[:, 0], d[:, 1]).sum())
 
@@ -271,6 +198,17 @@ def _cells_yx_to_km(grid, cells_yx):
     return np.column_stack([xs, ys])
 
 
+# ─── ИЗВЕСТНЫЕ ОГРАНИЧЕНИЯ / ЗАДЕЛ НА БУДУЩЕЕ (движение маршрута) ────────────────
+#  Модель ходит ПО ЯЧЕЙКАМ 8-связной сетки, поэтому маршрут по своей природе не вполне
+#  «бпла-подобный»: остаются мелкие зигзаги (8 фиксированных направлений), возможны
+#  локальные возвраты назад (back_allow) и не учитывается настоящая кинематика (радиус
+#  разворота R_min, скорость, инерция). Пост-обработка (RDP + Катмулл-Ром) это сглаживает
+#  ВИЗУАЛЬНО, но не физически.
+#  Направление развития (не реализовано): планирование сразу в непрерывном пространстве
+#  с учётом R_min — кривые Дубинса (Dubins) / деревья RRT* по costmap, либо сглаживание
+#  с жёстким ограничением кривизны. Тогда «длина прямого участка» и радиус разворота
+#  станут настоящими кинематическими ограничениями, а не приближением.
+# ────────────────────────────────────────────────────────────────────────────────
 def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                 heading0=None, wmode="medium", visited=None):
     """Стохастический спуск по полю расстояний dfield от start к goal (надёжно приходит):
@@ -339,7 +277,10 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
             cand.append((vy, vx, mul, (uy, ux))); score.append(s)
         if not cand:
             return None
-        cum = np.cumsum(np.asarray(score, float))       # быстрый выбор ∝ весу (без rng.choice(p=))
+        # РАЗВИЛКА — «метод рулетки»: вероятность выбрать соседа ∝ его оценке score.
+        # cumsum даёт нарастающие границы секторов, searchsorted находит сектор, в который
+        # попала случайная точка на [0, сумма). Быстрее и без аллокаций rng.choice(p=...).
+        cum = np.cumsum(np.asarray(score, float))
         j = min(int(np.searchsorted(cum, rng.random() * cum[-1])), len(cand) - 1)
         vy, vx, mul, unit = cand[j]
         step = mul * h
@@ -470,48 +411,3 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix"):
     eps = float(np.clip(turn_interval_km * 0.18, grid.h * 1.2, 8.0))
     poly = _catmull_rom(_rdp(_cells_yx_to_km(grid, cells), eps=eps))
     return poly if _poly_len_km(poly) <= L_max * 1.15 else None
-
-
-def iterate_routes(grid, entry_km, target_km, n_routes, mode, L_max,
-                   turn_interval_km, max_gap_km, seed=None):
-    """МНОЖЕСТВО вероятных маршрутов (итерационная модель, методичка §4.5) — пакетно.
-    Каждый — стохастический проход вход→цель по коридорам: развилки выбираются случайно
-    по весу коридора соседа (режим heavy/balanced/light/mix), курс держится между
-    доворотами, длина ограничена запасом хода L_max. Возвращает список (M,2) км."""
-    ctx = build_iter_context(grid, entry_km, target_km, max_gap_km)
-    if not ctx["reachable"]:
-        return []
-    rng = np.random.default_rng(seed)
-    routes, tries, cap = [], 0, max(1, int(n_routes)) * 6
-    while len(routes) < int(n_routes) and tries < cap:
-        tries += 1
-        r = sample_one_route(ctx, mode, L_max, turn_interval_km, rng)
-        if r is not None:
-            routes.append(r)
-    return routes
-
-
-def plan_routes(grid, entry_km, target_km, n_routes, base_cost, weight_scale,
-                urban_cost=200.0):
-    """Список маршрутов (каждый — (M,2) км) от входа к цели. Первый — самый «тяжёлый»
-    коридор; далее альтернативы (через штраф уже пройденных ячеек).
-
-    Город — не жёсткий запрет, а БОЛЬШАЯ доп. стоимость (urban_cost): маршрут сильно
-    обходит населённые пункты, но если вход/цель заданы В городе — путь всё равно
-    существует (иначе, окружив старт застройкой, мы получили бы «маршрут не найден»)."""
-    base = _step_cost(grid, base_cost, weight_scale, urban_cost)
-    blocked = np.zeros(grid.weight.shape, bool)               # жёстких запретов нет
-
-    start = _cell_of(grid, entry_km)
-    goal = _cell_of(grid, target_km)
-    penalty = np.ones_like(base)
-    routes = []
-    for _ in range(max(1, int(n_routes))):
-        path = _dijkstra(base * penalty, blocked, start, goal)
-        if path is None:
-            break
-        routes.append(_path_to_km(grid, path))
-        for c in path:                                         # штраф коридора -> разнообразие
-            iy, ix = divmod(c, grid.nx)
-            penalty[max(0, iy - 1):iy + 2, max(0, ix - 1):ix + 2] *= 2.5
-    return routes

@@ -44,15 +44,22 @@ _KM_PER_DEG_LAT = 110.574
 
 
 def _km_per_deg_lon(lat0):
+    """Сколько км в одном градусе ДОЛГОТЫ на широте lat0. Меридианы сходятся к полюсам,
+    поэтому длина градуса долготы = 111.32 км × cos(широта) (по широте она почти постоянна,
+    _KM_PER_DEG_LAT). Это и есть локальная равнопромежуточная проекция «градусы → км»."""
     return 111.320 * math.cos(math.radians(lat0))
 
 
 def lonlat_to_km(lon, lat, lon0, lat0):
+    """Перевод (долгота, широта) → (x, y) в км относительно опорной точки (lon0, lat0).
+    Работает и со скалярами, и с массивами numpy. Единая км-система для сетки/маршрутов/датчиков."""
     return ((np.asarray(lon, float) - lon0) * _km_per_deg_lon(lat0),
             (np.asarray(lat, float) - lat0) * _KM_PER_DEG_LAT)
 
 
 def bbox_lonlat_to_km(bbox_lonlat, lon0, lat0):
+    """Прямоугольник участка из градусов (lon_min,lat_min,lon_max,lat_max) → в км
+    (x0,x1,y0,y1), с сортировкой границ по возрастанию."""
     lo, la, ho, ha = bbox_lonlat
     x0, y0 = lonlat_to_km(lo, la, lon0, lat0)
     x1, y1 = lonlat_to_km(ho, ha, lon0, lat0)
@@ -696,6 +703,9 @@ class ThreatModel:
 
     # ---- построение карты (наложение цифровых слоёв на сетку) ----
     def build(self):
+        """Загрузить цифровые слои (из файла/кэша/демо) и наложить их на сетку 500 м —
+        получить весовую (тепловую) карту. Сбрасывает прежние маршруты/датчики/контекст
+        выборки (карта пересобрана). Возвращает готовую ThreatGrid."""
         self.layers, self.source = load_layers(
             self.lon0, self.lat0, self.data_path, THREAT_BBOX_LONLAT)
         self.grid = build_threat_grid(self.layers, self.bbox_km,
@@ -845,12 +855,16 @@ class ThreatModel:
         return self.p.threat_L_max
 
     def ensure_built(self):
+        """Гарантировать, что карта построена (построить, если ещё нет), и вернуть сетку."""
         if self.grid is None:
             self.build()
         return self.grid
 
     # ---- кандидатные позиции датчика (сетка минус вода) ----
     def candidate_positions(self):
+        """Возможные места установки датчика — узлы регулярной сетки с шагом
+        threat_cand_step_km, МИНУС вода (датчик на воду не ставим). Из них жадный алгоритм
+        выбирает N лучших (см. place_sensors)."""
         g = self.ensure_built()
         step = max(0.5, float(self.p.threat_cand_step_km))
         kx0, kx1, ky0, ky1 = self.bbox_km

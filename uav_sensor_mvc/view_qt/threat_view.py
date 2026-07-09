@@ -23,7 +23,18 @@ from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from . import geomap as gm
 
-# Цвета векторных слоёв цифровой карты (различимые на тёмной подложке/спутнике)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ЦВЕТА ВКЛАДКИ 3 — ПРАВИТЬ ЗДЕСЬ (одно место на всю вкладку)
+# ───────────────────────────────────────────────────────────────────────────────
+#  1) LAYER_STYLE — векторные слои цифровой карты (реки/дороги/ЛЭП/…): цвет,
+#     толщина линии, штрих (dash). Каждый ключ = слой из THREAT_LAYERS.
+#  2) THREAT_COLORS — маршруты, огибающая, датчики, маркеры и легенда. Значение
+#     используется И в слое на карте, И в легенде — правка в одном месте меняет оба.
+#     В комментарии указано, ГДЕ на карте применяется цвет (имя элемента/метода).
+#  Формат: "#rrggbb" (hex) либо (r, g, b, a) — RGBA 0..255 для полупрозрачных заливок.
+#  Прозрачность отдельных ЛИНИЙ задаётся рядом с элементом (alpha в mkPen) — см.
+#  _build_scene_items; здесь — базовые цвета.
+# ═══════════════════════════════════════════════════════════════════════════════
 LAYER_STYLE = {
     "river":      dict(color="#3aa0ff", width=3.4, dash=None),
     "road_major": dict(color="#ff9f43", width=3.2, dash=None),
@@ -34,6 +45,32 @@ LAYER_STYLE = {
     "tree_row":   dict(color="#4fd18b", width=2.2, dash=[1, 3]),
     "built_up":   dict(color="#8aa0b6", width=1.7, dash=None),
 }
+
+THREAT_COLORS = {
+    # — МАРШРУТЫ (линии на карте и в легенде) —
+    "route_all":   "#00e5ff",           # все возможные маршруты (полупрозр.), self.route_item
+    "route_iter":  "#ff5a5a",           # накопленные итерационные («выборка»), self.route_iter_item
+    "route_gen":   "#ff2d2d",           # обобщённая выборка 10 %, self.route_gen_item
+    "route_main":  "#0a0a0a",           # ОСНОВНОЙ (текущий) маршрут итерации — чёрный, self.route_cur_item
+    "uav":         "#ff4dff",           # маркер летящего БПЛА, self.uav_marker
+    # — ОГИБАЮЩАЯ И ДАТЧИКИ —
+    "envelope":    (255, 70, 245, 120),  # «все места пролёта» (розовая заливка), render_routes
+    "sensor":      "#ff8c1a",           # датчики: кольцо зоны обзора + центр, render_sensors
+    # — ПРОЧИЕ ЗНАЧКИ/ЛЕГЕНДА —
+    "crossing":    "#ffd166",           # перекрёстки-развилки (ромбы), self.crossing_scatter
+    "crossing_edge": "#7a5c00",         # обводка ромбов перекрёстков
+    "legend_bg":   "#0b111c",           # фон панели-легенды
+    "legend_head": "#36c5f0",           # заголовок легенды
+    "legend_area": "#ff4dff",           # квадрат «места пролёта» в легенде (= розовая заливка)
+    "legend_main": "#e6edf3",           # образец ОСНОВНОГО маршрута в легенде: светлый, т.к.
+                                        # чёрная линия (route_main) на тёмном фоне легенды не видна
+    "legend_entry": "#3ddc97",          # вход A в легенде (на карте — THEME['ok'])
+    "legend_target": "#ff5d6c",         # цель B в легенде (на карте — THEME['warn'])
+    "legend_bridge": "#ff5d6c",         # мост в легенде
+}
+# Зоны-исключения (маска), render_exclusions — RGBA 0..255:
+THREAT_URBAN_RGBA = (255, 93, 108, 120)   # город — красный (исключён из пролёта)
+THREAT_WATER_RGBA = (58, 160, 255, 150)   # вода — синий (запрет установки датчика)
 
 
 def _threat_cmap():
@@ -58,6 +95,16 @@ def _iter_heat_lut():
 
 
 class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
+    """Экран вкладки 3: карта-подложка + слои (тепловая карта весов, векторные слои,
+    огибающая, маршруты, датчики) + панель управления справа.
+
+    ТОЛЬКО отрисовка и ввод — расчётов не содержит (их делает ThreatModel, дирижирует
+    ThreatController). Каждый слой карты — отдельный элемент pyqtgraph (`ImageItem` для
+    растров-масок, `PlotDataItem` для линий-маршрутов, `ScatterPlotItem` для точек). Порядок
+    наложения слоёв задаётся Z-value (см. `_build_scene_items`): чем больше — тем выше;
+    зона обзора датчиков стоит поверх всего. Цвета — в палитрах THREAT_COLORS / LAYER_STYLE
+    вверху файла. Методы `render_*` принимают данные из контроллера и обновляют элементы;
+    методы `get_*`/`set_*` — обмен значениями полей с контроллером."""
 
     THREAT_PARAM_SPECS = [
         ("threat_N", "Датчиков N", int),
@@ -187,10 +234,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             setattr(self, name, fn)
 
     def _legend_html(self):
-        """HTML-легенда: какой цвет какой объект. Яркий фон + крупный шрифт."""
-        rows = ['<div style="background:#0b111c;padding:8px 12px;border:2px solid '
-                '#36c5f0;border-radius:6px;font-size:10pt;color:#ffffff;line-height:155%;">']
-        rows.append('<b style="color:#36c5f0;">ЛЕГЕНДА · слои цифровой карты</b><br>')
+        """HTML-легенда (что каким цветом). ВСЕ цвета берутся из палитр THREAT_COLORS и
+        LAYER_STYLE (вверху файла) — правка там меняет и карту, и легенду синхронно."""
+        c = THREAT_COLORS
+        rows = [f'<div style="background:{c["legend_bg"]};padding:8px 12px;border:2px solid '
+                f'{c["legend_head"]};border-radius:6px;font-size:10pt;color:#ffffff;line-height:155%;">']
+        rows.append(f'<b style="color:{c["legend_head"]};">ЛЕГЕНДА · слои цифровой карты</b><br>')
         from config import THREAT_LAYERS as _TL
         for name in THREAT_LAYER_ORDER:
             st = LAYER_STYLE.get(name)
@@ -198,17 +247,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 continue
             lab = _TL.get(name, {}).get("label", name)
             rows.append(f'<span style="color:{st["color"]};font-size:13pt;">&#9644;&#9644;</span> {lab}<br>')
-        rows.append('<span style="color:#ff5d6c;">&#9650;</span> мост &nbsp; '
-                    '<span style="color:#ffd166;">&#9670;</span> пересечение (развилка)<br>')
-        rows.append('<span style="color:#ff4dff;">&#9632;</span> места пролёта (огибающая) '
-                    '&nbsp; <span style="color:#00e5ff;font-size:13pt;">&#9644;&#9644;</span> '
+        rows.append(f'<span style="color:{c["legend_bridge"]};">&#9650;</span> мост &nbsp; '
+                    f'<span style="color:{c["crossing"]};">&#9670;</span> пересечение (развилка)<br>')
+        rows.append(f'<span style="color:{c["legend_area"]};">&#9632;</span> места пролёта (огибающая) '
+                    f'&nbsp; <span style="color:{c["route_all"]};font-size:13pt;">&#9644;&#9644;</span> '
                     'возможные маршруты<br>')
-        rows.append('<span style="color:#e6edf3;font-size:13pt;">&#9644;&#9644;</span> основной '
-                    'маршрут (чёрный) &nbsp; <span style="color:#ff2d2d;font-size:13pt;">&#9644;&#9644;</span> '
+        rows.append(f'<span style="color:{c["legend_main"]};font-size:13pt;">&#9644;&#9644;</span> основной '
+                    f'маршрут (чёрный) &nbsp; <span style="color:{c["route_gen"]};font-size:13pt;">&#9644;&#9644;</span> '
                     'выборка маршрутов<br>')
-        rows.append('<span style="color:#ff8c1a;">&#9679;</span> датчик (зона обзора — поверх всего)<br>')
-        rows.append('<span style="color:#3ddc97;">&#9733;</span> вход (A) &nbsp; '
-                    '<span style="color:#ff5d6c;">&#10005;</span> цель (B)')
+        rows.append(f'<span style="color:{c["sensor"]};">&#9679;</span> датчик (зона обзора — поверх всего)<br>')
+        rows.append(f'<span style="color:{c["legend_entry"]};">&#9733;</span> вход (A) &nbsp; '
+                    f'<span style="color:{c["legend_target"]};">&#10005;</span> цель (B)')
         rows.append('</div>')
         return "".join(rows)
 
@@ -526,6 +575,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     # ==================================================================
     def _build_scene_items(self):
+        """Создать ВСЕ постоянные слои-элементы карты один раз (потом только меняем данные,
+        а не пересоздаём). Порядок наложения — через setZValue: подложка/тепло — отрицательные,
+        маршруты — 1..6, датчики и точки A/B — 20..22 (поверх всего). Цвета — из THREAT_COLORS."""
         # весовая карта (тепловой слой)
         self.threat_img = pg.ImageItem(); self.threat_img.setOpts(axisOrder="row-major")
         self.threat_img.setZValue(-8); self.threat_img.setOpacity(0.55)
@@ -571,7 +623,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # линии-примеры маршрутов поверх фона-огибающей: бирюзовый, но ПОЛУПРОЗРАЧНЫЙ —
         # чтобы не перекрывать датчики и не сливаться в сплошную заливку.
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                       pen=pg.mkPen(_qcolor("#00e5ff", 100), width=1.6))
+                                       pen=pg.mkPen(_qcolor(THREAT_COLORS["route_all"], 100), width=1.6))
         self.route_item.setZValue(3)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
@@ -582,31 +634,31 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # Анимацию ведёт контроллер (iter_setup_flight/iter_update_flight) — как вкладка 2.
         # накопленные итерационные маршруты («выборка») — КРАСНЫЕ и полупрозрачные (менее плотно)
         self.route_iter_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                            pen=pg.mkPen(_qcolor("#ff5a5a", 80), width=1.4))
+                                            pen=pg.mkPen(_qcolor(THREAT_COLORS["route_iter"], 80), width=1.4))
         self.route_iter_item.setZValue(1)
         # ОБОБЩЁННАЯ выборка (~10 % итераций) — тоже КРАСНАЯ, но плотнее накопленных (её видно).
         self.route_gen_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                           pen=pg.mkPen(_qcolor("#ff2d2d", 160), width=2.2))
+                                           pen=pg.mkPen(_qcolor(THREAT_COLORS["route_gen"], 160), width=2.2))
         self.route_gen_item.setZValue(4); self.route_gen_item.setVisible(False)
         # ОСНОВНОЙ (текущий) маршрут итерации — ЧЁРНЫЙ, чётко виден на светлой карте
         self.route_cur_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                           pen=pg.mkPen(_qcolor("#0a0a0a", 255), width=3.2))
+                                           pen=pg.mkPen(_qcolor(THREAT_COLORS["route_main"], 255), width=3.2))
         self.route_cur_item.setZValue(5); self.route_cur_item.setVisible(False)
         self.uav_marker = pg.ScatterPlotItem(
-            size=14, symbol="t1", brush=pg.mkBrush(_qcolor("#ff4dff")),
+            size=14, symbol="t1", brush=pg.mkBrush(_qcolor(THREAT_COLORS["uav"])),
             pen=pg.mkPen("white", width=1.3))
         self.uav_marker.setZValue(6); self.uav_marker.setVisible(False)
         self.pi.addItem(self.uav_marker)
         # пересечения (перекрёстки дорог/рек/ЛЭП) — узлы развилок, скрыто по умолчанию
         self.crossing_scatter = pg.ScatterPlotItem(
-            size=7, symbol="d", brush=pg.mkBrush(_qcolor("#ffd166", 220)),
-            pen=pg.mkPen("#7a5c00", width=0.6))
+            size=7, symbol="d", brush=pg.mkBrush(_qcolor(THREAT_COLORS["crossing"], 220)),
+            pen=pg.mkPen(THREAT_COLORS["crossing_edge"], width=0.6))
         self.crossing_scatter.setZValue(-2); self.pi.addItem(self.crossing_scatter)
 
         # легенда векторных слоёв (цвет -> объект) — что чем отображается.
         # anchor (0,1) — точка привязки = НИЖНИЙ-левый угол текста (легенда в левом
         # нижнем углу вида); включается отдельным чекбоксом «легенда».
-        self.legend = pg.TextItem(anchor=(0, 1), fill=pg.mkBrush("#0b111c"))
+        self.legend = pg.TextItem(anchor=(0, 1), fill=pg.mkBrush(THREAT_COLORS["legend_bg"]))
         self.legend.setZValue(20); self.legend.setHtml(self._legend_html())
         self.pi.addItem(self.legend); self.legend.setVisible(False)
 
@@ -774,9 +826,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         shape = (water_mask if water_mask is not None else urban_mask).shape
         rgba = np.zeros(shape + (4,), np.ubyte)
         if urban_mask is not None:
-            rgba[urban_mask] = (255, 93, 108, 120)     # красный — город (исключён)
+            rgba[urban_mask] = THREAT_URBAN_RGBA       # красный — город (исключён), палитра
         if water_mask is not None:
-            rgba[water_mask] = (58, 160, 255, 150)     # синий — вода (запрет датчика)
+            rgba[water_mask] = THREAT_WATER_RGBA       # синий — вода (запрет датчика), палитра
         self.water_img.setImage(rgba, autoLevels=False)
         x0, x1, y0, y1 = extent
         self.water_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
@@ -790,7 +842,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if show and route_area is not None and np.asarray(route_area).any():
             ra = np.asarray(route_area)
             rgba = np.zeros(ra.shape + (4,), np.ubyte)
-            rgba[ra] = (255, 70, 245, 120)                 # розовый фон — все достижимые места (плотнее/контрастнее)
+            rgba[ra] = THREAT_COLORS["envelope"]           # розовый фон — все достижимые места (палитра)
             self.route_area_img.setImage(rgba, autoLevels=False)
             x0, x1, y0, y1 = extent
             self.route_area_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
@@ -900,9 +952,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.cand_scatter.setData(cand[:, 0], cand[:, 1])
         self.cand_scatter.setVisible(True)
 
-    SENSOR_COLOR = "#ff8c1a"      # оранжевый — датчики хорошо видны на карте
+    SENSOR_COLOR = THREAT_COLORS["sensor"]   # цвет датчиков — см. палитру THREAT_COLORS
 
     def render_sensors(self, sensors, R):
+        """Нарисовать датчики: у каждого — КОЛЬЦО зоны обзора радиуса R (залитый круг) и
+        яркая точка-центр. Старые убираем и создаём заново (число меняется). Стоят поверх
+        всех слоёв (Z=20/21), чтобы маршруты их не перекрывали. Цвет — THREAT_COLORS['sensor']."""
         for it in self._sensor_items:
             self.pi.removeItem(it)
         self._sensor_items.clear()
