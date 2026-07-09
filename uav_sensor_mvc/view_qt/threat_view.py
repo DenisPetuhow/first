@@ -342,10 +342,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_water.setToolTip("Синим — вода (запрет датчика), красным — населённые "
                                   "пункты (исключены из пролёта и из веса).")
         self.chk_cand = QtWidgets.QCheckBox("кандидатные позиции")
-        self.chk_routes = QtWidgets.QCheckBox("маршруты (все возможные)")
-        self.chk_routes.setToolTip("ВСЕ возможные маршруты вход→цель (розовым) по коридорам "
-                                   "тепловой карты в пределах запаса хода — не 14, а сколько "
-                                   "уместится (зависит от L_max). Плюс огибающая мест пролёта.")
+        self.chk_routes = QtWidgets.QCheckBox("маршруты (все места пролёта)")
+        self.chk_routes.setToolTip("Розовый ФОН = ВСЕ достижимые места пролёта (огибающая): "
+                                   "куда БПЛА может дойти A→место→цель ≤ L_max по коридорам "
+                                   "(вес≠0 + мостики < шага БПЛА) — считается ГРАФОМ, точно, "
+                                   "включая юг. Поверх — линии-ПРИМЕРЫ путей (их всего "
+                                   "экспоненциально много, показываем выборку).")
         self.chk_cross = QtWidgets.QCheckBox("пересечения (перекрёстки)")
         self.chk_cross.setToolTip("Узлы, где сходятся ≥2 разных слоёв (дорога×река=мост, "
                                   "дорога×ЛЭП и т.д.) — точки развилок. Скрыто по умолчанию.")
@@ -534,10 +536,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_area_img = pg.ImageItem(); self.route_area_img.setOpts(axisOrder="row-major")
         self.route_area_img.setZValue(-6); self.route_area_img.setVisible(False)
         self.pi.addItem(self.route_area_img)
-        # ВСЕ возможные маршруты вход->цель (розовым, тонко/полупрозрачно — плотность видна
-        # как градиент: где путей больше, там ярче, а не сплошной «фон»)
+        # линии-примеры маршрутов поверх фона-огибающей (потолще, ярче)
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                       pen=pg.mkPen(_qcolor("#ff4dff", 70), width=0.9))
+                                       pen=pg.mkPen(_qcolor("#ff4dff", 130), width=1.6))
         self.route_item.setZValue(3)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
@@ -742,11 +743,21 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.water_img.setVisible(True)
 
     def render_routes(self, routes, route_area, extent, toggles):
-        """ВСЕ возможные маршруты вход→цель (розовые ЛИНИИ). Огибающую-«фон» (route_area)
-        НЕ рисуем — она путала («розовый фон»); сами линии показывают достижимую область."""
+        """ВСЕ возможные места пролёта: розовый ФОН = огибающая (route_area) — КОРРЕКТНО
+        посчитанная ГРАФОМ достижимость A→ячейка→цель ≤ L_max (все места, куда может дойти
+        БПЛА по коридорам, включая юг). Поверх — розовые ЛИНИИ-примеры маршрутов."""
         show = toggles["show_routes"]
-        self.route_area_img.setVisible(False)              # без заливки-фона — только линии
-        # ВСЕ возможные маршруты (розовыми линиями)
+        if show and route_area is not None and np.asarray(route_area).any():
+            ra = np.asarray(route_area)
+            rgba = np.zeros(ra.shape + (4,), np.ubyte)
+            rgba[ra] = (255, 77, 255, 60)                  # розовый фон — все достижимые места
+            self.route_area_img.setImage(rgba, autoLevels=False)
+            x0, x1, y0, y1 = extent
+            self.route_area_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+            self.route_area_img.setVisible(True)
+        else:
+            self.route_area_img.setVisible(False)
+        # линии-примеры маршрутов поверх фона
         if show and routes:
             nan = np.array([np.nan])
             xs, ys = [], []

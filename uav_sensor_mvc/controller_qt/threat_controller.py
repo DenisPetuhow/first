@@ -246,9 +246,10 @@ class ThreatController:
         elif kind == "routes":
             self._render_all()
             self._full_metrics()
+            n, area = self.model.reachable_stats()
             self.view.set_title(
-                f"Возможных маршрутов А→Б: {len(self.model.routes)} · "
-                f"L_max={self.model.p.threat_L_max:g} км (заход с любой стороны).")
+                f"Мест пролёта (граф, ≤L_max): {area:.0f} км² ({n} ячеек) · "
+                f"линий-примеров {len(self.model.routes)} · L_max={self.model.p.threat_L_max:g} км.")
         elif kind == "iter":
             self.view.iter_clear_current()               # пакетно — без летящего маркера
             if len(self.model.iter_routes) >= 5:         # датчики по выборке маршрутов
@@ -429,9 +430,11 @@ class ThreatController:
             f"  участок {kx1-kx0:.0f}×{ky1-ky0:.0f} км",
             f"  ячейка {cell*1000:.0f} м",
             f"  источник: {self.model.source}", "",
-            "МАРШРУТЫ",
-            f"  возможных путей А→Б: {len(self.model.routes)}",
-            f"  итерационных (выборка): {len(self.model.iter_routes)}",
+            "МЕСТА ПРОЛЁТА (граф, ≤ L_max)",
+            f"  достижимо: {self.model.reachable_stats()[0]} ячеек "
+            f"= {self.model.reachable_stats()[1]:.0f} км²",
+            f"  линий-примеров: {len(self.model.routes)} · "
+            f"итерац.: {len(self.model.iter_routes)}",
             f"  запас хода L_max: {p.threat_L_max:g} км", "",
             "РЕСУРС",
             f"  N={p.threat_N}  R={p.threat_R:g} км  k={p.threat_k}",

@@ -970,6 +970,15 @@ class ThreatModel:
     def metrics(self):
         return self._metrics
 
+    def reachable_stats(self):
+        """Корректная мера «всех возможных мест пролёта» — размер огибающей (граф-обход):
+        число достижимых ячеек и их площадь (км²). Путей через них — экспоненциально много
+        (не считаем), а вот ДОСТИЖИМАЯ ОБЛАСТЬ считается точно."""
+        if self.route_area is None or self.grid is None:
+            return 0, 0.0
+        n = int(np.asarray(self.route_area).sum())
+        return n, n * (self.grid.h ** 2)
+
     # ---- точка входа (фиксирована у реки) и цель (можно задать кликом) ----
     def set_target(self, x_km, y_km):
         """Задать целевую точку кликом по карте (режим «указать цель»). Запас хода
