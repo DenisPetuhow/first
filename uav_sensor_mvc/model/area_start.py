@@ -19,14 +19,14 @@ MODEL · Режим «зона старта -> цель» (вкладка 2).
 """
 import numpy as np
 
-from config import MODES
-from . import detection
+from . import detection      # MODES теперь используется в RouteModelBase
 from .geometry import ellipse_geometry
 from .trajectories import (make_arc_by_angle, max_deflection_angle, _sample_angle,
                            polyline_length, arc_fan, maneuver_path, polyline_path,
                            turn_radius_km, signed_max_lateral,
                            representative_trajectories)
 from .optimization import CoverageCache, filter_not_past_target
+from .route_model import RouteModelBase
 
 
 # ----------------------------------------------------------------------
@@ -172,8 +172,11 @@ def sample_polyline(A, B, depth, width, L_max, rng, n_points, profile, r_min=0.5
 # ----------------------------------------------------------------------
 # Модель режима «зона старта -> цель»
 # ----------------------------------------------------------------------
-class AreaStartModel:
-    """Размещение датчиков при старте из зоны и движении к цели B."""
+class AreaStartModel(RouteModelBase):
+    """Размещение датчиков при старте из зоны и движении к цели B (вкладка 2).
+
+    Общее поведение «накопление выборки → жадная расстановка» — в RouteModelBase; здесь —
+    зона старта, порождение маршрута из случайной точки зоны, геометрия и показатели."""
 
     def __init__(self, params):
         self.p = params
@@ -194,18 +197,9 @@ class AreaStartModel:
         self._view_bbox = self._corr_bbox
 
     # ---- настройка ----
-    def set_mode(self, mode):
-        self.p.mode = mode
-
-    def set_profile(self, profile):
-        self.p.motion_profile = profile
-
+    # set_mode / set_profile / weights — в RouteModelBase (общие для вкладок 1 и 2)
     def set_movement(self, movement):
         self.movement = movement
-
-    @property
-    def weights(self):
-        return MODES[self.p.mode]
 
     def set_route(self, A, B):
         """Зафиксировать маршрут (центр зоны старта A и цель B) и сбросить выборку."""
@@ -333,37 +327,7 @@ class AreaStartModel:
         P = self.B - (2.0 / 3.0) * self.p.R * (d / L)
         return int(np.argmin(np.linalg.norm(self.candidates - P, axis=1)))
 
-    def recompute_placement(self):
-        self.sensors = self.cache.greedy(self.p.N, self.weights,
-                                         anchor_idx=self._anchor_idx(),
-                                         anchor_sep=1.35 * self.p.R)
-        return self.sensors
-
-    def add_and_replace(self, traj, feature):
-        self.trajectories.append(traj)
-        self.features.append(feature)
-        self.cache.add_trajectory(traj)
-        self.iteration += 1
-        return self.recompute_placement()
-
-    def step(self):
-        traj, feature = self.sample_trajectory()
-        sensors = self.add_and_replace(traj, feature)
-        return traj, sensors
-
-    def run_batch(self, T=None, mode=None):
-        if mode is not None:
-            self.p.mode = mode
-        T = T or self.p.T
-        self.reset()
-        for _ in range(T):
-            traj, feature = self.sample_trajectory()
-            self.trajectories.append(traj)
-            self.features.append(feature)
-            self.cache.add_trajectory(traj)
-        self.iteration = T
-        self.recompute_placement()
-        return self.sensors, self.evaluate()
+    # recompute_placement / add_and_replace / step / run_batch — в RouteModelBase
 
     # ---- слои ----
     def frequent_paths(self, n=10):
@@ -429,20 +393,4 @@ class AreaStartModel:
             share_meeting_k=float(np.mean([x >= p.k for x in n_list]) * 100.0),
             n_sensors=len(S))
 
-    def compare_modes(self):
-        saved = self.p.mode
-        out = {}
-        ai, asep = self._anchor_idx(), 1.35 * self.p.R
-        for m in MODES:
-            S = self.cache.greedy(self.p.N, MODES[m], anchor_idx=ai, anchor_sep=asep)
-            out[m] = self.evaluate(sensors=S)
-        self.p.mode = saved
-        self.recompute_placement()
-        return out
-
-    def live_metrics(self, partial_traj):
-        if len(partial_traj) < 2:
-            return 0.0, 0
-        seen = detection.continuous_coverage(partial_traj, self.sensors, self.p.R) * 100.0
-        nd = detection.n_detections(partial_traj, self.sensors, self.p.R)
-        return seen, nd
+    # compare_modes / live_metrics — в RouteModelBase

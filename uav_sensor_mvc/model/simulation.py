@@ -15,7 +15,7 @@ MODEL · Главный класс модели SimulationModel.
 """
 import numpy as np
 
-from config import Params, MODES
+from config import Params      # MODES теперь используется в RouteModelBase
 from . import detection
 from .geometry import ellipse_geometry, geo_to_local_km
 from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
@@ -24,10 +24,14 @@ from .trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
                            frequent_maneuvers, maneuver_fan, turn_radius_km,
                            representative_trajectories)
 from .optimization import candidate_grid, CoverageCache, filter_not_past_target
+from .route_model import RouteModelBase
 
 
-class SimulationModel:
-    """Вычислительная модель размещения датчиков обнаружения БПЛА."""
+class SimulationModel(RouteModelBase):
+    """Вычислительная модель размещения датчиков обнаружения БПЛА (вкладка 1, маршрут A→B).
+
+    Общее поведение «накопление выборки → жадная расстановка» — в RouteModelBase; здесь —
+    геометрия коридора A→B, порождение маршрута и показатели."""
 
     def __init__(self, params: Params):
         params.validate()
@@ -87,18 +91,10 @@ class SimulationModel:
         dx, dy = (x1 - x0) * margin, (y1 - y0) * margin + 1e-6
         return (float(x0 - dx), float(x1 + dx), float(y0 - dy), float(y1 + dy))
 
-    def set_mode(self, mode):
-        self.p.mode = mode
-
     def set_traj_model(self, traj_model):
         self.p.traj_model = traj_model
 
-    def set_profile(self, profile):
-        self.p.motion_profile = profile
-
-    @property
-    def weights(self):
-        return MODES[self.p.mode]
+    # set_mode / set_profile / weights — в RouteModelBase (общие для вкладок 1 и 2)
 
     def corridor_bbox(self):
         """Габариты полного коридора движения (все возможные маршруты)."""
@@ -134,37 +130,7 @@ class SimulationModel:
         P = B - (2.0 / 3.0) * self.p.R * (d / L)
         return int(np.argmin(np.linalg.norm(self.candidates - P, axis=1)))
 
-    def recompute_placement(self):
-        self.sensors = self.cache.greedy(self.p.N, self.weights,
-                                         anchor_idx=self._anchor_idx(),
-                                         anchor_sep=1.35 * self.p.R)
-        return self.sensors
-
-    def add_and_replace(self, traj, feature):
-        self.trajectories.append(traj)
-        self.features.append(feature)
-        self.cache.add_trajectory(traj)
-        self.iteration += 1
-        return self.recompute_placement()
-
-    def step(self):
-        traj, feature = self.sample_trajectory()
-        sensors = self.add_and_replace(traj, feature)
-        return traj, sensors
-
-    def run_batch(self, T=None, mode=None):
-        if mode is not None:
-            self.p.mode = mode
-        T = T or self.p.T
-        self.reset()
-        for _ in range(T):
-            traj, feature = self.sample_trajectory()
-            self.trajectories.append(traj)
-            self.features.append(feature)
-            self.cache.add_trajectory(traj)
-        self.iteration = T
-        self.recompute_placement()
-        return self.sensors, self.evaluate()
+    # recompute_placement / add_and_replace / step / run_batch — в RouteModelBase
 
     # ------------------------------------------------------------------
     # Слои вероятных путей (аналитические, данные не требуются)
@@ -244,23 +210,7 @@ class SimulationModel:
             n_sensors=len(S),
         )
 
-    def compare_modes(self):
-        saved = self.p.mode
-        out = {}
-        ai, asep = self._anchor_idx(), 1.35 * self.p.R
-        for m in MODES:
-            S = self.cache.greedy(self.p.N, MODES[m], anchor_idx=ai, anchor_sep=asep)
-            out[m] = self.evaluate(sensors=S)
-        self.p.mode = saved
-        self.recompute_placement()
-        return out
-
-    def live_metrics(self, partial_traj):
-        if len(partial_traj) < 2:
-            return 0.0, 0
-        seen = detection.continuous_coverage(partial_traj, self.sensors, self.p.R) * 100.0
-        nd = detection.n_detections(partial_traj, self.sensors, self.p.R)
-        return seen, nd
+    # compare_modes / live_metrics — в RouteModelBase
 
 
 def _length(traj):

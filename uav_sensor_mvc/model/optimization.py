@@ -251,11 +251,3 @@ class CoverageCache:
                 d = np.linalg.norm(self.cand - self.cand[c], axis=1)
                 avail[d < min_sep] = False
         return self.cand[chosen] if chosen else np.empty((0, 2), float)
-
-
-def greedy_placement(trajectories, candidates, N, R, k, L_segments, weights):
-    """Жадное размещение по списку маршрутов (строит CoverageCache внутри)."""
-    cache = CoverageCache(candidates, R, L_segments, k)
-    for tr in trajectories:
-        cache.add_trajectory(tr)
-    return cache.greedy(N, weights)
