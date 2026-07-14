@@ -13,4 +13,7 @@ out_serp/
 tile_cache/
 geo_cache/
 
+# Пакеты для офлайн-установки (~168 МБ, ставятся локально)
+offline_packages/
+
 .DS_Store

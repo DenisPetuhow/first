@@ -1,0 +1,10 @@
+# Нормализация переводов строк: в репозитории всегда LF.
+# Иначе git помечает все файлы как изменённые при переходе Windows <-> Linux.
+* text=auto eol=lf
+
+# Бинарные файлы — не трогать
+*.docx binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.zip  binary
