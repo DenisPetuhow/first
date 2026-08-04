@@ -11,7 +11,7 @@ import numpy as np
 from pyqtgraph.Qt import QtCore
 
 from config import (MODE_LABELS, THREAT_LAYERS, THREAT_CELL_M,
-                    THREAT_ITER_MODE_LABELS)
+                    THREAT_ITER_MODE_LABELS, THREAT_SENSOR_REFRESH_EVERY)
 
 
 class _TaskSignals(QtCore.QObject):
@@ -142,12 +142,11 @@ class ThreatController:
         """Пересчитать датчики по УЖЕ накопленной выборке пролётов — периодически, а не
         только в самом конце. Раньше во время итераций датчики стояли неподвижно (те, что
         были посчитаны по «возможным путям»), и казалось, что модель на выборку не
-        реагирует. Шаг обновления ~10 % от заказанного T (но не чаще, чем раз в 5
-        маршрутов), чтобы пересчёт не тормозил анимацию."""
+        реагирует. Шаг обновления — `THREAT_SENSOR_REFRESH_EVERY` накопленных маршрутов."""
         n = len(self.model.iter_routes)
-        if n < 5:
+        step = max(1, int(THREAT_SENSOR_REFRESH_EVERY))
+        if n < step:
             return False
-        step = max(5, int(self.model.p.threat_iter_routes) // 10)
         if not force and n - self._sensors_at < step:
             return False
         self.model.place_sensors()

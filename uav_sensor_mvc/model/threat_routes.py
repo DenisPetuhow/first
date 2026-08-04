@@ -259,6 +259,23 @@ _TAU_FREE = 0.40        # «температура» выбора соседа �
 _TAU_TIGHT = 0.05       # при исчерпанном запасе (идёт кратчайшим путём к цели)
 _SLACK_FULL_KM = 10.0   # запас, при котором маршрут считается полностью свободным
 
+# ФИНАЛЬНЫЙ ПОДХОД: ближе этого расстояния до цели маршрут больше НЕ УДАЛЯЕТСЯ от неё.
+# Виляние вбок и обход по дуге при этом разрешены — заход на цель с другой стороны это
+# нормальный манёвр. Запрещено именно «отвернул и пошёл назад» в нескольких километрах
+# от объекта (замер: 19 % маршрутов, подойдя на 15 км, снова удалялись до 5.3 км).
+FINAL_APPROACH_KM = 10.0
+# Сколько в зоне подхода разрешено отойти от цели ЗА ОДИН ШАГ. Ноль сделал бы обход
+# препятствия у объекта невозможным (маршрут упирался бы в тупик), четверть километра
+# при шаге сетки 0.5 км позволяет обогнуть помеху, но не развернуться.
+FINAL_DRIFT_KM = 0.25
+# Насколько маршруту позволено уходить ПОЗАДИ СТАРТА (проекция на ось старт→цель).
+# Немного назад в начале — нормально: БПЛА уходит от точки вылета и ищет коридор.
+# Дальше — уже «полетел не туда»: на карте это видно как полосу в обратную сторону.
+START_BACK_KM = 1.0
+VIA_BEHIND_KM = 1.0     # VIA-точка не должна лежать позади старта дальше этого
+# За цель заходить МОЖНО: облететь объект и зайти с другой стороны — штатный манёвр.
+VIA_BEYOND_KM = 10.0
+
 
 def _spend_tau(slack_km, slack0_km, frac_done, profile):
     """«Температура» выбора соседа: чем она меньше, тем жёстче маршрут идёт к цели.
@@ -313,6 +330,8 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
 
     Возвращает (список ячеек (y,x), длина_км, курс) или None (тупик / не хватило хода)."""
     grid = ctx["grid"]; pas = ctx["pas"]; wnorm = ctx["wnorm"]
+    axis_s = ctx.get("axis_s")          # проекция ячеек на ось старт→цель (км)
+    dgoal = ctx.get("dgoal")            # ПРЯМОЕ расстояние ячеек до цели (км)
     ny, nx = dfield.shape
     h = grid.h
     d_start = dfield[start]
@@ -348,6 +367,14 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         remain = dfield[cur] + tail_km
         frac_done = done / (done + remain) if (done + remain) > 1e-9 else 1.0
         tau = _spend_tau(slack, slack0, frac_done, spend)
+        # ФИНАЛЬНЫЙ ПОДХОД: рядом с целью запрещаем шаг ОТ неё (см. FINAL_APPROACH_KM).
+        # Идти вбок и обходить по дуге по-прежнему можно — заход с другой стороны это
+        # нормальный манёвр; нельзя именно «отвернуть и уйти назад» у самого объекта.
+        # tail_km — остаток пути ПОСЛЕ участка: на первом участке через VIA цель ещё
+        # далеко, там подход включать рано.
+        in_final = (tail_km <= 1e-9 and dgoal is not None
+                    and dgoal[cur] <= FINAL_APPROACH_KM)
+        allow_back = 0.0 if in_final else back_allow
         cy, cx = cur
         cand, score = [], []
         for k, (dy, dx, mul) in enumerate(_NEIGHBORS):
@@ -355,8 +382,12 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
             if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not pas[vy, vx]:
                 continue
             dj = dfield[vy, vx]
-            if not np.isfinite(dj) or dj > dfield[cur] + back_allow:   # к цели, почти без «назад»
+            if not np.isfinite(dj) or dj > dfield[cur] + allow_back:   # к цели, почти без «назад»
                 continue
+            if axis_s is not None and axis_s[vy, vx] < -START_BACK_KM:
+                continue                           # не уходить назад за точку вылета
+            if in_final and dgoal[vy, vx] > dgoal[cur] + FINAL_DRIFT_KM:
+                continue                           # у цели не отворачиваем от неё
             uy, ux = _NB_UNIT[k]
             if heading is None:
                 hf = 1.0
@@ -466,15 +497,39 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5)):
                                                 grid.ox + (cx + 0.5) * grid.h, max_km=18.0)
                     if vc is None or vc in via_cell or vc == goal or vc == start:
                         continue
-                    gv = _dijkstra_dist(pas, vc, grid.h)     # поле расстояний ОТ этой via
                     vxk = grid.ox + (vc[1] + 0.5) * grid.h
                     vyk = grid.oy + (vc[0] + 0.5) * grid.h
+                    # VIA не должна лежать ПОЗАДИ старта или ЗА целью: маршрут через
+                    # такую точку сперва уходит в сторону, обратную цели, либо пролетает
+                    # мимо цели и возвращается — на карте это выглядит как «полетел не
+                    # туда». Небольшой заступ допустим (обход препятствия у самой точки).
+                    s_axis = float((np.array([vxk, vyk]) - A) @ (B - A)) / ab
+                    if s_axis < -VIA_BEHIND_KM or s_axis > ab + VIA_BEYOND_KM:
+                        continue
+                    # VIA рядом с целью, но НЕ за ней, заставляет маршрут отвернуть у
+                    # самого объекта и вернуться — на карте это «дёрнулся в сторону в
+                    # пяти километрах от цели». Заход ЗА цель (s_axis > ab) оставляем:
+                    # облететь объект и зайти с другой стороны — штатный манёвр.
+                    if (float(np.hypot(vxk - B[0], vyk - B[1])) < FINAL_APPROACH_KM
+                            and s_axis <= ab):
+                        continue
+                    gv = _dijkstra_dist(pas, vc, grid.h)     # поле расстояний ОТ этой via
                     via_cell.append(vc)
                     via_gv.append(gv)
                     via_segd.append(_seg_dist_km((vxk, vyk), A, B))
                     via_togoal.append(float(gv[goal]))
                     via_minlen.append(float(gv[start] + gv[goal]))   # вход→via→цель, минимум
+    # Проекция каждой ячейки на ось старт→цель (км): 0 у старта, ab у цели,
+    # отрицательная — ПОЗАДИ старта. По ней маршрут ограничивается, чтобы не уходить
+    # в сторону, обратную цели (см. START_BACK_KM в _walk_field).
+    gxc, gyc = grid.cell_centers_km()
+    axis_s = ((gxc - A[0]) * (B[0] - A[0]) + (gyc - A[1]) * (B[1] - A[1])) / ab
+    # ПРЯМОЕ расстояние ячейки до цели (км). Именно его видно на карте: расстояние по
+    # коридорам (`gt`) может быть вдвое больше, и по нему зона подхода срабатывала
+    # не там, где кажется глазу.
+    dgoal = np.hypot(gxc - B[0], gyc - B[1])
     return dict(grid=grid, pas=pas, gt=gt, wnorm=wnorm, start=start, goal=goal, ab=ab,
+                axis_s=axis_s, dgoal=dgoal,
                 via_cell=via_cell, via_gv=via_gv, via_segd=np.asarray(via_segd),
                 via_minlen=np.asarray(via_minlen), via_togoal=np.asarray(via_togoal),
                 gt_start=float(gt[start]), reachable=bool(np.isfinite(gt[start])))
