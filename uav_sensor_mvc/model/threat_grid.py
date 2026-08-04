@@ -38,7 +38,7 @@ from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
                     THREAT_VILLAGE_RADIUS_MIN_KM, THREAT_VILLAGE_RADIUS_MAX_KM,
                     THREAT_RIVER_CORRIDOR_MAX_KM2,
                     THREAT_DEM_FILE, THREAT_DEM_WINDOW_KM, THREAT_DEM_WEIGHT,
-                    THREAT_DEM_FULL_M,
+                    THREAT_DEM_FULL_M, THREAT_ENTRY_FREE_KM, THREAT_TARGET_FREE_KM,
                     THREAT_LMAX_AUTO_FRAC, THREAT_LMAX_CORRIDOR_FRAC)
 
 
@@ -323,10 +323,44 @@ class ThreatGrid:
         village &= ~city                        # город главнее
         return city, village
 
+    def _free_zone_mask(self, free_points, city, village):
+        """Свободные зоны у точки вылета и у цели: где запрет города НЕ действует.
+
+        Точка задаётся как `(x, y, radius_km, expand_km)`:
+          * `radius_km` — круг вокруг самой точки;
+          * `expand_km` — если не None, добавляется ВЕСЬ населённый пункт, внутри
+            которого точка стоит, расширенный на это расстояние наружу.
+
+        Для ЦЕЛИ нужен второй режим: при цели в центре города края НП остались бы
+        закрытыми и подлёт был бы возможен лишь с одной стороны. Для ВЫЛЕТА достаточно
+        круга: расширение всего НП на радиус зоны освобождало соседние города за
+        десятки километров (на карте без минуса оказывались Лисичанск, Тошковка,
+        Гірське — они не имеют отношения к точке вылета)."""
+        free = np.zeros((self.ny, self.nx), bool)
+        if not free_points:
+            return free
+        gx, gy = self.cell_centers_km()
+        occupied = city | village
+        lab, nlab = _label8(occupied) if occupied.any() else (None, 0)
+        for pt in free_points:
+            x, y, rad = float(pt[0]), float(pt[1]), float(max(0.0, pt[2]))
+            expand = pt[3] if len(pt) > 3 else None
+            zone = np.hypot(gx - x, gy - y) <= rad          # круг вокруг точки
+            if expand is not None and lab is not None:
+                ix = int(math.floor((x - self.ox) / self.h))
+                iy = int(math.floor((y - self.oy) / self.h))
+                if 0 <= ix < self.nx and 0 <= iy < self.ny:
+                    c = int(lab[iy, ix])
+                    if c > 0:                                # точка внутри НП — весь НП
+                        zone |= _dilate(lab == c,
+                                        int(round(float(expand) / self.h)))
+            free |= zone
+        return free
+
     def apply_settlements(self, places_km, min_area_km2, town_city_km2, buffer_km,
                           village_core, village_edge, r_min_km, r_max_km,
                           river_corridor_max_km2, zero_weight=True,
-                          place_polys=None):
+                          place_polys=None, free_points=None):
         """Разметить населённые пункты и применить их к весу и проходимости.
 
         Классификация пятен застройки (связные компоненты по сырой застройке):
@@ -348,6 +382,7 @@ class ThreatGrid:
         river_corridor_max_km2; у крупных городов русло закрывается вместе с городом."""
         self._urban = np.zeros((self.ny, self.nx), bool)
         self._village_penalty = np.zeros((self.ny, self.nx), float)
+        self._free = np.zeros((self.ny, self.nx), bool)
         self.layers["village"] = np.zeros((self.ny, self.nx), float)
         self._town_city_km2 = float(town_city_km2)
         # Контуры НП из OSM (готовые границы) — основа; пятна застройки дополняют их
@@ -374,6 +409,10 @@ class ThreatGrid:
         village &= ~city
         if not (city.any() or village.any()):
             return
+        # Свободные зоны (вылет/цель) — там ничего не запрещаем и не гасим
+        self._free = self._free_zone_mask(free_points, city, village)
+        city &= ~self._free
+        village &= ~self._free
 
         # --- деревни: плавный штраф от центра к краю ---
         if village.any():
@@ -395,6 +434,7 @@ class ThreatGrid:
             small &= city                                      # вне города не трогаем
             small = _dilate(small, r) & ~_dilate(city & ~small, r)
             city_zone = city_zone & ~(river & small)
+        city_zone &= ~self._free          # буфер соседнего города не лезет в свободную зону
         self._urban = city_zone
         # Слой застройки больше НЕ штрафует сам по себе: его роль полностью взяли на
         # себя город (обнуление) и деревня (градиент). Иначе деревня получала минус
@@ -524,19 +564,59 @@ class ThreatGrid:
         return self._relief
 
     def set_bridge_mask_from_layer(self):
-        """Ячейки с мостом — прямо из слоя `bridge` (реальные объекты OSM bridge=yes).
-        Прежде мост ВЫЧИСЛЯЛСЯ как пересечение реки с дорогой и появлялся там, где по
-        векторным данным моста нет; теперь берём только размеченные переправы."""
+        """Ячейки-ПЕРЕПРАВЫ: мост из OSM (`bridge=yes`) НАД ВОДОЙ. Прежде мост
+        вычислялся как пересечение реки с дорогой и появлялся там, где по векторным
+        данным моста нет.
+
+        Маркерами показываем только переправы: тег `bridge` висит и на путепроводах над
+        дорогами и ж/д (замер: 466 мостов, из них 386 над водой и 80 путепроводов), а
+        для маршрута значима именно переправа через водную преграду. Сами мосты как
+        линии рисуются отдельным слоем — там видно все."""
         m = self._present.get("bridge")
-        self._bridge_mask = (m.copy() if m is not None
-                             else np.zeros((self.ny, self.nx), bool))
+        if m is None:
+            self._bridge_mask = np.zeros((self.ny, self.nx), bool)
+            return
+        water = np.zeros((self.ny, self.nx), bool)
+        for key in ("river", "stream"):
+            w = self._present.get(key)
+            if w is not None:
+                water |= w
+        self._bridge_mask = m & _dilate(water, 1) if water.any() else m.copy()
 
     def bridge_cells_km(self):
-        """Центры ячеек-мостов (для маркеров на карте)."""
+        """Центры ячеек-мостов — грубая привязка (шаг сетки 500 м). Для маркеров лучше
+        `bridge_points_km`: тот даёт реальные координаты."""
         iy, ix = np.nonzero(self._bridge_mask)
         x = self.ox + (ix + 0.5) * self.h
         y = self.oy + (iy + 0.5) * self.h
         return list(zip(x.tolist(), y.tolist()))
+
+    def bridge_points_km(self, bridge_polys):
+        """ТОЧНЫЕ координаты переправ: середина каждой мостовой линии OSM, проходящей
+        над водой. Раньше маркер ставился в центр ЯЧЕЙКИ (500 м), и при приближении
+        треугольник заметно не совпадал с самим мостом — до 250 м в сторону."""
+        water = np.zeros((self.ny, self.nx), bool)
+        for key in ("river", "stream"):
+            w = self._present.get(key)
+            if w is not None:
+                water |= w
+        if not water.any():
+            return []
+        wet = _dilate(water, 1)
+        out = []
+        for poly in bridge_polys or []:
+            P = np.asarray(poly, float)
+            if P.ndim != 2 or len(P) < 2:
+                continue
+            ix = np.floor((P[:, 0] - self.ox) / self.h).astype(int)
+            iy = np.floor((P[:, 1] - self.oy) / self.h).astype(int)
+            ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
+            if not ok.any() or not wet[iy[ok], ix[ok]].any():
+                continue                       # мост не над водой — это путепровод
+            seg = P[ok]
+            mid = seg[len(seg) // 2]           # середина линии моста
+            out.append((float(mid[0]), float(mid[1])))
+        return out
 
     def crossing_cells_km(self, min_layers=2):
         """Центры ячеек-ПЕРЕСЕЧЕНИЙ: где сходятся ≥ min_layers РАЗНЫХ слоёв-аттракторов
@@ -1116,7 +1196,7 @@ def _synthetic_layers(lon0, lat0):
 # Построение весовой карты из слоёв
 # ----------------------------------------------------------------------
 def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None,
-                      dem=None):
+                      dem=None, free_points=None):
     """Собрать ThreatGrid: наложить слои с весами из THREAT_LAYERS, funnel-бонус,
     рельеф, разметить населённые пункты, отметить воду для запрета датчиков.
 
@@ -1158,7 +1238,8 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None,
                             THREAT_VILLAGE_RADIUS_MIN_KM, THREAT_VILLAGE_RADIUS_MAX_KM,
                             THREAT_RIVER_CORRIDOR_MAX_KM2,
                             zero_weight=THREAT_CITY_ZERO_WEIGHT,
-                            place_polys=layers.get(PLACE_POLY_LAYER))
+                            place_polys=layers.get(PLACE_POLY_LAYER),
+                            free_points=free_points)
     # вода -> запрет датчиков (буфер из конфига); только если слой реки включён
     if enabled is None or "river" in enabled:
         wet = list(layers.get("river", [])) + list(layers.get("stream", []))
@@ -1215,11 +1296,20 @@ class ThreatModel:
             self.lon0, self.lat0, self.data_path, THREAT_BBOX_LONLAT)
         probe = ThreatGrid(self.bbox_km, THREAT_CELL_M / 1000.0)   # сетка для выборки высот
         self.dem = load_dem_grid(probe, self.lon0, self.lat0)      # None, если файла нет
+        entry, target = self.entry_target_km()
+        # вылет — только круг вокруг точки; цель — ещё и её населённый пункт целиком
+        # плюс буфер (иначе подлёт к цели в центре города остаётся односторонним)
+        free_points = [(entry[0], entry[1], THREAT_ENTRY_FREE_KM, None),
+                       (target[0], target[1], THREAT_TARGET_FREE_KM,
+                        THREAT_TARGET_FREE_KM)]
         self.grid = build_threat_grid(self.layers, self.bbox_km,
-                                      enabled=self.enabled_layers, dem=self.dem)
+                                      enabled=self.enabled_layers, dem=self.dem,
+                                      free_points=free_points)
         if self.dem is not None:
             self.source += " + рельеф"
-        self.layers["bridge_pts"] = self.grid.bridge_cells_km()   # мосты — ячейки слоя
+        # маркеры переправ — по РЕАЛЬНЫМ координатам мостов, а не по центрам ячеек
+        self.layers["bridge_pts"] = self.grid.bridge_points_km(
+            self.layers.get("bridge", []))
         self.sensors = np.empty((0, 2), float)
         self.routes = []
         self.iter_routes = []
@@ -1673,6 +1763,8 @@ class ThreatModel:
         self.iter_iteration = 0
         self._iter_ctx = None                          # цель сменилась — контекст устарел
         self.sync_auto_L_max()
+        if self.grid is not None:
+            self.build()      # свободная зона привязана к цели -> карту пересобрать
 
     def entry_km(self):
         _, elon, elat = THREAT_ENTRY

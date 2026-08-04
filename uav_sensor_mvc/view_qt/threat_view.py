@@ -45,6 +45,7 @@ LAYER_STYLE = {
     "power":      dict(color="#f6e05e", width=2.0, dash=[2, 3]),
     "pipeline":   dict(color="#b794f6", width=2.2, dash=[8, 4]),
     "tree_row":   dict(color="#4fd18b", width=2.2, dash=[1, 3]),
+    "bridge":     dict(color="#ff6b6b", width=3.0, dash=None),
     "built_up":   dict(color="#8aa0b6", width=1.7, dash=None),
 }
 
@@ -791,7 +792,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # ---- отрисовка данных карты ----
     MAX_LAYER_PTS = 48000     # предел точек на слой при отрисовке (прореживание)
     MAX_LAYER_POLYS = 10000   # предел числа линий на слой (берём самые длинные)
-    MAX_BRIDGES = 150         # предел маркеров мостов (чтобы не засорять карту)
+    MAX_BRIDGES = 600         # маркеры ПЕРЕПРАВ (мост над водой); их ~400, влезают все
     BUILTUP_RASTER_FRAC = 0.35  # кадр уже этой доли участка -> застройка контурами
 
     @classmethod
