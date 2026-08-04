@@ -68,6 +68,7 @@ class ThreatController:
         self._cur_route = None            # маршрут, который сейчас «летит»
         self._cur_j = 0                   # индекс точки анимации
         self._speed = 6                   # скорость анимации (точек за кадр)
+        self._sensors_at = 0              # при скольких маршрутах датчики пересчитаны
         view.set_callbacks(
             on_build=self.on_build, on_place=self.on_place, on_apply=self.on_apply,
             on_reset=self.on_reset, on_reset_view=self.on_reset_view,
@@ -75,11 +76,27 @@ class ThreatController:
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
             on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
-            on_iter_spread=self.on_iter_spread,
+            on_iter_spread=self.on_iter_spread, on_iter_spend=self.on_iter_spend,
             on_iter_play=self.on_iter_play, on_iter_step=self.on_iter_step,
             on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed,
             on_iter_gen_frac=self.on_iter_gen_frac)
+        # перерисовка слоёв при смене масштаба/панораме: прореживание считается по
+        # ВИДИМОЙ области, а застройка переключается растр <-> контуры
+        self.view.on_view_changed = self._on_view_changed
         self._idle_metrics()
+
+    def _on_view_changed(self):
+        """Вид изменился — перерисовать только векторные слои (остальное не зависит
+        от масштаба). Дёшево: слои и так строятся из готовых массивов."""
+        g = self.model.grid
+        if g is None:
+            return
+        t = self.view.get_toggles()
+        if not t.get("show_layers"):
+            return
+        self.view.render_layers(self.model.layers,
+                                self.model.layers.get("bridge_pts", []), t,
+                                built_mask=g._built_cells, extent=g.extent_km())
 
     # ================= ИТЕРАЦИИ (симуляция как во вкладке 2) =================
     def _iter_ready(self):
@@ -112,6 +129,7 @@ class ThreatController:
             if not self.model.iter_reset():
                 self.view.flash_title("Цель недостижима по коридорам (проверьте L_max/цель).")
                 return
+            self._sensors_at = 0                          # выборка начата заново
             self.view.iter_show_accumulated([])
         self._anim_running = True
         self.view.set_iter_running(True)
@@ -119,6 +137,23 @@ class ThreatController:
 
     def _iter_finished(self):
         return self.model.iter_iteration >= int(self.model.p.threat_iter_routes)
+
+    def _maybe_refresh_sensors(self, force=False):
+        """Пересчитать датчики по УЖЕ накопленной выборке пролётов — периодически, а не
+        только в самом конце. Раньше во время итераций датчики стояли неподвижно (те, что
+        были посчитаны по «возможным путям»), и казалось, что модель на выборку не
+        реагирует. Шаг обновления ~10 % от заказанного T (но не чаще, чем раз в 5
+        маршрутов), чтобы пересчёт не тормозил анимацию."""
+        n = len(self.model.iter_routes)
+        if n < 5:
+            return False
+        step = max(5, int(self.model.p.threat_iter_routes) // 10)
+        if not force and n - self._sensors_at < step:
+            return False
+        self.model.place_sensors()
+        self._sensors_at = n
+        self.view.render_sensors(self.model.sensors, self.model.p.threat_R)
+        return True
 
     def _anim_stop(self):
         self._anim.stop()
@@ -133,8 +168,7 @@ class ThreatController:
         if self._cur_route is None:
             if self._iter_finished():
                 self._anim_stop()
-                if len(self.model.iter_routes) >= 5:       # датчики по выборке маршрутов
-                    self.model.place_sensors()
+                self._maybe_refresh_sensors(force=True)    # финал: по всей выборке пролётов
                 self._render_all()
                 self._full_metrics()
                 self.view.set_title(self._iter_title() + " — готово. Датчики по выборке пролётов.")
@@ -163,6 +197,7 @@ class ThreatController:
         self.view.iter_update_flight(self._cur_route, self._cur_j)
         if self._cur_j >= end:                            # долетел -> следующая итерация
             self._cur_route = None
+            self._maybe_refresh_sensors()                 # датчики «сходятся» по ходу выборки
             if self.view.get_toggles().get("show_iter_gen"):   # 10 % «на этот момент»
                 self._refresh_generalized()
 
@@ -177,10 +212,12 @@ class ThreatController:
             if not self.model.iter_reset():
                 self.view.flash_title("Цель недостижима по коридорам.")
                 return
+            self._sensors_at = 0                          # выборка начата заново
         route = self.model.iter_step()
         self.view.iter_show_accumulated(self.model.iter_routes)
         if route is not None:
             self.view.iter_update_flight(route, len(route) - 1)   # весь маршрут + БПЛА в цели
+        self._maybe_refresh_sensors()                            # датчики по накопленной выборке
         self._refresh_generalized()                              # 10 % «на этот момент»
         self.view.set_title(self._iter_title())
 
@@ -192,22 +229,35 @@ class ThreatController:
         self.view.iter_clear_current()
         self.view.set_iter_checked(True)
         self.model.p.threat_iter_routes = self.view.get_iter_T()
+        self._sensors_at = 0                             # iter_batch начинает выборку заново
         self._run_async("iter", self.model.iter_batch)
 
     # ---- окно «Входные данные»: применить сразу (не блокирует программу) ----
     def on_input_apply(self, vals):
+        gap_before = getattr(self.model.p, "threat_max_gap_km", None)
         for n, v in vals.items():
             setattr(self.model.p, n, v)
+        gap_changed = (getattr(self.model.p, "threat_max_gap_km", None) != gap_before)
+        # РАЗРЫВ меняет саму проходимость: коридоры сшиваются/рвутся, а значит меняются и
+        # область залёта, и набор возможных маршрутов. Всё накопленное построено по старой
+        # проходимости — сбрасываем и считаем заново (контекст выборки модель пересоберёт
+        # сама: разрыв входит в его ключ).
+        if gap_changed:
+            self.model.routes = []
+            self.model.iter_routes = []
+            self.model.iter_iteration = 0
         # маршруты/итерации зависят от запаса хода — пересчитать показанное
         t = self.view.get_toggles()
         if self.model.grid is not None and t.get("show_iter"):
             self._run_async("iter", self.model.iterate_routes)
-        elif self.model.grid is not None and t["show_routes"]:
+        elif self.model.grid is not None and (t["show_routes"] or gap_changed):
             self.model.routes = []
-            self._run_async("routes", self.model.plan_routes)
+            self._run_async("routes", self.model.plan_routes)   # пересчитает и область залёта
         else:
             self._render_all()
-        self.view.set_title("Входные данные применены.")
+        self.view.set_title("Входные данные применены."
+                            + (" Разрыв изменён — область залёта пересчитана."
+                               if gap_changed else ""))
 
     # ---- смена приоритета по весу (max/medium/min/mix) ----
     def on_iter_mode(self, key):
@@ -219,6 +269,15 @@ class ThreatController:
     # ---- смена разброса по карте (center/middle/edge/mix) ----
     def on_iter_spread(self, key):
         self.model.p.threat_iter_spread = key
+        if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
+                and not self._busy):
+            self._run_async("iter", self.model.iterate_routes)
+
+    # ---- смена профиля расхода запаса хода (late/early/even) ----
+    # Влияет только на ИТЕРАЦИИ: «возможные маршруты» строятся веером всех повадок,
+    # чтобы показывать возможности целиком, а не один выбранный сценарий.
+    def on_iter_spend(self, key):
+        self.model.p.threat_spend = key
         if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
                 and not self._busy):
             self._run_async("iter", self.model.iterate_routes)
@@ -265,20 +324,25 @@ class ThreatController:
             self._render_all()
             me = self.model.metrics()
             self.view.set_title(
-                f"Датчиков {me['n_sensors']} · покрыто веса "
-                f"{me['covered_frac']*100:.0f}% · режим {MODE_LABELS[self.model.p.mode]}")
+                f"Датчиков {me['n_sensors']} · засечено пролётов "
+                f"{me.get('detect_k_frac', 0)*100:.0f}% (кратность ≥{self.model.p.threat_k}) · "
+                f"покрыто веса {me['covered_frac']*100:.0f}% · "
+                f"режим {MODE_LABELS[self.model.p.mode]}")
             self._full_metrics()
         elif kind == "routes":
             self._render_all()
             self._full_metrics()
             n, area = self.model.reachable_stats()
+            # Всего маршрутов — астрономически много (~1e107), нарисовать их нельзя; полную
+            # картину даёт ЗАКРАШЕННАЯ ОБЛАСТЬ, а линии — выборка, разложенная по ней широко.
+            total = self.model.count_routes()
+            tot_s = f" · всего путей ≈{total:.1e}" if total > 0 else ""
             self.view.set_title(
-                f"Мест пролёта (граф, ≤L_max): {area:.0f} км² ({n} ячеек) · "
-                f"линий-примеров {len(self.model.routes)} · L_max={self.model.p.threat_L_max:g} км.")
+                f"Мест пролёта (≤L_max): {area:.0f} км² ({n} ячеек){tot_s} · "
+                f"показано {len(self.model.routes)} · L_max={self.model.p.threat_L_max:g} км.")
         elif kind == "iter":
             self.view.iter_clear_current()               # пакетно — без летящего маркера
-            if len(self.model.iter_routes) >= 5:         # датчики по выборке маршрутов
-                self.model.place_sensors()
+            self._maybe_refresh_sensors(force=True)      # датчики по выборке пролётов
             self._render_all()
             self._full_metrics()
             self.view.set_title(self._iter_title() + " (пакетно). Датчики по выборке пролётов.")
@@ -417,7 +481,8 @@ class ThreatController:
         self.view.render_threat(g.weight, extent, t)
         self.view.render_exclusions(g.water_mask(), g.urban_mask(), extent, t)
         self.view.render_layers(self.model.layers,
-                                self.model.layers.get("bridge_pts", []), t)
+                                self.model.layers.get("bridge_pts", []), t,
+                                built_mask=g._built_cells, extent=extent)
         if t["show_cand"] and len(self.model.candidates) == 0:
             self.model.candidates = self.model.candidate_positions()
         self.view.render_candidates(self.model.candidates, t)
@@ -457,7 +522,7 @@ class ThreatController:
         nx = int(round((kx1 - kx0) / cell)); ny = int(round((ky1 - ky0) / cell))
         self.view.set_metrics([
             "ВКЛАДКА 3 · цифровая карта угроз", "",
-            "Участок (район Северодонецка):",
+            "Участок (демо-регион):",
             f"  {kx1-kx0:.0f}×{ky1-ky0:.0f} км",
             f"  сетка {cell*1000:.0f} м → {nx}×{ny} = {nx*ny} ячеек", "",
             "1) «Построить карту» — наложение слоёв",
@@ -504,6 +569,11 @@ class ThreatController:
                 f"  покрытый вес: {me.get('covered_weight', 0):.0f} / "
                 f"{me.get('total_weight', 0):.0f}",
                 f"  доля покрытия: {me.get('covered_frac', 0)*100:.0f}%",
+                "",
+                f"ЗАСЕЧКА ПРОЛЁТОВ (по {me.get('n_routes_eval', 0)} маршрутам)",
+                f"  засечено ≥1 датчиком: {me.get('detect_frac', 0)*100:.0f}%",
+                f"  засечено ≥k({p.threat_k}): {me.get('detect_k_frac', 0)*100:.0f}%",
+                f"  средняя кратность: {me.get('mean_hits', 0):.1f}",
             ]
         self.view.set_metrics(lines)
 

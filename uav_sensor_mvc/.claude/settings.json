@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -X utf8 C:\\Users\\17D3~1\\AppData\\Local\\Temp\\claude:*)",
+      "Bash(python -X utf8 \"C:\\Users\\17D3~1\\AppData\\Local\\Temp\\claude:*)",
+      "Bash(python C:\\Users\\17D3~1\\AppData\\Local\\Temp\\claude:*)",
+      "Bash(python \"C:\\Users\\17D3~1\\AppData\\Local\\Temp\\claude:*)",
+      "Bash(python -X utf8 check_env.py:*)",
+      "Bash(python check_env.py:*)",
+      "Bash(python -X utf8 tools/build_threat_grid.py:*)",
+      "Bash(python tools/build_threat_grid.py:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python -X utf8 -m pytest:*)",
+      "Bash(pytest:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python -m json.tool:*)",
+      "PowerShell(python -X utf8 C:\\Users\\17D3~1\\AppData\\Local\\Temp\\claude:*)",
+      "PowerShell(python -X utf8 check_env.py:*)",
+      "PowerShell(python -m pytest:*)",
+      "PowerShell(pytest:*)"
+    ]
+  }
+}

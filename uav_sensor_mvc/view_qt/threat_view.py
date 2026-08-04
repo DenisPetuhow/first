@@ -2,8 +2,8 @@
 """
 VIEW (Qt) · Вкладка 3 «Цифровая карта угроз».
 
-Ограниченный участок местности (район Северодонецка, bbox по ориентирам Рубежное /
-Дебальцево / Молодогвардейск) с жёстким пределом обзора. На карту накладываются:
+Ограниченный демонстрационный участок местности (фиксированный bbox по трём
+условным ориентирам) с жёстким пределом обзора. На карту накладываются:
   * векторные слои цифровой карты (реки, дороги, ж/д, ЛЭП, трубопроводы, лесополосы,
     мосты, застройка) — основные вероятные ориентиры маршрута БПЛА;
   * весовая сетка 500×500 м как тепловой слой (сумма весов слоёв по каждой ячейке);
@@ -19,7 +19,8 @@ import matplotlib.cm as cm
 
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
-                    THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS)
+                    THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS,
+                    THREAT_SPEND_LABELS)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from . import geomap as gm
 
@@ -37,6 +38,7 @@ from . import geomap as gm
 # ═══════════════════════════════════════════════════════════════════════════════
 LAYER_STYLE = {
     "river":      dict(color="#3aa0ff", width=3.4, dash=None),
+    "stream":     dict(color="#7cc4ff", width=1.8, dash=None),
     "road_major": dict(color="#ff9f43", width=3.2, dash=None),
     "road_local": dict(color="#ffd18c", width=2.1, dash=None),
     "railway":    dict(color="#e6edf3", width=2.3, dash=[6, 5]),
@@ -157,6 +159,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_input_apply = lambda vals: None
         self.on_iter_mode = lambda key: None
         self.on_iter_spread = lambda key: None
+        self.on_iter_spend = lambda key: None
         self.on_iter_play = lambda: None
         self.on_iter_step = lambda: None
         self.on_iter_batch = lambda: None
@@ -174,6 +177,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                            scheme_points=self._orient_points())
         self._set_view_limits(self.bbox_km)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
+        # смена масштаба/панорама -> перерисовать слои под новый кадр (прореживание по
+        # видимой области + переключение застройки растр/контуры). С задержкой, чтобы
+        # не считать на каждом кадре плавного зума.
+        self.on_view_changed = lambda: None
+        self._view_timer = QtCore.QTimer(self)
+        self._view_timer.setSingleShot(True)
+        self._view_timer.setInterval(180)
+        self._view_timer.timeout.connect(lambda: self.on_view_changed())
+        self.vb.sigRangeChanged.connect(lambda *_: self._view_timer.start())
 
     # ---- режим «указать цель» (клик по карте) ----
     def _begin_target(self):
@@ -353,8 +365,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         self.btn_target = QtWidgets.QPushButton("Указать цель")
         self.btn_target.setToolTip(
-            "Кликните точку ЦЕЛИ на карте. Точка входа фиксирована (Северодонецк, "
-            "у реки). Цель — задел для построения маршрутов (Этап 3).")
+            "Кликните точку ЦЕЛИ на карте. Точка появления БПЛА фиксирована "
+            "(у реки). Цель — задел для построения маршрутов (Этап 3).")
         self.btn_target.clicked.connect(self._begin_target)
         col.addWidget(self.btn_target)
 
@@ -456,6 +468,28 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.combo_spread.currentIndexChanged.connect(self._spread_changed)
         row_sp2.addWidget(self.combo_spread, 1)
         col.addLayout(row_sp2)
+        # 3-й список: РАСХОД ЗАПАСА ХОДА — когда БПЛА виляет, а когда идёт прямо на цель.
+        # Действует на ИТЕРАЦИИ. На «возможные маршруты» (до итераций) не влияет: там
+        # перебирается веер всех повадок, чтобы область покрывалась целиком.
+        row_sp3 = QtWidgets.QHBoxLayout()
+        row_sp3.addWidget(QtWidgets.QLabel("расход запаса:"))
+        self.combo_spend = QtWidgets.QComboBox()
+        self._spend_keys = list(THREAT_SPEND_LABELS)
+        for k in self._spend_keys:
+            self.combo_spend.addItem(THREAT_SPEND_LABELS[k])
+        cur = getattr(params, "threat_spend", "late")
+        self.combo_spend.setCurrentIndex(self._spend_keys.index(cur)
+                                         if cur in self._spend_keys else 0)
+        self.combo_spend.setToolTip(
+            "Когда БПЛА тратит СВОБОДНЫЙ ЗАПАС хода (остаток минус кратчайший путь до цели):\n"
+            "• виляет, потом прямо — пока запас есть, идёт по коридорам; на исходе "
+            "выпрямляется и идёт к цели;\n"
+            "• прямо, потом виляет — сначала кратчайшим путём, запас тратит ближе к цели;\n"
+            "• равномерно — тратит запас понемногу на всём пути.\n"
+            "Действует на ИТЕРАЦИИ (возможные маршруты строятся веером всех повадок).")
+        self.combo_spend.currentIndexChanged.connect(self._spend_changed)
+        row_sp3.addWidget(self.combo_spend, 1)
+        col.addLayout(row_sp3)
         # число итераций T (как во вкладке 2) + доля обобщённой выборки, %
         row_t = QtWidgets.QHBoxLayout()
         row_t.addWidget(QtWidgets.QLabel("число итераций:"))
@@ -569,6 +603,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def _spread_changed(self, i):
         self.on_iter_spread(self._spread_keys[i])
 
+    def _spend_changed(self, i):
+        self.on_iter_spend(self._spend_keys[i])
+
     def _on_field_submit(self):
         if not self._suppress:
             self.on_apply()
@@ -598,11 +635,18 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.water_img.setVisible(False)
         self.pi.addItem(self.water_img)
 
+        # застройка растром — на ОБЩЕМ виде вместо 8275 контуров (они там всё равно
+        # сливаются в пятно, а рисуются долго); при приближении включаются контуры
+        self.builtup_img = pg.ImageItem(); self.builtup_img.setOpts(axisOrder="row-major")
+        self.builtup_img.setZValue(-5.5); self.builtup_img.setOpacity(0.55)
+        self.builtup_img.setVisible(False)
+        self.pi.addItem(self.builtup_img)
+
         # векторные слои. antialias=False + connect="finite" — на реальных данных
         # (сотни тысяч точек) сглаживание линий делает панораму медленной; без него
         # быстро. Данные ещё и ПРОРЕЖИВАЮТСЯ при отрисовке (см. _polys_to_xy).
         for name in THREAT_LAYER_ORDER:
-            if name == "bridge" or name not in LAYER_STYLE:
+            if name not in LAYER_STYLE:
                 continue
             st = LAYER_STYLE[name]
             pen = pg.mkPen(_qcolor(st["color"], 235), width=st["width"],
@@ -745,48 +789,96 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         QtWidgets.QApplication.processEvents()
 
     # ---- отрисовка данных карты ----
-    MAX_LAYER_PTS = 12000     # предел точек на слой при отрисовке (прореживание)
-    MAX_LAYER_POLYS = 1500    # предел числа линий на слой (берём самые длинные)
+    MAX_LAYER_PTS = 48000     # предел точек на слой при отрисовке (прореживание)
+    MAX_LAYER_POLYS = 10000   # предел числа линий на слой (берём самые длинные)
     MAX_BRIDGES = 150         # предел маркеров мостов (чтобы не засорять карту)
+    BUILTUP_RASTER_FRAC = 0.35  # кадр уже этой доли участка -> застройка контурами
 
     @classmethod
-    def _polys_to_xy(cls, polys):
+    def _polys_to_xy(cls, polys, view_box=None):
         """Список ломаных -> массивы X,Y с NaN-разрывами, с ПРОРЕЖИВАНИЕМ (иначе
         сотни тысяч точек и тысячи мелких линий тормозят отрисовку при панораме):
         оставляем не более MAX_LAYER_POLYS самых длинных линий и прореживаем точки до
-        ~MAX_LAYER_PTS. Концы линий сохраняются. Полностью на numpy."""
+        ~MAX_LAYER_PTS. Концы линий сохраняются. Полностью на numpy.
+
+        «Длинные» — по ГЕОГРАФИЧЕСКОЙ длине (км), не по числу точек: у порезанных
+        сегментов число точек одинаковое (2), и сортировка по len() оставляла первые
+        попавшиеся — дороги рисовались только вокруг одного города.
+
+        view_box (x0,x1,y0,y1) — ВИДИМАЯ область: линии вне кадра отбрасываются ДО
+        прореживания, поэтому при приближении лимиты тратятся только на то, что видно,
+        и объект рисуется целиком. При отдалении в кадр попадает всё — прореживание
+        работает как раньше."""
         arrs = [np.asarray(p, float) for p in polys
                 if np.ndim(p) == 2 and len(p) >= 2]
         if not arrs:
             return np.empty(0), np.empty(0)
+        if view_box is not None:
+            vx0, vx1, vy0, vy1 = view_box
+            vis = []
+            for p in arrs:                                 # habbox линии пересекает кадр?
+                if (p[:, 0].max() >= vx0 and p[:, 0].min() <= vx1 and
+                        p[:, 1].max() >= vy0 and p[:, 1].min() <= vy1):
+                    vis.append(p)
+            arrs = vis or arrs                             # пусто — показать хоть что-то
         if len(arrs) > cls.MAX_LAYER_POLYS:                # самые длинные (значимые) линии
-            arrs.sort(key=len, reverse=True)
-            arrs = arrs[:cls.MAX_LAYER_POLYS]
+            km = [float(np.hypot(*(np.diff(p, axis=0).T)).sum()) for p in arrs]
+            order = np.argsort(km)[::-1][:cls.MAX_LAYER_POLYS]
+            arrs = [arrs[i] for i in order]
         total = sum(len(p) for p in arrs)
         step = max(1, int(np.ceil(total / cls.MAX_LAYER_PTS)))
         nan = np.array([np.nan])
         xs, ys = [], []
         for p in arrs:
-            if step > 1 and len(p) > 2:
+            if step > 1 and len(p) > 4:
                 idx = np.arange(0, len(p), step)
-                if idx[-1] != len(p) - 1:
+                if len(idx) < 4:                           # мелкий полигон (квартал города)
+                    idx = np.linspace(0, len(p) - 1, 4).astype(int)   # не схлопывать
+                elif idx[-1] != len(p) - 1:
                     idx = np.append(idx, len(p) - 1)       # сохранить конец линии
                 p = p[idx]
             xs.append(p[:, 0]); xs.append(nan)
             ys.append(p[:, 1]); ys.append(nan)
         return np.concatenate(xs), np.concatenate(ys)
 
-    def render_layers(self, layers, bridge_pts, toggles):
+    def _view_box_km(self):
+        """Видимая область в км (x0,x1,y0,y1) — по ней прореживаются слои."""
+        try:
+            (x0, x1), (y0, y1) = self.vb.viewRange()
+            return (float(x0), float(x1), float(y0), float(y1))
+        except Exception:
+            return None
+
+    def _zoomed_in(self, view_box):
+        """Приблизились ли настолько, что застройку пора рисовать НАСТОЯЩИМИ контурами
+        (а не растровой маской). Порог — ширина кадра меньше доли всего участка."""
+        if view_box is None:
+            return True
+        kx0, kx1, _, _ = self.bbox_km
+        span = max(1e-6, kx1 - kx0)
+        return (view_box[1] - view_box[0]) <= span * self.BUILTUP_RASTER_FRAC
+
+    def render_layers(self, layers, bridge_pts, toggles, built_mask=None,
+                      extent=None):
         """Отрисовать векторные слои. Чекбокс «векторные слои» ПОЛНОСТЬЮ скрывает их
-        (данные очищаются -> нулевая стоимость отрисовки)."""
+        (данные очищаются -> нулевая стоимость отрисовки).
+
+        Прореживание идёт по ВИДИМОЙ области: при приближении лимиты тратятся только на
+        то, что в кадре, поэтому объекты рисуются целиком. Застройка на общем виде
+        показывается растровой маской (8275 контуров всё равно сливаются в пятно и
+        только тормозят), а при приближении переключается на настоящие контуры."""
         show = toggles["show_layers"]
+        vb = self._view_box_km() if show else None
+        raster_built = (show and built_mask is not None and extent is not None
+                        and not self._zoomed_in(vb))
         for name, item in self._layer_items.items():
-            if show:
-                xs, ys = self._polys_to_xy(layers.get(name, []))
+            if show and not (name == "built_up" and raster_built):
+                xs, ys = self._polys_to_xy(layers.get(name, []), vb)
                 item.setData(xs, ys, antialias=False, connect="finite")
             else:
                 item.setData([], [])                     # полностью убрать нагрузку
-            item.setVisible(show)
+            item.setVisible(show and not (name == "built_up" and raster_built))
+        self._render_builtup_raster(built_mask if raster_built else None, extent)
         if show and len(bridge_pts):
             bp = np.asarray(bridge_pts, float)
             if len(bp) > self.MAX_BRIDGES:               # не заваливать карту маркерами
@@ -806,6 +898,21 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             except Exception:
                 pass
         self.legend.setVisible(show_legend)
+
+    def _render_builtup_raster(self, mask, extent):
+        """Застройка растровой маской (общий вид). None — скрыть слой."""
+        if mask is None or extent is None:
+            self.builtup_img.setVisible(False)
+            return
+        m = np.asarray(mask, bool)
+        rgba = np.zeros((m.shape[0], m.shape[1], 4), np.ubyte)
+        col = _qcolor(LAYER_STYLE["built_up"]["color"])
+        rgba[m, 0] = col.red(); rgba[m, 1] = col.green(); rgba[m, 2] = col.blue()
+        rgba[m, 3] = 255
+        self.builtup_img.setImage(rgba, autoLevels=False)
+        x0, x1, y0, y1 = extent
+        self.builtup_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+        self.builtup_img.setVisible(True)
 
     def render_threat(self, weight, extent, toggles):
         if not toggles["show_threat"] or weight is None:
@@ -1060,16 +1167,31 @@ class DigitalMapsDialog(QtWidgets.QDialog):
 
 
 class InputDataDialog(QtWidgets.QDialog):
-    """НЕмодальное окно «Входные данные» маршрута: запас хода, скорость, крен, интервал
-    смены направления. |AB| считается между входом и целью (только показ). Enter в любом
-    поле СРАЗУ применяет к основной карте (не блокирует программу — окно остаётся открытым).
+    """НЕмодальное окно «Входные данные» маршрута: запас хода, скорость, крен, длина прямого
+    участка, РАЗРЫВ между весовыми секторами. |AB| считается между входом и целью (только
+    показ). Enter в любом поле СРАЗУ применяет к основной карте (не блокирует программу —
+    окно остаётся открытым).
     """
     FIELDS = [
         ("threat_L_max", "Запас хода L_max, км"),
         ("threat_speed_kmh", "Скорость, км/ч"),
         ("threat_bank_deg", "Крен, °"),
         ("threat_turn_interval_km", "Длина прямого участка, км"),
+        ("threat_max_gap_km", "Разрыв между секторами, км"),
     ]
+    # Подсказки к полям (иначе смысл «разрыва» неочевиден).
+    HINTS = {
+        "threat_max_gap_km":
+            "Пустое место между весовыми секторами: если оно КОРОЧЕ этого значения — БПЛА "
+            "его перелетит, и коридоры сшиваются в один (маршрут возможен). Длиннее — "
+            "коридор разорван, маршрута через него нет.\nМеняет и ОБЛАСТЬ ЗАЛЁТА, и набор "
+            "возможных маршрутов — ещё до итераций.",
+        "threat_turn_interval_km":
+            "Целевая длина ПРЯМОГО участка: маршрут держит курс примерно столько км, "
+            "потом доворачивает.",
+        "threat_L_max":
+            "Главное ограничение маршрута: полная длина пути вход→цель не может его превысить.",
+    }
 
     def __init__(self, parent, params, on_apply):
         super().__init__(parent)
@@ -1091,6 +1213,8 @@ class InputDataDialog(QtWidgets.QDialog):
         for name, label in self.FIELDS:
             e = QtWidgets.QLineEdit(str(getattr(params, name)))
             e.returnPressed.connect(self._apply)
+            if name in self.HINTS:
+                e.setToolTip(self.HINTS[name])
             self._edits[name] = e
             lay.addRow(label, e)
         self._auto_changed()                       # выставить доступность поля L_max
@@ -1118,14 +1242,19 @@ class InputDataDialog(QtWidgets.QDialog):
 
     def _auto_changed(self, *_):
         """Авто-запас: поле L_max ВСЕГДА показывает текущее значение (и при снятии галочки
-        оно не пропадает — просто становится редактируемым). В авто — только для чтения."""
+        оно не пропадает — просто становится редактируемым). В авто — только для чтения.
+
+        Цвета БЕРЁМ НЕ ИЗ ТЁМНОЙ ТЕМЫ: это окно — обычный системный диалог со светлым фоном
+        (THEME задана только на карте). Раньше редактируемое поле красилось в THEME['text']
+        (#e6edf3) — почти белым по белому, и значение было не видно."""
         auto = self.chk_auto.isChecked()
         e = self._edits.get("threat_L_max")
         if e is None:
             return
         e.setText(f"{float(getattr(self._params, 'threat_L_max', 0.0)):g}")  # всегда заполнено
         e.setReadOnly(auto)
-        e.setStyleSheet("color:%s;" % (THEME["muted"] if auto else THEME["text"]))
+        e.setStyleSheet("color:#6b7785; background:#f0f0f0;" if auto   # авто: серым, «только чтение»
+                        else "")                                       # руками: обычное поле
 
     def _apply(self):
         """Применить поля. Нечисловое поле берётся из текущих параметров (не роняем ввод).

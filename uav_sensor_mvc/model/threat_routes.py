@@ -110,6 +110,46 @@ def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km):
     return env, dmin
 
 
+def count_possible_routes(env, gt, entry_cell, goal_cell):
+    """СКОЛЬКО ВСЕГО маршрутов вход→цель существует внутри области залёта — точное число,
+    БЕЗ их перечисления.
+
+    Маршрут — это путь по дереву развилок: из ячейки можно шагнуть в любого соседа, который
+    ближе к цели (в среднем таких ~3 — то самое «ветвление на 3 линии»). Число листьев
+    такого дерева считается динамическим программированием от цели наружу:
+
+        N(цель) = 1,   N(ячейка) = Σ N(соседей, которые ближе к цели)
+
+    Порядок обхода — по убыванию расстояния до цели, поэтому каждая ячейка считается один
+    раз (граф ациклический: шаг всегда сокращает расстояние). Сложность O(ячеек).
+
+    ЗАЧЕМ: показать, из чего сделана выборка. На реальных данных таких маршрутов ~1e107 —
+    их нельзя ни перечислить, ни нарисовать (атомов во Вселенной ~1e80). Поэтому «все
+    возможные пролёты» показывает ЗАКРАШЕННАЯ ОБЛАСТЬ (она точна), а маршруты — выборка.
+    Возвращает float («бесконечность» тут невозможна, но число огромно — int переполнил бы
+    смысл, а float даёт порядок)."""
+    ny, nx = gt.shape
+    ok = env & np.isfinite(gt)
+    ys, xs = np.nonzero(ok)
+    if len(ys) == 0 or not ok[goal_cell] or not ok[entry_cell]:
+        return 0.0
+    order = np.argsort(gt[ys, xs])                     # от цели наружу
+    N = np.zeros((ny, nx), float)
+    N[goal_cell] = 1.0
+    for i in order:
+        cy, cx = int(ys[i]), int(xs[i])
+        if (cy, cx) == goal_cell:
+            continue
+        tot = 0.0
+        d = gt[cy, cx]
+        for dy, dx, _mul in _NEIGHBORS:
+            vy, vx = cy + dy, cx + dx
+            if 0 <= vy < ny and 0 <= vx < nx and ok[vy, vx] and gt[vy, vx] < d:
+                tot += N[vy, vx]
+        N[cy, cx] = tot
+    return float(N[entry_cell])
+
+
 # --- ИТЕРАЦИОННАЯ (стохастическая) генерация множества маршрутов ---------------
 # 8 единичных векторов направлений (в порядке _NEIGHBORS) — для «держания курса».
 _NB_UNIT = [(dy / mul, dx / mul) for dy, dx, mul in _NEIGHBORS]
@@ -209,24 +249,77 @@ def _cells_yx_to_km(grid, cells_yx):
 #  с жёстким ограничением кривизны. Тогда «длина прямого участка» и радиус разворота
 #  станут настоящими кинематическими ограничениями, а не приближением.
 # ────────────────────────────────────────────────────────────────────────────────
+#
+#  РАСХОД ЗАПАСА ХОДА (реализовано, см. `_spend_tau`): маршрут больше не летит «вслепую».
+#  На каждом шаге известен СВОБОДНЫЙ ЗАПАС slack = остаток_хода − кратчайший_путь_до_цели.
+#  Профиль (config.THREAT_SPEND_LABELS) решает, когда его тратить: `late` — виляет, пока
+#  запас есть, на исходе идёт прямо; `early` — наоборот; `even` — равномерно.
+# ────────────────────────────────────────────────────────────────────────────────
+_TAU_FREE = 0.40        # «температура» выбора соседа при БОЛЬШОМ свободном запасе (виляет)
+_TAU_TIGHT = 0.05       # при исчерпанном запасе (идёт кратчайшим путём к цели)
+_SLACK_FULL_KM = 10.0   # запас, при котором маршрут считается полностью свободным
+
+
+def _spend_tau(slack_km, slack0_km, frac_done, profile):
+    """«Температура» выбора соседа: чем она меньше, тем жёстче маршрут идёт к цели.
+
+    slack_km  — СВОБОДНЫЙ ЗАПАС сейчас (км, которые ещё можно потратить на виляние);
+    slack0_km — свободный запас в начале маршрута (сколько его было всего);
+    frac_done — доля ВСЕГО маршрута, уже пройденная (0..1);
+    profile   — из config.THREAT_SPEND_LABELS.
+
+    Свобода вилять = (запас ещё есть) × (профиль разрешает вилять именно сейчас).
+    Запас кончился — идём прямо при любом профиле (на остатке топлива не петляют).
+
+      late  — виляет, пока запас есть (профиль не ограничивает);
+      early — в начале держит курс, виляет ближе к цели (свобода растёт с frac_done);
+      even  — тратит запас РАВНОМЕРНО: сверяется с «планом расхода» (к доле пути f должна
+              быть истрачена доля f запаса). Идём с опережением плана — виляем свободнее;
+              перерасход — выпрямляемся."""
+    by_slack = min(1.0, max(0.0, slack_km) / _SLACK_FULL_KM)
+    if profile == "early":              # виляем ближе к цели: в начале держим курс
+        by_phase = frac_done
+    elif profile == "even":             # держимся плана равномерного расхода
+        spent_frac = ((slack0_km - slack_km) / slack0_km) if slack0_km > 1e-6 else 1.0
+        by_phase = min(1.0, max(0.0, 0.5 + 3.0 * (frac_done - spent_frac)))
+    else:                               # "late" (по умолчанию): виляем, пока запас есть
+        by_phase = 1.0
+    return _TAU_TIGHT + (_TAU_FREE - _TAU_TIGHT) * by_slack * by_phase
+
+
 def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
-                heading0=None, wmode="medium", visited=None):
+                heading0=None, wmode="medium", visited=None, spend="late",
+                done0_km=0.0, tail_km=0.0):
     """Стохастический спуск по полю расстояний dfield от start к goal (надёжно приходит):
     выбор коридора — по ВЕСУ соседа (тепловая карта, приоритет по режиму wmode) и развилкам.
 
-    ПРЯМОЛИНЕЙНОСТЬ: `turn_interval_km` теперь трактуется как ЦЕЛЕВАЯ длина ПРЯМОГО участка —
-    маршрут держит курс, пока не пролетит ~столько км, и только потом доворачивает (БПЛА
-    стремится лететь прямыми отрезками этой длины). БЕЗ «КРУЖЕНИЯ»: посещённые ячейки не
-    выбираются повторно (кроме тупика), «назад» по полю разрешено чуть-чуть — петли уходят.
+    ЗАПАС ХОДА расходуется осмысленно (`spend`, см. `_spend_tau`): пока свободный запас
+    (остаток − кратчайший путь до цели) велик, маршрут виляет по коридорам; когда тает —
+    выпрямляется и идёт к цели. Если дойти уже нельзя (остаток < кратчайшего пути) —
+    обрываемся сразу, не тратя шаги. Раньше маршрут вилял «вслепую», проедал весь запас и
+    отбраковывался у самой цели: на реальных данных доходило ~5 % попыток, стало ~90 %.
+
+    ПРЯМОЛИНЕЙНОСТЬ: `turn_interval_km` — ЦЕЛЕВАЯ длина ПРЯМОГО участка: маршрут держит курс,
+    пока не пролетит ~столько км, и только потом доворачивает. БЕЗ «КРУЖЕНИЯ»: посещённые
+    ячейки штрафуются, «назад» по полю разрешено чуть-чуть — петли уходят.
 
     `visited` — общий набор пройденных ячеек (flat-индексы); для маршрута через VIA
     передаётся сквозь оба участка, чтобы они не наматывались друг на друга.
-    Возвращает (список ячеек (y,x), длина_км, курс) или None (тупик / вышли за budget)."""
+
+    `done0_km` / `tail_km` — участок знает своё место во ВСЁМ маршруте: сколько км уже
+    пройдено ДО него и сколько минимум предстоит ПОСЛЕ (для второго участка через VIA это
+    0). Без этого профиль расхода считал бы фазу пути от начала КАЖДОГО участка, и маршрут
+    через VIA дважды «начинал сначала».
+
+    Возвращает (список ячеек (y,x), длина_км, курс) или None (тупик / не хватило хода)."""
     grid = ctx["grid"]; pas = ctx["pas"]; wnorm = ctx["wnorm"]
     ny, nx = dfield.shape
     h = grid.h
-    if not np.isfinite(dfield[start]):
+    d_start = dfield[start]
+    if not np.isfinite(d_start) or d_start > budget:    # цель недостижима / не хватает хода
         return None
+    # свободный запас ВСЕГО маршрута в его начале (сколько км можно потратить на виляние)
+    slack0 = max(0.0, (budget + done0_km) - (d_start + tail_km + done0_km))
     # ЦЕЛЕВАЯ длина прямого участка задаётся пользователем, но в самом блуждании «держим
     # курс» лишь мягко и не дольше L_hold (жёсткая длинная прямая роняет доходимость до цели,
     # особенно на маршрутах через VIA). Итоговую ПРЯМОЛИНЕЙНОСТЬ даёт пост-обработка
@@ -235,7 +328,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     back_allow = 0.8                                   # км «назад» по полю (иначе тупики у стенок)
     if visited is None:
         visited = set()
-    step_cap = int(6 * dfield[start] / h + 80)
+    step_cap = int(6 * d_start / h + 80)
     cur = start
     visited.add(cur[0] * nx + cur[1])
     path = [cur]
@@ -245,6 +338,16 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     for _ in range(step_cap):
         if cur == goal or dfield[cur] <= h:
             break
+        # СВОБОДНЫЙ ЗАПАС: сколько км ещё можно потратить на виляние, оставшись в бюджете.
+        # Отрицательный — дойти уже нельзя, обрываемся сразу (не жжём шаги впустую).
+        slack = (budget - route_len) - dfield[cur]
+        if slack < 0.0:
+            return None
+        # доля ВСЕГО маршрута, уже пройденная (а не только текущего участка)
+        done = done0_km + route_len
+        remain = dfield[cur] + tail_km
+        frac_done = done / (done + remain) if (done + remain) > 1e-9 else 1.0
+        tau = _spend_tau(slack, slack0, frac_done, spend)
         cy, cx = cur
         cand, score = [], []
         for k, (dy, dx, mul) in enumerate(_NEIGHBORS):
@@ -269,7 +372,8 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                           else 1.0 + 2.5 * max(dot, 0.0))   # но прямо всё равно охотнее
             prog = dfield[cur] - dj
             corr = _mode_corridor_pref(wnorm[vy, vx], wmode)   # приоритет по весу (режим)
-            s = float(np.exp(prog / 0.4)) * corr * hf
+            # tau мал (запас на исходе) -> exp резко выделяет соседа с макс. прогрессом к цели
+            s = float(np.exp(prog / tau)) * corr * hf
             if vy * nx + vx in visited:                 # штраф за повторный заход — гасит петли,
                 s *= 0.12                               # но не запрещает (иначе тупики)
             if s <= 0.0:
@@ -280,8 +384,12 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         # РАЗВИЛКА — «метод рулетки»: вероятность выбрать соседа ∝ его оценке score.
         # cumsum даёт нарастающие границы секторов, searchsorted находит сектор, в который
         # попала случайная точка на [0, сумма). Быстрее и без аллокаций rng.choice(p=...).
-        cum = np.cumsum(np.asarray(score, float))
-        j = min(int(np.searchsorted(cum, rng.random() * cum[-1])), len(cand) - 1)
+        sc = np.asarray(score, float)
+        if not np.isfinite(sc).all() or sc.sum() <= 0.0:
+            j = int(np.argmax(np.nan_to_num(sc, posinf=np.finfo(float).max)))   # exp переполнился
+        else:                                           # при tau->0: берём лучшего соседа
+            cum = np.cumsum(sc)
+            j = min(int(np.searchsorted(cum, rng.random() * cum[-1])), len(cand) - 1)
         vy, vx, mul, unit = cand[j]
         step = mul * h
         route_len += step
@@ -324,8 +432,17 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5)):
     """Подготовить (один раз, кэшируется) контекст выборки. VIA-точки — СЕТКА по всей
     проходимой области (все стороны, включая юг/восток и «за целью» — заход в Б с ЛЮБОГО
     направления, если хватает хода), с предвычисленными полями расстояний. Каждой via
-    сопоставлена «дальность обхода» (расстояние до отрезка вход→цель) — для режима разброса.
-    Порог мостика через провал = ШАГ СЕТКИ ДАТЧИКА (passable_mask). Не зависит от L_max."""
+    сопоставлены:
+      * `via_segd`  — «дальность обхода» (расстояние до отрезка вход→цель), для разброса;
+      * `via_minlen` — МИНИМАЛЬНАЯ длина пути вход→via→цель. Маршрут через via физически
+        возможен, только если via_minlen ≤ запаса хода. Раньше это не проверялось, и
+        половина via была заведомо недостижима — каждая попытка через них гарантированно
+        проваливалась (см. `_pick_via`);
+      * `via_togoal` — кратчайший путь via→цель: столько хода надо ОСТАВИТЬ на второй участок.
+
+    Порог мостика через провал = `max_gap_km` (разрыв между весовыми секторами, из
+    интерфейса). Контекст зависит от разрыва и от цели, но НЕ от запаса хода L_max —
+    поэтому кэшируется и переиспользуется при смене L_max."""
     start = _cell_of(grid, entry_km)
     goal = _cell_of(grid, target_km)
     pas = _open_endpoints(passable_mask(grid, max_gap_km), (start, goal), grid)
@@ -336,7 +453,7 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5)):
     wnorm = np.clip(w / max(ref, 1e-6), 0.0, 1.0)
     A = np.asarray(entry_km, float); B = np.asarray(target_km, float)
     ab = float(np.hypot(*(B - A))) or 1.0
-    via_cell, via_gv, via_segd = [], [], []
+    via_cell, via_gv, via_segd, via_minlen, via_togoal = [], [], [], [], []
     if np.isfinite(gt[start]):
         ys, xs = np.nonzero(pas & np.isfinite(gt))     # достижимые проходимые ячейки
         if len(ys):
@@ -349,25 +466,38 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5)):
                                                 grid.ox + (cx + 0.5) * grid.h, max_km=18.0)
                     if vc is None or vc in via_cell or vc == goal or vc == start:
                         continue
+                    gv = _dijkstra_dist(pas, vc, grid.h)     # поле расстояний ОТ этой via
                     vxk = grid.ox + (vc[1] + 0.5) * grid.h
                     vyk = grid.oy + (vc[0] + 0.5) * grid.h
                     via_cell.append(vc)
+                    via_gv.append(gv)
                     via_segd.append(_seg_dist_km((vxk, vyk), A, B))
-                    via_gv.append(_dijkstra_dist(pas, vc, grid.h))
+                    via_togoal.append(float(gv[goal]))
+                    via_minlen.append(float(gv[start] + gv[goal]))   # вход→via→цель, минимум
     return dict(grid=grid, pas=pas, gt=gt, wnorm=wnorm, start=start, goal=goal, ab=ab,
                 via_cell=via_cell, via_gv=via_gv, via_segd=np.asarray(via_segd),
+                via_minlen=np.asarray(via_minlen), via_togoal=np.asarray(via_togoal),
                 gt_start=float(gt[start]), reachable=bool(np.isfinite(gt[start])))
 
 
-def _pick_via(ctx, spread, rng):
+def _pick_via(ctx, spread, rng, L_max):
     """Выбрать индекс VIA по режиму РАЗБРОСА (по дальности обхода segd): center — близкие к
-    прямой, edge — дальние (юг/восток/за целью), middle — средние, mix — любая. None = прямо."""
+    прямой, edge — дальние (юг/восток/за целью), middle — средние, mix — любая. None = прямо.
+
+    Сначала отбрасываем VIA, ЧЕРЕЗ КОТОРЫЕ НЕ ХВАТИТ ХОДА: путь вход→via→цель не короче
+    `via_minlen`, и если это больше L_max — маршрут через неё невозможен, сколько ни
+    пробуй. Раньше такие via разыгрывались наравне с остальными (на реальных данных —
+    половина всех точек), и каждая попытка через них была гарантированным отказом."""
     segd = ctx["via_segd"]
-    n = len(segd)
-    if n == 0:
+    if len(segd) == 0:
         return None
+    minlen = ctx["via_minlen"]
+    ok = np.nonzero(np.isfinite(minlen) & (minlen <= L_max))[0]   # достижимые при этом ходе
+    if len(ok) == 0:
+        return None                                    # ни одна via не по силам — только прямой
     sp = ("center", "middle", "edge")[rng.integers(3)] if spread == "mix" else spread
-    order = np.argsort(segd)                           # от близких к прямой к дальним
+    order = ok[np.argsort(segd[ok])]                   # от близких к прямой к дальним
+    n = len(order)
     if sp == "center":
         pool = order[:max(1, n // 3)]
     elif sp == "edge":
@@ -375,31 +505,81 @@ def _pick_via(ctx, spread, rng):
     else:                                              # middle
         lo, hi = n // 4, max(n // 4 + 1, 3 * n // 4)
         pool = order[lo:hi]
+        if len(pool) == 0:                             # мало via — берём что есть
+            pool = order
     return int(pool[rng.integers(len(pool))])
 
 
-def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix"):
+def _off_corridor(poly, grid, pas):
+    """Сколько точек линии вышло за ПРОХОДИМУЮ зону (город / провал шире разрыва)."""
+    ix = np.clip(((poly[:, 0] - grid.ox) / grid.h).astype(np.int64), 0, grid.nx - 1)
+    iy = np.clip(((poly[:, 1] - grid.oy) / grid.h).astype(np.int64), 0, grid.ny - 1)
+    return int((~pas[iy, ix]).sum())
+
+
+def _smooth_safe(raw, grid, pas, eps0):
+    """Сгладить ломаную, НЕ ВЫВОДЯ её из проходимого коридора.
+
+    Упрощение (RDP) с большим допуском спрямляет маршрут, но срезает углы — и линия
+    может уйти туда, куда БПЛА не летит (плотная застройка, провал шире разрыва).
+    Раньше так и было: сама ломаная по ячейкам всегда лежала в коридоре, а СГЛАЖЕННАЯ
+    кривая — та, что рисуется и по которой считаются датчики, — срезала углы через город.
+
+    Поэтому допуск подбирается: пробуем заданный, и пока кривая режет запретное —
+    уменьшаем вдвое (углы срезаются меньше, линия жмётся к расчётной). В пределе
+    возвращаем сглаживание по опорным точкам сетки — оно из коридора не выходит.
+
+    Порядок проверок выбран из соображений скорости: упрощение (RDP) дёшево, сплайн —
+    дорого, поэтому сначала отбраковываем по упрощённой ломаной и только уцелевшую
+    доводим сплайном."""
+    eps = float(eps0)
+    for _ in range(4):
+        simp = _rdp(raw, eps=eps)
+        if _off_corridor(simp, grid, pas) == 0:    # дёшево: ломаная уже режет запретное?
+            poly = _catmull_rom(simp)
+            if _off_corridor(poly, grid, pas) == 0:
+                return poly
+        eps *= 0.5
+    poly = _catmull_rom(raw)                       # без упрощения: кривая идёт по ячейкам
+    return poly if _off_corridor(poly, grid, pas) == 0 else raw
+
+
+def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spend="late"):
     """ОДИН стохастический маршрут вход→цель. mode = приоритет клетки по ВЕСУ
     (max/medium/min/mix). spread = РАЗБРОС по карте (center/middle/edge/mix) — через какую
     VIA-точку строить (center — вдоль прямой, edge — дальний обход/заход с любой стороны).
+    spend = профиль РАСХОДА ЗАПАСА ХОДА (late/early/even, см. `_spend_tau`).
     None, если не уложились в запас хода."""
     if not ctx["reachable"]:
         return None
     wmode = ("max", "medium", "min")[rng.integers(3)] if mode == "mix" else mode
+    if spend == "mix":                                  # веер всех повадок (для «возможных путей»)
+        spend = ("late", "early", "even")[rng.integers(3)]
     grid = ctx["grid"]
-    j = None if (spread == "center" and rng.random() < 0.5) else _pick_via(ctx, spread, rng)
+    j = (None if (spread == "center" and rng.random() < 0.5)
+         else _pick_via(ctx, spread, rng, L_max))
     if j is None:                                       # прямой маршрут (через центр)
         r = _walk_field(ctx, ctx["gt"], ctx["start"], ctx["goal"], L_max,
-                        turn_interval_km, rng, wmode=wmode)
+                        turn_interval_km, rng, wmode=wmode, spend=spend)
         cells = r[0] if r else None
     else:                                               # через VIA (обход/заход со стороны)
         via = ctx["via_cell"][j]
-        r1 = _walk_field(ctx, ctx["via_gv"][j], ctx["start"], via, L_max,
-                         turn_interval_km, rng, wmode=wmode)   # каждый участок — свой набор visited
-        if r1 is None:
+        togoal = float(ctx["via_togoal"][j])
+        # На участок via→цель надо ОСТАВИТЬ хода не меньше кратчайшего пути оттуда, иначе
+        # первый участок проест весь запас и второй гарантированно не дойдёт.
+        budget1 = L_max - togoal
+        if budget1 <= 0.0:
+            return None
+        # tail_km/done0_km: участки знают своё место во всём маршруте — иначе профиль
+        # расхода отсчитывал бы фазу пути заново от каждого из них.
+        r1 = _walk_field(ctx, ctx["via_gv"][j], ctx["start"], via, budget1,
+                         turn_interval_km, rng, wmode=wmode, spend=spend,
+                         done0_km=0.0, tail_km=togoal)
+        if r1 is None:                                  # каждый участок — свой набор visited
             return None
         r2 = _walk_field(ctx, ctx["gt"], via, ctx["goal"], L_max - r1[1],
-                         turn_interval_km, rng, heading0=r1[2], wmode=wmode)
+                         turn_interval_km, rng, heading0=r1[2], wmode=wmode, spend=spend,
+                         done0_km=r1[1], tail_km=0.0)
         if r2 is None:
             return None
         cells = r1[0] + r2[0][1:]                        # склейка без дубля via
@@ -408,6 +588,9 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix"):
     # ПРЯМОЛИНЕЙНОСТЬ ∝ «длине прямого участка»: чем она больше, тем крупнее допуск упрощения
     # (RDP) -> тем длиннее прямые звенья и тем прямее маршрут. Затем интерполяция Катмулла–Рома
     # делает повороты плавными ДУГАМИ, а прямые оставляет прямыми (плавно «дугами и прямыми»).
+    # Допуск подбирается так, чтобы сглаженная кривая НЕ вышла из коридора (см. _smooth_safe).
     eps = float(np.clip(turn_interval_km * 0.18, grid.h * 1.2, 8.0))
-    poly = _catmull_rom(_rdp(_cells_yx_to_km(grid, cells), eps=eps))
-    return poly if _poly_len_km(poly) <= L_max * 1.15 else None
+    poly = _smooth_safe(_cells_yx_to_km(grid, cells), grid, ctx["pas"], eps)
+    # Запас хода — строго: длина маршрута не может его превышать (сглаживание маршрут
+    # только СПРЯМЛЯЕТ, т.е. укорачивает, поэтому прежний допуск ×1.15 был лишним).
+    return poly if _poly_len_km(poly) <= L_max else None

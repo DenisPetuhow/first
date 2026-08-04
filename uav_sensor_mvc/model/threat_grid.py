@@ -14,7 +14,7 @@ CoverageCache.greedy_weighted).
     по линиям сетки — см. _accumulate_polyline);
   * load_layers() — источник геоданных: реальные слои OSM из офлайн-кэша (geo_cache/
     *.npz, подготовленные tools/build_threat_grid.py на pyrosm/geopandas) ИЛИ, если
-    их нет, синтетическая СХЕМА (река через Северодонецк + опорные дороги/ЛЭП/ж-д),
+    их нет, синтетическая СХЕМА (демо-река + опорные дороги/ЛЭП/ж-д),
     чтобы вкладка работала офлайн без внешних данных;
   * ThreatModel — обёртка для контроллера вкладки 3: строит карту, держит слои для
     отрисовки, готовит маску запрета датчиков на воде, считает показатели.
@@ -25,14 +25,21 @@ CoverageCache.greedy_weighted).
   «задел/не задел»), и сопоставим между слоями по масштабу, а не по частоте данных.
 """
 import os
+import re
 import math
 import numpy as np
 
 from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
                     THREAT_LAYER_ORDER, THREAT_INTERSECTION_BONUS,
                     THREAT_WATER_BUFFER_M, THREAT_ENTRY, THREAT_TARGET,
-                    THREAT_URBAN_NEIGHBORHOOD_KM, THREAT_URBAN_DENSITY_FRAC,
-                    THREAT_URBAN_PENALTY, THREAT_LMAX_AUTO_FRAC)
+                    THREAT_URBAN_MIN_AREA_KM2, THREAT_URBAN_BUFFER_KM,
+                    THREAT_TOWN_CITY_KM2, THREAT_CITY_ZERO_WEIGHT,
+                    THREAT_VILLAGE_PENALTY_CORE, THREAT_VILLAGE_PENALTY_EDGE,
+                    THREAT_VILLAGE_RADIUS_MIN_KM, THREAT_VILLAGE_RADIUS_MAX_KM,
+                    THREAT_RIVER_CORRIDOR_MAX_KM2,
+                    THREAT_DEM_FILE, THREAT_DEM_WINDOW_KM, THREAT_DEM_WEIGHT,
+                    THREAT_DEM_FULL_M,
+                    THREAT_LMAX_AUTO_FRAC, THREAT_LMAX_CORRIDOR_FRAC)
 
 
 # ----------------------------------------------------------------------
@@ -194,7 +201,9 @@ class ThreatGrid:
         self._present = {}                     # name -> (ny,nx) bool: слой есть в ячейке
         self._bridge_mask = np.zeros((self.ny, self.nx), bool)
         self._built_cells = np.zeros((self.ny, self.nx), bool)   # ячейка в застройке
-        self._urban = np.zeros((self.ny, self.nx), bool)         # исключено (нас. пункт)
+        self._urban = np.zeros((self.ny, self.nx), bool)         # город: пролёт запрещён
+        self._village_penalty = np.zeros((self.ny, self.nx), float)  # мягкий штраф деревень
+        self._relief = np.zeros((self.ny, self.nx), float)       # превышение над окрестностью, м
 
     # ---- геометрия ячеек ----
     def cell_centers_km(self):
@@ -263,58 +272,264 @@ class ThreatGrid:
         if attractor:
             self._attr_count += (contrib != 0).astype(np.int32)
 
-    def apply_urban_exclusion(self, neighborhood_km, density_frac, penalty,
-                              in_weight=False):
-        """Отметить КРУПНЫЕ населённые пункты (плотность застройки в окне neighborhood_km
-        выше density_frac — это ГОРОД, не деревня). Маска `_urban` блокирует МАРШРУТ (БПЛА
-        не летит над плотной застройкой).
+    def place_masks_from_polygons(self, polys, settled=None):
+        """Растеризовать КОНТУРЫ населённых пунктов: вернуть (маска города, маска
+        деревни). Контур — готовая граница НП из OSM, она точнее пятна застройки:
+        внутри города парки, площади и промзоны не размечены как landuse=residential,
+        и по одной застройке в центре зияли дыры.
 
-        `in_weight`: вносить ли штраф `penalty` в ВЕСОВУЮ карту (датчики/тепло). По
-        умолчанию НЕТ — иначе город становится «-40-пустыней», и датчики, максимизируя
-        положительный вес, разбегаются от городов (покрытие падает). Маршрут обходит
-        город независимо от веса — через маску `_urban`.
+        Тип берётся из третьей колонки (код PLACE_CODES): city/suburb/borough — город,
+        town — город при площади ≥ town_city_km2 (проверяется вызывающим), village —
+        деревня, hamlet и мельче — не учитывается."""
+        city = np.zeros((self.ny, self.nx), bool)
+        village = np.zeros((self.ny, self.nx), bool)
+        for poly in polys or []:
+            P = np.asarray(poly, float)
+            if P.ndim != 2 or len(P) < 3 or P.shape[1] < 3:
+                continue
+            code = int(round(P[0, 2]))
+            if code < 1:                       # hamlet и мельче — пропускаем
+                continue
+            ix0 = max(0, int(math.floor((P[:, 0].min() - self.ox) / self.h)))
+            ix1 = min(self.nx - 1, int(math.floor((P[:, 0].max() - self.ox) / self.h)))
+            iy0 = max(0, int(math.floor((P[:, 1].min() - self.oy) / self.h)))
+            iy1 = min(self.ny - 1, int(math.floor((P[:, 1].max() - self.oy) / self.h)))
+            if ix0 > ix1 or iy0 > iy1:
+                continue
+            cx = self.ox + (np.arange(ix0, ix1 + 1) + 0.5) * self.h
+            cy = self.oy + (np.arange(iy0, iy1 + 1) + 0.5) * self.h
+            gx, gy = np.meshgrid(cx, cy)
+            inside = _points_in_polygon(gx.ravel(), gy.ravel(),
+                                        P[:, :2]).reshape(gy.shape)
+            if not inside.any():
+                continue
+            # ЗАСТРОЕН ли контур на самом деле. В OSM границы НП часто административные
+            # и включают поля вокруг села (замер: контуры town дают 667 км² при участке
+            # 7135 км², под запрет уходило 30 % вместо 14). Берём контур, только если
+            # внутри реальная застройка — иначе это граница сельсовета, а не сам НП.
+            built_in = self._built_cells[iy0:iy1 + 1, ix0:ix1 + 1] & inside
+            n_in = float(inside.sum())
+            built_frac = float(built_in.sum()) / max(n_in, 1.0)
+            built_km2 = float(built_in.sum()) * self.h * self.h
+            if built_frac < PLACE_BUILT_FRAC and built_km2 < PLACE_BUILT_MIN_KM2:
+                continue
+            area = n_in * self.h * self.h
+            tgt = city if (code >= 3 or (code == 2 and area >= self._town_city_km2)) \
+                else village
+            tgt[iy0:iy1 + 1, ix0:ix1 + 1] |= inside
+        if settled is not None:
+            city &= settled                     # не тянуть поля внутри границы
+            village &= settled
+        village &= ~city                        # город главнее
+        return city, village
 
-        ВАЖНО: ячейки с РЕКОЙ из города НЕ исключаются — БПЛА идёт по руслу даже сквозь
-        город (реки/ручьи остаются коридором). Одиночный хутор (низкая плотность в окне)
-        тоже не блокируется. Плотность — box-фильтром (интегральное изображение)."""
+    def apply_settlements(self, places_km, min_area_km2, town_city_km2, buffer_km,
+                          village_core, village_edge, r_min_km, r_max_km,
+                          river_corridor_max_km2, zero_weight=True,
+                          place_polys=None):
+        """Разметить населённые пункты и применить их к весу и проходимости.
+
+        Классификация пятен застройки (связные компоненты по сырой застройке):
+          * ТИП берётся с метки OSM `place`, попавшей в пятно (или ближайшей к нему);
+            city/suburb/borough -> город, town -> город при площади ≥ town_city_km2
+            (иначе деревня), village -> деревня, hamlet и мельче -> не учитывается;
+          * если метки нет — запасной критерий по площади (≥ min_area_km2 -> город).
+
+        ГОРОД: пролёт ЗАПРЕЩЁН (маска `_urban` + буфер buffer_km), вклад ВСЕХ слоёв
+        внутри ОБНУЛЯЕТСЯ. Ноль, а не штраф: отрицательный вес делал город «ямой», от
+        которой разбегались датчики; запрет держит маска, а не знак веса.
+
+        ДЕРЕВНЯ: пролёт РАЗРЕШЁН, но чем ближе к центру, тем менее вероятен — штраф
+        спадает линейно от village_core в центре до village_edge на границе радиуса
+        (радиус ~ размеру пятна, в пределах r_min_km..r_max_km) и до 0 дальше. Маршрут
+        сам прижимается к окраине, но при необходимости проходит.
+
+        РЕКА сквозь населённый пункт остаётся коридором, пока пятно меньше
+        river_corridor_max_km2; у крупных городов русло закрывается вместе с городом."""
+        self._urban = np.zeros((self.ny, self.nx), bool)
+        self._village_penalty = np.zeros((self.ny, self.nx), float)
+        self.layers["village"] = np.zeros((self.ny, self.nx), float)
+        self._town_city_km2 = float(town_city_km2)
+        # Контуры НП из OSM (готовые границы) — основа; пятна застройки дополняют их
+        # там, где контура нет (у 2/3 пунктов есть только метка-точка). Контур режем
+        # по «обжитой зоне» — застройке, расширенной на километр: она закрывает дыры
+        # внутри города, но не тянет за собой поля внутри административной границы.
+        settled = _dilate(self._built_cells, max(1, int(round(1.0 / self.h)))) \
+            if self._built_cells.any() else None
+        city, village = self.place_masks_from_polygons(place_polys, settled)
         if not self._built_cells.any():
+            lab = np.zeros((self.ny, self.nx), np.int32)
+            nlab = 0
+            area = np.zeros(1)
+            kind = np.zeros(1, np.int8)
+        else:
+            # Компоненты метим ПО СЫРОЙ застройке: склейка разрывов ДО разметки сцепляла
+            # бы цепочки сёл вдоль трассы в «псевдогород» (замер: 17.9 % вместо 4.5 %).
+            lab, nlab = _label8(self._built_cells)
+            area = np.bincount(lab.ravel(), minlength=nlab + 1) * (self.h * self.h)
+            kind = self._classify_components(lab, nlab, area, places_km,
+                                             min_area_km2, town_city_km2)
+            city |= kind[lab] == 2                             # пятна-города
+            village |= kind[lab] == 1                          # пятна-деревни
+        village &= ~city
+        if not (city.any() or village.any()):
             return
-        r = max(1, int(round(0.5 * neighborhood_km / self.h)))     # полуокно в ячейках
-        dens = _box_mean(self._built_cells.astype(np.float64), r)
-        urban = dens >= density_frac
+
+        # --- деревни: плавный штраф от центра к краю ---
+        if village.any():
+            self._village_penalty = self._village_field(
+                village, village_core, village_edge, r_min_km, r_max_km)
+
+        # --- города: обнулить вклад всех слоёв внутри ---
+        city_zone = city.copy()
+        r = int(round(max(0.0, buffer_km) / self.h))
+        if r > 0:
+            city_zone = _dilate(city_zone, r)                  # буфер облёта
         river = self._present.get("river")
         if river is not None:
-            urban = urban & (~river)                               # река в городе — оставляем коридором
-        self._urban = urban                                        # маска для маршрута (всегда)
-        if in_weight:
-            self.weight[urban] = penalty                           # перекрывает вклад дорог/funnel
-            self.layers["urban_excl"] = np.where(urban, penalty, 0.0)
-        else:
-            self.layers["urban_excl"] = np.zeros_like(self.weight)  # в вес не вносим
+            # русло остаётся коридором, пока сам город меньше порога; у крупных
+            # (Луганск, Алчевск) река закрывается вместе с городом
+            clab, cn = _label8(city)
+            carea = np.bincount(clab.ravel(), minlength=cn + 1) * (self.h * self.h)
+            small = (carea <= float(river_corridor_max_km2))[clab]
+            small &= city                                      # вне города не трогаем
+            small = _dilate(small, r) & ~_dilate(city & ~small, r)
+            city_zone = city_zone & ~(river & small)
+        self._urban = city_zone
+        # Слой застройки больше НЕ штрафует сам по себе: его роль полностью взяли на
+        # себя город (обнуление) и деревня (градиент). Иначе деревня получала минус
+        # дважды — от built_up и от village (замер: −26.7 вместо −15).
+        bu = self.layers.get("built_up")
+        if isinstance(bu, np.ndarray):
+            self.weight -= bu
+            self.layers["built_up"] = np.zeros_like(self.weight)
+        if zero_weight:
+            self.weight[city_zone] = 0.0
+            for name, arr in self.layers.items():
+                if isinstance(arr, np.ndarray) and arr.shape == self.weight.shape:
+                    arr[city_zone] = 0.0
+            self._attr_count[city_zone] = 0
+        # штраф деревень — только ВНЕ города: буфер города и радиус соседней деревни
+        # перекрывались, и в городских ячейках оставался минус вместо нуля
+        self._village_penalty[city_zone] = 0.0
+        self.weight += self._village_penalty
+        self.layers["village"] = self._village_penalty
 
-    def add_bridges_from_grid(self, weight,
-                              road_keys=("road_major", "railway")):
-        """Мост = ячейка, где ЕСТЬ река И (КРУПНАЯ дорога или ж/д) — переправа. По сетке
-        (пересечение булевых масок), O(ячеек) и векторно — вместо прежнего перебора пар
-        ломаных O(N²), который на реальных данных подвешивал приложение.
+    def _classify_components(self, lab, nlab, area, places_km,
+                             min_area_km2, town_city_km2):
+        """Тип каждой компоненты застройки: 2 — город, 1 — деревня, 0 — не учитываем.
+        Основа — метка OSM `place` внутри пятна (или ближайшая в пределах 2 км),
+        запасной вариант при отсутствии метки — площадь пятна."""
+        kind = np.zeros(nlab + 1, np.int8)
+        best = np.zeros(nlab + 1, np.int8)                     # макс. код метки в пятне
+        found = np.zeros(nlab + 1, bool)
+        P = np.asarray(places_km, float) if places_km is not None else np.empty((0, 3))
+        if P.ndim == 2 and len(P) and P.shape[1] >= 3:
+            ix = np.floor((P[:, 0] - self.ox) / self.h).astype(int)
+            iy = np.floor((P[:, 1] - self.oy) / self.h).astype(int)
+            ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
+            ix, iy, code = ix[ok], iy[ok], P[ok, 2].astype(np.int8)
+            comp = lab[iy, ix]
+            # метка вне застройки — отнести к ближайшему пятну в радиусе 2 ячеек
+            miss = comp == 0
+            if miss.any():
+                rad = max(1, int(round(2.0 / self.h)))
+                for j in np.nonzero(miss)[0]:
+                    y0, y1 = max(0, iy[j] - rad), min(self.ny, iy[j] + rad + 1)
+                    x0, x1 = max(0, ix[j] - rad), min(self.nx, ix[j] + rad + 1)
+                    win = lab[y0:y1, x0:x1]
+                    nz = win[win > 0]
+                    if len(nz):
+                        vals, cnt = np.unique(nz, return_counts=True)
+                        comp[j] = int(vals[np.argmax(cnt)])
+            for c, k in zip(comp, code):
+                if c > 0:
+                    found[c] = True
+                    best[c] = max(best[c], int(k))
+        for c in range(1, nlab + 1):
+            a = area[c]
+            if found[c]:
+                k = best[c]
+                if k >= 3:                                     # city / suburb / borough
+                    kind[c] = 2
+                elif k == 2:                                   # town: крупный -> город
+                    kind[c] = 2 if a >= float(town_city_km2) else 1
+                elif k == 1:                                   # village
+                    kind[c] = 1
+                else:                                          # hamlet и мельче
+                    kind[c] = 0
+            else:                                              # метки нет — по площади
+                kind[c] = 2 if a >= float(min_area_km2) else 0
+        return kind
 
-        МЕСТНЫЕ дороги (residential) СПЕЦИАЛЬНО исключены: в плотной сети жилые улицы
-        соприкасаются с ручьями/реками в тысячах ячеек и давали тысячи ложных «мостов»
-        (перегружали карту и отрисовку). Настоящая переправа — это магистраль/ж-д над
-        рекой, таких на порядок меньше и это корректнее."""
-        river = self._present.get("river")
-        if river is None:
-            self._bridge_mask = np.zeros((self.ny, self.nx), bool)
+    def _village_field(self, village_mask, core, edge, r_min_km, r_max_km):
+        """Поле штрафа деревень: `core` в центре, `edge` на ПОЛОВИНЕ радиуса, 0 на его
+        границе — спад без ступеньки (обрыв edge→0 на краю давал маршруту резкую
+        границу). Радиус ~ размеру деревни (√площади), в пределах r_min..r_max.
+        Работает по МАСКЕ: деревня может прийти и контуром OSM, и пятном застройки."""
+        out = np.zeros((self.ny, self.nx), float)
+        gx, gy = self.cell_centers_km()
+        lab, nlab = _label8(village_mask)
+        area = np.bincount(lab.ravel(), minlength=nlab + 1) * (self.h * self.h)
+        for c in range(1, nlab + 1):
+            iy, ix = np.nonzero(lab == c)
+            if not len(ix):
+                continue
+            cx = self.ox + (ix.mean() + 0.5) * self.h
+            cy = self.oy + (iy.mean() + 0.5) * self.h
+            rad = float(np.clip(math.sqrt(max(area[c], 1e-6)), r_min_km, r_max_km))
+            y0 = max(0, int((cy - rad - self.oy) / self.h))
+            y1 = min(self.ny, int((cy + rad - self.oy) / self.h) + 2)
+            x0 = max(0, int((cx - rad - self.ox) / self.h))
+            x1 = min(self.nx, int((cx + rad - self.ox) / self.h) + 2)
+            if y0 >= y1 or x0 >= x1:
+                continue
+            d = np.hypot(gx[y0:y1, x0:x1] - cx, gy[y0:y1, x0:x1] - cy)
+            t = np.clip(d / rad, 0.0, 1.0)                      # 0 в центре, 1 на границе
+            val = np.where(t <= 0.5,
+                           core + (edge - core) * (t / 0.5),    # центр -> половина радиуса
+                           edge * (1.0 - (t - 0.5) / 0.5))      # половина -> край, до нуля
+            val = np.where(d <= rad, val, 0.0)
+            out[y0:y1, x0:x1] = np.minimum(out[y0:y1, x0:x1], val)   # берём худший штраф
+        return out
+
+    def add_relief_layer(self, dem_km, window_km, weight, full_m):
+        """Рельеф: ПРЕВЫШЕНИЕ НАД ОКРЕСТНОСТЬЮ как вклад в вес.
+
+        Абсолютная высота бесполезна (весь участок может лежать на плато), поэтому
+        считаем dh = высота − средняя высота в окне радиуса window_km:
+          dh < 0 — низина, балка, пойма  -> ПЛЮС к весу (пролёт вероятнее);
+          dh > 0 — холм, гребень         -> МИНУС (даже если по нему идёт дорога).
+        Вклад ограничен ±weight (насыщение при |dh| = full_m), чтобы рельеф правил
+        картину, а не перекрывал линейные ориентиры. dem_km — высоты, уже приведённые
+        к сетке (ny,nx); NaN там, где данных нет."""
+        if dem_km is None:
             return
-        road = np.zeros((self.ny, self.nx), bool)
-        for k in road_keys:
-            m = self._present.get(k)
-            if m is not None:
-                road |= m
-        self._bridge_mask = river & road
-        contrib = weight * self._bridge_mask
+        h = np.asarray(dem_km, float)
+        if h.shape != (self.ny, self.nx) or not np.isfinite(h).any():
+            return
+        ok = np.isfinite(h)
+        filled = np.where(ok, h, np.nanmean(h[ok]))
+        r = max(1, int(round(window_km / self.h)))
+        base = _box_mean(filled, r)                    # средний уровень вокруг
+        self._relief = np.where(ok, filled - base, 0.0)
+        t = np.clip(-self._relief / max(1e-6, float(full_m)), -1.0, 1.0)  # низина -> +1
+        contrib = float(weight) * t
+        contrib[~ok] = 0.0
         self.weight += contrib
-        self.layers["bridge"] = contrib.astype(float)
+        self.layers["relief"] = contrib
+
+    def relief_field(self):
+        """Превышение над окрестностью (м) — для показа/отладки."""
+        return self._relief
+
+    def set_bridge_mask_from_layer(self):
+        """Ячейки с мостом — прямо из слоя `bridge` (реальные объекты OSM bridge=yes).
+        Прежде мост ВЫЧИСЛЯЛСЯ как пересечение реки с дорогой и появлялся там, где по
+        векторным данным моста нет; теперь берём только размеченные переправы."""
+        m = self._present.get("bridge")
+        self._bridge_mask = (m.copy() if m is not None
+                             else np.zeros((self.ny, self.nx), bool))
 
     def bridge_cells_km(self):
         """Центры ячеек-мостов (для маркеров на карте)."""
@@ -400,11 +615,11 @@ class ThreatGrid:
 
 
 # ----------------------------------------------------------------------
-# Вспомогательное: точка в полигоне, дилатация, box-фильтр (плотность)
+# Вспомогательное: точка в полигоне, связные компоненты, дилатация
 # ----------------------------------------------------------------------
 def _box_mean(a, r):
     """Среднее по квадратному окну (2r+1)² вокруг каждой ячейки — через интегральное
-    изображение (O(ячеек)). Для оценки плотности застройки в окрестности."""
+    изображение, O(ячеек). Нужно для «среднего уровня местности» вокруг ячейки."""
     if r <= 0:
         return a
     ny, nx = a.shape
@@ -414,8 +629,7 @@ def _box_mean(a, r):
     x0 = np.clip(np.arange(nx) - r, 0, nx); x1 = np.clip(np.arange(nx) + r + 1, 0, nx)
     Y0, X0 = np.meshgrid(y0, x0, indexing="ij"); Y1, X1 = np.meshgrid(y1, x1, indexing="ij")
     total = ii[Y1, X1] - ii[Y0, X1] - ii[Y1, X0] + ii[Y0, X0]
-    area = (Y1 - Y0) * (X1 - X0)
-    return total / np.maximum(area, 1)
+    return total / np.maximum((Y1 - Y0) * (X1 - X0), 1)
 
 
 def _points_in_polygon(px, py, poly):
@@ -433,6 +647,30 @@ def _points_in_polygon(px, py, poly):
         inside ^= cond & (px < xint)
         j = i
     return inside
+
+
+def _label8(mask):
+    """Разметка связных компонент булевой маски (8-связность). Возвращает (lab, n):
+    lab — int-массив той же формы (0 = фон, 1..n — номер компоненты). Чистый numpy +
+    BFS по застроенным ячейкам — на сетке ~30 тыс. ячеек мгновенно, scipy не нужен."""
+    ny, nx = mask.shape
+    lab = np.zeros((ny, nx), np.int32)
+    n = 0
+    nb = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+    for sy, sx in zip(*np.nonzero(mask)):
+        if lab[sy, sx]:
+            continue
+        n += 1
+        lab[sy, sx] = n
+        stack = [(sy, sx)]
+        while stack:
+            y, x = stack.pop()
+            for dy, dx in nb:
+                y2, x2 = y + dy, x + dx
+                if 0 <= y2 < ny and 0 <= x2 < nx and mask[y2, x2] and not lab[y2, x2]:
+                    lab[y2, x2] = n
+                    stack.append((y2, x2))
+    return lab, n
 
 
 def _dilate(mask, r):
@@ -483,15 +721,39 @@ def load_layers(lon0, lat0, data_path=None, bbox_lonlat=None):
 # Фильтры тегов OSM по слоям (единый источник правды: используют и офлайн-скрипт
 # tools/build_threat_grid.py, и окно выбора карт в интерфейсе).
 OSM_LAYER_FILTERS = {
-    "river":      {"waterway": ["river", "canal", "stream"]},
+    "river":      {"waterway": ["river", "canal"]},
+    "stream":     {"waterway": ["stream"]},
     "road_major": {"highway": ["motorway", "trunk", "primary", "secondary"]},
     "road_local": {"highway": ["tertiary", "unclassified", "residential"]},
     "railway":    {"railway": ["rail"]},
     "power":      {"power": ["line"]},
     "pipeline":   {"man_made": ["pipeline"]},
     "tree_row":   {"natural": ["tree_row"]},
+    "bridge":     {"bridge": ["yes", "viaduct"]},
     "built_up":   {"landuse": ["residential", "industrial"]},
 }
+
+# Населённые пункты: отдельный служебный слой (в вес НЕ входит) — по нему
+# классифицируются пятна застройки: город запрещён, деревня обходится по краю.
+# Метка может быть точкой (у 2/3 пунктов границ в OSM нет) — тогда тип берётся с
+# точки, а границы даёт связное пятно застройки вокруг неё.
+OSM_PLACE_FILTER = {"place": ["city", "town", "village", "hamlet", "suburb", "borough"]}
+PLACE_LAYER = "place_pts"          # метки-точки: массив (N,3) — x_км, y_км, код типа
+PLACE_POLY_LAYER = "place_poly"    # контуры НП: массивы (M,3) — x_км, y_км, код типа
+PLACE_CODES = {"city": 3, "borough": 3, "suburb": 3, "town": 2, "village": 1, "hamlet": 0}
+# Контур крупнее этого — административная единица (район, община), а не сам населённый
+# пункт: в данных встречаются такие «пятна» до 500 км², их брать нельзя.
+PLACE_POLY_MAX_KM2 = 120.0
+# Контур засчитывается, только если внутри РЕАЛЬНАЯ застройка: доля застроенных ячеек
+# от площади контура ИЛИ абсолютная застроенная площадь. Отсекает административные
+# границы (сельсовет вокруг села), оставляя сам населённый пункт.
+PLACE_BUILT_FRAC = 0.15
+PLACE_BUILT_MIN_KM2 = 2.0
+
+# Запас обрезки геометрии вокруг участка, км. complete_relations=True тянет объекты
+# далеко за bbox (замер: трубопровод от −94 до +94 км при участке ±37) — без клипа это
+# лишний вес в кэше и линии, уходящие за карту.
+OSM_CLIP_MARGIN_KM = 10.0
 
 
 def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
@@ -509,7 +771,12 @@ def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
             "  pip install pyrosm geopandas shapely pyproj\n"
             f"(исходная ошибка: {e})")
     lo, la, ho, ha = bbox_lonlat or THREAT_BBOX_LONLAT
-    osm = OSM(pbf_path, bounding_box=[lo, la, ho, ha])
+    # complete_relations=True: у мультиполигонов-relations (контуры городов) добираются
+    # члены за пределами bbox — иначе крупный город на краю участка приходит с дыркой.
+    osm = OSM(pbf_path, bounding_box=[lo, la, ho, ha], complete_relations=True)
+    # рамка обрезки в км: участок + запас (complete_relations тянет объекты далеко за
+    # bbox — без клипа в кэш попадали линии за сотню км от участка)
+    clip = _clip_box_km(lon0, lat0, (lo, la, ho, ha), OSM_CLIP_MARGIN_KM)
     out = {}
     for layer, flt in OSM_LAYER_FILTERS.items():
         try:
@@ -525,18 +792,236 @@ def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
             if geom is None or geom.is_empty:
                 continue
             parts += _geom_to_kms(geom, lon0, lat0)
+        parts = _clip_parts(parts, clip)
         if parts:
-            out[layer] = [p for p in parts if len(p) >= 2]
+            out[layer] = parts
+    place_pts, place_poly = _places_from_osm(osm, lon0, lat0, clip)
+    if len(place_pts):
+        out[PLACE_LAYER] = [place_pts]
+    if place_poly:
+        out[PLACE_POLY_LAYER] = place_poly
     return out
 
 
+def load_dem_grid(grid, lon0, lat0, path=None):
+    """Высоты рельефа, приведённые к ячейкам сетки: массив (ny,nx) в метрах, NaN — нет
+    данных. None, если файла нет (тогда слой рельефа просто не участвует).
+
+    Поддерживает GeoTIFF (через rasterio) и «сырой» SRTM .hgt — последний читается
+    чистым numpy: это квадрат 1201² или 3601² int16 big-endian на тайл 1°×1°, где имя
+    файла задаёт юго-западный угол (например N48E038.hgt).
+    Файл ищется в geo_cache: THREAT_DEM_FILE + .tif/.tiff/.hgt."""
+    cand = []
+    if path:
+        cand.append(path)
+    else:
+        base = os.path.join(geo_cache_root(), THREAT_DEM_FILE)
+        cand += [base + ext for ext in (".tif", ".tiff", ".hgt")]
+        # плюс любые тайлы .hgt рядом (N48E038.hgt и т.п.)
+        root = geo_cache_root()
+        if os.path.isdir(root):
+            cand += [os.path.join(root, f) for f in sorted(os.listdir(root))
+                     if f.lower().endswith(".hgt")]
+    files = [p for p in cand if p and os.path.exists(p)]
+    if not files:
+        return None
+    gx, gy = grid.cell_centers_km()
+    lon, lat = km_to_lonlat(gx, gy, lon0, lat0)
+    out = np.full(gx.shape, np.nan)
+    for p in files:
+        try:
+            if p.lower().endswith((".tif", ".tiff")):
+                vals = _sample_geotiff(p, lon, lat)
+            else:
+                vals = _sample_hgt(p, lon, lat)
+        except Exception:
+            continue
+        if vals is not None:
+            take = np.isnan(out) & np.isfinite(vals)
+            out[take] = vals[take]
+    return out if np.isfinite(out).any() else None
+
+
+def km_to_lonlat(x_km, y_km, lon0, lat0):
+    """Обратное к lonlat_to_km: км в локальном фрейме -> (долгота, широта)."""
+    return (np.asarray(x_km, float) / _km_per_deg_lon(lat0) + lon0,
+            np.asarray(y_km, float) / _KM_PER_DEG_LAT + lat0)
+
+
+def _sample_geotiff(path, lon, lat):
+    """Выборка высот GeoTIFF в точках (lon,lat) — ближайший пиксель."""
+    try:
+        import rasterio
+    except Exception:
+        return None
+    with rasterio.open(path) as ds:
+        band = ds.read(1)
+        nodata = ds.nodata
+        inv = ~ds.transform
+        cols, rows = inv * (lon.ravel(), lat.ravel())
+        c = np.rint(np.asarray(cols)).astype(int)
+        r = np.rint(np.asarray(rows)).astype(int)
+        ok = (c >= 0) & (c < ds.width) & (r >= 0) & (r < ds.height)
+        vals = np.full(lon.size, np.nan)
+        vals[ok] = band[r[ok], c[ok]].astype(float)
+        if nodata is not None:
+            vals[vals == float(nodata)] = np.nan
+        vals[vals < -1000] = np.nan                 # типовые «пустые» значения SRTM
+        return vals.reshape(lon.shape)
+
+
+_HGT_NAME = re.compile(r"([NS])(\d{2})([EW])(\d{3})", re.I)
+
+
+def _sample_hgt(path, lon, lat):
+    """Выборка высот из сырого SRTM .hgt (int16 big-endian, тайл 1°×1°)."""
+    m = _HGT_NAME.search(os.path.basename(path))
+    if not m:
+        return None
+    lat0_t = int(m.group(2)) * (1 if m.group(1).upper() == "N" else -1)
+    lon0_t = int(m.group(4)) * (1 if m.group(3).upper() == "E" else -1)
+    raw = np.fromfile(path, dtype=">i2")
+    n = int(round(math.sqrt(raw.size)))
+    if n * n != raw.size:
+        return None
+    tile = raw.reshape(n, n).astype(float)
+    tile[tile <= -32768] = np.nan
+    # строка 0 — СЕВЕРНЫЙ край тайла
+    fy = (lat0_t + 1 - lat) * (n - 1)
+    fx = (lon - lon0_t) * (n - 1)
+    r = np.rint(fy).astype(int)
+    c = np.rint(fx).astype(int)
+    ok = (r >= 0) & (r < n) & (c >= 0) & (c < n)
+    vals = np.full(lon.shape, np.nan)
+    vals[ok] = tile[r[ok], c[ok]]
+    return vals
+
+
+def _clip_box_km(lon0, lat0, bbox_lonlat, margin_km):
+    """Рамка обрезки (x0,x1,y0,y1) в км: участок плюс запас со всех сторон."""
+    x0, x1, y0, y1 = bbox_lonlat_to_km(bbox_lonlat, lon0, lat0)
+    m = float(margin_km)
+    return (x0 - m, x1 + m, y0 - m, y1 + m)
+
+
+def _clip_parts(parts, clip):
+    """Оставить только куски геометрии, попадающие в рамку.
+
+    Линия рвётся на подотрезки по признаку «точка внутри рамки»: то, что уходит за
+    участок, отбрасывается, а проходящая насквозь линия сохраняется куском внутри.
+    Полностью внешние объекты исчезают — за этим и нужен клип."""
+    x0, x1, y0, y1 = clip
+    out = []
+    for p in parts:
+        P = np.asarray(p, float)
+        if P.ndim != 2 or len(P) < 2:
+            continue
+        inside = ((P[:, 0] >= x0) & (P[:, 0] <= x1) &
+                  (P[:, 1] >= y0) & (P[:, 1] <= y1))
+        if inside.all():
+            out.append(P)
+            continue
+        if not inside.any():
+            continue
+        # разрезать на непрерывные куски внутри рамки; на выходе за край добавляем не
+        # исходную дальнюю точку (она уводила линию на длину сегмента за рамку —
+        # замер: до 11.7 км при допуске 10), а точку ПЕРЕСЕЧЕНИЯ с границей
+        idx = np.nonzero(inside)[0]
+        for s in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
+            a, b = int(s[0]), int(s[-1])
+            piece = [P[a:b + 1]]
+            if a > 0:
+                piece.insert(0, _edge_point(P[a], P[a - 1], clip)[None, :])
+            if b < len(P) - 1:
+                piece.append(_edge_point(P[b], P[b + 1], clip)[None, :])
+            seg = np.vstack(piece)
+            if len(seg) >= 2:
+                out.append(seg)
+    return out
+
+
+def _edge_point(p_in, p_out, clip):
+    """Точка на отрезке p_in→p_out, лежащая на границе рамки clip (p_in внутри)."""
+    x0, x1, y0, y1 = clip
+    d = p_out - p_in
+    t = 1.0
+    for lo, hi, i in ((x0, x1, 0), (y0, y1, 1)):
+        if d[i] > 1e-12:
+            t = min(t, (hi - p_in[i]) / d[i])
+        elif d[i] < -1e-12:
+            t = min(t, (lo - p_in[i]) / d[i])
+    return p_in + max(0.0, min(1.0, t)) * d
+
+
+def _places_from_osm(osm, lon0, lat0, clip):
+    """Населённые пункты -> (точки, контуры).
+
+    * точки  — массив (N,3): x_км, y_км, код типа (PLACE_CODES);
+    * контуры — список массивов (M,3): те же координаты + код в каждой строке.
+
+    Контуры есть примерно у трети пунктов и это ГОТОВАЯ граница НП — она точнее
+    пятна застройки (внутри города парки, площади и промзоны не размечены как
+    landuse=residential, и по одной застройке в центре зияли дыры). Для остальных
+    пунктов остаётся точка, а границы даёт пятно застройки вокруг неё."""
+    empty = (np.empty((0, 3), np.float32), [])
+    try:
+        gdf = osm.get_data_by_custom_criteria(
+            custom_filter=OSM_PLACE_FILTER, filter_type="keep",
+            keep_nodes=True, keep_ways=True, keep_relations=True)
+    except Exception:
+        return empty
+    if gdf is None or len(gdf) == 0 or "place" not in gdf.columns:
+        return empty
+    x0, x1, y0, y1 = clip
+    pts, polys = [], []
+    for geom, kind in zip(gdf.geometry, gdf["place"]):
+        code = PLACE_CODES.get(str(kind), -1)
+        if code < 0 or geom is None or geom.is_empty:
+            continue
+        c = geom.centroid
+        x, y = lonlat_to_km(c.x, c.y, lon0, lat0)
+        if not (x0 <= x <= x1 and y0 <= y <= y1):
+            continue
+        pts.append((float(x), float(y), float(code)))
+        if geom.geom_type in ("Polygon", "MultiPolygon"):
+            for ring in _geom_to_kms(geom, lon0, lat0):
+                R = np.asarray(ring, float)
+                if len(R) < 3:
+                    continue
+                area = abs(np.dot(R[:, 0], np.roll(R[:, 1], 1)) -
+                           np.dot(R[:, 1], np.roll(R[:, 0], 1))) * 0.5
+                if area > PLACE_POLY_MAX_KM2:
+                    continue          # это административная единица, а не сам НП
+                polys.append(np.column_stack(
+                    [R, np.full(len(R), float(code))]).astype(np.float32))
+    return (np.asarray(pts, np.float32) if pts else np.empty((0, 3), np.float32),
+            polys)
+
+
 def _geom_to_kms(geom, lon0, lat0):
-    """shapely-геометрия -> список массивов (N,2) в км (линии и кольца полигонов)."""
+    """shapely-геометрия -> список массивов (N,2) в км (линии и кольца полигонов).
+
+    ВАЖНО: pyrosm отдаёт way не цельной линией, а MultiLineString из 2-точечных
+    сегментов (дорога из 40 точек = 39 обрезков). Раньше обрезки складывались как есть
+    — кэш содержал 10 717 «дорог» вместо 790, и прореживание при отрисовке выкидывало
+    большинство (пропадали М-30/Р-66 вдали от города). Теперь смежные сегменты
+    сшиваются linemerge в цельные линии."""
     out = []
     gt = geom.geom_type
     if gt == "LineString":
         out.append(_ll(np.asarray(geom.coords, float), lon0, lat0))
-    elif gt in ("MultiLineString", "GeometryCollection"):
+    elif gt == "MultiLineString":
+        try:
+            from shapely.ops import linemerge
+            geom = linemerge(geom)             # сшить смежные сегменты одного way
+        except Exception:
+            pass
+        if geom.geom_type == "LineString":
+            out.append(_ll(np.asarray(geom.coords, float), lon0, lat0))
+        else:                                  # несмежные куски — каждый цельным
+            for g in geom.geoms:
+                out.append(_ll(np.asarray(g.coords, float), lon0, lat0))
+    elif gt == "GeometryCollection":
         for g in geom.geoms:
             out += _geom_to_kms(g, lon0, lat0)
     elif gt == "Polygon":
@@ -568,16 +1053,16 @@ def _ll(seq, lon0, lat0):
 
 
 def _synthetic_layers(lon0, lat0):
-    """Демо-схема района Северодонецка: русло Северского Донца (аттрактор+вода),
+    """Демо-схема условного участка местности: русло реки (аттрактор+вода),
     несколько дорог, ж/д, ЛЭП, лесополос и контур застройки. Координаты приблизительные
     — этого достаточно, чтобы показать МЕХАНИКУ наложения, пока нет реальных OSM-данных.
     """
-    # Русло Северского Донца (упрощённо, с С-З на Ю-В через Северодонецк/Счастье)
+    # Русло реки (упрощённо, с С-З на Ю-В)
     river = [(38.42, 49.00), (38.49, 48.95), (38.60, 48.83), (38.78, 48.72),
              (38.95, 48.66), (39.10, 48.60), (39.28, 48.57), (39.45, 48.52)]
     # Крупные дороги
     road_a = [(38.49, 48.95), (38.62, 48.90), (38.80, 48.80), (38.95, 48.70),
-              (39.10, 48.62), (39.31, 48.57)]              # к Луганску вдоль реки
+              (39.10, 48.62), (39.31, 48.57)]              # вдоль реки
     road_b = [(38.40, 48.60), (38.75, 48.62), (39.10, 48.60), (39.55, 48.58)]
     road_c = [(38.55, 49.01), (38.60, 48.70), (38.66, 48.40)]   # поперечная
     # Местные дороги
@@ -599,39 +1084,53 @@ def _synthetic_layers(lon0, lat0):
         return [(clon - dlon, clat - dlat), (clon + dlon, clat - dlat),
                 (clon + dlon, clat + dlat), (clon - dlon, clat + dlat),
                 (clon - dlon, clat - dlat)]
-    built = [rect(38.49, 48.95, 0.06, 0.04),        # Северодонецк/Лисичанск
-             rect(39.31, 48.57, 0.05, 0.035),        # Луганск (край bbox)
-             rect(38.52, 48.34, 0.04, 0.03)]         # Дебальцево (край)
+    built = [rect(38.49, 48.95, 0.06, 0.04),        # населённый пункт 1
+             rect(39.31, 48.57, 0.05, 0.035),        # населённый пункт 2 (край bbox)
+             rect(38.52, 48.34, 0.04, 0.03)]         # населённый пункт 3 (край)
 
     def L(seqs):
         return [_ll(s, lon0, lat0) for s in seqs]
 
+    # мост и метка НП — чтобы демо-схема шла тем же путём, что и реальные данные
+    bridge = [(38.62, 48.895), (38.64, 48.885)]        # переправа через русло
+    places = np.array([[*lonlat_to_km(38.49, 48.95, lon0, lat0), 3.0],   # город
+                       [*lonlat_to_km(39.31, 48.57, lon0, lat0), 1.0],   # деревня
+                       [*lonlat_to_km(38.52, 48.34, lon0, lat0), 1.0]],  # деревня
+                      dtype=np.float32)
     return {
         "river":      L([river]),
+        "stream":     L([road_local1]),                # условный ручей (демо)
         "road_major": L([road_a, road_b, road_c]),
         "road_local": L([road_local1, road_local2]),
         "railway":    L([rail]),
         "power":      L([power1, power2]),
         "pipeline":   L([pipeline]),
         "tree_row":   L([tree1, tree2]),
+        "bridge":     L([bridge]),
         "built_up":   L(built),
+        PLACE_LAYER:  [places],
     }
 
 
 # ----------------------------------------------------------------------
 # Построение весовой карты из слоёв
 # ----------------------------------------------------------------------
-def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None):
+def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None,
+                      dem=None):
     """Собрать ThreatGrid: наложить слои с весами из THREAT_LAYERS, funnel-бонус,
-    мосты, отметить воду для запрета датчиков.
+    рельеф, разметить населённые пункты, отметить воду для запрета датчиков.
 
     enabled — набор имён слоёв для наложения (из окна «Выбрать цифровые карты»);
-    None = все слои. Выключенный слой просто не участвует в сумме весов."""
+    None = все слои. Выключенный слой просто не участвует в сумме весов.
+    dem — высоты, приведённые к сетке (ny,nx), или None (рельеф не учитывается).
+
+    ПОРЯДОК ВАЖЕН: сначала линейные/площадные слои и бонусы, затем рельеф, и только
+    ПОСЛЕ ЭТОГО населённые пункты — город обнуляет всё, что накопилось в его ячейках."""
     cell_km = (THREAT_CELL_M / 1000.0) if cell_km is None else cell_km
     g = ThreatGrid(bbox_km, cell_km)
     for name in THREAT_LAYER_ORDER:
-        if name not in THREAT_LAYERS or name == "bridge":
-            continue                            # мост считается по сетке ниже
+        if name not in THREAT_LAYERS:
+            continue
         if enabled is not None and name not in enabled:
             continue
         spec = THREAT_LAYERS[name]
@@ -645,21 +1144,25 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None):
         elif spec["geom"] == "area":
             g.add_area_layer(name, objs, w, attractor=attr,
                              mark_urban=(name == "built_up"))
-    # мост = ячейка «река + дорога/ж-д» (по сетке, быстро)
-    if enabled is None or "bridge" in enabled:
-        g.add_bridges_from_grid(THREAT_LAYERS.get("bridge", {}).get("weight", 0.0))
+    g.set_bridge_mask_from_layer()          # мосты — реальные объекты OSM (bridge=yes)
     # funnel-бонус за пересечения слоёв-аттракторов
     g.add_intersection_bonus(THREAT_INTERSECTION_BONUS)
-    # исключение населённых пунктов (после всех слоёв — перекрывает вес дорог/funnel
-    # в городе; см. apply_urban_exclusion). Только если слой застройки включён.
+    # рельеф: низина — плюс, холм — минус (до разметки НП, чтобы город обнулил и его)
+    g.add_relief_layer(dem, THREAT_DEM_WINDOW_KM, THREAT_DEM_WEIGHT, THREAT_DEM_FULL_M)
+    # населённые пункты: город запрещён и обнулён, деревня — мягкий штраф от центра
     if enabled is None or "built_up" in enabled:
-        from config import THREAT_URBAN_IN_WEIGHT
-        g.apply_urban_exclusion(THREAT_URBAN_NEIGHBORHOOD_KM,
-                                THREAT_URBAN_DENSITY_FRAC, THREAT_URBAN_PENALTY,
-                                in_weight=THREAT_URBAN_IN_WEIGHT)
+        g.apply_settlements(layers.get(PLACE_LAYER, [None])[0],
+                            THREAT_URBAN_MIN_AREA_KM2, THREAT_TOWN_CITY_KM2,
+                            THREAT_URBAN_BUFFER_KM,
+                            THREAT_VILLAGE_PENALTY_CORE, THREAT_VILLAGE_PENALTY_EDGE,
+                            THREAT_VILLAGE_RADIUS_MIN_KM, THREAT_VILLAGE_RADIUS_MAX_KM,
+                            THREAT_RIVER_CORRIDOR_MAX_KM2,
+                            zero_weight=THREAT_CITY_ZERO_WEIGHT,
+                            place_polys=layers.get(PLACE_POLY_LAYER))
     # вода -> запрет датчиков (буфер из конфига); только если слой реки включён
     if enabled is None or "river" in enabled:
-        g.mark_water(layers.get("river", []), THREAT_WATER_BUFFER_M / 1000.0)
+        wet = list(layers.get("river", [])) + list(layers.get("stream", []))
+        g.mark_water(wet, THREAT_WATER_BUFFER_M / 1000.0)
     return g
 
 
@@ -679,6 +1182,7 @@ class ThreatModel:
         self.sensors = np.empty((0, 2), float)
         self.candidates = np.empty((0, 2), float)
         self._metrics = {}
+        self.dem = None                # высоты рельефа на сетке (None — файла нет)
         self.data_path = None          # явный источник цифровых карт (.npz/.osm.pbf)
         self.enabled_layers = None     # набор включённых слоёв (None = все)
         self.target_km = None          # цель, заданная кликом («указать цель»)
@@ -686,6 +1190,7 @@ class ThreatModel:
         self.iter_routes = []          # итерационные (стохастические) маршруты — накопление
         self.iter_iteration = 0        # номер текущей итерации (как t во вкладке 2)
         self._iter_ctx = None          # контекст выборки (проходимость/поле расстояний/вес)
+        self._ctx_built_key = None     # при каком (разрыв, цель) собран контекст — см. _ensure_ctx
         self._iter_rng = None          # ГПСЧ выборки
         self.route_area = None         # маска ВСЕХ возможных мест пролёта (в пределах L_max)
         self.route_min_len = float("inf")   # мин. длина пути вход->цель, км
@@ -708,9 +1213,13 @@ class ThreatModel:
         выборки (карта пересобрана). Возвращает готовую ThreatGrid."""
         self.layers, self.source = load_layers(
             self.lon0, self.lat0, self.data_path, THREAT_BBOX_LONLAT)
+        probe = ThreatGrid(self.bbox_km, THREAT_CELL_M / 1000.0)   # сетка для выборки высот
+        self.dem = load_dem_grid(probe, self.lon0, self.lat0)      # None, если файла нет
         self.grid = build_threat_grid(self.layers, self.bbox_km,
-                                      enabled=self.enabled_layers)
-        self.layers["bridge_pts"] = self.grid.bridge_cells_km()   # мосты — из сетки
+                                      enabled=self.enabled_layers, dem=self.dem)
+        if self.dem is not None:
+            self.source += " + рельеф"
+        self.layers["bridge_pts"] = self.grid.bridge_cells_km()   # мосты — ячейки слоя
         self.sensors = np.empty((0, 2), float)
         self.routes = []
         self.iter_routes = []
@@ -719,9 +1228,27 @@ class ThreatModel:
         return self.grid
 
     def _route_gap_km(self):
-        """Порог «мостика» через провал = ШАГ СЕТКИ ДАТЧИКА (как определил пользователь:
-        если разрыв < шага сетки датчика — маршрут можно проложить), но не меньше 2 км."""
-        return max(2.0, float(self.p.threat_cand_step_km))
+        """РАЗРЫВ между весовыми секторами (км) — задаётся в интерфейсе («Входные данные»).
+        Пустое место короче разрыва БПЛА перелетит (коридоры сшиваются в один), длиннее —
+        коридор разорван и маршрута через него нет. Управляет и областью залёта, и набором
+        возможных маршрутов ещё ДО итераций."""
+        return max(0.0, float(getattr(self.p, "threat_max_gap_km", 2.0)))
+
+    def _ctx_key(self):
+        """От чего зависит кэш контекста выборки: разрыв (меняет проходимость) и цель.
+        Запас хода L_max сюда НЕ входит — контекст от него не зависит (см. build_iter_context)."""
+        return (self._route_gap_km(), self.target_km)
+
+    def _ensure_ctx(self, entry, target):
+        """Контекст выборки (проходимость, поля расстояний, VIA). Пересобирается, только
+        если сменился разрыв или цель — иначе переиспользуется (веер VIA-полей дорогой)."""
+        from .threat_routes import build_iter_context
+        key = self._ctx_key()
+        if self._iter_ctx is None or self._ctx_built_key != key:
+            self._iter_ctx = build_iter_context(self.grid, entry, target,
+                                                self._route_gap_km())
+            self._ctx_built_key = key
+        return self._iter_ctx
 
     def _route_sig(self, poly):
         """Огрублённая подпись маршрута (для дедупликации почти одинаковых путей)."""
@@ -732,27 +1259,36 @@ class ThreatModel:
 
     # ---- маршруты пролёта вход->цель ----
     def plan_routes(self):
-        """ВСЕ возможные маршруты вход→цель (не 14): большая РАЗНООБРАЗНАЯ выборка путей по
-        коридорам (вес>0 или разрыв < шага сетки датчика) с учётом запаса хода — все режимы
-        веса и разброса, заход в цель с любой стороны. Дедуп почти одинаковых. Строго «все»
-        перечислить нельзя (их экспоненциально много). Контекст выборки кэшируется."""
-        from .threat_routes import build_iter_context, sample_one_route
-        from config import THREAT_ROUTE_COUNT
-        g = self.ensure_built()
+        """ВОЗМОЖНЫЕ маршруты вход→цель — показываются ДО итераций, вместе с областью залёта.
+
+        Это ВЫБОРКА, а не полный перебор: всего таких маршрутов ~1e107 (см. count_routes) —
+        их нельзя ни перечислить, ни нарисовать. Полную картину «где может пролететь БПЛА»
+        даёт ЗАКРАШЕННАЯ ОБЛАСТЬ (route_area) — она точна и учитывает всё.
+
+        Задача выборки — лечь по области МАКСИМАЛЬНО ШИРОКО и РАВНОМЕРНО, а не показать
+        «типичный» путь. Поэтому:
+          * повадки БПЛА берутся ВЕЕРОМ (все режимы веса × все разбросы × все профили
+            расхода — всё "mix"): выбор в панели итераций на эту картину не влияет, она
+            показывает возможности целиком, а не один сценарий;
+          * из накопленных кандидатов ЖАДНО отбираются те, что покрывают ЕЩЁ НЕ ПОКРЫТУЮ
+            часть области (тот же субмодулярный принцип, что у датчиков) — маршруты
+            расходятся по разным коридорам, а не липнут к одному."""
+        from .threat_routes import sample_one_route
+        from config import THREAT_ROUTE_COUNT, THREAT_ROUTE_POOL_MULT
+        self.ensure_built()
         entry, target = self._refresh_envelope()       # авто-L_max + огибающая
-        if self._iter_ctx is None:                     # общий контекст с итерациями (кэш)
-            self._iter_ctx = build_iter_context(g, entry, target, self._route_gap_km())
-        ctx = self._iter_ctx
+        ctx = self._ensure_ctx(entry, target)          # общий контекст с итерациями (кэш)
         rng = np.random.default_rng()
         want = max(1, int(THREAT_ROUTE_COUNT))
-        # ОБОБЩЁННАЯ выборка: вес «medium» (вероятность ∝ сумме весов тепловой карты —
-        # «наиболее вероятные» пути) + разброс «mix» (распределённо по всей карте).
-        routes, seen, tries, cap = [], set(), 0, min(want * 6, 800)   # предел попыток ~ по времени
-        since_new = 0                                  # ранняя остановка: набор уникальных исчерпан
-        while len(routes) < want and tries < cap and since_new < 350:
+        # 1) НАБИРАЕМ пул кандидатов (больше, чем нужно) — полным веером повадок
+        pool, seen, tries = [], set(), 0
+        cap = int(want * THREAT_ROUTE_POOL_MULT)
+        since_new = 0
+        while len(pool) < cap and tries < cap * 3 and since_new < 400:
             tries += 1
-            r = sample_one_route(ctx, "medium", self.p.threat_L_max,
-                                 self.p.threat_turn_interval_km, rng, spread="mix")
+            r = sample_one_route(ctx, "mix", self.p.threat_L_max,
+                                 self.p.threat_turn_interval_km, rng,
+                                 spread="mix", spend="mix")
             if r is None:
                 since_new += 1
                 continue
@@ -760,21 +1296,68 @@ class ThreatModel:
             if sig in seen:                            # уже есть почти такой же маршрут
                 since_new += 1
                 continue
-            seen.add(sig); routes.append(r); since_new = 0
-        self.routes = routes
+            seen.add(sig); pool.append(r); since_new = 0
+        # 2) ОТБИРАЕМ из пула самые «расходящиеся» — максимальное покрытие области
+        self.routes = self._spread_over_area(pool, want)
         return self.routes
+
+    def _spread_over_area(self, pool, want):
+        """Жадно отобрать `want` маршрутов, покрывающих область залёта КАК МОЖНО ШИРЕ.
+
+        Каждый шаг берём маршрут, который задевает больше всего ЕЩЁ НЕ ПОКРЫТЫХ ячеек, и
+        помечаем их покрытыми. Так следующий маршрут вынужден идти по ДРУГОМУ коридору —
+        выборка расходится по всей области, а не скучивается у кратчайшего пути.
+        (Тот же жадный субмодулярный отбор, что у датчиков; гарантия ≥ (1−1/e) от оптимума.)"""
+        if not pool or want >= len(pool):
+            return list(pool)
+        g = self.grid
+        ncell = g.ny * g.nx
+        # матрица «маршрут × ячейка» (булева): что задевает каждый кандидат
+        M = np.zeros((len(pool), ncell), bool)
+        for i, r in enumerate(pool):
+            ix = np.clip(((r[:, 0] - g.ox) / g.h).astype(np.int64), 0, g.nx - 1)
+            iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(np.int64), 0, g.ny - 1)
+            M[i, iy * g.nx + ix] = True
+        new = np.zeros(ncell, bool)                    # ещё не покрытые ячейки (инвертируем ниже)
+        uncovered = np.ones(ncell, bool)
+        chosen = []
+        alive = np.ones(len(pool), bool)
+        for _ in range(want):
+            gain = (M & uncovered).sum(axis=1)         # НОВЫХ ячеек у каждого кандидата
+            gain[~alive] = -1
+            best = int(np.argmax(gain))
+            if gain[best] <= 0:                        # новых ячеек больше нет — веер исчерпан
+                break
+            alive[best] = False
+            uncovered &= ~M[best]
+            chosen.append(pool[best])
+        if len(chosen) < want:                         # добить остатком (покрытие уже насыщено)
+            chosen += [pool[i] for i in np.nonzero(alive)[0][:want - len(chosen)]]
+        return chosen
+
+    def count_routes(self):
+        """ТОЧНОЕ число возможных маршрутов вход→цель внутри области залёта (без перебора).
+        Их порядка 1e107 — отсюда и невозможность «показать все» иначе как областью."""
+        from .threat_routes import count_possible_routes, _cell_of
+        if self.grid is None or self.route_area is None or self._iter_ctx is None:
+            return 0.0
+        ctx = self._iter_ctx
+        return count_possible_routes(np.asarray(self.route_area), ctx["gt"],
+                                     ctx["start"], ctx["goal"])
+
+    def _spend(self):
+        """Профиль расхода запаса хода — повадка БПЛА для ИТЕРАЦИЙ (панель справа).
+        На «возможные маршруты» не влияет: там перебирается веер всех профилей."""
+        return getattr(self.p, "threat_spend", "late")
 
     # ---- ИТЕРАЦИОННЫЕ маршруты (стохастические пути по коридорам) ----
     # Пошаговая модель как во вкладке 2: iter_reset -> iter_step (××T) / iter_batch.
     def iter_reset(self):
         """Начать выборку заново: пересчитать авто-запас хода и огибающую, подготовить
         контекст выборки, обнулить счётчик. Возвращает True, если цель достижима."""
-        from .threat_routes import build_iter_context
         self.ensure_built()
         entry, target = self._refresh_envelope()       # авто-L_max + огибающая
-        if self._iter_ctx is None:                     # веер VIA-полей считаем ОДИН раз на цель
-            self._iter_ctx = build_iter_context(self.grid, entry, target,
-                                                self._route_gap_km())
+        self._ensure_ctx(entry, target)                # веер VIA-полей — один раз на (разрыв, цель)
         self._iter_rng = np.random.default_rng()
         self.iter_routes = []
         self.iter_iteration = 0
@@ -791,7 +1374,8 @@ class ThreatModel:
         for _ in range(12):                             # попытки на итерацию (стохастика)
             route = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
                                      self.p.threat_L_max, self.p.threat_turn_interval_km,
-                                     self._iter_rng, spread=self.p.threat_iter_spread)
+                                     self._iter_rng, spread=self.p.threat_iter_spread,
+                                     spend=self._spend())
             if route is not None:
                 break
         if route is not None:
@@ -810,7 +1394,8 @@ class ThreatModel:
             tries += 1
             r = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
                                  self.p.threat_L_max, self.p.threat_turn_interval_km,
-                                 self._iter_rng, spread=self.p.threat_iter_spread)
+                                 self._iter_rng, spread=self.p.threat_iter_spread,
+                                 spend=self._spend())
             if r is None:
                 since_new += 1
                 continue
@@ -843,14 +1428,16 @@ class ThreatModel:
         return entry, target
 
     def sync_auto_L_max(self, min_corridor_km=None):
-        """Если запас хода НЕ задан руками — авто: |AB|·(1+25 %), но не меньше
-        min_corridor_km·1.20 (кратчайший коридорный путь + запас). Возвращает L_max, км."""
+        """Если запас хода НЕ задан руками — авто: |AB|·(1+THREAT_LMAX_AUTO_FRAC), но не меньше
+        кратчайшего КОРИДОРНОГО пути с запасом THREAT_LMAX_CORRIDOR_FRAC (по прямой цель может
+        быть близко, а по коридорам — вдвое дальше; без этого маршрут не уместился бы вовсе).
+        Возвращает L_max, км."""
         if not getattr(self.p, "threat_L_max_manual", False):
             entry, target = self.entry_target_km()
             ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
             lmax = ab * (1.0 + THREAT_LMAX_AUTO_FRAC)
             if min_corridor_km is not None and np.isfinite(min_corridor_km):
-                lmax = max(lmax, min_corridor_km * 1.35)   # запас на боковой разброс маршрутов
+                lmax = max(lmax, min_corridor_km * (1.0 + THREAT_LMAX_CORRIDOR_FRAC))
             self.p.threat_L_max = round(lmax, 1)
         return self.p.threat_L_max
 
@@ -942,7 +1529,7 @@ class ThreatModel:
         cache = CoverageCache(cand, R, self.p.L_seg, self.p.threat_k)
         for r in routes:
             cache.add_trajectory(r)
-        covsum = np.asarray(cache._hit, dtype=np.int64).sum(axis=0)   # покрытие маршрутов кандидатом
+        covsum = cache.routes_covered_by_candidate()   # сколько маршрутов накрывает кандидат
         u = d / np.sqrt(D2) if D2 > 1e-9 else np.array([1.0, 0.0])
 
         def anchor_near(pt):                           # кандидат у точки, max покрытия маршрутов
@@ -955,9 +1542,18 @@ class ThreatModel:
         anchor_a = anchor_near(A + 0.45 * R * u)       # у входа A (внутрь, к B)
         anchors = [anchor_b] + ([anchor_a] if anchor_a != anchor_b else [])
         weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
-        sep = 1.6 * R                                  # расстояние центров -> перекрытие зон ≤ ~10 %
-        return cache.greedy(self.p.threat_N, weights, anchors=anchors,
-                            anchor_sep=sep, min_sep=sep)
+        # Разнос: ЖЕЛАЕМЫЙ 1.6·R (перекрытие зон ≤ ~10 %), но если при нём полезных
+        # позиций не хватило на заказанные N — постепенно ослабляем до нижней границы
+        # threat_min_sep_frac·R. Раньше 1.6·R был жёстким: на реальных данных набиралось
+        # 9 из 12, а остальные 3 уходили в пустоту (см. greedy — третичный ключ).
+        N = int(self.p.threat_N)
+        sep_min = max(0.1, float(self.p.threat_min_sep_frac)) * R
+        sep = max(1.6 * R, sep_min)
+        sens = cache.greedy(N, weights, anchors=anchors, anchor_sep=sep, min_sep=sep)
+        while len(sens) < N and sep > sep_min:
+            sep = max(sep_min, sep * 0.85)
+            sens = cache.greedy(N, weights, anchors=anchors, anchor_sep=sep, min_sep=sep)
+        return sens
 
     def _sample_for_sensors(self):
         """Выборка маршрутов, по которой считаются датчики и 2-я тепловая карта (§4.6):
@@ -1025,7 +1621,10 @@ class ThreatModel:
         return (dens / mx if mx > 0 else dens).reshape(g.ny, g.nx)
 
     def _evaluate(self, cells_xy, cells_w):
-        """Показатели: суммарный вес карты, покрытый вес, доля, разбивка по слоям."""
+        """Показатели: суммарный вес карты, покрытый вес, доля, разбивка по слоям и
+        ЗАСЕЧКА МАРШРУТОВ. Последняя — прямая мера качества расстановки: датчики
+        ставятся по выборке пролётов, а «покрытый вес» считается по СЫРОЙ весовой карте
+        и потому не отражает цель оптимизации (может быть высоким при плохой засечке)."""
         g = self.grid
         total = float(np.sum(np.clip(g.weight, 0, None)))
         covered = 0.0
@@ -1035,8 +1634,19 @@ class ThreatModel:
             d = np.linalg.norm(xy[:, None, :] - self.sensors[None, :, :], axis=2)
             seen = (d <= self.p.threat_R).any(axis=1)
             covered = float(np.sum(w[seen]))
+        det1 = detk = mean_hits = 0.0
+        sample = self._sample_for_sensors()
+        if len(self.sensors) and sample:
+            hits = np.array([int((np.linalg.norm(
+                r[:, None, :] - self.sensors[None, :, :], axis=2).min(axis=0)
+                <= self.p.threat_R).sum()) for r in sample])
+            det1 = float((hits >= 1).mean())
+            detk = float((hits >= self.p.threat_k).mean())
+            mean_hits = float(hits.mean())
         return dict(total_weight=total, covered_weight=covered,
                     covered_frac=(covered / total if total > 0 else 0.0),
+                    detect_frac=det1, detect_k_frac=detk, mean_hits=mean_hits,
+                    n_routes_eval=len(sample) if sample else 0,
                     n_sensors=int(len(self.sensors)),
                     n_candidates=int(len(self.candidates)),
                     by_layer=g.totals_by_layer())
@@ -1070,8 +1680,8 @@ class ThreatModel:
         return (float(ex), float(ey))
 
     def entry_target_km(self):
-        """(вход, цель) в км. Вход — фиксированный (Северодонецк, у реки); цель —
-        заданная пользователем, иначе дефолтная метка (Луганск)."""
+        """(вход, цель) в км. Вход — фиксированный (демо-точка появления у реки); цель —
+        заданная пользователем, иначе дефолтная демо-метка контролируемого объекта."""
         entry = self.entry_km()
         if self.target_km is not None:
             return entry, self.target_km

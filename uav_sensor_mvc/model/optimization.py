@@ -118,11 +118,25 @@ class CoverageCache:
                 mask_row |= (seg_hit.astype(np.uint32) << np.uint32(j))
         self._mask.append(mask_row)
 
+    def routes_covered_by_candidate(self):
+        """Сколько маршрутов выборки засекает КАЖДЫЙ кандидат — вектор (C,).
+        Нужен для выбора «якорных» датчиков у входа и цели (вкладка 3): среди ближних
+        кандидатов берётся тот, что накрывает больше всего маршрутов."""
+        if not self._hit:
+            return np.zeros(self.C, np.int64)
+        return np.asarray(self._hit, dtype=np.int64).sum(axis=0)
+
     def greedy(self, N, weights, anchors=None, anchor_sep=0.0, min_sep=0.0):
-        """Жадный выбор N позиций. Всегда возвращает min(N, C) датчиков.
+        """Жадный выбор N позиций. Возвращает до min(N, C) датчиков.
 
         Основной ключ — субмодулярный прирост phi; при его насыщении —
-        вторичный ключ «распределения» (прирост покрытия по маршрутам).
+        вторичный ключ «распределения» (прирост покрытия по маршрутам); когда насыщены
+        ОБА — третичный ключ «сколько маршрутов вообще накрывает кандидат» (резерв
+        кратности). Без третичного ключа score оказывался нулевым у всех кандидатов, и
+        `argmax` брал ПЕРВЫЙ по порядку — датчики уходили в угол карты, где маршрутов
+        нет (на реальных данных 4 из 12 не ловили ни одного пролёта). Если и третичный
+        ключ нулевой (полезных позиций не осталось) — расстановка прекращается, лишние
+        датчики в пустоту не ставятся.
 
         anchors — СПИСОК индексов ПРИНУДИТЕЛЬНЫХ «якорных» датчиков (напр. у входа A и у
         цели B): ставятся первыми; кандидаты ближе anchor_sep к ним исключаются (не дают
@@ -138,6 +152,7 @@ class CoverageCache:
         Fc = np.asarray(self._cov, dtype=np.float64)      # (T, C)
         k, Lseg = self.k, self.L_seg
 
+        covsum = H.sum(axis=0).astype(float)              # маршрутов на кандидата (третичный ключ)
         n_vec = np.zeros(T, np.int64)
         mask_vec = np.zeros(T, np.uint32)
         cur_min = np.zeros(T)
@@ -178,12 +193,18 @@ class CoverageCache:
             new_cov = np.minimum(cur_cov[:, None] + Fc, 1.0)
             gain_cov = (new_cov - cur_cov[:, None]).mean(axis=0)      # (C,)
 
-            # лексикографика: основной критерий; при его насыщении — вторичный.
-            score = primary if primary.max() > 1e-9 else SPREAD_EPS * gain_cov
+            # лексикографика: основной критерий → вторичный → третичный (резерв кратности)
+            secondary = SPREAD_EPS * gain_cov
+            if primary.max() > 1e-9:
+                score = primary
+            elif secondary.max() > 1e-12:
+                score = secondary
+            else:
+                score = covsum                             # хоть сколько-то маршрутов
             score = np.where(avail, score, -np.inf)
             c = int(np.argmax(score))
-            if not np.isfinite(score[c]):
-                break
+            if not np.isfinite(score[c]) or score[c] <= 0.0:
+                break                                      # полезных позиций не осталось
             take(c)
             exclude_near(c, min_sep)                       # датчики не ближе min_sep друг к другу
 
