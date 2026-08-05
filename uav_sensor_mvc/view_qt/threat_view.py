@@ -70,10 +70,45 @@ THREAT_COLORS = {
     "legend_entry": "#3ddc97",          # вход A в легенде (на карте — THEME['ok'])
     "legend_target": "#ff5d6c",         # цель B в легенде (на карте — THEME['warn'])
     "legend_bridge": "#ff5d6c",         # мост в легенде
+    # — РЕЛЬЕФ: два независимых слоя показа (чекбоксы «карта высот» / «приоритет по высоте») —
+    "legend_relief": "#c9b458",         # образец карты высот в легенде
+    "legend_hide":   "#3aa0ff",         # образец «укрытие» в легенде
 }
+# Карта высот — привычная топографическая шкала «низины зелёные → вершины светлые».
+# Ступени равномерны по ПЕРЦЕНТИЛЯМ высоты, а не по метрам: иначе на участке с размахом
+# 23…365 м вся обжитая полоса слилась бы в один оттенок.
+RELIEF_RAMP = ((0.00, (47, 107, 61)),      # пойма, балки — зелёный
+               (0.35, (140, 150, 70)),     # ровное место — оливковый
+               (0.62, (201, 180, 88)),     # подъём — песочный
+               (0.84, (150, 100, 62)),     # возвышенность — коричневый
+               (1.00, (232, 224, 213)))    # вершины — светлый, как на топокартах
+# Приоритет по высоте (множитель k): синим укрытия, красным возвышенности, чёрным — снятое
+# отсечкой. Прозрачность растёт с отклонением k от единицы, нейтральное почти не видно.
+RELIEF_HIDE_RGB = (58, 160, 255)           # k > 1: низина, укрытие
+RELIEF_OPEN_RGB = (255, 93, 108)           # k < 1: возвышенность, заметнее
+RELIEF_CUT_RGBA = (16, 16, 22, 210)        # отсечка: коридор снят полностью
+RELIEF_MAX_ALPHA = 165                     # предел непрозрачности слоя приоритета
 # Зоны-исключения (маска), render_exclusions — RGBA 0..255:
 THREAT_URBAN_RGBA = (255, 93, 108, 120)   # город — красный (исключён из пролёта)
 THREAT_WATER_RGBA = (58, 160, 255, 150)   # вода — синий (запрет установки датчика)
+
+
+def _hillshade(h, az_deg=315.0, alt_deg=45.0, z=6.0, lo=0.72, hi=1.22):
+    """Теневая отмывка карты высот: множитель яркости по наклону поверхности к источнику
+    света (по умолчанию северо-запад, 45° над горизонтом — картографическая традиция).
+
+    Без отмывки цветная шкала читается как абстрактные пятна: понять, где балка, а где
+    гребень, нельзя. `z` — вертикальное преувеличение: на равнине уклоны малы, и без
+    подъёма контраста рельеф не проявился бы."""
+    gy, gx = np.gradient(np.asarray(h, float))
+    gx = gx * z; gy = gy * z
+    slope = np.arctan(np.hypot(gx, gy))
+    aspect = np.arctan2(-gx, gy)
+    az = np.radians(360.0 - az_deg + 90.0)
+    alt = np.radians(alt_deg)
+    shade = (np.sin(alt) * np.cos(slope)
+             + np.cos(alt) * np.sin(slope) * np.cos(az - aspect))
+    return lo + (hi - lo) * np.clip(shade, 0.0, 1.0)
 
 
 def _threat_cmap():
@@ -147,6 +182,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         # callbacks (контроллер переопределит)
         self.on_build = lambda: None
+        self.on_relief = lambda: None     # кнопка «Добавить/Убрать рельеф»
         self.on_place = lambda: None
         self.on_apply = lambda: None
         self.on_reset = lambda: None
@@ -269,6 +305,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     f'маршрут (чёрный) &nbsp; <span style="color:{c["route_gen"]};font-size:13pt;">&#9644;&#9644;</span> '
                     'выборка маршрутов<br>')
         rows.append(f'<span style="color:{c["sensor"]};">&#9679;</span> датчик (зона обзора — поверх всего)<br>')
+        # рельеф — два независимых слоя показа; цвета те же, что в RELIEF_* выше
+        rows.append(f'<span style="color:{c["legend_relief"]};">&#9632;</span> карта высот '
+                    f'(низины зелёные → вершины светлые) &nbsp; '
+                    f'<span style="color:{c["legend_hide"]};">&#9632;</span> укрытие '
+                    f'&nbsp; <span style="color:{c["legend_target"]};">&#9632;</span> '
+                    'возвышенность (заметнее)<br>')
         rows.append(f'<span style="color:{c["legend_entry"]};">&#9733;</span> вход (A) &nbsp; '
                     f'<span style="color:{c["legend_target"]};">&#10005;</span> цель (B)')
         rows.append('</div>')
@@ -364,6 +406,16 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.btn_build.clicked.connect(lambda: self.on_build())
         col.addWidget(self.btn_build)
 
+        self.btn_relief = QtWidgets.QPushButton("Добавить рельеф")
+        self.btn_relief.setToolTip(
+            "Пересобрать весовую карту С УЧЁТОМ ВЫСОТ: та же дорога в низине станет "
+            "привлекательнее, чем на гребне, а очень высокие места перестанут быть "
+            "коридорами.\n\nБез этой кнопки карта считается без рельефа — как раньше.\n"
+            "ВНИМАНИЕ: пересборка сбрасывает накопленные маршруты, итерации и датчики — "
+            "они построены по другой карте.")
+        self.btn_relief.clicked.connect(lambda: self.on_relief())
+        col.addWidget(self.btn_relief)
+
         self.btn_target = QtWidgets.QPushButton("Указать цель")
         self.btn_target.setToolTip(
             "Кликните точку ЦЕЛИ на карте. Точка появления БПЛА фиксирована "
@@ -430,12 +482,23 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                                      "маршрутов: самые ЧАСТЫЕ (по тепловой карте), но "
                                      "РАСПРЕДЕЛЁННО по всей карте, не кучкой. Прошло 150 из "
                                      "500 → покажет 15. Обобщает тепловую карту пролётов.")
+        self.chk_relief = QtWidgets.QCheckBox("карта высот (рельеф)")
+        self.chk_relief.setToolTip(
+            "Абсолютные высоты местности: зелёные низины → коричневые возвышенности, "
+            "со светотенью. Показ НЕ зависит от кнопки «Добавить рельеф» — посмотреть "
+            "местность можно всегда.")
+        self.chk_relief_k = QtWidgets.QCheckBox("приоритет по высоте")
+        self.chk_relief_k.setToolTip(
+            "Что рельеф СДЕЛАЛ с весом: синим укрытия (вес вырос), красным возвышенности "
+            "(вес упал), чёрным — места, где коридор снят как «очень высокая гора». "
+            "Работает только когда рельеф добавлен в вес.")
         self.chk_legend = QtWidgets.QCheckBox("легенда")
         self.chk_legend.setChecked(True)
         self.chk_legend.setToolTip("Легенда (какой цвет какой объект) — в левом нижнем углу.")
         for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand,
                     self.chk_routes, self.chk_cross, self.chk_iter, self.chk_iter_heat,
-                    self.chk_iter_gen, self.chk_legend):
+                    self.chk_iter_gen, self.chk_relief, self.chk_relief_k,
+                    self.chk_legend):
             chk.stateChanged.connect(lambda _s: self.on_toggle())
             col.addWidget(chk)
         # режим стохастического выбора развилки (для «итераций»)
@@ -616,6 +679,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         """Создать ВСЕ постоянные слои-элементы карты один раз (потом только меняем данные,
         а не пересоздаём). Порядок наложения — через setZValue: подложка/тепло — отрицательные,
         маршруты — 1..6, датчики и точки A/B — 20..22 (поверх всего). Цвета — из THREAT_COLORS."""
+        # рельеф: карта высот — самый нижний слой (фон-подложка под всем остальным),
+        # поверх неё «приоритет по высоте». Оба под весовой картой и векторными слоями,
+        # чтобы реки и дороги оставались читаемыми.
+        self.relief_img = pg.ImageItem(); self.relief_img.setOpts(axisOrder="row-major")
+        self.relief_img.setZValue(-9.0); self.relief_img.setOpacity(0.55)
+        self.relief_img.setVisible(False)
+        self.pi.addItem(self.relief_img)
+        self.relief_k_img = pg.ImageItem(); self.relief_k_img.setOpts(axisOrder="row-major")
+        self.relief_k_img.setZValue(-8.5); self.relief_k_img.setOpacity(0.75)
+        self.relief_k_img.setVisible(False)
+        self.pi.addItem(self.relief_k_img)
         # весовая карта (тепловой слой)
         self.threat_img = pg.ImageItem(); self.threat_img.setOpts(axisOrder="row-major")
         self.threat_img.setZValue(-8); self.threat_img.setOpacity(0.55)
@@ -741,6 +815,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_iter=self.chk_iter.isChecked(),
                     show_iter_heat=self.chk_iter_heat.isChecked(),
                     show_iter_gen=self.chk_iter_gen.isChecked(),
+                    show_relief=self.chk_relief.isChecked(),
+                    show_relief_k=self.chk_relief_k.isChecked(),
                     iter_mode=self._iter_keys[self.combo_iter.currentIndex()],
                     show_legend=self.chk_legend.isChecked())
 
@@ -765,6 +841,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         for b in (self.btn_data, self.btn_build, self.btn_target, self.btn_place,
                   self.btn_apply, self.btn_reset):
             b.setEnabled(not busy)
+        # кнопка рельефа отдельно: без файла высот она остаётся недоступной и после расчёта
+        self.btn_relief.setEnabled((not busy) and getattr(self, "_relief_enabled", False))
         self.setCursor(QtCore.Qt.WaitCursor if busy else QtCore.Qt.ArrowCursor)
 
     def set_source(self, text):
@@ -925,6 +1003,80 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         x0, x1, y0, y1 = extent
         self.threat_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.threat_img.setVisible(True); self.cbar.setVisible(True)
+
+    def render_relief(self, dem, extent, toggles):
+        """КАРТА ВЫСОТ: привычная топография (низины зелёные → вершины светлые) со
+        светотенью. `dem` — высоты в метрах, `extent` — (x0,x1,y0,y1) в км.
+
+        Шкала строится по ПЕРЦЕНТИЛЯМ, а не по метрам: на участке с размахом 23…365 м
+        равномерная по высоте шкала слила бы всю обжитую полосу в один оттенок.
+        Показ не зависит от того, добавлен ли рельеф в вес, — местность можно смотреть
+        всегда."""
+        if not toggles.get("show_relief") or dem is None or extent is None:
+            self.relief_img.setVisible(False)
+            return
+        h = np.asarray(dem, float)
+        ok = np.isfinite(h)
+        if not ok.any():
+            self.relief_img.setVisible(False)
+            return
+        lo, hi = np.percentile(h[ok], (2.0, 98.0))
+        t = np.clip((h - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        t = np.where(ok, t, 0.0)
+        stops = np.array([s for s, _ in RELIEF_RAMP], float)
+        cols = np.array([c for _, c in RELIEF_RAMP], float)
+        rgb = np.empty(h.shape + (3,), float)
+        for ch in range(3):                       # кусочно-линейная интерполяция шкалы
+            rgb[..., ch] = np.interp(t, stops, cols[:, ch])
+        rgb *= _hillshade(np.where(ok, h, np.nanmean(h[ok])))[..., None]
+        rgba = np.zeros(h.shape + (4,), np.ubyte)
+        rgba[..., :3] = np.clip(rgb, 0, 255).astype(np.ubyte)
+        rgba[..., 3] = np.where(ok, 255, 0).astype(np.ubyte)
+        self.relief_img.setImage(rgba, autoLevels=False)
+        x0, x1, y0, y1 = extent
+        self.relief_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+        self.relief_img.setVisible(True)
+
+    def render_relief_priority(self, k, cut, extent, toggles):
+        """ПРИОРИТЕТ ПО ВЫСОТЕ: что рельеф сделал с весом. Синим — укрытия (множитель > 1),
+        красным — возвышенности (< 1), чёрным — места, где коридор снят как «очень высокая
+        гора». Нейтральное (k ≈ 1) остаётся прозрачным, чтобы не мутить карту.
+
+        `k` = None означает, что рельеф в вес не добавлен, — показывать нечего."""
+        if not toggles.get("show_relief_k") or k is None or extent is None:
+            self.relief_k_img.setVisible(False)
+            return
+        k = np.asarray(k, float)
+        rgba = np.zeros(k.shape + (4,), np.ubyte)
+        up = k > 1.0                              # укрытие: вес вырос
+        dn = k < 1.0                              # возвышенность: вес упал
+        span_up = max(float(np.nanmax(k)) - 1.0, 1e-6)
+        span_dn = max(1.0 - float(np.nanmin(k)), 1e-6)
+        a_up = np.clip((k - 1.0) / span_up, 0.0, 1.0) * RELIEF_MAX_ALPHA
+        a_dn = np.clip((1.0 - k) / span_dn, 0.0, 1.0) * RELIEF_MAX_ALPHA
+        for ch in range(3):
+            rgba[up, ch] = RELIEF_HIDE_RGB[ch]
+            rgba[dn, ch] = RELIEF_OPEN_RGB[ch]
+        rgba[up, 3] = a_up[up].astype(np.ubyte)
+        rgba[dn, 3] = a_dn[dn].astype(np.ubyte)
+        if cut is not None:
+            rgba[np.asarray(cut, bool)] = RELIEF_CUT_RGBA
+        self.relief_k_img.setImage(rgba, autoLevels=False)
+        x0, x1, y0, y1 = extent
+        self.relief_k_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+        self.relief_k_img.setVisible(True)
+
+    def set_relief_button(self, active, enabled):
+        """Состояние кнопки рельефа: подпись «Добавить/Убрать», подсветка и доступность
+        (нет файла высот — нажимать нечего)."""
+        self._relief_enabled = bool(enabled)
+        self.btn_relief.setText("Убрать рельеф" if active else "Добавить рельеф")
+        self.btn_relief.setEnabled(bool(enabled))
+        self._tint(self.btn_relief, THEME["ok"] if active else THEME["muted"])
+        if not enabled:
+            self.btn_relief.setToolTip(
+                "Нет файла высот. Положите geo_cache/dem.tif — см. "
+                "теория/МЕТОДИЧКА_ЗАГРУЗКА_КАРТ.md §4.1")
 
     def render_exclusions(self, water_mask, urban_mask, extent, toggles):
         """Показать зоны-исключения: вода (синий — запрет датчика) и населённые пункты
@@ -1179,6 +1331,7 @@ class InputDataDialog(QtWidgets.QDialog):
         ("threat_bank_deg", "Крен, °"),
         ("threat_turn_interval_km", "Длина прямого участка, км"),
         ("threat_max_gap_km", "Разрыв между секторами, км"),
+        ("threat_corridor_slack_km", "Уход от ориентира, км"),
     ]
     # Подсказки к полям (иначе смысл «разрыва» неочевиден).
     HINTS = {
@@ -1187,6 +1340,13 @@ class InputDataDialog(QtWidgets.QDialog):
             "его перелетит, и коридоры сшиваются в один (маршрут возможен). Длиннее — "
             "коридор разорван, маршрута через него нет.\nМеняет и ОБЛАСТЬ ЗАЛЁТА, и набор "
             "возможных маршрутов — ещё до итераций.",
+        "threat_corridor_slack_km":
+            "Насколько маршрут отклоняется ВБОК от реки или дороги, вдоль которой идёт.\n"
+            "Это НЕ то же, что разрыв: разрыв — про перелёт через пустоту МЕЖДУ коридорами, "
+            "а это — про свободу манёвра вдоль коридора. Раньше обе величины задавались "
+            "одним параметром, и дать маршруту место для обхода холма можно было, только "
+            "увеличив перелёты через пустоту.\nБольше значение — шире полоса возможного "
+            "манёвра и охотнее обход препятствий, но маршруты дальше уходят от ориентиров.",
         "threat_turn_interval_km":
             "Целевая длина ПРЯМОГО участка: маршрут держит курс примерно столько км, "
             "потом доворачивает.",

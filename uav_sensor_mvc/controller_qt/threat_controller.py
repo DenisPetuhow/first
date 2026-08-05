@@ -70,7 +70,8 @@ class ThreatController:
         self._speed = 6                   # скорость анимации (точек за кадр)
         self._sensors_at = 0              # при скольких маршрутах датчики пересчитаны
         view.set_callbacks(
-            on_build=self.on_build, on_place=self.on_place, on_apply=self.on_apply,
+            on_build=self.on_build, on_relief=self.on_relief,
+            on_place=self.on_place, on_apply=self.on_apply,
             on_reset=self.on_reset, on_reset_view=self.on_reset_view,
             on_mode=self.on_mode, on_toggle=self.on_toggle,
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
@@ -83,7 +84,29 @@ class ThreatController:
         # перерисовка слоёв при смене масштаба/панораме: прореживание считается по
         # ВИДИМОЙ области, а застройка переключается растр <-> контуры
         self.view.on_view_changed = self._on_view_changed
+        self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
         self._idle_metrics()
+
+    # ================= РЕЛЬЕФ =================
+    def on_relief(self):
+        """Кнопка «Добавить рельеф» / «Убрать рельеф».
+
+        Карта пересобирается целиком (рельеф — последний шаг конвейера весов, досчитать
+        его поверх готовой карты нельзя). Пересборка обнуляет накопленные маршруты,
+        итерации и датчики: они построены по другой карте, смешивать выборки нельзя."""
+        if self._busy:
+            self.view.flash_title("Идёт расчёт — подождите…")
+            return
+        if not self.model.has_dem():
+            self.view.flash_title("Нет файла высот: положите geo_cache/dem.tif")
+            return
+        want = not self.model.relief_on
+        self._anim_stop()
+        self.view.iter_clear_current()
+        self.model.set_relief(want)
+        self.view.set_relief_button(self.model.relief_on, True)
+        self._sensors_at = 0
+        self._run_async("build", self.model.build)
 
     def _on_view_changed(self):
         """Вид изменился — перерисовать только векторные слои (остальное не зависит
@@ -311,6 +334,8 @@ class ThreatController:
             return
         if kind == "build":
             self.view.set_source(self.model.source)
+            # файл высот мог появиться (или исчезнуть) между запусками — сверить кнопку
+            self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
             self._render_all()
             self.view.set_title("Карта построена. Считаю все возможные маршруты…")
             self._full_metrics()
@@ -477,6 +502,17 @@ class ThreatController:
         if g is None:
             return
         extent = g.extent_km()
+        # рельеф: карта высот берётся в РОДНОМ разрешении (сетка 500 м для показа груба),
+        # приоритет — с сетки, потому что он показывает ровно то, что ушло в вес
+        if t.get("show_relief"):
+            disp = self.model.relief_display()
+            if disp is None:
+                self.view.render_relief(g.relief_height(), extent, t)
+            else:
+                self.view.render_relief(disp[0], disp[1], t)
+        else:
+            self.view.render_relief(None, None, t)
+        self.view.render_relief_priority(g.relief_k(), g.relief_cut(), extent, t)
         self.view.render_threat(g.weight, extent, t)
         self.view.render_exclusions(g.water_mask(), g.urban_mask(), extent, t)
         self.view.render_layers(self.model.layers,
@@ -532,6 +568,28 @@ class ThreatController:
             "Веса слоёв — в config.THREAT_LAYERS.",
         ])
 
+    def _relief_lines(self):
+        """Блок показателей по рельефу. Пока рельеф не добавлен — одна строка-подсказка,
+        чтобы было видно, что механизм есть и чем он управляется."""
+        g = self.model.grid
+        if g is None or not self.model.relief_on or g.relief_k() is None:
+            hint = ("нет файла высот" if not self.model.has_dem()
+                    else "выключен · кнопка «Добавить рельеф»")
+            return ["РЕЛЬЕФ", f"  {hint}", ""]
+        k = g.relief_k(); cut = g.relief_cut(); h = g.relief_height()
+        import numpy as _np
+        pos = g.weight > 0
+        up = int((pos & (k > 1.02)).sum()); dn = int((pos & (k < 0.98)).sum())
+        n = max(int(pos.sum()), 1)
+        return [
+            "РЕЛЬЕФ (в весе)",
+            f"  высоты: {_np.nanmin(h):.0f}…{_np.nanmax(h):.0f} м",
+            f"  укрытий: {up} ({100.0*up/n:.0f} %) · "
+            f"открытых: {dn} ({100.0*dn/n:.0f} %)",
+            f"  снято как гора: {int(cut.sum())} ячеек",
+            "",
+        ]
+
     def _full_metrics(self):
         me = self.model.metrics()
         p = self.model.p
@@ -548,6 +606,9 @@ class ThreatController:
             f"  линий-примеров: {len(self.model.routes)} · "
             f"итерац.: {len(self.model.iter_routes)}",
             f"  запас хода L_max: {p.threat_L_max:g} км", "",
+        ]
+        lines += self._relief_lines()
+        lines += [
             "РЕСУРС",
             f"  N={p.threat_N}  R={p.threat_R:g} км  k={p.threat_k}",
             f"  режим: {MODE_LABELS[p.mode]}",

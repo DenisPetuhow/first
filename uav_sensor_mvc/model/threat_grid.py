@@ -37,8 +37,13 @@ from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
                     THREAT_VILLAGE_PENALTY_CORE, THREAT_VILLAGE_PENALTY_EDGE,
                     THREAT_VILLAGE_RADIUS_MIN_KM, THREAT_VILLAGE_RADIUS_MAX_KM,
                     THREAT_RIVER_CORRIDOR_MAX_KM2,
-                    THREAT_DEM_FILE, THREAT_DEM_WINDOW_KM, THREAT_DEM_WEIGHT,
-                    THREAT_DEM_FULL_M, THREAT_ENTRY_FREE_KM, THREAT_TARGET_FREE_KM,
+                    THREAT_DEM_FILE, THREAT_DEM_ON_START,
+                    THREAT_DEM_AREA_KM, THREAT_DEM_LOCAL_KM,
+                    THREAT_DEM_AREA_FULL_M, THREAT_DEM_LOCAL_FULL_M,
+                    THREAT_DEM_AREA_S, THREAT_DEM_LOCAL_S,
+                    THREAT_DEM_K_MIN, THREAT_DEM_K_MAX, THREAT_DEM_FLOOR,
+                    THREAT_DEM_CUT_AREA_M, THREAT_DEM_CUT_LOCAL_M,
+                    THREAT_ENTRY_FREE_KM, THREAT_TARGET_FREE_KM,
                     THREAT_LMAX_AUTO_FRAC, THREAT_LMAX_CORRIDOR_FRAC)
 
 
@@ -203,7 +208,9 @@ class ThreatGrid:
         self._built_cells = np.zeros((self.ny, self.nx), bool)   # ячейка в застройке
         self._urban = np.zeros((self.ny, self.nx), bool)         # город: пролёт запрещён
         self._village_penalty = np.zeros((self.ny, self.nx), float)  # мягкий штраф деревень
-        self._relief = np.zeros((self.ny, self.nx), float)       # превышение над окрестностью, м
+        self._relief_h = None          # высоты поверхности на сетке, м (None — не загружены)
+        self._relief_k = None          # множитель рельефа: <1 возвышенность, >1 укрытие
+        self._relief_cut = None        # маска «уж очень высокая гора» — вес там снят
 
     # ---- геометрия ячеек ----
     def cell_centers_km(self):
@@ -533,16 +540,32 @@ class ThreatGrid:
             out[y0:y1, x0:x1] = np.minimum(out[y0:y1, x0:x1], val)   # берём худший штраф
         return out
 
-    def add_relief_layer(self, dem_km, window_km, weight, full_m):
-        """Рельеф: ПРЕВЫШЕНИЕ НАД ОКРЕСТНОСТЬЮ как вклад в вес.
+    def add_relief_layer(self, dem_km, area_km, local_km, area_full_m, local_full_m,
+                         area_s, local_s, k_min, k_max, floor, cut_area_m, cut_local_m):
+        """Рельеф: МНОЖИТЕЛЬ к уже накопленному ПОЛОЖИТЕЛЬНОМУ весу.
 
-        Абсолютная высота бесполезна (весь участок может лежать на плато), поэтому
-        считаем dh = высота − средняя высота в окне радиуса window_km:
-          dh < 0 — низина, балка, пойма  -> ПЛЮС к весу (пролёт вероятнее);
-          dh > 0 — холм, гребень         -> МИНУС (даже если по нему идёт дорога).
-        Вклад ограничен ±weight (насыщение при |dh| = full_m), чтобы рельеф правил
-        картину, а не перекрывал линейные ориентиры. dem_km — высоты, уже приведённые
-        к сетке (ny,nx); NaN там, где данных нет."""
+        Считаем превышение над окружающей местностью в ДВУХ масштабах (абсолютная высота
+        бесполезна — участок может целиком лежать на плато):
+          A — над РАЙОНОМ (area_km): плато, гряда, общий подъём местности;
+          B — над ОКРЕСТНОСТЬЮ (local_km): одиночный холм, бугор прямо на пути.
+        Без A высокое открытое плато даёт превышение ≈ 0 и не штрафуется вовсе, хотя
+        видно оттуда на десятки километров.
+
+        ПОЧЕМУ МНОЖИТЕЛЬ, А НЕ СЛАГАЕМОЕ. Прибавление вклада ко всем ячейкам ломает модель
+        дважды. 57 % участка имеет вес ровно 0 — это чистое поле, и бонус за низину делает
+        его «коридором»: маршрут пошёл бы по голой пойме без единого ориентира, хотя вся
+        модель построена на полёте ВДОЛЬ ориентиров. А дорога, поднявшаяся на гребень,
+        уходит в минус, и коридор обрывается посередине. Замер на реальных данных: 4982
+        ложных коридора, связность рассыпается с 68 до 148 компонент. Множитель сравнивает
+        объект сам с собой — «та же дорога, но в низине / на гребне», и структура карты
+        сохраняется точно.
+
+        ПОЧЕМУ НЕ УВОДИМ ВЕС В МИНУС. В этой модели вес ≤ 0 — не «маловероятно», а полный
+        запрет: `threat_routes.passable_mask` берёт `weight > 0`, и отрицательная ячейка
+        неотличима от застройки. Поэтому низкий приоритет выражается малым ПОЛОЖИТЕЛЬНЫМ
+        весом (пол), а полный отказ — нулём по отсечке.
+
+        dem_km — высоты, уже приведённые к сетке (ny,nx); NaN там, где данных нет."""
         if dem_km is None:
             return
         h = np.asarray(dem_km, float)
@@ -550,18 +573,40 @@ class ThreatGrid:
             return
         ok = np.isfinite(h)
         filled = np.where(ok, h, np.nanmean(h[ok]))
-        r = max(1, int(round(window_km / self.h)))
-        base = _box_mean(filled, r)                    # средний уровень вокруг
-        self._relief = np.where(ok, filled - base, 0.0)
-        t = np.clip(-self._relief / max(1e-6, float(full_m)), -1.0, 1.0)  # низина -> +1
-        contrib = float(weight) * t
-        contrib[~ok] = 0.0
-        self.weight += contrib
-        self.layers["relief"] = contrib
+        self._relief_h = np.where(ok, filled, np.nan)
+        A = filled - _box_mean(filled, max(1, int(round(area_km / self.h))))    # над районом
+        B = filled - _box_mean(filled, max(1, int(round(local_km / self.h))))   # над окрестностью
+        k = (1.0 - float(area_s) * _relief_f(A / max(1e-6, float(area_full_m)))
+                 - float(local_s) * _relief_f(B / max(1e-6, float(local_full_m))))
+        k = np.clip(k, float(k_min), float(k_max))
+        k[~ok] = 1.0                                   # нет данных о высоте — вес не трогаем
+        cut = ok & ((A >= float(cut_area_m)) | (B >= float(cut_local_m)))
+        before = self.weight.copy()
+        pos = before > 0
+        # ПОЛ: коридор не опускается ниже floor, но и НЕ поднимается выше исходного веса —
+        # 4.2 % коридоров слабее единицы изначально, и поднимать их было бы искажением
+        # в другую сторону (рельеф усилил бы шум вместо того, чтобы ослабить высоты).
+        lo = np.minimum(before, float(floor))
+        self.weight[pos] = np.maximum(before[pos] * k[pos], lo[pos])
+        # отсечка СНИМАЕТ КОРИДОР, а не стирает ячейку: отрицательный вес (застройка,
+        # деревня) остаётся своим — он и так означает запрет, а обнуление сделало бы
+        # застройку на горе «нейтральной» и исказило тепловую карту
+        self.weight[cut & pos] = 0.0
+        self._relief_k = k
+        self._relief_cut = cut
+        self.layers["relief"] = self.weight - before   # что именно рельеф изменил
 
-    def relief_field(self):
-        """Превышение над окрестностью (м) — для показа/отладки."""
-        return self._relief
+    def relief_height(self):
+        """Высоты поверхности на сетке, м (None — рельеф не загружен)."""
+        return self._relief_h
+
+    def relief_k(self):
+        """Множитель рельефа: < 1 возвышенность, > 1 укрытие (None — рельеф не применён)."""
+        return self._relief_k
+
+    def relief_cut(self):
+        """Маска «уж очень высокая гора»: там вес снят полностью (None — рельефа нет)."""
+        return self._relief_cut
 
     def set_bridge_mask_from_layer(self):
         """Ячейки-ПЕРЕПРАВЫ: мост из OSM (`bridge=yes`) НАД ВОДОЙ. Прежде мост
@@ -712,6 +757,18 @@ def _box_mean(a, r):
     return total / np.maximum((Y1 - Y0) * (X1 - X0), 1)
 
 
+def _relief_f(x):
+    """Отклик на превышение (аргумент — превышение, делённое на порог насыщения).
+
+    Вверх круче линейного (`x^1.5`): высунулся — штраф резкий. Вниз слабее (`0.5·x`):
+    закопался — выигрыш умеренный. Асимметрия намеренная — зона, откуда аппарат виден,
+    растёт быстрее самой высоты. Аргумент насыщается по модулю единицей: без потолка одна
+    гора перевесила бы всю карту, а десятки равноценных низких коридоров схлопнулись бы
+    в одну долину (вместе с разнообразием маршрутов)."""
+    x = np.clip(x, -1.0, 1.0)
+    return np.where(x > 0.0, np.power(np.maximum(x, 0.0), 1.5), 0.5 * x)
+
+
 def _points_in_polygon(px, py, poly):
     """Векторный ray-casting: маска точек (px,py) внутри замкнутого полигона poly."""
     px = np.asarray(px, float); py = np.asarray(py, float)
@@ -766,6 +823,26 @@ def _dilate(mask, r):
     for dy in range(-r, r + 1):
         for dx in range(-r, r + 1):
             out |= pad[r + dy:r + dy + ny, r + dx:r + dx + nx]
+    return out
+
+
+def _erode(mask, r):
+    """Эрозия булевой маски на r ячеек — обратная к `_dilate`. Нужна для ЗАМЫКАНИЯ
+    (дилатация + эрозия), которым сшиваются провалы между коридорами, не расширяя сам
+    коридор (см. `threat_routes.passable_mask`).
+
+    За границей массива считаем «занято» (True) — в отличие от `_dilate`, который
+    паддится нулями. Иначе замыкание подъедало бы коридоры, прижатые к рамке участка:
+    у края не хватило бы соседей, и ячейка ошибочно считалась бы непроходимой."""
+    if r <= 0:
+        return mask.copy()
+    ny, nx = mask.shape
+    pad = np.ones((ny + 2 * r, nx + 2 * r), bool)
+    out = np.ones((ny, nx), bool)
+    pad[r:r + ny, r:r + nx] = mask
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            out &= pad[r + dy:r + dy + ny, r + dx:r + dx + nx]
     return out
 
 
@@ -891,27 +968,22 @@ def load_dem_grid(grid, lon0, lat0, path=None):
     чистым numpy: это квадрат 1201² или 3601² int16 big-endian на тайл 1°×1°, где имя
     файла задаёт юго-западный угол (например N48E038.hgt).
     Файл ищется в geo_cache: THREAT_DEM_FILE + .tif/.tiff/.hgt."""
-    cand = []
+    files = dem_files()
     if path:
-        cand.append(path)
-    else:
-        base = os.path.join(geo_cache_root(), THREAT_DEM_FILE)
-        cand += [base + ext for ext in (".tif", ".tiff", ".hgt")]
-        # плюс любые тайлы .hgt рядом (N48E038.hgt и т.п.)
-        root = geo_cache_root()
-        if os.path.isdir(root):
-            cand += [os.path.join(root, f) for f in sorted(os.listdir(root))
-                     if f.lower().endswith(".hgt")]
-    files = [p for p in cand if p and os.path.exists(p)]
+        files = [path] + [p for p in files if p != path]
+    files = [p for p in files if p and os.path.exists(p)]
     if not files:
         return None
     gx, gy = grid.cell_centers_km()
     lon, lat = km_to_lonlat(gx, gy, lon0, lat0)
+    # размер ячейки в градусах — по нему высота усредняется ПО ЯЧЕЙКЕ, а не берётся
+    # из случайного пикселя (ячейка 500 м ≈ 400 пикселей SRTM)
+    cell_deg = (grid.h / _km_per_deg_lon(lat0), grid.h / _KM_PER_DEG_LAT)
     out = np.full(gx.shape, np.nan)
     for p in files:
         try:
             if p.lower().endswith((".tif", ".tiff")):
-                vals = _sample_geotiff(p, lon, lat)
+                vals = _sample_geotiff(p, lon, lat, cell_deg)
             else:
                 vals = _sample_hgt(p, lon, lat)
         except Exception:
@@ -922,32 +994,139 @@ def load_dem_grid(grid, lon0, lat0, path=None):
     return out if np.isfinite(out).any() else None
 
 
+def dem_files():
+    """Файлы рельефа в geo_cache: `THREAT_DEM_FILE` + .tif/.tiff/.hgt, плюс любые тайлы
+    .hgt рядом (N48E038.hgt и т.п.). Пустой список — рельефа нет, и кнопка «Добавить
+    рельеф» должна быть неактивна."""
+    root = geo_cache_root()
+    base = os.path.join(root, THREAT_DEM_FILE)
+    cand = [base + ext for ext in (".tif", ".tiff", ".hgt")]
+    if os.path.isdir(root):
+        cand += [os.path.join(root, f) for f in sorted(os.listdir(root))
+                 if f.lower().endswith(".hgt")]
+    seen, out = set(), []
+    for p in cand:
+        if p not in seen and os.path.exists(p):
+            seen.add(p); out.append(p)
+    return out
+
+
+def load_dem_display(lon0, lat0, bbox_km, max_px=1400):
+    """Высоты для ОТРИСОВКИ: окно участка в исходном разрешении растра, прорежённое до
+    ~max_px по длинной стороне. Возвращает (высоты (ny,nx) в метрах, extent_km) или None.
+
+    Зачем отдельно от `load_dem_grid`: весовая сетка 500 м для показа слишком груба —
+    рельеф выглядит лего-кубиками, по такой картинке местность не узнать. Здесь берём
+    родные 30 м и прореживаем: 1400 px по длинной стороне — это ~3.6 МБ RGBA, рисуется
+    мгновенно. В вес эта версия НЕ идёт, она только для глаз.
+
+    Массив переворачивается по вертикали: у GeoTIFF строка 0 — северный край, а у нашей
+    сетки строка 0 — южный (ImageItem рисуется от `oy` вверх)."""
+    files = [p for p in dem_files() if p.lower().endswith((".tif", ".tiff"))]
+    if not files:
+        return None
+    try:
+        import rasterio
+        from rasterio.windows import Window
+    except Exception:
+        return None
+    x0, x1, y0, y1 = [float(v) for v in bbox_km]
+    lon_w, lat_s = km_to_lonlat(np.array(x0), np.array(y0), lon0, lat0)
+    lon_e, lat_n = km_to_lonlat(np.array(x1), np.array(y1), lon0, lat0)
+    try:
+        with rasterio.open(files[0]) as ds:
+            inv = ~ds.transform
+            c_w, r_n = inv * (float(lon_w), float(lat_n))     # север -> меньший row
+            c_e, r_s = inv * (float(lon_e), float(lat_s))
+            c0 = int(np.clip(np.floor(min(c_w, c_e)), 0, ds.width - 1))
+            c1 = int(np.clip(np.ceil(max(c_w, c_e)), 1, ds.width))
+            r0 = int(np.clip(np.floor(min(r_n, r_s)), 0, ds.height - 1))
+            r1 = int(np.clip(np.ceil(max(r_n, r_s)), 1, ds.height))
+            if c1 <= c0 or r1 <= r0:
+                return None
+            band = ds.read(1, window=Window(c0, r0, c1 - c0, r1 - r0)).astype(np.float64)
+            step = max(1, int(np.ceil(max(band.shape) / float(max_px))))
+            band = band[::step, ::step]
+            if ds.nodata is not None:
+                band[band == float(ds.nodata)] = np.nan
+            band[band < -1000.0] = np.nan
+            # фактические границы окна в км (строки/столбцы обрезались до целых пикселей)
+            lon_a, lat_b = ds.transform * (c0, r0)            # северо-запад окна
+            lon_b, lat_a = ds.transform * (c1, r1)            # юго-восток окна
+            ex0, ey0 = lonlat_to_km(np.array(lon_a), np.array(lat_a), lon0, lat0)
+            ex1, ey1 = lonlat_to_km(np.array(lon_b), np.array(lat_b), lon0, lat0)
+    except Exception:
+        return None
+    if not np.isfinite(band).any():
+        return None
+    return np.flipud(band), (float(ex0), float(ex1), float(ey0), float(ey1))
+
+
 def km_to_lonlat(x_km, y_km, lon0, lat0):
     """Обратное к lonlat_to_km: км в локальном фрейме -> (долгота, широта)."""
     return (np.asarray(x_km, float) / _km_per_deg_lon(lat0) + lon0,
             np.asarray(y_km, float) / _KM_PER_DEG_LAT + lat0)
 
 
-def _sample_geotiff(path, lon, lat):
-    """Выборка высот GeoTIFF в точках (lon,lat) — ближайший пиксель."""
+def _sample_geotiff(path, lon, lat, cell_deg=None):
+    """Выборка высот GeoTIFF в точках (lon,lat).
+
+    `cell_deg` — размер ячейки сетки в градусах (dlon, dlat). Задан — берём СРЕДНЕЕ по
+    ячейке, не задан — ближайший пиксель.
+
+    Зачем среднее: ячейка сетки 500 м — это около 400 пикселей SRTM, и брать один из них
+    было лотереей. Замер расхождения с усреднением: медиана 1.4 м, 95-й процентиль 6.4 м,
+    максимум 42.5 м на обрывах. Вдобавок SRTM — модель ПОВЕРХНОСТИ, и одиночный пиксель
+    мог попасть на крону дерева. Считается через интегральное изображение: одна свёртка
+    на весь растр независимо от числа ячеек."""
     try:
         import rasterio
     except Exception:
         return None
     with rasterio.open(path) as ds:
-        band = ds.read(1)
-        nodata = ds.nodata
+        band = np.asarray(ds.read(1), dtype=np.float64)
+        bad = ~np.isfinite(band)
+        if ds.nodata is not None:
+            bad |= (band == float(ds.nodata))
+        bad |= (band < -1000.0)                     # типовые «пустые» значения SRTM
         inv = ~ds.transform
         cols, rows = inv * (lon.ravel(), lat.ravel())
-        c = np.rint(np.asarray(cols)).astype(int)
-        r = np.rint(np.asarray(rows)).astype(int)
-        ok = (c >= 0) & (c < ds.width) & (r >= 0) & (r < ds.height)
-        vals = np.full(lon.size, np.nan)
-        vals[ok] = band[r[ok], c[ok]].astype(float)
-        if nodata is not None:
-            vals[vals == float(nodata)] = np.nan
-        vals[vals < -1000] = np.nan                 # типовые «пустые» значения SRTM
-        return vals.reshape(lon.shape)
+        c = np.asarray(cols).reshape(lon.shape)
+        r = np.asarray(rows).reshape(lon.shape)
+        if cell_deg is None:                        # ближайший пиксель
+            ci = np.rint(c).astype(int); ri = np.rint(r).astype(int)
+            ok = ((ci >= 0) & (ci < ds.width) & (ri >= 0) & (ri < ds.height))
+            vals = np.full(lon.shape, np.nan)
+            take = ok & ~bad[np.clip(ri, 0, ds.height - 1), np.clip(ci, 0, ds.width - 1)]
+            vals[take] = band[ri[take], ci[take]]
+            return vals
+        hx = 0.5 * abs(float(cell_deg[0]) / ds.transform.a)   # полуячейка в пикселях
+        hy = 0.5 * abs(float(cell_deg[1]) / ds.transform.e)
+        return _block_mean_at(band, bad, r, c, hy, hx)
+
+
+def _block_mean_at(band, bad, r, c, hy, hx):
+    """Среднее значение растра по прямоугольнику (2hy × 2hx пикселей) вокруг каждой точки
+    (r, c) — через интегральное изображение: O(растр + точки), а не O(точки × окно).
+    Пустые пиксели (`bad`) не участвуют ни в сумме, ни в счётчике."""
+    good = (~bad).astype(np.float64)
+    ny, nx = band.shape
+    ii = np.zeros((ny + 1, nx + 1), np.float64)
+    ii[1:, 1:] = np.cumsum(np.cumsum(np.where(bad, 0.0, band), axis=0), axis=1)
+    nn = np.zeros((ny + 1, nx + 1), np.float64)
+    nn[1:, 1:] = np.cumsum(np.cumsum(good, axis=0), axis=1)
+    r0 = np.clip(np.floor(r - hy).astype(int), 0, ny)
+    r1 = np.clip(np.ceil(r + hy).astype(int), 0, ny)
+    c0 = np.clip(np.floor(c - hx).astype(int), 0, nx)
+    c1 = np.clip(np.ceil(c + hx).astype(int), 0, nx)
+    r1 = np.maximum(r1, np.minimum(r0 + 1, ny))     # окно не бывает пустым
+    c1 = np.maximum(c1, np.minimum(c0 + 1, nx))
+    tot = ii[r1, c1] - ii[r0, c1] - ii[r1, c0] + ii[r0, c0]
+    cnt = nn[r1, c1] - nn[r0, c1] - nn[r1, c0] + nn[r0, c0]
+    out = np.full(r.shape, np.nan)
+    has = cnt > 0
+    out[has] = tot[has] / cnt[has]
+    return out
 
 
 _HGT_NAME = re.compile(r"([NS])(\d{2})([EW])(\d{3})", re.I)
@@ -1204,8 +1383,16 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None,
     None = все слои. Выключенный слой просто не участвует в сумме весов.
     dem — высоты, приведённые к сетке (ny,nx), или None (рельеф не учитывается).
 
-    ПОРЯДОК ВАЖЕН: сначала линейные/площадные слои и бонусы, затем рельеф, и только
-    ПОСЛЕ ЭТОГО населённые пункты — город обнуляет всё, что накопилось в его ячейках."""
+    ПОРЯДОК ВАЖЕН: сначала линейные/площадные слои и бонусы, затем населённые пункты
+    (город обнуляет всё, что накопилось в его ячейках), и рельеф — ПОСЛЕДНИМ.
+
+    Почему рельеф последний. Он МНОЖИТ положительный вес, и гарантия «ноль остаётся нулём,
+    коридор не исчезает» верна только относительно ИТОГОВОГО веса. Когда рельеф стоял до
+    населённых пунктов, деревенский штраф добавлялся уже к ослабленному весу и уводил его
+    в минус: дорога +10 в краю деревни (−8) без рельефа давала +2 и была коридором, а с
+    рельефом на возвышенности 10·0.25 − 8 = −5.5, и коридор пропадал. Замер: так терялось
+    117 ячеек помимо отсечки. Городу же порядок безразличен — обнулённый вес умножается
+    на что угодно и остаётся нулём."""
     cell_km = (THREAT_CELL_M / 1000.0) if cell_km is None else cell_km
     g = ThreatGrid(bbox_km, cell_km)
     for name in THREAT_LAYER_ORDER:
@@ -1227,8 +1414,6 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None,
     g.set_bridge_mask_from_layer()          # мосты — реальные объекты OSM (bridge=yes)
     # funnel-бонус за пересечения слоёв-аттракторов
     g.add_intersection_bonus(THREAT_INTERSECTION_BONUS)
-    # рельеф: низина — плюс, холм — минус (до разметки НП, чтобы город обнулил и его)
-    g.add_relief_layer(dem, THREAT_DEM_WINDOW_KM, THREAT_DEM_WEIGHT, THREAT_DEM_FULL_M)
     # населённые пункты: город запрещён и обнулён, деревня — мягкий штраф от центра
     if enabled is None or "built_up" in enabled:
         g.apply_settlements(layers.get(PLACE_LAYER, [None])[0],
@@ -1240,6 +1425,12 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None,
                             zero_weight=THREAT_CITY_ZERO_WEIGHT,
                             place_polys=layers.get(PLACE_POLY_LAYER),
                             free_points=free_points)
+    # РЕЛЬЕФ — последним, по итоговому весу (см. «почему» в шапке функции)
+    g.add_relief_layer(dem, THREAT_DEM_AREA_KM, THREAT_DEM_LOCAL_KM,
+                       THREAT_DEM_AREA_FULL_M, THREAT_DEM_LOCAL_FULL_M,
+                       THREAT_DEM_AREA_S, THREAT_DEM_LOCAL_S,
+                       THREAT_DEM_K_MIN, THREAT_DEM_K_MAX, THREAT_DEM_FLOOR,
+                       THREAT_DEM_CUT_AREA_M, THREAT_DEM_CUT_LOCAL_M)
     # вода -> запрет датчиков (буфер из конфига); только если слой реки включён
     if enabled is None or "river" in enabled:
         wet = list(layers.get("river", [])) + list(layers.get("stream", []))
@@ -1264,6 +1455,8 @@ class ThreatModel:
         self.candidates = np.empty((0, 2), float)
         self._metrics = {}
         self.dem = None                # высоты рельефа на сетке (None — файла нет)
+        self.relief_on = bool(THREAT_DEM_ON_START)   # учитывать рельеф в весе (кнопка)
+        self._dem_display = None       # высоты в родном разрешении — только для показа
         self.data_path = None          # явный источник цифровых карт (.npz/.osm.pbf)
         self.enabled_layers = None     # набор включённых слоёв (None = все)
         self.target_km = None          # цель, заданная кликом («указать цель»)
@@ -1287,6 +1480,33 @@ class ThreatModel:
         self.enabled_layers = set(names) if names is not None else None
         self.grid = None
 
+    # ---- рельеф ----
+    def has_dem(self):
+        """Есть ли файл высот (по нему кнопка «Добавить рельеф» активна или нет)."""
+        return bool(dem_files())
+
+    def set_relief(self, on):
+        """Включить/выключить учёт рельефа в весовой карте (кнопка «Добавить рельеф»).
+
+        Карта ПЕРЕСОБИРАЕТСЯ целиком, а не досчитывается: рельеф обязан применяться ДО
+        разметки населённых пунктов — город обнуляет всё, что накопилось в его ячейках,
+        включая рельеф. Досчёт поверх готовой карты вернул бы вес городским ячейкам.
+        Побочный эффект пересборки — сброс накопленных маршрутов, итераций и датчиков:
+        они построены по другой карте и смешивать выборки нельзя."""
+        want = bool(on) and self.has_dem()
+        if want == self.relief_on:
+            return False
+        self.relief_on = want
+        self.grid = None                               # потребуется пересборка
+        return True
+
+    def relief_display(self):
+        """Высоты в родном разрешении для отрисовки: (массив, extent_km) или None.
+        Грузится лениво — только когда включили показ карты высот, дальше из памяти."""
+        if self._dem_display is None:
+            self._dem_display = load_dem_display(self.lon0, self.lat0, self.bbox_km) or False
+        return self._dem_display or None
+
     # ---- построение карты (наложение цифровых слоёв на сетку) ----
     def build(self):
         """Загрузить цифровые слои (из файла/кэша/демо) и наложить их на сетку 500 м —
@@ -1302,10 +1522,13 @@ class ThreatModel:
         free_points = [(entry[0], entry[1], THREAT_ENTRY_FREE_KM, None),
                        (target[0], target[1], THREAT_TARGET_FREE_KM,
                         THREAT_TARGET_FREE_KM)]
+        # высоты грузим всегда (их можно показать на карте), но в ВЕС отдаём только по
+        # кнопке «Добавить рельеф» — иначе карта менялась бы молча, от факта наличия файла
         self.grid = build_threat_grid(self.layers, self.bbox_km,
-                                      enabled=self.enabled_layers, dem=self.dem,
+                                      enabled=self.enabled_layers,
+                                      dem=(self.dem if self.relief_on else None),
                                       free_points=free_points)
-        if self.dem is not None:
+        if self.dem is not None and self.relief_on:
             self.source += " + рельеф"
         # маркеры переправ — по РЕАЛЬНЫМ координатам мостов, а не по центрам ячеек
         self.layers["bridge_pts"] = self.grid.bridge_points_km(
@@ -1324,19 +1547,28 @@ class ThreatModel:
         возможных маршрутов ещё ДО итераций."""
         return max(0.0, float(getattr(self.p, "threat_max_gap_km", 2.0)))
 
+    def _route_slack_km(self):
+        """УХОД ОТ ОРИЕНТИРА (км) — насколько маршрут отклоняется вбок от реки или дороги,
+        вдоль которой идёт. Отдельно от разрыва: разрыв про перелёт через пустоту МЕЖДУ
+        коридорами, а это — про свободу манёвра вдоль коридора (нужна для обхода холмов)."""
+        return max(0.0, float(getattr(self.p, "threat_corridor_slack_km", 1.0)))
+
     def _ctx_key(self):
-        """От чего зависит кэш контекста выборки: разрыв (меняет проходимость) и цель.
-        Запас хода L_max сюда НЕ входит — контекст от него не зависит (см. build_iter_context)."""
-        return (self._route_gap_km(), self.target_km)
+        """От чего зависит кэш контекста выборки: разрыв и уход от ориентира (оба меняют
+        проходимость) и цель. Запас хода L_max сюда НЕ входит — контекст от него не
+        зависит (см. build_iter_context)."""
+        return (self._route_gap_km(), self._route_slack_km(), self.target_km)
 
     def _ensure_ctx(self, entry, target):
         """Контекст выборки (проходимость, поля расстояний, VIA). Пересобирается, только
-        если сменился разрыв или цель — иначе переиспользуется (веер VIA-полей дорогой)."""
+        если сменился разрыв, уход от ориентира или цель — иначе переиспользуется
+        (веер VIA-полей дорогой)."""
         from .threat_routes import build_iter_context
         key = self._ctx_key()
         if self._iter_ctx is None or self._ctx_built_key != key:
             self._iter_ctx = build_iter_context(self.grid, entry, target,
-                                                self._route_gap_km())
+                                                self._route_gap_km(),
+                                                slack_km=self._route_slack_km())
             self._ctx_built_key = key
         return self._iter_ctx
 
@@ -1508,13 +1740,14 @@ class ThreatModel:
         from .threat_routes import flight_envelope
         g = self.grid
         gap = self._route_gap_km()                             # тот же порог, что у маршрутов
+        slack = self._route_slack_km()                         # и тот же уход от ориентира
         entry, target = self.entry_target_km()
         self.sync_auto_L_max()                                 # предварительно |AB|+25 %
         _, self.route_min_len = flight_envelope(               # кратчайший путь (от L_max не зависит)
-            g, entry, target, self.p.threat_L_max, gap)
+            g, entry, target, self.p.threat_L_max, gap, slack_km=slack)
         self.sync_auto_L_max(self.route_min_len)               # поднять до «кратчайший+20 %», если авто
         self.route_area, self.route_min_len = flight_envelope(
-            g, entry, target, self.p.threat_L_max, gap)
+            g, entry, target, self.p.threat_L_max, gap, slack_km=slack)
         return entry, target
 
     def sync_auto_L_max(self, min_corridor_km=None):

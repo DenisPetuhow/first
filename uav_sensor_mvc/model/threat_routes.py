@@ -29,6 +29,8 @@ MODEL · Построение маршрутов пролёта БПЛА по в
 import heapq                      # двоичная куча для Дейкстры (_dijkstra_dist)
 import numpy as np
 
+from config import THREAT_LOOKAHEAD_KM, THREAT_LOOKAHEAD_POWER
+
 # 8 соседей ячейки: (dy, dx, множитель длины шага). Орт. сосед — шаг h, диагональный — h·√2.
 _NEIGHBORS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
               (-1, -1, 1.41421356), (-1, 1, 1.41421356),
@@ -67,15 +69,32 @@ def _dijkstra_dist(passable, start, h):
     return dist.reshape(ny, nx)
 
 
-def passable_mask(grid, max_gap_km):
-    """Проходимые ячейки для маршрута: коридоры (вес>0) + короткие ПРЯМЫЕ мостики через
-    провалы ≤ max_gap_km (дилатация коридоров на пол-провала), МИНУС город (кроме рек).
-    Провал > max_gap_km не перекрывается -> коридор там разорван (маршрут невозможен
-    напрямую, идёт в обход или не строится)."""
-    from .threat_grid import _dilate
+def passable_mask(grid, max_gap_km, slack_km=None):
+    """Проходимые ячейки для маршрута: коридоры (вес>0), СШИТЫЕ через провалы ≤ max_gap_km,
+    плюс буфер УХОДА ОТ ОРИЕНТИРА slack_km, МИНУС город (кроме рек).
+
+    ДВА ПАРАМЕТРА, А НЕ ОДИН. Раньше одна дилатация делала обе работы сразу: сшивала
+    разорванные коридоры И разрешала маршруту отклоняться вбок от реки/дороги (буфер
+    получался равен половине разрыва). Настроить одно, не испортив другое, было нельзя —
+    чтобы дать маршруту место для обхода холма, приходилось увеличивать перелёты через
+    пустоту. Теперь сшивка — это ЗАМЫКАНИЕ (дилатация + эрозия): провалы короче разрыва
+    закрываются, а ширина самого коридора не растёт; буфер задаётся отдельно.
+
+    slack_km=None -> прежнее поведение (буфер = разрыв / 2). Провал > max_gap_km не
+    перекрывается -> коридор там разорван (маршрут идёт в обход или не строится)."""
+    from .threat_grid import _dilate, _erode
     corridor = grid.weight > 0
-    r = max(0, int(round(0.5 * max_gap_km / grid.h)))          # мостик ≤ 2r ячеек
-    pas = _dilate(corridor, r) if r > 0 else corridor.copy()
+    r_gap = max(0, int(round(0.5 * max_gap_km / grid.h)))       # мостик ≤ 2·r_gap ячеек
+    r_slack = r_gap if slack_km is None else max(0, int(round(slack_km / grid.h)))
+    pas = corridor
+    if r_gap > 0:
+        # `| corridor` — страховка: замыкание по определению не теряет ячеек, но дешевле
+        # гарантировать это явно, чем ловить краевой эффект на прижатых к рамке коридорах
+        pas = _erode(_dilate(corridor, r_gap), r_gap) | corridor
+    if r_slack > 0:
+        pas = _dilate(pas, r_slack)
+    else:
+        pas = pas.copy()
     pas &= ~grid.urban_mask()                                  # город (кроме рек) непроходим
     return pas
 
@@ -90,7 +109,7 @@ def _open_endpoints(pas, cells_yx, grid, radius_km=3.0):
     return pas
 
 
-def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km):
+def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km, slack_km=None):
     """ВСЕ ВОЗМОЖНЫЕ МЕСТА ПРОЛЁТА при запасе хода L_max. Ячейка попадает в «возможные
     места», если существует путь вход→ячейка→цель по коридорам (с мостиками ≤ max_gap)
     суммарной длиной ≤ L_max:
@@ -101,7 +120,7 @@ def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km):
     запас хода. Возвращает (mask_возможных_ячеек, min_длина_вход→цель)."""
     start = _cell_of(grid, entry_km)
     goal = _cell_of(grid, target_km)
-    pas = _open_endpoints(passable_mask(grid, max_gap_km), (start, goal), grid)
+    pas = _open_endpoints(passable_mask(grid, max_gap_km, slack_km), (start, goal), grid)
     ge = _dijkstra_dist(pas, start, grid.h)
     gt = _dijkstra_dist(pas, goal, grid.h)
     total = ge + gt
@@ -163,6 +182,43 @@ def _mode_corridor_pref(wnorm, wmode):
     if wmode == "min":                        # приоритет лёгких («пустоши», одинокая река)
         return 0.10 + 1.6 * (1.0 - wnorm)
     return 0.30 + 0.8 * wnorm                 # medium: вероятность ∝ весу
+
+
+def _lookahead_fields(grid, look_km):
+    """Средний множитель РЕЛЬЕФА впереди по каждому из 8 направлений: `ahead[d][y,x]` —
+    каково будет дальше, если шагнуть из (y,x) в направлении d.
+
+    ЗАЧЕМ. Горизонт решения в блуждании — одна ячейка (500 м), а тяга к цели считается по
+    чистой геометрии (`_dijkstra_dist` не знает ни весов, ни высот). Из-за этого узкий холм
+    маршрут обтекал, а перед широким массивом упирался: локальное нежелание лезть вверх
+    пересиливалось тягой к цели. Поле `ahead` поднимает горизонт до look_km, и отворот
+    начинается заранее.
+
+    СРЕДНЕЕ, А НЕ МИНИМУМ: минимум блокировал бы направление из-за одной плохой клетки,
+    среднее даёт плавный отворот. За краем массива клетки не учитываются, пустое
+    направление даёт нейтральную единицу.
+
+    Стоимость: 8 направлений × L сдвигов массива 189×151 — доли миллисекунды, считается
+    один раз на контекст выборки. None — рельеф не применён, механизм не участвует."""
+    k = grid.relief_k() if hasattr(grid, "relief_k") else None
+    if k is None or look_km <= 0.0:
+        return None
+    k = np.asarray(k, float)
+    ny, nx = k.shape
+    out = []
+    for dy, dx, mul in _NEIGHBORS:
+        L = max(1, int(round(look_km / (grid.h * mul))))     # диагональный шаг длиннее
+        acc = np.zeros((ny, nx)); cnt = np.zeros((ny, nx))
+        for i in range(1, L + 1):
+            sy, sx = dy * i, dx * i
+            y0, y1 = max(0, -sy), min(ny, ny - sy)           # куда пишем
+            x0, x1 = max(0, -sx), min(nx, nx - sx)
+            if y0 >= y1 or x0 >= x1:
+                break
+            acc[y0:y1, x0:x1] += k[y0 + sy:y1 + sy, x0 + sx:x1 + sx]
+            cnt[y0:y1, x0:x1] += 1.0
+        out.append(np.where(cnt > 0.0, acc / np.maximum(cnt, 1.0), 1.0))
+    return out
 
 
 def _catmull_rom(points, seg_km=1.5, alpha=0.5):
@@ -332,6 +388,8 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     grid = ctx["grid"]; pas = ctx["pas"]; wnorm = ctx["wnorm"]
     axis_s = ctx.get("axis_s")          # проекция ячеек на ось старт→цель (км)
     dgoal = ctx.get("dgoal")            # ПРЯМОЕ расстояние ячеек до цели (км)
+    ahead = ctx.get("ahead")            # средний рельеф впереди по каждому направлению
+    look_p = float(THREAT_LOOKAHEAD_POWER)   # 0 -> предвидение выключено
     ny, nx = dfield.shape
     h = grid.h
     d_start = dfield[start]
@@ -403,6 +461,10 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                           else 1.0 + 2.5 * max(dot, 0.0))   # но прямо всё равно охотнее
             prog = dfield[cur] - dj
             corr = _mode_corridor_pref(wnorm[vy, vx], wmode)   # приоритет по весу (режим)
+            if ahead is not None and look_p > 0.0:
+                # ЧТО ЖДЁТ ДАЛЬШЕ по этому курсу: холм впереди снижает привлекательность
+                # направления заранее, за километры, а не за одну клетку до подножия
+                corr *= float(ahead[k][cy, cx]) ** look_p
             # tau мал (запас на исходе) -> exp резко выделяет соседа с макс. прогрессом к цели
             s = float(np.exp(prog / tau)) * corr * hf
             if vy * nx + vx in visited:                 # штраф за повторный заход — гасит петли,
@@ -459,7 +521,8 @@ def _seg_dist_km(pt, a, b):
     return float(np.hypot(*(p - (a + t * ab))))
 
 
-def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5)):
+def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
+                       slack_km=None):
     """Подготовить (один раз, кэшируется) контекст выборки. VIA-точки — СЕТКА по всей
     проходимой области (все стороны, включая юг/восток и «за целью» — заход в Б с ЛЮБОГО
     направления, если хватает хода), с предвычисленными полями расстояний. Каждой via
@@ -476,8 +539,9 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5)):
     поэтому кэшируется и переиспользуется при смене L_max."""
     start = _cell_of(grid, entry_km)
     goal = _cell_of(grid, target_km)
-    pas = _open_endpoints(passable_mask(grid, max_gap_km), (start, goal), grid)
+    pas = _open_endpoints(passable_mask(grid, max_gap_km, slack_km), (start, goal), grid)
     gt = _dijkstra_dist(pas, goal, grid.h)              # поле расстояний до цели (тяга)
+    ahead = _lookahead_fields(grid, THREAT_LOOKAHEAD_KM)   # что ждёт впереди по курсу
     w = np.clip(grid.weight, 0.0, None)                 # нормировка веса по p90 (как в стоимости)
     pos = w[w > 0]
     ref = float(np.percentile(pos, 90)) if pos.size else 1.0
@@ -529,7 +593,7 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5)):
     # не там, где кажется глазу.
     dgoal = np.hypot(gxc - B[0], gyc - B[1])
     return dict(grid=grid, pas=pas, gt=gt, wnorm=wnorm, start=start, goal=goal, ab=ab,
-                axis_s=axis_s, dgoal=dgoal,
+                axis_s=axis_s, dgoal=dgoal, ahead=ahead,
                 via_cell=via_cell, via_gv=via_gv, via_segd=np.asarray(via_segd),
                 via_minlen=np.asarray(via_minlen), via_togoal=np.asarray(via_togoal),
                 gt_start=float(gt[start]), reachable=bool(np.isfinite(gt[start])))
