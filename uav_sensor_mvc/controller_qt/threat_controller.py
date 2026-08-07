@@ -86,6 +86,8 @@ class ThreatController:
         # ВИДИМОЙ области, а застройка переключается растр <-> контуры
         self.view.on_view_changed = self._on_view_changed
         self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
+        self.model.sync_cand_step(force=True)      # шаг сетки под текущий радиус
+        self.view.set_param_values(self.model.p)
         self._idle_metrics()
 
     # ================= ЗАПРЕТНЫЕ ЗОНЫ =================
@@ -498,6 +500,11 @@ class ThreatController:
         if self.model.p.threat_N < 1 or self.model.p.threat_R <= 0:
             self.view.flash_title("N ≥ 1 и R > 0.")
             return
+        # ШАГ СЕТКИ ДАТЧИКОВ подгоняется под радиус, но только если радиус СМЕНИЛСЯ:
+        # иначе затирали бы значение, которое пользователь только что ввёл руками
+        before = float(self.model.p.threat_cand_step_km)
+        if abs(self.model.sync_cand_step() - before) > 1e-9:
+            self.view.set_param_values(self.model.p)     # показать пересчитанный шаг
         if self.model.grid is None:
             self.on_build()
         elif len(self.model.sensors):
