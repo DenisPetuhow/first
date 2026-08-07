@@ -111,6 +111,7 @@ class ThreatController:
     def _on_view_changed(self):
         """Вид изменился — перерисовать только векторные слои (остальное не зависит
         от масштаба). Дёшево: слои и так строятся из готовых массивов."""
+        self.view.reposition_legends()      # легенды прижаты к углам вида, а не участка
         g = self.model.grid
         if g is None:
             return
@@ -268,18 +269,21 @@ class ThreatController:
             self.model.routes = []
             self.model.iter_routes = []
             self.model.iter_iteration = 0
-        # маршруты/итерации зависят от запаса хода — пересчитать показанное
-        t = self.view.get_toggles()
-        if self.model.grid is not None and t.get("show_iter"):
-            self._run_async("iter", self.model.iterate_routes)
-        elif self.model.grid is not None and (t["show_routes"] or gap_changed):
-            self.model.routes = []
-            self._run_async("routes", self.model.plan_routes)   # пересчитает и область залёта
+        # Маршруты, область залёта и датчики зависят от запаса хода и разрыва —
+        # пересчитываем ВСЕГДА, а не только то, что сейчас показано на карте. Раньше
+        # условие смотрело на чекбоксы: при выключенных «маршрутах» правка L_max меняла
+        # только надпись, а область, линии и датчики оставались от прежних значений —
+        # подхватывалось лишь после «Сбросить» или «Расставить».
+        if self.model.grid is not None:
+            if self.view.get_toggles().get("show_iter") and self.model.iter_routes:
+                self._run_async("iter", self.model.iterate_routes)
+            else:
+                self.model.routes = []
+                self._run_async("routes", self.model.plan_routes)  # и область залёта, и датчики
         else:
             self._render_all()
-        self.view.set_title("Входные данные применены."
-                            + (" Разрыв изменён — область залёта пересчитана."
-                               if gap_changed else ""))
+        self.view.set_title("Входные данные применены — пересчёт области, маршрутов и датчиков."
+                            + (" Разрыв изменён." if gap_changed else ""))
 
     # ---- смена приоритета по весу (max/medium/min/mix) ----
     def on_iter_mode(self, key):
@@ -354,6 +358,14 @@ class ThreatController:
                 f"режим {MODE_LABELS[self.model.p.mode]}")
             self._full_metrics()
         elif kind == "routes":
+            # Датчики стоят по ЭТОЙ ЖЕ выборке (до итераций — по «возможным маршрутам»,
+            # см. _sample_for_sensors), поэтому после её пересчёта их надо обновить.
+            # Раньше они оставались от прежнего запаса хода: область залёта на карте
+            # выросла, маршруты перестроились, а кольца датчиков висели по-старому —
+            # и подвинуть их можно было только «Расставить» или сбросом.
+            if len(self.model.sensors):
+                self.model.place_sensors()
+                self._sensors_at = len(self.model.iter_routes)
             self._render_all()
             self._full_metrics()
             n, area = self.model.reachable_stats()

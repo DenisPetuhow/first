@@ -36,7 +36,12 @@ from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
                     THREAT_TOWN_CITY_KM2, THREAT_CITY_ZERO_WEIGHT,
                     THREAT_VILLAGE_PENALTY_CORE, THREAT_VILLAGE_PENALTY_EDGE,
                     THREAT_VILLAGE_RADIUS_MIN_KM, THREAT_VILLAGE_RADIUS_MAX_KM,
-                    THREAT_RIVER_CORRIDOR_MAX_KM2,
+                    THREAT_VILLAGE_FLOOR, THREAT_VILLAGE_SKIP_FACTOR,
+                    THREAT_VILLAGE_TOWNLIKE_MED, THREAT_RIVER_CORRIDOR_MAX_KM2,
+                    THREAT_PLACE_GRADE_ON, THREAT_PLACE_GRADE_TOL,
+                    THREAT_PLACE_GRADE_MIN_SAMPLE, THREAT_PLACE_CLOSE_KM,
+                    THREAT_PLACE_GRADE_OUTLIER, THREAT_PLACE_GRADE_STRICT_UP,
+                    THREAT_PLACE_GRADE_MODE,
                     THREAT_DEM_FILE, THREAT_DEM_ON_START,
                     THREAT_DEM_AREA_KM, THREAT_DEM_LOCAL_KM,
                     THREAT_DEM_AREA_FULL_M, THREAT_DEM_LOCAL_FULL_M,
@@ -208,6 +213,10 @@ class ThreatGrid:
         self._built_cells = np.zeros((self.ny, self.nx), bool)   # ячейка в застройке
         self._urban = np.zeros((self.ny, self.nx), bool)         # город: пролёт запрещён
         self._village_penalty = np.zeros((self.ny, self.nx), float)  # мягкий штраф деревень
+        self._village_grade = {}       # какие пороги отсечения хуторов сработали
+        self._place_tag_raw = None     # исходные коды place из OSM (для сверки)
+        self._place_grade = {}         # отчёт собственной градации пунктов
+        self._place_dens = None        # компактность пятен застройки
         self._relief_h = None          # высоты поверхности на сетке, м (None — не загружены)
         self._relief_k = None          # множитель рельефа: <1 возвышенность, >1 укрытие
         self._relief_cut = None        # маска «уж очень высокая гора» — вес там снят
@@ -367,7 +376,11 @@ class ThreatGrid:
     def apply_settlements(self, places_km, min_area_km2, town_city_km2, buffer_km,
                           village_core, village_edge, r_min_km, r_max_km,
                           river_corridor_max_km2, zero_weight=True,
-                          place_polys=None, free_points=None):
+                          place_polys=None, free_points=None, village_floor=0.0,
+                          village_skip_factor=0.0, village_townlike_med=0.0,
+                          grade_on=False, grade_tol=0.15, grade_min_sample=5,
+                          grade_close_km=1.0, grade_z=0.0, grade_strict_up=True,
+                          grade_mode="both"):
         """Разметить населённые пункты и применить их к весу и проходимости.
 
         Классификация пятен застройки (связные компоненты по сырой застройке):
@@ -384,6 +397,17 @@ class ThreatGrid:
         спадает линейно от village_core в центре до village_edge на границе радиуса
         (радиус ~ размеру пятна, в пределах r_min_km..r_max_km) и до 0 дальше. Маршрут
         сам прижимается к окраине, но при необходимости проходит.
+
+        `village_skip_factor` / `village_townlike_med` — СОБСТВЕННАЯ градация пунктов по
+        данным участка (см. `_village_size_filter`): слишком мелкие пятна (хутора) и,
+        если включено, слишком крупные (посёлки) штраф не накладывают вовсе.
+
+        `village_floor` — ПОЛ штрафа: деревня ослабляет ориентир, но не стирает его.
+        Штраф фиксирован (−20/−10), а ориентиры весят немного (река +10, местная дорога
+        +3), поэтому без пола деревня уводила их в минус — то есть в полный запрет,
+        вопреки собственному правилу «пролёт разрешён». Замер до правки: 1019 ячеек с
+        ориентирами теряли коридор только из-за штрафа, среди них 54 ячейки реки.
+        0.0 -> прежнее поведение.
 
         РЕКА сквозь населённый пункт остаётся коридором, пока пятно меньше
         river_corridor_max_km2; у крупных городов русло закрывается вместе с городом."""
@@ -410,7 +434,12 @@ class ThreatGrid:
             lab, nlab = _label8(self._built_cells)
             area = np.bincount(lab.ravel(), minlength=nlab + 1) * (self.h * self.h)
             kind = self._classify_components(lab, nlab, area, places_km,
-                                             min_area_km2, town_city_km2)
+                                             min_area_km2, town_city_km2,
+                                             grade_on=grade_on, grade_tol=grade_tol,
+                                             grade_min_sample=grade_min_sample,
+                                             close_km=grade_close_km, grade_z=grade_z,
+                                             grade_strict_up=grade_strict_up,
+                                             grade_mode=grade_mode)
             city |= kind[lab] == 2                             # пятна-города
             village |= kind[lab] == 1                          # пятна-деревни
         village &= ~city
@@ -422,6 +451,10 @@ class ThreatGrid:
         village &= ~self._free
 
         # --- деревни: плавный штраф от центра к краю ---
+        # Сперва СОБСТВЕННАЯ градация по данным участка: хутора (и, если включено,
+        # посёлки) из маски убираются — они не штрафуют вовсе.
+        village, self._village_grade = self._village_size_filter(
+            village, village_skip_factor, village_townlike_med)
         if village.any():
             self._village_penalty = self._village_field(
                 village, village_core, village_edge, r_min_km, r_max_km)
@@ -433,12 +466,17 @@ class ThreatGrid:
             city_zone = _dilate(city_zone, r)                  # буфер облёта
         river = self._present.get("river")
         if river is not None:
-            # русло остаётся коридором, пока сам город меньше порога; у крупных
-            # (Луганск, Алчевск) река закрывается вместе с городом
-            clab, cn = _label8(city)
-            carea = np.bincount(clab.ravel(), minlength=cn + 1) * (self.h * self.h)
-            small = (carea <= float(river_corridor_max_km2))[clab]
-            small &= city                                      # вне города не трогаем
+            # Русло остаётся коридором, пока сам населённый пункт меньше порога; у
+            # крупных (Луганск, Алчевск) река закрывается вместе с городом.
+            #
+            # РАЗМЕР МЕРЯЕТСЯ ПО ИСХОДНОМУ ПЯТНУ ЗАСТРОЙКИ, а не по связной области
+            # `city`. Раньше бралось `_label8(city)`, а туда уже слиты контуры соседних
+            # пунктов, «обжитая зона» (застройка + 1 км) и буфер облёта: цепочка сёл
+            # вдоль реки давала одну компоненту в 431 км², и правило не срабатывало
+            # НИКОГДА — именно вдоль рек посёлки и стоят цепочкой. Тот же приём уже
+            # применён при классификации (см. `_label8(self._built_cells)` выше):
+            # мерить надо по сырой застройке, иначе получается «псевдогород».
+            small = self._own_place_small(city, float(river_corridor_max_km2), r)
             small = _dilate(small, r) & ~_dilate(city & ~small, r)
             city_zone = city_zone & ~(river & small)
         city_zone &= ~self._free          # буфер соседнего города не лезет в свободную зону
@@ -459,14 +497,313 @@ class ThreatGrid:
         # штраф деревень — только ВНЕ города: буфер города и радиус соседней деревни
         # перекрывались, и в городских ячейках оставался минус вместо нуля
         self._village_penalty[city_zone] = 0.0
+        before = self.weight.copy()
         self.weight += self._village_penalty
-        self.layers["village"] = self._village_penalty
+        # ПОЛ: деревня ОСЛАБЛЯЕТ ориентир, но не стирает. Иначе река (+10) под штрафом
+        # (−17) уходила в минус, а минус в этой модели — полный запрет (passable_mask
+        # берёт weight > 0), а не «маловероятно». Градиент «ближе к центру — менее
+        # вероятно» при этом сохраняется: вес падает, просто не ниже пола.
+        if village_floor > 0.0:
+            pos = before > 0.0
+            lo = np.minimum(before, float(village_floor))
+            self.weight[pos] = np.maximum(self.weight[pos], lo[pos])
+        # в слое «village» — фактическое изменение веса, а не сырой штраф: иначе после
+        # применения пола слой врал бы (показывал −17 там, где вес упал на 9)
+        self.layers["village"] = self.weight - before
+
+    def own_place_area_km2(self, buf_cells=0):
+        """Для КАЖДОЙ ячейки — площадь её «родного» населённого пункта (км²), то есть
+        пятна СЫРОЙ застройки, отвечающего за эту ячейку. 0 — рядом застройки нет.
+
+        Зачем не связная маска города. `city` склеивает соседние пункты сразу тремя
+        способами: «обжитая зона» расширяет застройку на 1 км, контуры НП из OSM
+        накладываются в одну общую маску, сверху идёт буфер облёта. Цепочка сёл вдоль
+        реки превращается в одну область в сотни км², и любое правило вида «пункт
+        меньше стольких-то км²» не срабатывает никогда. По сырой застройке цепочка
+        снова распадается на отдельные посёлки — тот же приём, что при классификации
+        (`_label8(self._built_cells)`).
+
+        Ячейка может лежать и вне самой застройки (её привёл контур или буфер), поэтому
+        пятно ищется в окрестности `1 км + buf_cells`. Из дотянувшихся берётся САМОЕ
+        КРУПНОЕ: на стыке большого города и хутора ячейка обязана считаться городской,
+        иначе одинокий хутор смягчил бы правило в центре города."""
+        best = np.zeros((self.ny, self.nx), float)
+        if not self._built_cells.any():
+            return best
+        lab, nlab = _label8(self._built_cells)
+        if nlab == 0:
+            return best
+        area = np.bincount(lab.ravel(), minlength=nlab + 1) * (self.h * self.h)
+        rr = max(1, int(round(1.0 / self.h)) + max(0, int(buf_cells)))
+        for c in range(1, nlab + 1):
+            iy, ix = np.nonzero(lab == c)
+            if not len(iy):
+                continue
+            y0, y1 = max(0, iy.min() - rr), min(self.ny, iy.max() + rr + 1)
+            x0, x1 = max(0, ix.min() - rr), min(self.nx, ix.max() + rr + 1)
+            zone = _dilate((lab == c)[y0:y1, x0:x1], rr)   # дилатация по bbox пятна
+            np.maximum(best[y0:y1, x0:x1], np.where(zone, area[c], 0.0),
+                       out=best[y0:y1, x0:x1])
+        return best
+
+    def _own_place_small(self, city, max_km2, buf_cells):
+        """Маска «ячейка принадлежит НЕБОЛЬШОМУ населённому пункту» — по площади его
+        собственного пятна застройки (см. `own_place_area_km2`), а не связной области.
+        Ячейки, к которым не дотянулось ни одно пятно, небольшими не считаются."""
+        best = self.own_place_area_km2(buf_cells)
+        return city & (best > 0.0) & (best <= float(max_km2))
+
+    def _village_size_filter(self, village, skip_factor, townlike_med):
+        """Убрать из маски деревни пятна, которые по СОБСТВЕННОЙ градации участка
+        штрафовать не должны.
+
+        Градация строится по самим данным (`settlement_stats`), а не по тегу OSM
+        `place`: тег ненадёжен — одинаковые по размеру пятна размечены то village, то
+        town, а хутор из трёх домов тоже village. Пороги берутся ОТНОСИТЕЛЬНО участка,
+        поэтому переносятся на другую местность, где масштаб застройки иной.
+
+          * мельче `минимум × skip_factor` — фактически хутор, штрафа нет;
+          * крупнее `медиана × townlike_med` — уже посёлок со своей дорожной сетью,
+            гасить коридоры вокруг него незачем (правило выключено при 0).
+
+        Возвращает (новая маска, справка о применённых порогах)."""
+        info = dict(skip_below=0.0, skip_above=float("inf"), dropped_small=0,
+                    dropped_big=0)
+        if not village.any() or not self._built_cells.any():
+            return village, info
+        mn, med, _mx, n = self.settlement_stats()
+        if n == 0:
+            return village, info
+        if skip_factor > 0.0:
+            info["skip_below"] = mn * float(skip_factor)
+        if townlike_med > 0.0:
+            info["skip_above"] = med * float(townlike_med)
+        if info["skip_below"] <= 0.0 and not np.isfinite(info["skip_above"]):
+            return village, info
+        own = self.own_place_area_km2()
+        drop_small = village & (own > 0.0) & (own < info["skip_below"])
+        drop_big = village & (own > info["skip_above"])
+        info["dropped_small"] = int(drop_small.sum())
+        info["dropped_big"] = int(drop_big.sum())
+        return village & ~(drop_small | drop_big), info
+
+    def settlement_stats(self):
+        """РАСПРЕДЕЛЕНИЕ пятен застройки по площади на рабочем участке (км²):
+        `(минимум, медиана, максимум, число пятен)` — основа СОБСТВЕННОЙ градации
+        населённых пунктов (см. `THREAT_VILLAGE_SKIP_FACTOR`).
+
+        Зачем считать по данным, а не брать фиксированные числа: тег OSM `place`
+        ненадёжен — одинаковые по размеру пятна размечены то как village, то как town,
+        а хутор из трёх домов тоже значится village. Масштаб застройки к тому же
+        меняется от участка к участку. Относительная картина «мелкие / средние /
+        крупные» устойчивее, поэтому пороги берутся от неё.
+        Пусто -> (0, 0, 0, 0)."""
+        if not self._built_cells.any():
+            return (0.0, 0.0, 0.0, 0)
+        lab, nlab = _label8(self._built_cells)
+        if nlab == 0:
+            return (0.0, 0.0, 0.0, 0)
+        area = np.bincount(lab.ravel(), minlength=nlab + 1)[1:] * (self.h * self.h)
+        area = area[area > 0]
+        if not area.size:
+            return (0.0, 0.0, 0.0, 0)
+        return (float(area.min()), float(np.median(area)), float(area.max()), int(area.size))
+
+    def place_profiles(self, lab, nlab, area, close_km=1.0):
+        """ПАСПОРТ каждого пятна застройки — два измеримых признака:
+
+          * `area_km2`  — МАСШТАБ: площадь самой застройки;
+          * `density`   — КОМПАКТНОСТЬ: та же площадь, делённая на площадь ЗАМКНУТОГО
+            контура пятна (0..1).
+
+        Замыкание (дилатация + эрозия радиусом `close_km`) закрывает парки, площади и
+        промзоны внутри города — они не размечены как `landuse=residential` и иначе
+        рвали бы пятно на куски, — но не захватывает поля снаружи. Знаменатель поэтому
+        отражает сам пункт, а не то, как OSM нарисовал административную границу.
+
+        Возвращает (площади, плотности) — массивы длиной nlab+1, нулевой элемент фиктивный.
+        Каждое пятно замыкается ПО СВОЕМУ bbox: полная морфология на 411 пятнах вышла бы
+        заметно дороже, а результат тот же."""
+        dens = np.zeros(nlab + 1, float)
+        if nlab == 0:
+            return np.asarray(area, float), dens
+        r = max(1, int(round(float(close_km) / self.h)))
+        for c in range(1, nlab + 1):
+            iy, ix = np.nonzero(lab == c)
+            if not len(iy):
+                continue
+            y0, y1 = max(0, iy.min() - r - 1), min(self.ny, iy.max() + r + 2)
+            x0, x1 = max(0, ix.min() - r - 1), min(self.nx, ix.max() + r + 2)
+            sub = (lab[y0:y1, x0:x1] == c)
+            closed = _erode(_dilate(sub, r), r) | sub      # замыкание не теряет ячеек
+            n_closed = float(closed.sum())
+            dens[c] = (float(sub.sum()) / n_closed) if n_closed > 0 else 0.0
+        return np.asarray(area, float), dens
+
+    def grade_places(self, tag, area, dens, nlab, tol=0.15, min_sample=5, q=0.0,
+                     strict_up=True, mode="both"):
+        """ПЕРЕСЧЁТ типа пункта по данным рабочей области. Возвращает (новый тег, отчёт).
+
+        `tag[c]` — исходный код из OSM (3 city / 2 town / 1 village / 0 мельче;
+        4 — район города, в статистику и переводы не входит: это часть города, а не
+        самостоятельный пункт, и раньше такие районы ломали класс `city` — см. PLACE_CODES).
+
+        Как считается. По каждой группе тега берутся минимум, среднее и максимум ОБОИХ
+        признаков — это и есть градация, посчитанная по текущему участку, а не взятая
+        из константы. Пункт переводится в соседний класс, если с допуском `tol`
+        дотягивается до его границы, причём ОБА признака согласны: по одному масштабу
+        хутор с плотной застройкой ушёл бы в города, по одной плотности — тоже.
+
+        `q` — порог ОТСЕВА ошибок разметки (modified z-score на медиане и MAD). Объект,
+        слишком далёкий от середины своего класса, — это не «маленький город», а ошибка
+        тега, и границу класса задавать он не должен. Замер: в `city` оказался пункт
+        0.50 км² (хутор с ошибочным тегом), и он один опустил нижнюю границу класса до
+        уровня деревни — после чего вверх уехали 133 пункта из 208, а городская зона
+        выросла вместо сокращения. Порог безразмерный, поэтому одинаков для любого
+        участка. `q = 0` -> отсев выключен.
+
+        `strict_up` — пороги перехода отсчитываются от СВОЕГО класса, симметрично в обе
+        стороны: чтобы подняться, надо превзойти МАКСИМУМ своего класса; чтобы упасть —
+        оказаться ниже его МИНИМУМА. Классы по тегу перекрываются почти полностью, и
+        сравнение с чужим классом даёт ошибку в обе стороны: «дотянуться до минимума
+        city» могла рядовая деревня, а «оказаться ниже максимума town» (23.50 км²) —
+        настоящий город вроде Северодонецка (17.25 км²).
+
+        Пять предохранителей:
+          * класс, в котором меньше `min_sample` пунктов, статистики не имеет — В НЕГО
+            НЕ ПЕРЕВОДИТСЯ НИЧЕГО, остаётся исходный тег;
+          * выбросы отсеиваются до расчёта границ (см. `q`) — один ошибочный тег не
+            открывает дверь всему классу;
+          * подъём требует превзойти максимум своего класса (см. `strict_up`);
+          * если пункт одновременно дотягивается и вверх, и вниз, он не переводится
+            (классы пересеклись — данные не дают однозначного ответа);
+          * ОДИН проход: пороги считаются до переводов и потом не пересчитываются, иначе
+            границы классов сдвинулись бы и часть пунктов замигрировала бы обратно."""
+        out = np.array(tag, np.int8, copy=True)
+        rep = dict(moved_up=0, moved_down=0, skipped_small=[], stats={}, changes=[])
+        if nlab == 0:
+            return out, rep
+        idx = np.arange(nlab + 1)
+        zmax = float(max(0.0, q))
+
+        def keep_mask(v):
+            """Кого оставить в выборке класса. Объект, слишком далёкий от середины, —
+            это не «маленький город», а ОШИБКА ТЕГА, и границу класса задавать он не
+            должен. Мера — modified z-score на медиане и MAD: обе величины сами не
+            сдвигаются от выбросов, поэтому порог безразмерный и одинаков для любого
+            участка (никакой привязки к километрам этой конкретной области)."""
+            if zmax <= 0.0 or v.size < 4:
+                return np.ones(v.size, bool)
+            med = float(np.median(v))
+            mad = float(np.median(np.abs(v - med)))
+            if mad <= 1e-12:                     # выборка почти вырождена — не чистим
+                return np.ones(v.size, bool)
+            return 0.6745 * np.abs(v - med) / mad <= zmax
+
+        def bounds(v):
+            """(минимум, среднее, максимум) по ОЧИЩЕННОЙ выборке."""
+            if not v.size:
+                return (0.0, 0.0, 0.0)
+            return (float(v.min()), float(v.mean()), float(v.max()))
+
+        use_mad = mode in ("mad", "both")
+        use_cascade = mode in ("cascade", "both")
+        prev_max_a = prev_max_d = None                     # планка от класса снизу
+        for k in PLACE_LADDER:                             # village / town / city
+            sel = (tag == k) & (idx > 0)
+            n = int(sel.sum())
+            a_v, d_v = area[sel], dens[sel]
+            n_mad = n_casc = 0
+            if use_mad:
+                # выброс по ЛЮБОМУ из признаков исключает объект целиком: пункт с
+                # ошибочным тегом врёт обоими числами, половину его данных не оставляем
+                keep = keep_mask(a_v) & keep_mask(d_v)
+                if int(keep.sum()) >= 3:                   # чистим, пока выборка жива
+                    n_mad = int((~keep).sum())
+                    a_v, d_v = a_v[keep], d_v[keep]
+            if use_cascade and prev_max_a is not None and a_v.size:
+                # КАСКАД: «город не может быть меньше самого крупного посёлка».
+                # Планка — максимум УЖЕ ОЧИЩЕННОГО класса снизу, иначе одна ошибка
+                # разметки в village задрала бы планку всем town и city.
+                keep = (a_v >= prev_max_a) | (d_v >= prev_max_d)
+                if int(keep.sum()) >= 3:
+                    n_casc = int((~keep).sum())
+                    a_v, d_v = a_v[keep], d_v[keep]
+            n_used = int(a_v.size)
+            rep["stats"][k] = dict(n=n, n_used=n_used, dropped=n - n_used,
+                                   dropped_mad=n_mad, dropped_cascade=n_casc,
+                                   area=bounds(a_v), dens=bounds(d_v))
+            if n_used:
+                prev_max_a, prev_max_d = rep["stats"][k]["area"][2], rep["stats"][k]["dens"][2]
+            if n_used < int(min_sample):
+                rep["skipped_small"].append(k)
+        up, dn = 1.0 + float(tol), 1.0 - float(tol)
+        # ПОРОГИ ПЕРЕХОДА — оба СИММЕТРИЧНО от СВОЕГО класса, а не от чужого.
+        #
+        # Вверх: мало дотянуться до минимума класса выше — надо превзойти МАКСИМУМ
+        # своего. Иначе при перекрытии классов (замер: city 0.50…42.75 против town
+        # 0.25…23.50) «дотянуться до минимума city» могла рядовая деревня.
+        #
+        # Вниз: мало оказаться ниже максимума класса снизу — надо упасть ниже МИНИМУМА
+        # своего. Сперва понижение сравнивалось с чужим классом, и это разжаловало
+        # настоящие города: максимум town на участке 23.50 км², поэтому Северодонецк
+        # (17.25 км², плотность 0.81) уходил в town вместе со всеми городами мельче
+        # 27.6 км². Зеркальная ошибка той, что была при подъёме.
+        def gate(hi, lo, key, up_dir):
+            """Порог перехода из класса `lo` в `hi` по признаку `key`."""
+            if up_dir:
+                g = rep["stats"][hi][key][0]               # минимум класса выше
+                if strict_up and rep["stats"].get(lo, {}).get("n_used", 0) >= 3:
+                    g = max(g, rep["stats"][lo][key][2])   # ...но не ниже максимума своего
+            else:
+                g = rep["stats"][lo][key][2]               # максимум класса ниже
+                if strict_up and rep["stats"].get(hi, {}).get("n_used", 0) >= 3:
+                    g = min(g, rep["stats"][hi][key][0])   # ...но не выше минимума своего
+            return g
+
+        for c in range(1, nlab + 1):
+            k = int(tag[c])
+            # hamlet и мельче не трогаем; район города — тоже: это часть города,
+            # а не самостоятельный пункт, переклассифицировать там нечего
+            if k not in PLACE_LADDER:
+                continue
+            # СВОЙ класс тоже должен иметь статистику. Пороги обоих переходов считаются
+            # от границ своего класса, и если в нём меньше min_sample пунктов, эти
+            # границы недостоверны — судить не по чему, оставляем тег. Замер: когда в
+            # классе `city` осталось 2 пункта, оба НАСТОЯЩИХ города оказались разжалованы
+            # по границе, построенной на них же самих.
+            if k in rep["skipped_small"]:
+                continue
+            pos = PLACE_LADDER.index(k)
+            hi = PLACE_LADDER[pos + 1] if pos + 1 < len(PLACE_LADDER) else None
+            lo = PLACE_LADDER[pos - 1] if pos > 0 else None
+            can_up = can_dn = False
+            if hi is not None and hi not in rep["skipped_small"] and rep["stats"].get(hi, {}).get("n"):
+                can_up = (area[c] * up >= gate(hi, k, "area", True)
+                          and dens[c] * up >= gate(hi, k, "dens", True))
+            if lo is not None and lo not in rep["skipped_small"] and rep["stats"].get(lo, {}).get("n"):
+                can_dn = (area[c] * dn <= gate(k, lo, "area", False)
+                          and dens[c] * dn <= gate(k, lo, "dens", False))
+            if can_up == can_dn:                           # оба или ни одного — не трогаем
+                continue
+            out[c] = hi if can_up else lo
+            rep["moved_up" if can_up else "moved_down"] += 1
+            rep["changes"].append((int(c), k, int(out[c]), float(area[c]), float(dens[c])))
+        return out, rep
 
     def _classify_components(self, lab, nlab, area, places_km,
-                             min_area_km2, town_city_km2):
+                             min_area_km2, town_city_km2,
+                             grade_on=False, grade_tol=0.15, grade_min_sample=5,
+                             close_km=1.0, grade_z=0.0, grade_strict_up=True,
+                             grade_mode="both"):
         """Тип каждой компоненты застройки: 2 — город, 1 — деревня, 0 — не учитываем.
         Основа — метка OSM `place` внутри пятна (или ближайшая в пределах 2 км),
-        запасной вариант при отсутствии метки — площадь пятна."""
+        запасной вариант при отсутствии метки — площадь пятна.
+
+        При `grade_on` тип затем ПЕРЕСЧИТЫВАЕТСЯ по данным участка (`grade_places`):
+        тег ненадёжен, а раздутый контур делает «городом» пятно, где застроено 27 %
+        площади. Исходный тег сохраняется в `self._place_tag_raw`, результат сверки —
+        в `self._place_grade`."""
         kind = np.zeros(nlab + 1, np.int8)
         best = np.zeros(nlab + 1, np.int8)                     # макс. код метки в пятне
         found = np.zeros(nlab + 1, bool)
@@ -493,10 +830,24 @@ class ThreatGrid:
                 if c > 0:
                     found[c] = True
                     best[c] = max(best[c], int(k))
+        # СОБСТВЕННАЯ ГРАДАЦИЯ: пересчитать код пункта по измеримым признакам участка.
+        # Работает по тем же кодам, что и тег (3/2/1), поэтому дальнейшая логика
+        # «city -> город, town -> по площади, village -> деревня» не меняется.
+        self._place_tag_raw = np.array(best, np.int8, copy=True)
+        self._place_grade = {}
+        code = best
+        if grade_on and nlab:
+            tag = np.where(found, best, 0).astype(np.int8)      # без метки — не градуем
+            a_km2, dens = self.place_profiles(lab, nlab, area, close_km)
+            self._place_dens = dens
+            code, self._place_grade = self.grade_places(
+                tag, a_km2, dens, nlab, tol=grade_tol, min_sample=grade_min_sample,
+                q=grade_z, strict_up=grade_strict_up, mode=grade_mode)
+            code = np.where(found, code, best).astype(np.int8)  # метки нет — как было
         for c in range(1, nlab + 1):
             a = area[c]
             if found[c]:
-                k = best[c]
+                k = code[c]
                 if k >= 3:                                     # city / suburb / borough
                     kind[c] = 2
                 elif k == 2:                                   # town: крупный -> город
@@ -897,7 +1248,22 @@ OSM_LAYER_FILTERS = {
 OSM_PLACE_FILTER = {"place": ["city", "town", "village", "hamlet", "suburb", "borough"]}
 PLACE_LAYER = "place_pts"          # метки-точки: массив (N,3) — x_км, y_км, код типа
 PLACE_POLY_LAYER = "place_poly"    # контуры НП: массивы (M,3) — x_км, y_км, код типа
-PLACE_CODES = {"city": 3, "borough": 3, "suburb": 3, "town": 2, "village": 1, "hamlet": 0}
+# Коды типов населённых пунктов. Всё, что `>= 3`, — город (пролёт запрещён), но РАЙОН
+# города (suburb/borough) и сам город различаются: район не самостоятельный пункт и в
+# СТАТИСТИКУ собственной градации не входит — иначе он её ломает. Замер: класс `city`
+# на участке имел минимум 0.50 км² при максимуме 42.75, потому что 62 района Луганска и
+# Северодонецка считались отдельными «городами» по 0.5–2 км². Медиана класса от этого
+# падала, и НАСТОЯЩИЕ города оказывались выбросами в собственном классе.
+#
+# ВАЖЕН ПОРЯДОК: у города код ВЫШЕ, чем у района. Тип пятна берётся как МАКСИМУМ кодов
+# попавших в него меток (`best[c] = max(...)`), и при обратном порядке пятно города,
+# внутри которого размечены его же районы, получало бы код района — из восьми городов
+# участка в класс попадали два.
+PLACE_CODES = {"city": 4, "borough": 3, "suburb": 3, "town": 2, "village": 1, "hamlet": 0}
+# ЛЕСТНИЦА КЛАССОВ для градации: village -> town -> city. Район (3) в неё не входит —
+# переклассифицировать часть города не в чем. Соседний класс берётся по позиции в этом
+# списке, а не арифметикой над кодом, — иначе смена кодировки молча ломает переходы.
+PLACE_LADDER = (1, 2, 4)
 # Контур крупнее этого — административная единица (район, община), а не сам населённый
 # пункт: в данных встречаются такие «пятна» до 500 км², их брать нельзя.
 PLACE_POLY_MAX_KM2 = 120.0
@@ -1424,7 +1790,17 @@ def build_threat_grid(layers, bbox_km, cell_km=None, enabled=None,
                             THREAT_RIVER_CORRIDOR_MAX_KM2,
                             zero_weight=THREAT_CITY_ZERO_WEIGHT,
                             place_polys=layers.get(PLACE_POLY_LAYER),
-                            free_points=free_points)
+                            free_points=free_points,
+                            village_floor=THREAT_VILLAGE_FLOOR,
+                            village_skip_factor=THREAT_VILLAGE_SKIP_FACTOR,
+                            village_townlike_med=THREAT_VILLAGE_TOWNLIKE_MED,
+                            grade_on=THREAT_PLACE_GRADE_ON,
+                            grade_tol=THREAT_PLACE_GRADE_TOL,
+                            grade_min_sample=THREAT_PLACE_GRADE_MIN_SAMPLE,
+                            grade_close_km=THREAT_PLACE_CLOSE_KM,
+                            grade_z=THREAT_PLACE_GRADE_OUTLIER,
+                            grade_strict_up=THREAT_PLACE_GRADE_STRICT_UP,
+                            grade_mode=THREAT_PLACE_GRADE_MODE)
     # РЕЛЬЕФ — последним, по итоговому весу (см. «почему» в шапке функции)
     g.add_relief_layer(dem, THREAT_DEM_AREA_KM, THREAT_DEM_LOCAL_KM,
                        THREAT_DEM_AREA_FULL_M, THREAT_DEM_LOCAL_FULL_M,
@@ -1589,26 +1965,36 @@ class ThreatModel:
 
         Задача выборки — лечь по области МАКСИМАЛЬНО ШИРОКО и РАВНОМЕРНО, а не показать
         «типичный» путь. Поэтому:
-          * повадки БПЛА берутся ВЕЕРОМ (все режимы веса × все разбросы × все профили
-            расхода — всё "mix"): выбор в панели итераций на эту картину не влияет, она
-            показывает возможности целиком, а не один сценарий;
-          * из накопленных кандидатов ЖАДНО отбираются те, что покрывают ЕЩЁ НЕ ПОКРЫТУЮ
-            часть области (тот же субмодулярный принцип, что у датчиков) — маршруты
-            расходятся по разным коридорам, а не липнут к одному."""
+          * РАЗБРОС и профиль расхода берутся веером ("mix"): маршруты уходят через
+            разные VIA-точки по всей области, а не липнут к прямой;
+          * ПРИОРИТЕТ ПО ВЕСУ берётся ИЗ ПАНЕЛИ (`THREAT_ROUTE_MODE_SRC = "panel"`).
+            Раньше он тоже был "mix", а "mix" разыгрывает режим КАЖДОМУ маршруту — то
+            есть треть синих линий строилась в режиме «приоритет МИНИМАЛЬНОГО веса»,
+            целенаправленно уходя с тяжёлых коридоров, и выбор в панели на картину не
+            влиял вовсе;
+          * из накопленных кандидатов ЖАДНО отбираются те, что приносят больше ещё не
+            покрытой ЦЕННОСТИ (тот же субмодулярный принцип, что у датчиков) — маршруты
+            расходятся по разным коридорам, а не липнут к одному. Ценность учитывает вес
+            ячейки (`THREAT_ROUTE_SPREAD_W`): раньше считалось голое число ячеек, и
+            пустое поле стоило столько же, сколько река."""
         from .threat_routes import sample_one_route
-        from config import THREAT_ROUTE_COUNT, THREAT_ROUTE_POOL_MULT
+        from config import (THREAT_ROUTE_COUNT, THREAT_ROUTE_POOL_MULT,
+                            THREAT_ROUTE_SPREAD_W, THREAT_ROUTE_MODE_SRC)
         self.ensure_built()
         entry, target = self._refresh_envelope()       # авто-L_max + огибающая
         ctx = self._ensure_ctx(entry, target)          # общий контекст с итерациями (кэш)
         rng = np.random.default_rng()
         want = max(1, int(THREAT_ROUTE_COUNT))
-        # 1) НАБИРАЕМ пул кандидатов (больше, чем нужно) — полным веером повадок
+        wmode = (getattr(self.p, "threat_iter_mode", "mix")
+                 if THREAT_ROUTE_MODE_SRC == "panel" else "mix")
+        # 1) НАБИРАЕМ пул кандидатов (больше, чем нужно): приоритет по весу — из панели,
+        #    разброс и профиль расхода — веером
         pool, seen, tries = [], set(), 0
         cap = int(want * THREAT_ROUTE_POOL_MULT)
         since_new = 0
         while len(pool) < cap and tries < cap * 3 and since_new < 400:
             tries += 1
-            r = sample_one_route(ctx, "mix", self.p.threat_L_max,
+            r = sample_one_route(ctx, wmode, self.p.threat_L_max,
                                  self.p.threat_turn_interval_km, rng,
                                  spread="mix", spend="mix")
             if r is None:
@@ -1619,17 +2005,25 @@ class ThreatModel:
                 since_new += 1
                 continue
             seen.add(sig); pool.append(r); since_new = 0
-        # 2) ОТБИРАЕМ из пула самые «расходящиеся» — максимальное покрытие области
-        self.routes = self._spread_over_area(pool, want)
+        # 2) ОТБИРАЕМ из пула самые «расходящиеся» — максимальное покрытие области,
+        #    но с учётом ценности ячеек: тяжёлый коридор дороже пустого поля
+        self.routes = self._spread_over_area(pool, want, spread_w=THREAT_ROUTE_SPREAD_W)
         return self.routes
 
-    def _spread_over_area(self, pool, want):
+    def _spread_over_area(self, pool, want, spread_w=0.0):
         """Жадно отобрать `want` маршрутов, покрывающих область залёта КАК МОЖНО ШИРЕ.
 
-        Каждый шаг берём маршрут, который задевает больше всего ЕЩЁ НЕ ПОКРЫТЫХ ячеек, и
-        помечаем их покрытыми. Так следующий маршрут вынужден идти по ДРУГОМУ коридору —
-        выборка расходится по всей области, а не скучивается у кратчайшего пути.
-        (Тот же жадный субмодулярный отбор, что у датчиков; гарантия ≥ (1−1/e) от оптимума.)"""
+        Каждый шаг берём маршрут, который приносит больше всего ЕЩЁ НЕ ПОКРЫТОЙ ценности,
+        и помечаем задетые ячейки покрытыми. Так следующий маршрут вынужден идти по
+        ДРУГОМУ коридору — выборка расходится по всей области, а не скучивается у
+        кратчайшего пути. (Тот же жадный субмодулярный отбор, что у датчиков; гарантия
+        ≥ (1−1/e) от оптимума.)
+
+        `spread_w` — ЦЕННОСТЬ ВЕСА. Раньше считалось голое ЧИСЛО задетых ячеек, и пустое
+        поле стоило ровно столько же, сколько река: выборка охотно уходила туда, где
+        ориентиров нет вовсе. Теперь ценность ячейки = `1 + spread_w · вес(0…1)` —
+        разброс сохраняется (единица есть у всех), но при равном покрытии предпочитается
+        тяжёлый коридор. 0.0 -> прежнее поведение."""
         if not pool or want >= len(pool):
             return list(pool)
         g = self.grid
@@ -1640,15 +2034,23 @@ class ThreatModel:
             ix = np.clip(((r[:, 0] - g.ox) / g.h).astype(np.int64), 0, g.nx - 1)
             iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(np.int64), 0, g.ny - 1)
             M[i, iy * g.nx + ix] = True
-        new = np.zeros(ncell, bool)                    # ещё не покрытые ячейки (инвертируем ниже)
+        # ценность ячейки: нормировка веса та же, что в выборке маршрутов (p90 по
+        # положительным) — чтобы «тяжело» значило одно и то же в обоих местах
+        if spread_w > 0.0:
+            w = np.clip(g.weight, 0.0, None)
+            pos = w[w > 0]
+            ref = float(np.percentile(pos, 90)) if pos.size else 1.0
+            val = (1.0 + float(spread_w) * np.clip(w / max(ref, 1e-6), 0.0, 1.0)).ravel()
+        else:
+            val = np.ones(ncell, float)
         uncovered = np.ones(ncell, bool)
         chosen = []
         alive = np.ones(len(pool), bool)
         for _ in range(want):
-            gain = (M & uncovered).sum(axis=1)         # НОВЫХ ячеек у каждого кандидата
-            gain[~alive] = -1
+            gain = (M & uncovered) @ val               # НОВАЯ ценность у каждого кандидата
+            gain[~alive] = -1.0
             best = int(np.argmax(gain))
-            if gain[best] <= 0:                        # новых ячеек больше нет — веер исчерпан
+            if gain[best] <= 0.0:                      # новой ценности нет — веер исчерпан
                 break
             alive[best] = False
             uncovered &= ~M[best]

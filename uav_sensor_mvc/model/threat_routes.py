@@ -29,7 +29,10 @@ MODEL · Построение маршрутов пролёта БПЛА по в
 import heapq                      # двоичная куча для Дейкстры (_dijkstra_dist)
 import numpy as np
 
-from config import THREAT_LOOKAHEAD_KM, THREAT_LOOKAHEAD_POWER
+from config import (THREAT_LOOKAHEAD_KM, THREAT_LOOKAHEAD_POWER, THREAT_COST_POWER,
+                    THREAT_COST_RELIEF, THREAT_COST_MIX_BIAS, THREAT_COST_MIX_STEPS,
+                    THREAT_WEIGHT_GAIN,
+                    THREAT_DEM_K_MIN, THREAT_DEM_K_MAX)
 
 # 8 соседей ячейки: (dy, dx, множитель длины шага). Орт. сосед — шаг h, диагональный — h·√2.
 _NEIGHBORS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
@@ -69,9 +72,72 @@ def _dijkstra_dist(passable, start, h):
     return dist.reshape(ny, nx)
 
 
+def _cost_mul(grid, wnorm, power, relief_power=0.0):
+    """Множитель цены прохода через ячейку — ПРОИЗВЕДЕНИЕ двух независимых сомножителей:
+
+        (1 + power · (1 − вес))  ×  (1 + relief_power · (1 − рельеф))
+
+    Оба в [1, 1+сила]: дёшево там, где есть ориентир И где низко; дорого в пустоте и
+    на гребне. Цена шага = длина × этот множитель, поэтому стоимостное поле остаётся
+    В КИЛОМЕТРАХ-эквивалентах и «температура» tau сохраняет прежний смысл.
+
+    ПОЧЕМУ НЕ ОДИН МНОЖИТЕЛЬ. Сперва привлекательность считалась как произведение
+    `вес × рельеф`, обрезанное единицей, — и обрезка съедала поощрение за низину: река
+    в пойме (вес 1.0, рельеф 1.4) давала 1.4 → обрезалось до 1.0, ровно столько же,
+    сколько у той же реки на голом плато. Рельеф работал лишь как ослабление веса, хотя
+    это НЕЗАВИСИМАЯ физика: вес — «где есть ориентиры», рельеф — «где меня видно».
+
+    Рельеф нормируется по СВОЕМУ диапазону [k_min, k_max] → 0 (гребень) … 1 (низина),
+    поэтому `relief_power` не зависит от того, как настроены пороги высот.
+    Обе силы 0 -> None, то есть чистая геометрия, как было."""
+    if power <= 0.0 and relief_power <= 0.0:
+        return None
+    mul = np.ones_like(np.asarray(wnorm, float))
+    if power > 0.0:
+        mul = mul * (1.0 + float(power) * (1.0 - np.clip(np.asarray(wnorm, float), 0.0, 1.0)))
+    if relief_power > 0.0:
+        k = grid.relief_k() if hasattr(grid, "relief_k") else None
+        if k is not None:
+            lo, hi = float(THREAT_DEM_K_MIN), float(THREAT_DEM_K_MAX)
+            kn = np.clip((np.asarray(k, float) - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+            mul = mul * (1.0 + float(relief_power) * (1.0 - kn))
+    return mul
+
+
+def _dijkstra_cost(passable, start, h, mul):
+    """Поле СТОИМОСТИ пути от start (в км-эквивалентах) по проходимым ячейкам.
+
+    Цена шага — его длина, умноженная на среднее значение `mul` в двух ячейках: так
+    цена симметрична (из A в B столько же, сколько из B в A) и не зависит от того, с
+    какой стороны считали. `mul = None` -> обычные километры."""
+    if mul is None:
+        return _dijkstra_dist(passable, start, h)
+    ny, nx = passable.shape
+    m = np.asarray(mul, float).ravel()
+    dist = np.full(ny * nx, np.inf)
+    si = start[0] * nx + start[1]
+    dist[si] = 0.0
+    pq = [(0.0, si)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist[u]:
+            continue
+        uy, ux = divmod(u, nx)
+        for dy, dx, step in _NEIGHBORS:
+            vy, vx = uy + dy, ux + dx
+            if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not passable[vy, vx]:
+                continue
+            v = vy * nx + vx
+            nd = d + step * h * 0.5 * (m[u] + m[v])
+            if nd < dist[v]:
+                dist[v] = nd
+                heapq.heappush(pq, (nd, v))
+    return dist.reshape(ny, nx)
+
+
 def passable_mask(grid, max_gap_km, slack_km=None):
     """Проходимые ячейки для маршрута: коридоры (вес>0), СШИТЫЕ через провалы ≤ max_gap_km,
-    плюс буфер УХОДА ОТ ОРИЕНТИРА slack_km, МИНУС город (кроме рек).
+    плюс буфер УХОДА ОТ ОРИЕНТИРА slack_km, МИНУС город и МИНУС снятое отсечкой рельефа.
 
     ДВА ПАРАМЕТРА, А НЕ ОДИН. Раньше одна дилатация делала обе работы сразу: сшивала
     разорванные коридоры И разрешала маршруту отклоняться вбок от реки/дороги (буфер
@@ -96,6 +162,13 @@ def passable_mask(grid, max_gap_km, slack_km=None):
     else:
         pas = pas.copy()
     pas &= ~grid.urban_mask()                                  # город (кроме рек) непроходим
+    # ОТСЕЧКА РЕЛЬЕФА — такой же запрет, как город, и вычитается ПОСЛЕ буфера.
+    # Иначе правило «очень высокая гора — коридора нет» отменялось само собой: отсечка
+    # снимает вес, а идущая выше дилатация возвращает эти ячейки в проходимые, и маршрут
+    # спокойно летел поверх горы. Город исключался явно, гора — нет.
+    cut = grid.relief_cut() if hasattr(grid, "relief_cut") else None
+    if cut is not None:
+        pas &= ~np.asarray(cut, bool)
     return pas
 
 
@@ -176,12 +249,19 @@ _NB_UNIT = [(dy / mul, dx / mul) for dy, dx, mul in _NEIGHBORS]
 
 def _mode_corridor_pref(wnorm, wmode):
     """Предпочтение соседа по ВЕСУ клетки (тепловая карта), зависит от РЕЖИМА. «Пол» у
-    каждого режима не даёт вероятности занулиться (маршрут не вырождается в один коридор)."""
+    каждого режима не даёт вероятности занулиться (маршрут не вырождается в один коридор).
+
+    Размах задаётся `THREAT_WEIGHT_GAIN`: это ТАКТИКА (какую из соседних клеток взять),
+    тогда как стоимостное поле — стратегия (куда идти вообще). При прежнем значении 1.6
+    размах был ×17 и тонул на фоне удержания курса (×280) и приближения к цели (до
+    ×10¹³) — сам по себе, без стоимости, он не влиял вовсе (замер: вес под маршрутом
+    11.60 при ×17 и 11.64 при ×101)."""
+    g = float(THREAT_WEIGHT_GAIN)
     if wmode == "max":                        # приоритет тяжёлых коридоров (реки/дороги)
-        return 0.10 + 1.6 * wnorm
+        return 0.10 + g * wnorm
     if wmode == "min":                        # приоритет лёгких («пустоши», одинокая река)
-        return 0.10 + 1.6 * (1.0 - wnorm)
-    return 0.30 + 0.8 * wnorm                 # medium: вероятность ∝ весу
+        return 0.10 + g * (1.0 - wnorm)
+    return 0.30 + 0.5 * g * wnorm             # medium: вероятность ∝ весу
 
 
 def _lookahead_fields(grid, look_km):
@@ -362,7 +442,7 @@ def _spend_tau(slack_km, slack0_km, frac_done, profile):
 
 def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                 heading0=None, wmode="medium", visited=None, spend="late",
-                done0_km=0.0, tail_km=0.0):
+                done0_km=0.0, tail_km=0.0, dgeo=None, fscale=1.0):
     """Стохастический спуск по полю расстояний dfield от start к goal (надёжно приходит):
     выбор коридора — по ВЕСУ соседа (тепловая карта, приоритет по режиму wmode) и развилкам.
 
@@ -392,8 +472,15 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     look_p = float(THREAT_LOOKAHEAD_POWER)   # 0 -> предвидение выключено
     ny, nx = dfield.shape
     h = grid.h
-    d_start = dfield[start]
+    # СПУСК идёт по `dfield` (стоимость, если она включена), а ЗАПАС ХОДА считается по
+    # `dgeo` — честным километрам. Смешивать нельзя: иначе «дорогой» обход выглядел бы
+    # как нехватка топлива и маршрут обрывался бы там, где физически проходит.
+    if dgeo is None:
+        dgeo = dfield
+    d_start = dgeo[start]
     if not np.isfinite(d_start) or d_start > budget:    # цель недостижима / не хватает хода
+        return None
+    if not np.isfinite(dfield[start]):                  # по стоимости пути тоже нет
         return None
     # свободный запас ВСЕГО маршрута в его начале (сколько км можно потратить на виляние)
     slack0 = max(0.0, (budget + done0_km) - (d_start + tail_km + done0_km))
@@ -402,7 +489,14 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     # особенно на маршрутах через VIA). Итоговую ПРЯМОЛИНЕЙНОСТЬ даёт пост-обработка
     # (упрощение линии с допуском ∝ длине участка + сглаживание), см. sample_one_route.
     L_hold = min(max(1.0, float(turn_interval_km)), 6.0)
-    back_allow = 0.8                                   # км «назад» по полю (иначе тупики у стенок)
+    # МАСШТАБ ПОЛЯ. `dfield` может быть стоимостным, а величины ниже заданы в КИЛОМЕТРАХ:
+    # «сколько можно назад», порог «цель достигнута» и «температура» tau. Стоимостное
+    # поле крупнее геометрического в среднем в `fscale` раз, и без пересчёта эти пороги
+    # молча ужимались во столько же раз — стохастика падала, и вся выборка сваливалась
+    # в один оптимум (см. журнал п. 154). Приводим их к единицам поля.
+    fscale = max(float(fscale), 1e-6)
+    back_allow = 0.8 * fscale                          # «назад» по полю (иначе тупики у стенок)
+    reach_eps = h * fscale                             # порог «дошли до цели» в единицах поля
     if visited is None:
         visited = set()
     step_cap = int(6 * d_start / h + 80)
@@ -413,18 +507,21 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     dist_since_turn = L_hold                            # на старте курс можно выбрать свободно
     route_len = 0.0
     for _ in range(step_cap):
-        if cur == goal or dfield[cur] <= h:
+        if cur == goal or dfield[cur] <= reach_eps:
             break
         # СВОБОДНЫЙ ЗАПАС: сколько км ещё можно потратить на виляние, оставшись в бюджете.
         # Отрицательный — дойти уже нельзя, обрываемся сразу (не жжём шаги впустую).
-        slack = (budget - route_len) - dfield[cur]
+        # Считается по КИЛОМЕТРАМ (`dgeo`), а не по стоимости: это про топливо.
+        slack = (budget - route_len) - dgeo[cur]
         if slack < 0.0:
             return None
         # доля ВСЕГО маршрута, уже пройденная (а не только текущего участка)
         done = done0_km + route_len
-        remain = dfield[cur] + tail_km
+        remain = dgeo[cur] + tail_km
         frac_done = done / (done + remain) if (done + remain) > 1e-9 else 1.0
-        tau = _spend_tau(slack, slack0, frac_done, spend)
+        # «температура» задана в км/шаг — переводим в единицы поля тем же масштабом,
+        # иначе на стоимостном поле она означала бы вчетверо меньшую свободу выбора
+        tau = _spend_tau(slack, slack0, frac_done, spend) * fscale
         # ФИНАЛЬНЫЙ ПОДХОД: рядом с целью запрещаем шаг ОТ неё (см. FINAL_APPROACH_KM).
         # Идти вбок и обходить по дуге по-прежнему можно — заход с другой стороны это
         # нормальный манёвр; нельзя именно «отвернуть и уйти назад» у самого объекта.
@@ -495,7 +592,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         cur = (vy, vx)
         visited.add(vy * nx + vx)
         path.append(cur)
-    return (path, route_len, heading) if (cur == goal or dfield[cur] <= h) else None
+    return (path, route_len, heading) if (cur == goal or dfield[cur] <= reach_eps) else None
 
 
 def _nearest_passable_cell(pas, grid, y_km, x_km, max_km=12.0):
@@ -540,15 +637,47 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
     start = _cell_of(grid, entry_km)
     goal = _cell_of(grid, target_km)
     pas = _open_endpoints(passable_mask(grid, max_gap_km, slack_km), (start, goal), grid)
-    gt = _dijkstra_dist(pas, goal, grid.h)              # поле расстояний до цели (тяга)
     ahead = _lookahead_fields(grid, THREAT_LOOKAHEAD_KM)   # что ждёт впереди по курсу
     w = np.clip(grid.weight, 0.0, None)                 # нормировка веса по p90 (как в стоимости)
     pos = w[w > 0]
     ref = float(np.percentile(pos, 90)) if pos.size else 1.0
     wnorm = np.clip(w / max(ref, 1e-6), 0.0, 1.0)
+    # ДВА ПОЛЯ РАССТОЯНИЙ ДО ЦЕЛИ, потому что вопросов два:
+    #   gt_geo — честные километры: «хватит ли запаса хода» (физику подменять нельзя);
+    #   gt     — стоимость в км-эквивалентах: «куда выгоднее идти» (по ней идёт спуск).
+    # При THREAT_COST_POWER = 0 второе совпадает с первым — прежнее поведение.
+    mul = _cost_mul(grid, wnorm, THREAT_COST_POWER, THREAT_COST_RELIEF)
+    gt_geo = _dijkstra_dist(pas, goal, grid.h)
+    gt = gt_geo if mul is None else _dijkstra_cost(pas, goal, grid.h, mul)
+    # ВО СКОЛЬКО РАЗ стоимостное поле крупнее геометрического. По нему приводятся к
+    # единицам поля пороги, заданные в километрах («температура» tau, допуск «назад»,
+    # порог «дошли»). Считаем по ПРОХОДИМЫМ ячейкам — остальные к делу не относятся.
+    if mul is None:
+        cost_scale = 1.0
+    else:
+        m_ok = np.asarray(mul, float)[pas]
+        cost_scale = float(m_ok.mean()) if m_ok.size else 1.0
+    # НАБОР ПОЛЕЙ «жадности»: от чистой геометрии до полной стоимости. Каждое считается
+    # СВОЕЙ Дейкстрой по множителю `1 + a·(mul − 1)`, поэтому остаётся корректным полем
+    # расстояний — в отличие от линейной смеси готовых полей, где появляются локальные
+    # минимумы-ловушки и маршрут не доходит.
+    gt_mix = []
+    if mul is not None and THREAT_COST_MIX_BIAS > 0.0:
+        m = np.asarray(mul, float)
+        for a in THREAT_COST_MIX_STEPS:
+            if a <= 0.0:
+                fld, sc = gt_geo, 1.0
+            elif a >= 1.0:
+                fld, sc = gt, cost_scale
+            else:
+                ma = 1.0 + a * (m - 1.0)
+                fld = _dijkstra_cost(pas, goal, grid.h, ma)
+                sc = float(ma[pas].mean()) if pas.any() else 1.0
+            gt_mix.append(dict(a=float(a), gt=fld, scale=sc, via=[]))
     A = np.asarray(entry_km, float); B = np.asarray(target_km, float)
     ab = float(np.hypot(*(B - A))) or 1.0
-    via_cell, via_gv, via_segd, via_minlen, via_togoal = [], [], [], [], []
+    via_cell, via_gv, via_gv_geo = [], [], []
+    via_segd, via_minlen, via_togoal = [], [], []
     if np.isfinite(gt[start]):
         ys, xs = np.nonzero(pas & np.isfinite(gt))     # достижимые проходимые ячейки
         if len(ys):
@@ -577,12 +706,27 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                     if (float(np.hypot(vxk - B[0], vyk - B[1])) < FINAL_APPROACH_KM
                             and s_axis <= ab):
                         continue
-                    gv = _dijkstra_dist(pas, vc, grid.h)     # поле расстояний ОТ этой via
+                    # два поля ОТ этой via: геометрия — для бюджета, стоимость — для спуска
+                    gv_geo = _dijkstra_dist(pas, vc, grid.h)
+                    gv = gv_geo if mul is None else _dijkstra_cost(pas, vc, grid.h, mul)
                     via_cell.append(vc)
                     via_gv.append(gv)
+                    via_gv_geo.append(gv_geo)
+                    # то же для каждой «жадности» — иначе первый участок через via шёл бы
+                    # по другой логике, чем второй, и повадка маршрута ломалась посередине
+                    for f in gt_mix:
+                        if f["a"] <= 0.0:
+                            f["via"].append(gv_geo)
+                        elif f["a"] >= 1.0:
+                            f["via"].append(gv)
+                        else:
+                            f["via"].append(_dijkstra_cost(
+                                pas, vc, grid.h, 1.0 + f["a"] * (np.asarray(mul, float) - 1.0)))
                     via_segd.append(_seg_dist_km((vxk, vyk), A, B))
-                    via_togoal.append(float(gv[goal]))
-                    via_minlen.append(float(gv[start] + gv[goal]))   # вход→via→цель, минимум
+                    # «сколько хода оставить на второй участок» и «уложимся ли вообще» —
+                    # это КИЛОМЕТРЫ, поэтому берутся из геометрического поля
+                    via_togoal.append(float(gv_geo[goal]))
+                    via_minlen.append(float(gv_geo[start] + gv_geo[goal]))
     # Проекция каждой ячейки на ось старт→цель (км): 0 у старта, ab у цели,
     # отрицательная — ПОЗАДИ старта. По ней маршрут ограничивается, чтобы не уходить
     # в сторону, обратную цели (см. START_BACK_KM в _walk_field).
@@ -592,11 +736,14 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
     # коридорам (`gt`) может быть вдвое больше, и по нему зона подхода срабатывала
     # не там, где кажется глазу.
     dgoal = np.hypot(gxc - B[0], gyc - B[1])
-    return dict(grid=grid, pas=pas, gt=gt, wnorm=wnorm, start=start, goal=goal, ab=ab,
+    return dict(grid=grid, pas=pas, gt=gt, gt_geo=gt_geo, wnorm=wnorm,
+                cost_scale=cost_scale, gt_mix=gt_mix, start=start, goal=goal, ab=ab,
                 axis_s=axis_s, dgoal=dgoal, ahead=ahead,
-                via_cell=via_cell, via_gv=via_gv, via_segd=np.asarray(via_segd),
+                via_cell=via_cell, via_gv=via_gv, via_gv_geo=via_gv_geo,
+                via_segd=np.asarray(via_segd),
                 via_minlen=np.asarray(via_minlen), via_togoal=np.asarray(via_togoal),
-                gt_start=float(gt[start]), reachable=bool(np.isfinite(gt[start])))
+                gt_start=float(gt_geo[start]),
+                reachable=bool(np.isfinite(gt_geo[start])))
 
 
 def _pick_via(ctx, spread, rng, L_max):
@@ -674,12 +821,25 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
     wmode = ("max", "medium", "min")[rng.integers(3)] if mode == "mix" else mode
     if spend == "mix":                                  # веер всех повадок (для «возможных путей»)
         spend = ("late", "early", "even")[rng.integers(3)]
+    # «ЖАДНОСТЬ» ЭТОГО маршрута: какое из предрассчитанных полей взять — от чисто
+    # геометрического (летит напрямик) до полностью стоимостного (жмётся к коридорам и
+    # низинам). Одного поля мало: если путь A дешевле B на десятки единиц, локальная
+    # стохастика туда не уведёт, и вся выборка сваливается в один оптимум.
+    fields = ctx.get("gt_mix")
+    if fields:
+        u = float(rng.random()) ** float(THREAT_COST_MIX_BIAS)
+        fi = min(int(u * len(fields)), len(fields) - 1)
+        fmix, gt_use = fields[fi]["scale"], fields[fi]["gt"]
+        via_use = fields[fi]["via"]
+    else:
+        fmix, gt_use, via_use = ctx.get("cost_scale", 1.0), ctx["gt"], ctx["via_gv"]
     grid = ctx["grid"]
     j = (None if (spread == "center" and rng.random() < 0.5)
          else _pick_via(ctx, spread, rng, L_max))
     if j is None:                                       # прямой маршрут (через центр)
-        r = _walk_field(ctx, ctx["gt"], ctx["start"], ctx["goal"], L_max,
-                        turn_interval_km, rng, wmode=wmode, spend=spend)
+        r = _walk_field(ctx, gt_use, ctx["start"], ctx["goal"], L_max,
+                        turn_interval_km, rng, wmode=wmode, spend=spend,
+                        dgeo=ctx.get("gt_geo"), fscale=fmix)
         cells = r[0] if r else None
     else:                                               # через VIA (обход/заход со стороны)
         via = ctx["via_cell"][j]
@@ -691,14 +851,17 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
             return None
         # tail_km/done0_km: участки знают своё место во всём маршруте — иначе профиль
         # расхода отсчитывал бы фазу пути заново от каждого из них.
-        r1 = _walk_field(ctx, ctx["via_gv"][j], ctx["start"], via, budget1,
+        gv_geo = ctx.get("via_gv_geo")
+        g1 = gv_geo[j] if gv_geo else None
+        f1 = via_use[j] if (via_use and j < len(via_use)) else ctx["via_gv"][j]
+        r1 = _walk_field(ctx, f1, ctx["start"], via, budget1,
                          turn_interval_km, rng, wmode=wmode, spend=spend,
-                         done0_km=0.0, tail_km=togoal)
+                         done0_km=0.0, tail_km=togoal, dgeo=g1, fscale=fmix)
         if r1 is None:                                  # каждый участок — свой набор visited
             return None
-        r2 = _walk_field(ctx, ctx["gt"], via, ctx["goal"], L_max - r1[1],
+        r2 = _walk_field(ctx, gt_use, via, ctx["goal"], L_max - r1[1],
                          turn_interval_km, rng, heading0=r1[2], wmode=wmode, spend=spend,
-                         done0_km=r1[1], tail_km=0.0)
+                         done0_km=r1[1], tail_km=0.0, dgeo=ctx.get("gt_geo"), fscale=fmix)
         if r2 is None:
             return None
         cells = r1[0] + r2[0][1:]                        # склейка без дубля via

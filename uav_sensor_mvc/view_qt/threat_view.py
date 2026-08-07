@@ -36,13 +36,21 @@ from . import geomap as gm
 #  Прозрачность отдельных ЛИНИЙ задаётся рядом с элементом (alpha в mkPen) — см.
 #  _build_scene_items; здесь — базовые цвета.
 # ═══════════════════════════════════════════════════════════════════════════════
+#  ВЫБОР ЦВЕТА ЛИНИЙ. Слой рисуется поверх ПОДЛОЖКИ OSM — а это светло-зелёные поля,
+#  салатовый лес и жёлто-песочные дороги самой OSM. Дороги и ЛЭП были СВЕТЛЫМИ жёлто-
+#  оранжевыми (#ff9f43 / #ffd18c / #f6e05e) и на таком фоне не читались: контраст по
+#  WCAG выходил 1.00…1.20 при норме 4.5 — линия совпадала с фоном по яркости.
+#  Тон дорог сохранён (оранжевая магистраль, жёлтая местная — привычно по картам), но
+#  ЗАТЕМНЁН до порога 4.5; ЛЭП уведена в пурпур, которого нет ни в OSM, ни в turbo.
+#  Подбор — перебором по насыщенности при худшем фоне (лес #add19e), см.
+#  МЕТОДИЧКА_КАРТА_УГРОЗ.md §12.0.
 LAYER_STYLE = {
     "river":      dict(color="#3aa0ff", width=3.4, dash=None),
     "stream":     dict(color="#7cc4ff", width=1.8, dash=None),
-    "road_major": dict(color="#ff9f43", width=3.2, dash=None),
-    "road_local": dict(color="#ffd18c", width=2.1, dash=None),
+    "road_major": dict(color="#992d00", width=3.6, dash=None),   # тёмно-оранжевый
+    "road_local": dict(color="#565304", width=2.2, dash=None),   # тёмно-жёлтый, тоньше
     "railway":    dict(color="#e6edf3", width=2.3, dash=[6, 5]),
-    "power":      dict(color="#f6e05e", width=2.0, dash=[2, 3]),
+    "power":      dict(color="#960096", width=2.6, dash=[5, 4]), # тёмный пурпур
     "pipeline":   dict(color="#b794f6", width=2.2, dash=[8, 4]),
     "tree_row":   dict(color="#4fd18b", width=2.2, dash=[1, 3]),
     "bridge":     dict(color="#ff6b6b", width=3.0, dash=None),
@@ -72,7 +80,9 @@ THREAT_COLORS = {
     "legend_bridge": "#ff5d6c",         # мост в легенде
     # — РЕЛЬЕФ: два независимых слоя показа (чекбоксы «карта высот» / «приоритет по высоте») —
     "legend_relief": "#c9b458",         # образец карты высот в легенде
-    "legend_hide":   "#3aa0ff",         # образец «укрытие» в легенде
+    "legend_hide":   "#3aa0ff",         # образец «укрытие» в легенде (= RELIEF_HIDE_RGB)
+    "legend_cut":    "#101016",         # образец «коридор снят» (= RELIEF_CUT_RGBA)
+    "legend_cut_edge": "#8a93a6",       # обводка чёрного образца: на тёмном фоне иначе не видно
 }
 # Карта высот — привычная топографическая шкала «низины зелёные → вершины светлые».
 # Ступени равномерны по ПЕРЦЕНТИЛЯМ высоты, а не по метрам: иначе на участке с размахом
@@ -310,9 +320,38 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     f'(низины зелёные → вершины светлые) &nbsp; '
                     f'<span style="color:{c["legend_hide"]};">&#9632;</span> укрытие '
                     f'&nbsp; <span style="color:{c["legend_target"]};">&#9632;</span> '
-                    'возвышенность (заметнее)<br>')
+                    f'возвышенность (заметнее) &nbsp; '
+                    f'<span style="color:{c["legend_cut"]};">&#9632;</span> коридор снят '
+                    '(высокая гора)<br>')
         rows.append(f'<span style="color:{c["legend_entry"]};">&#9733;</span> вход (A) &nbsp; '
                     f'<span style="color:{c["legend_target"]};">&#10005;</span> цель (B)')
+        rows.append('</div>')
+        return "".join(rows)
+
+    # Размер легенды приоритета: базовый кегль при полном участке и предел при зуме.
+    # Панель мелкая и подписана коротко — она только расшифровывает три цвета, подробности
+    # (пороги, множители) есть в подсказке чекбокса и в методичке.
+    RELIEF_LEGEND_PT = 7.5
+    RELIEF_LEGEND_PT_MIN = 4.5
+
+    def _relief_legend_html(self, scale=1.0):
+        """Легенда режима «приоритет по высоте»: три цвета — три строки, без пояснений.
+
+        Панель у ПРАВОГО края, появляется вместе со своим чекбоксом. `scale` уменьшает
+        кегль при зуме (см. `reposition_legends`): приблизив карту, пользователь смотрит
+        на местность, и панель не должна занимать место."""
+        c = THREAT_COLORS
+        fs = max(self.RELIEF_LEGEND_PT_MIN, self.RELIEF_LEGEND_PT * float(scale))
+        rows = [f'<div style="background:{c["legend_bg"]};padding:{fs * 0.4:.1f}pt '
+                f'{fs * 0.7:.1f}pt;border:1px solid {c["legend_head"]};border-radius:4px;'
+                f'font-size:{fs:.1f}pt;color:#ffffff;line-height:135%;white-space:nowrap;">']
+        rows.append(f'<b style="color:{c["legend_head"]};">ПРИОРИТЕТ ПО ВЫСОТЕ</b><br>')
+        rows.append(f'<span style="color:{c["legend_hide"]};">&#9632;</span> укрытие<br>')
+        rows.append(f'<span style="color:{c["legend_target"]};">&#9632;</span> '
+                    'возвышенность<br>')
+        rows.append(f'<span style="color:{c["legend_cut"]};'
+                    f'background:{c["legend_cut_edge"]};">&nbsp;&#9632;&nbsp;</span> '
+                    'коридор снят')
         rows.append('</div>')
         return "".join(rows)
 
@@ -781,6 +820,16 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.legend.setZValue(20); self.legend.setHtml(self._legend_html())
         self.pi.addItem(self.legend); self.legend.setVisible(False)
 
+        # легенда режима «приоритет по высоте» — у ПРАВОГО края, как шкала весовой карты.
+        # anchor (1,0) — привязка за ВЕРХНИЙ-ПРАВЫЙ угол. Показывается своим чекбоксом,
+        # независимо от общей легенды: включил слой — сразу видно, что значат цвета.
+        self.relief_legend = pg.TextItem(anchor=(1, 0),
+                                         fill=pg.mkBrush(THREAT_COLORS["legend_bg"]))
+        self.relief_legend.setZValue(20)
+        self._relief_legend_scale = 1.0          # текущий кегль (доля от базового)
+        self.relief_legend.setHtml(self._relief_legend_html())
+        self.pi.addItem(self.relief_legend); self.relief_legend.setVisible(False)
+
         # рамка bbox
         self.bbox_item = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["accent"], 180),
                                                            width=1.6, dash=[8, 5]))
@@ -969,14 +1018,33 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.bridge_scatter.setData([], [])
             self.bridge_scatter.setVisible(False)
         # легенда — в левом НИЖНЕМ углу вида, по своему чекбоксу (независимо от слоёв)
-        show_legend = toggles.get("show_legend", False)
-        if show_legend:
-            try:
-                (x0, x1), (y0, y1) = self.vb.viewRange()
-                self.legend.setPos(x0 + (x1 - x0) * 0.005, y0 + (y1 - y0) * 0.02)
-            except Exception:
-                pass
-        self.legend.setVisible(show_legend)
+        self.legend.setVisible(toggles.get("show_legend", False))
+        self.reposition_legends()
+
+    def reposition_legends(self):
+        """Прижать обе легенды к углам ТЕКУЩЕГО вида: общую — влево вниз, легенду
+        приоритета по высоте — вправо вверх.
+
+        Отдельным методом, потому что вызывается ещё и при зуме/панораме: раньше
+        позиция ставилась только внутри `render_layers`, а та при выключенных слоях
+        не доходила до легенды — после зума панель оставалась на прежнем месте.
+
+        Заодно МЕЛЬЧАЕТ панель приоритета: чем сильнее приближение, тем меньше кегль
+        (корень сглаживает — иначе на двукратном зуме текст падал бы вдвое)."""
+        try:
+            (x0, x1), (y0, y1) = self.vb.viewRange()
+        except Exception:
+            return
+        if self.legend.isVisible():
+            self.legend.setPos(x0 + (x1 - x0) * 0.005, y0 + (y1 - y0) * 0.02)
+        if self.relief_legend.isVisible():
+            kx0, kx1, _ky0, _ky1 = self.bbox_km
+            frac = abs(x1 - x0) / max(abs(kx1 - kx0), 1e-6)      # доля участка в кадре
+            scale = float(np.clip(np.sqrt(min(frac, 1.0)), 0.55, 1.0))
+            if abs(scale - self._relief_legend_scale) > 0.03:    # не дёргать setHtml зря
+                self._relief_legend_scale = scale
+                self.relief_legend.setHtml(self._relief_legend_html(scale))
+            self.relief_legend.setPos(x1 - (x1 - x0) * 0.005, y1 - (y1 - y0) * 0.02)
 
     def _render_builtup_raster(self, mask, extent):
         """Застройка растровой маской (общий вид). None — скрыть слой."""
@@ -1042,9 +1110,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         красным — возвышенности (< 1), чёрным — места, где коридор снят как «очень высокая
         гора». Нейтральное (k ≈ 1) остаётся прозрачным, чтобы не мутить карту.
 
-        `k` = None означает, что рельеф в вес не добавлен, — показывать нечего."""
+        `k` = None означает, что рельеф в вес не добавлен, — показывать нечего.
+
+        Вместе со слоем появляется ЛЕГЕНДА у правого края: три цвета сами по себе ничего
+        не объясняют (см. `_relief_legend_html`)."""
         if not toggles.get("show_relief_k") or k is None or extent is None:
             self.relief_k_img.setVisible(False)
+            self.relief_legend.setVisible(False)
             return
         k = np.asarray(k, float)
         rgba = np.zeros(k.shape + (4,), np.ubyte)
@@ -1065,6 +1137,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         x0, x1, y0, y1 = extent
         self.relief_k_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.relief_k_img.setVisible(True)
+        self.relief_legend.setVisible(True)
+        self.reposition_legends()       # прижать к правому верхнему углу текущего вида
 
     def set_relief_button(self, active, enabled):
         """Состояние кнопки рельефа: подпись «Добавить/Убрать», подсветка и доступность
