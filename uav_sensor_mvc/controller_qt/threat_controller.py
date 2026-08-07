@@ -504,6 +504,12 @@ class ThreatController:
         Единая точка отрисовки — вызывается после любого изменения данных."""
         t = self.view.get_toggles()
         g = self.model.grid
+        # какие слои вообще есть — чтобы галка не стояла над пустотой (см. set_layer_enabled)
+        self.view.set_layer_enabled(
+            grid=g is not None,
+            dem=g is not None and g.relief_height() is not None,
+            relief=g is not None and g.relief_k() is not None,
+            iter=bool(self.model.iter_routes))
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, target)
         # |AB| вход->цель (для окна входных данных)

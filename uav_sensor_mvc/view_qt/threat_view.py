@@ -44,17 +44,68 @@ from . import geomap as gm
 #  ЗАТЕМНЁН до порога 4.5; ЛЭП уведена в пурпур, которого нет ни в OSM, ни в turbo.
 #  Подбор — перебором по насыщенности при худшем фоне (лес #add19e), см.
 #  МЕТОДИЧКА_КАРТА_УГРОЗ.md §12.0.
+#
+#  ПОЧЕМУ ОДНОГО ЦВЕТА МАЛО (правка по замечанию заказчика на общем виде). Когда включены
+#  все слои сразу, карта превращается в кашу — и виноват не контраст с фоном, а четыре
+#  других вещи, каждая со своим лекарством:
+#    1) ПОДЛОЖКА ДУБЛИРУЕТ наши слои. OSM рисует СВОИ дороги, воду и лес, мы кладём сверху
+#       свои — оранжевое на оранжевом, синее на синем. Лечится не палитрой, а гашением
+#       подложки в бледный фон (BASEMAP_FADE ниже);
+#    2) НЕТ ОБВОДКИ. Линии без канта сливаются друг с другом на пересечениях, а при
+#       отдалении пересечений сотни. Белый кант (`casing`) физически разделяет линии —
+#       это главный приём картографии, сильнее любого подбора оттенка;
+#    3) РАЗЛИЧИЕ ТОЛЬКО ПО ОТТЕНКУ. Тонкие линии при отдалении сжимаются в пиксель, и
+#       соседние оттенки смешиваются в грязь. Поэтому слои разведены ещё и ШТРИХОМ:
+#       сплошная (дороги, реки) / шпалы (ж/д) / точки (ЛЭП) / длинный пунктир (труба) /
+#       редкие точки (лесополоса). Даже если цвета сошлись, штрих разводит;
+#    4) ПОРЯДОК НЕ ЗАДАН. У всех слоёв стоял один `setZValue(-5)` — кто нарисован
+#       последним, тот и сверху, случайно. Теперь порядок явный (`z` ниже): снизу вверх
+#       застройка → лесополоса → вода → ж/д → труба → ЛЭП → дороги → мост.
+#  Поля: `casing` — цвет обводки (None = без неё), `casing_w` — её ширина, `alpha` —
+#  прозрачность самой линии (второстепенные приглушены, чтобы главные читались сквозь).
+#  ЯРКОСТЬ ПОДОБРАНА ЗАМЕРОМ, а не на глаз: для каждого цвета взят САМЫЙ СВЕТЛЫЙ тон,
+#  который ещё проходит норму контраста на ХУДШЕМ фоне OSM (это лес — самый тёмный из
+#  подложки). Не максимум контраста: все фоны светлые, и максимум даёт чёрный — тогда
+#  река, ЛЭП и дороги становятся одинаково чёрными, а это ровно та каша, от которой
+#  уходим. Слоям с обводкой порог мягче (3.6 против 4.5): белый кант сам отделяет линию
+#  от фона, и цвет можно оставить живым, не загоняя дороги в бурый.
 LAYER_STYLE = {
-    "river":      dict(color="#3aa0ff", width=3.4, dash=None),
-    "stream":     dict(color="#7cc4ff", width=1.8, dash=None),
-    "road_major": dict(color="#992d00", width=3.6, dash=None),   # тёмно-оранжевый
-    "road_local": dict(color="#565304", width=2.2, dash=None),   # тёмно-жёлтый, тоньше
-    "railway":    dict(color="#e6edf3", width=2.3, dash=[6, 5]),
-    "power":      dict(color="#960096", width=2.6, dash=[5, 4]), # тёмный пурпур
-    "pipeline":   dict(color="#b794f6", width=2.2, dash=[8, 4]),
-    "tree_row":   dict(color="#4fd18b", width=2.2, dash=[1, 3]),
-    "bridge":     dict(color="#ff6b6b", width=3.0, dash=None),
-    "built_up":   dict(color="#8aa0b6", width=1.7, dash=None),
+    # вода: синий далеко от оранжевого дорог; светлый кант отделяет от зелени подложки
+    "river":      dict(color="#2a6794", width=2.6, dash=None, z=-5.6,
+                       casing="#eaf2f7", casing_w=4.0, alpha=245),
+    "stream":     dict(color="#35576e", width=1.6, dash=None, z=-5.7,
+                       casing=None, alpha=230),
+    # дороги: белый кант — они читаются поверх любой мешанины
+    "road_major": dict(color="#9e4825", width=3.0, dash=None, z=-5.1,
+                       casing="#ffffff", casing_w=5.0, alpha=250),
+    "road_local": dict(color="#8a5725", width=1.6, dash=None, z=-5.2,
+                       casing="#ffffff", casing_w=3.2, alpha=235),
+    # Ж/Д, ЛЭП, ЛЕСОПОЛОСА — на общем виде их «не было видно вовсе»: линия шириной 1.2 px
+    # с редким пунктиром ([1,5] — точка через пять пустых) вырождается в еле заметную
+    # пыль, и различать там уже нечего, какой ни возьми цвет. Поэтому они СТАЛИ ТОЛЩЕ, а
+    # штрих ПЛОТНЕЕ: сначала линия должна читаться как линия, и только потом её тон
+    # что-то значит. Штрихи при этом разные — тем и разводятся: шпалы / точки / длинный
+    # пунктир / короткие штрихи.
+    "railway":    dict(color="#636363", width=2.2, dash=[7, 4], z=-5.5,
+                       casing="#ffffff", casing_w=4.0, alpha=255),
+    # Труба уведена из коричневого в ОЛИВКОВЫЙ: после затемнения до нормы она совпадала
+    # с местной дорогой (17 единиц RGB — на карте это один цвет). Застройка по той же
+    # причине уведена из бежевого в тёплый серый.
+    # штрих [1,3] закрашивал лишь четверть длины — ЛЭП вырождалась в пыль и «не читалась»
+    "power":      dict(color="#69428c", width=1.9, dash=[2, 3], z=-5.3,
+                       casing=None, alpha=240),
+    "pipeline":   dict(color="#57571b", width=1.9, dash=[9, 5], z=-5.4,
+                       casing=None, alpha=240),
+    "tree_row":   dict(color="#3b5c32", width=1.7, dash=[3, 4], z=-5.8,
+                       casing=None, alpha=225),
+    # мост — не отдельный кричащий цвет, а та же дорога с тёмным кантом
+    "bridge":     dict(color="#9e4825", width=3.4, dash=None, z=-5.0,
+                       casing="#333333", casing_w=5.4, alpha=255),
+    # застройка — КОНТУР площади, поэтому пунктиром: сплошной тонкой линией она
+    # неотличима от ручья (57 единиц RGB при одинаковой ширине), а пунктирная граница
+    # к тому же привычнее читается как «край населённого пункта»
+    "built_up":   dict(color="#5c5348", width=1.4, dash=[2, 3], z=-5.9,
+                       casing=None, alpha=190),
 }
 
 THREAT_COLORS = {
@@ -142,7 +193,22 @@ def _iter_heat_lut():
     return (cm.magma(stops) * 255).astype(np.ubyte)
 
 
+def _iter_heat_cmap():
+    """Та же magma, но как ColorMap — для цветовой шкалы у правого края."""
+    try:
+        return pg.colormap.getFromMatplotlib("magma")
+    except Exception:
+        stops = np.linspace(0, 1, 256)
+        return pg.colormap.ColorMap(stops, _iter_heat_lut())
+
+
 class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
+    # Подложка гасится: поверх неё лежат НАШИ дороги, реки и лесополосы, а OSM рисует
+    # свои — без гашения это две карты одного смысла друг на друге. Но и перебарщивать
+    # нельзя: при 0.62/0.30 карта выцветала почти в белый лист, теряя контекст (лес,
+    # поля, вода переставали различаться) — заказчик попросил не больше ~20 %.
+    # 0, 0 возвращает прежний вид.
+    BASEMAP_FADE = (0.20, 0.10)
     """Экран вкладки 3: карта-подложка + слои (тепловая карта весов, векторные слои,
     огибающая, маршруты, датчики) + панель управления справа.
 
@@ -183,8 +249,24 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._fields = {}
         self._suppress = False
         self._layer_items = {}
+        self._layer_casing = {}            # обводка слоя (широкая светлая линия под ним)
         self._sensor_items = []
         self._framed = False
+        # ВИДИМОСТЬ КАЖДОГО ВЕКТОРНОГО СЛОЯ по отдельности (окно «Векторные слои…»).
+        # Живёт здесь, а не в диалоге: окно можно закрыть и открыть, набор остаётся.
+        # Общий чекбокс «Векторные слои» гасит их все разом, не трогая этот выбор.
+        self._vec_visible = {name: True for name in LAYER_STYLE}
+        self._vec_dialog = None
+        self._last_layers = {}             # последние данные слоёв — чтобы перерисовать
+        self._last_built = None            # выбранный набор БЕЗ пересчёта модели
+        self._last_extent = None
+        self._group_busy = False           # идёт переключение группы: не перерисовывать на каждом
+        self._base_opacity = {}            # родная прозрачность слоя (рельеф 0.55, тепло 0.62)
+        self._marker_scale = 1.0           # текущий размер точечных маркеров (доля)
+        # порядок включения тепловых карт: шкала показывается для ПОСЛЕДНЕЙ включённой.
+        # Весовая карта стоит первой — она включена по умолчанию.
+        self._scale_order = ["iter_heat", "threat"]
+        self._scale_shown = None
 
         self._target_mode = False
         self._data_path = None            # текущий источник (для префилла окна выбора)
@@ -292,39 +374,49 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         for name, fn in cbs.items():
             setattr(self, name, fn)
 
-    def _legend_html(self):
+    # Размер общей легенды: базовый кегль при полном участке и предел при зуме. Раньше
+    # она была 10 pt и НЕ масштабировалась — на приближении занимала треть экрана.
+    LEGEND_PT = 7.8            # 6.5 читалось мелко — поднято на 20 % по замечанию
+    LEGEND_PT_MIN = 4.8
+
+    def _legend_html(self, scale=1.0):
         """HTML-легенда (что каким цветом). ВСЕ цвета берутся из палитр THREAT_COLORS и
-        LAYER_STYLE (вверху файла) — правка там меняет и карту, и легенду синхронно."""
+        LAYER_STYLE (вверху файла) — правка там меняет и карту, и легенду синхронно.
+
+        `scale` уменьшает кегль при зуме (как у легенды приоритета): панель поясняет
+        цвета, а не соперничает с картой за место. Пояснения в скобках убраны — они есть
+        в подсказках чекбоксов и в методичке."""
         c = THREAT_COLORS
-        rows = [f'<div style="background:{c["legend_bg"]};padding:8px 12px;border:2px solid '
-                f'{c["legend_head"]};border-radius:6px;font-size:10pt;color:#ffffff;line-height:155%;">']
-        rows.append(f'<b style="color:{c["legend_head"]};">ЛЕГЕНДА · слои цифровой карты</b><br>')
+        pt = max(self.LEGEND_PT * float(scale), self.LEGEND_PT_MIN)
+        sq = pt * 1.3                                   # значок чуть крупнее текста
+        rows = [f'<div style="background:{c["legend_bg"]};padding:3px 6px;border:1px solid '
+                f'{c["legend_head"]};border-radius:4px;font-size:{pt:.1f}pt;color:#ffffff;'
+                'line-height:125%;">']
+        rows.append(f'<b style="color:{c["legend_head"]};">ЛЕГЕНДА</b><br>')
         from config import THREAT_LAYERS as _TL
         for name in THREAT_LAYER_ORDER:
             st = LAYER_STYLE.get(name)
             if not st:
                 continue
             lab = _TL.get(name, {}).get("label", name)
-            rows.append(f'<span style="color:{st["color"]};font-size:13pt;">&#9644;&#9644;</span> {lab}<br>')
+            rows.append(f'<span style="color:{st["color"]};font-size:{sq:.1f}pt;">'
+                        f'&#9644;&#9644;</span> {lab}<br>')
         rows.append(f'<span style="color:{c["legend_bridge"]};">&#9650;</span> мост &nbsp; '
-                    f'<span style="color:{c["crossing"]};">&#9670;</span> пересечение (развилка)<br>')
-        rows.append(f'<span style="color:{c["legend_area"]};">&#9632;</span> места пролёта (огибающая) '
-                    f'&nbsp; <span style="color:{c["route_all"]};font-size:13pt;">&#9644;&#9644;</span> '
-                    'возможные маршруты<br>')
-        rows.append(f'<span style="color:{c["legend_main"]};font-size:13pt;">&#9644;&#9644;</span> основной '
-                    f'маршрут (чёрный) &nbsp; <span style="color:{c["route_gen"]};font-size:13pt;">&#9644;&#9644;</span> '
-                    'выборка маршрутов<br>')
-        rows.append(f'<span style="color:{c["sensor"]};">&#9679;</span> датчик (зона обзора — поверх всего)<br>')
+                    f'<span style="color:{c["crossing"]};">&#9670;</span> пересечение<br>')
+        rows.append(f'<span style="color:{c["legend_area"]};">&#9632;</span> места пролёта '
+                    f'&nbsp; <span style="color:{c["route_all"]};font-size:{sq:.1f}pt;">'
+                    '&#9644;&#9644;</span> возможные маршруты<br>')
+        rows.append(f'<span style="color:{c["legend_main"]};font-size:{sq:.1f}pt;">&#9644;&#9644;</span> '
+                    f'основной &nbsp; <span style="color:{c["route_gen"]};font-size:{sq:.1f}pt;">'
+                    '&#9644;&#9644;</span> выборка<br>')
+        rows.append(f'<span style="color:{c["sensor"]};">&#9679;</span> датчик<br>')
         # рельеф — два независимых слоя показа; цвета те же, что в RELIEF_* выше
-        rows.append(f'<span style="color:{c["legend_relief"]};">&#9632;</span> карта высот '
-                    f'(низины зелёные → вершины светлые) &nbsp; '
-                    f'<span style="color:{c["legend_hide"]};">&#9632;</span> укрытие '
-                    f'&nbsp; <span style="color:{c["legend_target"]};">&#9632;</span> '
-                    f'возвышенность (заметнее) &nbsp; '
-                    f'<span style="color:{c["legend_cut"]};">&#9632;</span> коридор снят '
-                    '(высокая гора)<br>')
-        rows.append(f'<span style="color:{c["legend_entry"]};">&#9733;</span> вход (A) &nbsp; '
-                    f'<span style="color:{c["legend_target"]};">&#10005;</span> цель (B)')
+        rows.append(f'<span style="color:{c["legend_relief"]};">&#9632;</span> высоты &nbsp; '
+                    f'<span style="color:{c["legend_hide"]};">&#9632;</span> укрытие &nbsp; '
+                    f'<span style="color:{c["legend_target"]};">&#9632;</span> возвышенность &nbsp; '
+                    f'<span style="color:{c["legend_cut"]};">&#9632;</span> коридор снят<br>')
+        rows.append(f'<span style="color:{c["legend_entry"]};">&#9733;</span> вход &nbsp; '
+                    f'<span style="color:{c["legend_target"]};">&#10005;</span> цель')
         rows.append('</div>')
         return "".join(rows)
 
@@ -492,54 +584,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._build_map_combo(col, params)
 
         # показ слоёв
-        col.addWidget(self._header("ПОКАЗ"))
-        self.chk_threat = QtWidgets.QCheckBox("весовая карта (тепло)")
-        self.chk_threat.setChecked(True)
-        self.chk_layers = QtWidgets.QCheckBox("векторные слои (реки/дороги/…)")
-        self.chk_layers.setChecked(True)
-        self.chk_water = QtWidgets.QCheckBox("исключения (вода/город)")
-        self.chk_water.setToolTip("Синим — вода (запрет датчика), красным — населённые "
-                                  "пункты (исключены из пролёта и из веса).")
-        self.chk_cand = QtWidgets.QCheckBox("кандидатные позиции")
-        self.chk_routes = QtWidgets.QCheckBox("маршруты (все места пролёта)")
-        self.chk_routes.setToolTip("Розовый ФОН = ВСЕ достижимые места пролёта (огибающая): "
-                                   "куда БПЛА может дойти A→место→цель ≤ L_max по коридорам "
-                                   "(вес≠0 + мостики < шага БПЛА) — считается ГРАФОМ, точно, "
-                                   "включая юг. Поверх — линии-ПРИМЕРЫ путей (их всего "
-                                   "экспоненциально много, показываем выборку).")
-        self.chk_cross = QtWidgets.QCheckBox("пересечения (перекрёстки)")
-        self.chk_cross.setToolTip("Узлы, где сходятся ≥2 разных слоёв (дорога×река=мост, "
-                                  "дорога×ЛЭП и т.д.) — точки развилок. Скрыто по умолчанию.")
-        self.chk_iter = QtWidgets.QCheckBox("итерационные маршруты (все)")
-        self.chk_iter.setToolTip("Показ ВСЕХ сгенерированных итерационных маршрутов БПЛА "
-                                 "(накопленная выборка). Генерация — кнопки Пуск/Шаг/Пакетно.")
-        self.chk_iter_heat = QtWidgets.QCheckBox("тепловая карта итераций (частота пролёта)")
-        self.chk_iter_heat.setToolTip("2-я тепловая карта: как часто маршруты БПЛА проходят "
-                                      "над клеткой. По ней и расставляются датчики.")
-        self.chk_iter_gen = QtWidgets.QCheckBox("обобщённая выборка (10% маршрутов)")
-        self.chk_iter_gen.setToolTip("Показать НЕ весь веер, а ~10 % пройденных итерационных "
-                                     "маршрутов: самые ЧАСТЫЕ (по тепловой карте), но "
-                                     "РАСПРЕДЕЛЁННО по всей карте, не кучкой. Прошло 150 из "
-                                     "500 → покажет 15. Обобщает тепловую карту пролётов.")
-        self.chk_relief = QtWidgets.QCheckBox("карта высот (рельеф)")
-        self.chk_relief.setToolTip(
-            "Абсолютные высоты местности: зелёные низины → коричневые возвышенности, "
-            "со светотенью. Показ НЕ зависит от кнопки «Добавить рельеф» — посмотреть "
-            "местность можно всегда.")
-        self.chk_relief_k = QtWidgets.QCheckBox("приоритет по высоте")
-        self.chk_relief_k.setToolTip(
-            "Что рельеф СДЕЛАЛ с весом: синим укрытия (вес вырос), красным возвышенности "
-            "(вес упал), чёрным — места, где коридор снят как «очень высокая гора». "
-            "Работает только когда рельеф добавлен в вес.")
-        self.chk_legend = QtWidgets.QCheckBox("легенда")
-        self.chk_legend.setChecked(True)
-        self.chk_legend.setToolTip("Легенда (какой цвет какой объект) — в левом нижнем углу.")
-        for chk in (self.chk_threat, self.chk_layers, self.chk_water, self.chk_cand,
-                    self.chk_routes, self.chk_cross, self.chk_iter, self.chk_iter_heat,
-                    self.chk_iter_gen, self.chk_relief, self.chk_relief_k,
-                    self.chk_legend):
-            chk.stateChanged.connect(lambda _s: self.on_toggle())
-            col.addWidget(chk)
+        self._build_layer_box(col)
         # режим стохастического выбора развилки (для «итераций»)
         row_it = QtWidgets.QHBoxLayout()
         row_it.addWidget(QtWidgets.QLabel("режим итераций:"))
@@ -658,6 +703,231 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.metrics.setMinimumHeight(200)
         col.addWidget(self.metrics, stretch=1)
 
+    # Слои показа: (атрибут, подпись, включён ли сразу, подсказка). Подпись короткая —
+    # подробности живут в подсказке, иначе двенадцать строк во всю ширину панели
+    # выдавливают вниз и управление итерациями, и показатели.
+    LAYER_GROUPS = (
+        ("местность", (
+            ("chk_layers", "Векторные слои", True,
+             "Реки, дороги, ЛЭП, железные дороги — то, по чему БПЛА ориентируется."),
+            ("chk_relief", "Карта высот", False,
+             "Абсолютные высоты: зелёные низины → коричневые возвышенности, со светотенью. "
+             "Показ НЕ зависит от кнопки «Добавить рельеф» — посмотреть местность можно всегда."),
+            ("chk_water", "Вода и города", False,
+             "Синим — вода (датчик ставить нельзя), красным — населённые пункты "
+             "(исключены из пролёта и из веса)."),
+            ("chk_cross", "Пересечения", False,
+             "Узлы, где сходятся ≥2 разных слоёв (дорога×река = мост, дорога×ЛЭП) — "
+             "точки развилок. Скрыто по умолчанию."),
+        )),
+        ("весовая карта", (
+            ("chk_threat", "Весовая карта", True,
+             "Тепловая карта весов: где местность удобна для полёта вообще."),
+            ("chk_relief_k", "Приоритет высот", False,
+             "Что рельеф СДЕЛАЛ с весом: синим укрытия (вес вырос), красным возвышенности "
+             "(вес упал), чёрным — где коридор снят как «очень высокая гора». "
+             "Работает, только когда рельеф добавлен в вес."),
+        )),
+        ("пролёт БПЛА", (
+            ("chk_routes", "Зона пролёта", False,
+             "Розовый фон — ВСЕ достижимые места пролёта (огибающая): куда БПЛА может дойти "
+             "вход→место→цель в пределах запаса хода. Считается графом, точно. Поверх — "
+             "линии-примеры путей (их экспоненциально много, показываем выборку)."),
+            ("chk_iter", "Маршруты движения", False,
+             "Все накопленные итерационные маршруты БПЛА. Генерация — Пуск / Шаг / Пакетно."),
+            ("chk_iter_heat", "Тепловая карта маршрутов", False,
+             "Вторая тепловая карта: как часто маршруты проходят над клеткой. "
+             "По ней и расставляются датчики."),
+            ("chk_iter_gen", "Выборка", False,
+             "Не весь веер, а ~10 % пройденных маршрутов: самые частые (по тепловой карте), "
+             "но распределённо по карте, не кучкой. Прошло 150 → покажет 15."),
+        )),
+        ("датчики и подписи", (
+            ("chk_cand", "Позиции датчиков", False,
+             "Кандидатные позиции — узлы сетки, из которых жадный алгоритм выбирает N лучших."),
+            ("chk_legend", "Легенда", False,
+             "Легенда (какой цвет какой объект) — в левом нижнем углу. По умолчанию "
+             "скрыта: она занимает место, а нужна не всегда."),
+        )),
+    )
+
+    def _build_layer_box(self, col):
+        """Блок «ПОКАЗ»: слои сгруппированы по смыслу и разложены в две колонки.
+
+        У группы свой переключатель — гасит всех её детей разом. У групп с заливками
+        (весовая карта, пролёт) есть ещё ползунок прозрачности: эти слои перекрывают друг
+        друга, и притушить верхний бывает нужнее, чем выключить. Линиям и точкам ползунок
+        не даём — они и так поверх, а двенадцать ползунков это и есть нагромождение."""
+        col.addWidget(self._header("ПОКАЗ"))
+        self._layer_checks = []
+        self._group_masters = []
+        for title, items in self.LAYER_GROUPS:
+            head = QtWidgets.QHBoxLayout(); head.setSpacing(6)
+            master = QtWidgets.QCheckBox(title)
+            master.setObjectName("muted")
+            master.setTristate(False)
+            master.setToolTip("Показать или скрыть всю группу разом.")
+            head.addWidget(master, 1)
+            col.addLayout(head)
+            grid = QtWidgets.QGridLayout()
+            grid.setSpacing(2); grid.setContentsMargins(14, 0, 0, 2)
+            kids = []
+            for i, (attr, label, on, tip) in enumerate(items):
+                chk = QtWidgets.QCheckBox(label)
+                chk.setChecked(on)
+                chk.setToolTip(tip)
+                chk.stateChanged.connect(lambda _s: self._layer_toggled())
+                # у тепловых карт общая цветовая шкала — запоминаем, какую включили позже
+                for key, spec in self.SCALE_SPECS.items():
+                    if spec["chk"] == attr:
+                        chk.toggled.connect(
+                            lambda on, k=key: self._note_scale_layer(k, on))
+                setattr(self, attr, chk)
+                self._layer_checks.append(chk)
+                kids.append(chk)
+                grid.addWidget(chk, i // 2, i % 2)
+            col.addLayout(grid)
+            master.setChecked(any(c.isChecked() for c in kids))
+            master.toggled.connect(lambda on, ks=kids: self._toggle_group(ks, on))
+            for c in kids:                       # ребёнка выключили руками — обновить шапку
+                c.stateChanged.connect(
+                    lambda _s, m=master, ks=kids: self._sync_master(m, ks))
+            self._group_masters.append((master, kids))
+            # кнопка «какие именно векторные слои показывать» — рядом со своей группой
+            if any(a == "chk_layers" for a, _l, _o, _t in items):
+                btn = QtWidgets.QPushButton("Векторные слои…")
+                btn.setToolTip("Список рек, дорог, ЛЭП и прочего: что показывать по "
+                               "отдельности. Влияет только на показ — ничего не "
+                               "пересчитывается.")
+                btn.clicked.connect(self._open_vector_dialog)
+                wrap = QtWidgets.QHBoxLayout(); wrap.setContentsMargins(14, 0, 0, 4)
+                wrap.addWidget(btn)
+                col.addLayout(wrap)
+            self._add_group_opacity(col, items)
+
+    # ЧТО ГАСИТ ПОЛЗУНОК. Для каждого слоя перечислены ВСЕ его элементы на карте, а не
+    # только заливка: сперва ползунок трогал одни растры, и выходило странное — розовая
+    # зона пролёта тускнела, а синие линии поверх неё оставались яркими; у векторных
+    # слоёв не менялось вовсе. Спецключ "*vectors" разворачивается в десяток линий и их
+    # обводки — они живут в словарях, а не отдельными полями.
+    OPACITY_TARGETS = {
+        "chk_layers":    ("*vectors", "bridge_scatter"),
+        "chk_relief":    ("relief_img",),
+        "chk_water":     ("water_img", "builtup_img"),
+        "chk_cross":     ("crossing_scatter",),
+        "chk_threat":    ("threat_img", "cbar"),
+        "chk_relief_k":  ("relief_k_img",),
+        "chk_routes":    ("route_area_img", "route_item"),
+        "chk_iter":      ("route_iter_item", "route_cur_item"),
+        "chk_iter_heat": ("iter_heat_img",),
+        "chk_iter_gen":  ("route_gen_item",),
+        "chk_cand":      ("cand_scatter",),
+    }
+
+    def _opacity_items(self, attrs):
+        """Развернуть цели в реальные элементы сцены (включая словарные слои)."""
+        out = []
+        for attr in attrs:
+            for item_name in self.OPACITY_TARGETS.get(attr, ()):
+                if item_name == "*vectors":
+                    out += list(self._layer_items.values())
+                    out += list(self._layer_casing.values())
+                    continue
+                it = getattr(self, item_name, None)
+                if it is not None:
+                    out.append(it)
+        return out
+
+    def _add_group_opacity(self, col, items):
+        """Ползунок прозрачности на группу — гасит всё, что эта группа рисует."""
+        targets = [a for a, _l, _o, _t in items if a in self.OPACITY_TARGETS]
+        if not targets:
+            return
+        row = QtWidgets.QHBoxLayout(); row.setContentsMargins(14, 0, 0, 6); row.setSpacing(6)
+        cap = QtWidgets.QLabel("прозрачность"); cap.setObjectName("muted")
+        sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        sld.setRange(20, 100); sld.setValue(100); sld.setFixedWidth(96)
+        sld.setToolTip("Притушить заливки этой группы, не выключая их. "
+                       "Только показ — веса не меняются.")
+        sld.valueChanged.connect(lambda v, ts=targets: self._set_group_opacity(ts, v))
+        row.addWidget(cap); row.addWidget(sld, 1)
+        col.addLayout(row)
+
+    def _set_group_opacity(self, attrs, value):
+        """Прозрачность слоёв-заливок. Модель не трогаем — это чистая отрисовка.
+
+        Ползунок МАСШТАБИРУЕТ родную прозрачность слоя, а не задаёт её: у рельефа она
+        0.55, у тепловой карты 0.62 — выставив 1.0, мы бы сделали их непрозрачными и
+        закрыли всё под ними. При 100 % слой выглядит ровно так, как задумано."""
+        a = max(0.0, min(1.0, value / 100.0))
+        for it in self._opacity_items(attrs):
+            try:
+                key = id(it)
+                if key not in self._base_opacity:
+                    self._base_opacity[key] = float(it.opacity())
+                it.setOpacity(self._base_opacity[key] * a)
+            except Exception:
+                pass
+
+    def _layer_toggled(self):
+        """Слой переключили. Во время группового переключения молчим — перерисуем один
+        раз в конце, а не по разу на каждый слой группы."""
+        if self._group_busy:
+            return
+        if self._vec_dialog is not None and self._vec_dialog.isVisible():
+            self._vec_dialog.sync()          # окно «Векторные слои» и панель — одно состояние
+        self.on_toggle()
+
+    def _toggle_group(self, kids, on):
+        """Переключатель группы: гасит/зажигает детей одной перерисовкой."""
+        self._group_busy = True
+        try:
+            for c in kids:
+                if c.isEnabled():
+                    c.setChecked(bool(on))
+        finally:
+            self._group_busy = False
+        self._layer_toggled()
+
+    def _sync_master(self, master, kids):
+        """Шапка группы показывает, включён ли хоть один её слой."""
+        if self._group_busy:
+            return
+        master.blockSignals(True)
+        master.setChecked(any(c.isChecked() for c in kids))
+        master.blockSignals(False)
+
+    def set_layer_enabled(self, **state):
+        """Погасить слои, которых ещё нет: «галка стоит, а на карте ничего» — это вопрос
+        к программе, а не к пользователю. Показ при этом НЕ трогаем: галка остаётся, где
+        стояла, и слой вернётся сам, как только данные появятся."""
+        # Гасим только то, что САМО не появится. «Зона пролёта», «Маршруты движения» и
+        # «Выборка» считаются по включению галки (см. on_toggle контроллера) — их держим
+        # доступными, пока есть карта. А тепловая карта маршрутов сама не считается: без
+        # накопленных маршрутов галка над ней стояла бы впустую.
+        rules = dict(
+            chk_threat="grid", chk_layers="grid", chk_water="grid", chk_cross="grid",
+            chk_routes="grid", chk_cand="grid", chk_iter="grid", chk_iter_gen="grid",
+            chk_relief="dem", chk_relief_k="relief", chk_iter_heat="iter")
+        hints = dict(
+            grid="Сначала «Построить карту».",
+            dem="Нет данных о высотах — карта высот не загружена.",
+            relief="Сначала «Добавить рельеф» — тогда видно, что он сделал с весом.",
+            iter="Сначала «Пуск», «Шаг» или «Пакетно» — маршрутов ещё нет.")
+        for attr, key in rules.items():
+            chk = getattr(self, attr, None)
+            if chk is None:
+                continue
+            ok = bool(state.get(key, True))
+            chk.setEnabled(ok)
+            if not ok:
+                chk.setToolTip(hints[key])
+            else:                                   # вернуть родную подсказку
+                for _t, items in self.LAYER_GROUPS:
+                    for a, _l, _on, tip in items:
+                        if a == attr:
+                            chk.setToolTip(tip)
+
     def _build_map_combo(self, col, params):
         col.addWidget(self._header("КАРТА"))
         self.combo_map = QtWidgets.QComboBox()
@@ -763,10 +1033,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             if name not in LAYER_STYLE:
                 continue
             st = LAYER_STYLE[name]
-            pen = pg.mkPen(_qcolor(st["color"], 235), width=st["width"],
+            z = float(st.get("z", -5.0))
+            # ОБВОДКА (casing) — широкая светлая линия ПОД цветной. Именно она разделяет
+            # линии на пересечениях: без неё дорога, река и ЛЭП в одной точке сливаются
+            # в неразличимое пятно. Своим элементом, чуть ниже по z.
+            if st.get("casing"):
+                cpen = pg.mkPen(_qcolor(st["casing"], 210),
+                                width=st.get("casing_w", st["width"] + 2.0))
+                cit = self.pi.plot([], [], pen=cpen, antialias=False, connect="finite")
+                cit.setZValue(z - 0.04)
+                self._layer_casing[name] = cit
+            pen = pg.mkPen(_qcolor(st["color"], st.get("alpha", 235)), width=st["width"],
                            dash=st["dash"])
             item = self.pi.plot([], [], pen=pen, antialias=False, connect="finite")
-            item.setZValue(-5)
+            item.setZValue(z)                    # порядок задан явно, а не «кто последний»
             self._layer_items[name] = item
         # мосты — точечные маркеры (число ограничено, см. render_layers)
         self.bridge_scatter = pg.ScatterPlotItem(
@@ -817,7 +1097,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # anchor (0,1) — точка привязки = НИЖНИЙ-левый угол текста (легенда в левом
         # нижнем углу вида); включается отдельным чекбоксом «легенда».
         self.legend = pg.TextItem(anchor=(0, 1), fill=pg.mkBrush(THREAT_COLORS["legend_bg"]))
-        self.legend.setZValue(20); self.legend.setHtml(self._legend_html())
+        self.legend.setZValue(20)
+        self._legend_scale = 1.0                 # текущий кегль (доля от базового)
+        self.legend.setHtml(self._legend_html())
         self.pi.addItem(self.legend); self.legend.setVisible(False)
 
         # легенда режима «приоритет по высоте» — у ПРАВОГО края, как шкала весовой карты.
@@ -995,17 +1277,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         то, что в кадре, поэтому объекты рисуются целиком. Застройка на общем виде
         показывается растровой маской (8275 контуров всё равно сливаются в пятно и
         только тормозят), а при приближении переключается на настоящие контуры."""
+        self._last_layers = layers                       # для перерисовки без пересчёта
+        self._last_built, self._last_extent = built_mask, extent
         show = toggles["show_layers"]
         vb = self._view_box_km() if show else None
-        raster_built = (show and built_mask is not None and extent is not None
+        raster_built = (show and self._vec_visible.get("built_up", True)
+                        and built_mask is not None and extent is not None
                         and not self._zoomed_in(vb))
         for name, item in self._layer_items.items():
-            if show and not (name == "built_up" and raster_built):
-                xs, ys = self._polys_to_xy(layers.get(name, []), vb)
-                item.setData(xs, ys, antialias=False, connect="finite")
-            else:
-                item.setData([], [])                     # полностью убрать нагрузку
-            item.setVisible(show and not (name == "built_up" and raster_built))
+            on = show and self._vec_visible.get(name, True)
+            vis = on and not (name == "built_up" and raster_built)
+            xs, ys = (self._polys_to_xy(layers.get(name, []), vb) if vis else ([], []))
+            item.setData(xs, ys, antialias=False, connect="finite")
+            item.setVisible(vis)                         # скрытый слой = нулевая нагрузка
+            self._set_casing(name, xs, ys, vis)
         self._render_builtup_raster(built_mask if raster_built else None, extent)
         if show and len(bridge_pts):
             bp = np.asarray(bridge_pts, float)
@@ -1021,6 +1306,97 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.legend.setVisible(toggles.get("show_legend", False))
         self.reposition_legends()
 
+    # ЦВЕТОВАЯ ШКАЛА — одна на две тепловые карты. Обе рисуются полупрозрачной заливкой
+    # по всей области, и держать две шкалы разом негде: они займут правый край вдвое.
+    # Показывается шкала ПОСЛЕДНЕГО ВКЛЮЧЁННОГО слоя — это и есть тот, на который
+    # пользователь смотрит сейчас.
+    SCALE_SPECS = {
+        "threat":    dict(item="threat_img", chk="chk_threat", cmap=_threat_cmap,
+                          label="вес ячейки (низкий → высокий)"),
+        "iter_heat": dict(item="iter_heat_img", chk="chk_iter_heat", cmap=_iter_heat_cmap,
+                          label="частота пролёта (редко → часто)"),
+    }
+
+    def _note_scale_layer(self, key, on):
+        """Запомнить, какой слой включили последним (по нему выбирается шкала)."""
+        if key in self._scale_order:
+            self._scale_order.remove(key)
+        if on:
+            self._scale_order.append(key)
+        else:                                  # выключенный уходит в начало, а не пропадает:
+            self._scale_order.insert(0, key)   # включат обратно — снова станет последним
+
+    def _update_scale(self):
+        """Показать шкалу того слоя, который включён последним. Ни одного — скрыть."""
+        live = [k for k in self._scale_order
+                if getattr(self, self.SCALE_SPECS[k]["item"], None) is not None
+                and getattr(self, self.SCALE_SPECS[k]["item"]).isVisible()]
+        if not live:
+            self.cbar.setVisible(False)
+            self._scale_shown = None
+            return
+        key = live[-1]
+        if key != self._scale_shown:           # не дёргать палитру на каждой отрисовке
+            spec = self.SCALE_SPECS[key]
+            try:
+                self.cbar.setColorMap(spec["cmap"]())
+                self.cbar.setLabel("right", spec["label"])
+            except Exception:
+                pass
+            self._scale_shown = key
+        self.cbar.setVisible(True)
+
+    def _set_casing(self, name, xs, ys, visible):
+        """Обводке — те же данные, что и самой линии (она рисуется под ней)."""
+        cit = self._layer_casing.get(name)
+        if cit is None:
+            return
+        cit.setData(xs, ys, antialias=False, connect="finite")
+        cit.setVisible(bool(visible))
+
+    def apply_vector_visibility(self):
+        """Показать/скрыть отдельные векторные слои ПО СОХРАНЁННЫМ данным.
+
+        Модель не трогается вовсе: веса, маршруты и датчики остаются как были — меняется
+        только то, что нарисовано. Данные берутся из последнего вызова `render_layers`,
+        поэтому включённый обратно слой рисуется сразу, а не после пересборки карты."""
+        if not self._layer_items:
+            return
+        show = self.chk_layers.isChecked()
+        vb = self._view_box_km() if show else None
+        raster_built = (show and self._vec_visible.get("built_up", True)
+                        and self._last_built is not None and self._last_extent is not None
+                        and not self._zoomed_in(vb))
+        for name, item in self._layer_items.items():
+            on = show and self._vec_visible.get(name, True)
+            vis = on and not (name == "built_up" and raster_built)
+            xs, ys = (self._polys_to_xy(self._last_layers.get(name, []), vb)
+                      if vis else ([], []))
+            item.setData(xs, ys, antialias=False, connect="finite")
+            item.setVisible(vis)
+            self._set_casing(name, xs, ys, vis)
+        self._render_builtup_raster(self._last_built if raster_built else None,
+                                    self._last_extent)
+
+    def _open_vector_dialog(self):
+        """Окно со списком векторных слоёв. Не модальное: с ним можно работать, глядя
+        на карту, — переключил слой и сразу видно результат. Второй раз открывается то же
+        окно, а не новое."""
+        if self._vec_dialog is None:
+            self._vec_dialog = VectorLayersDialog(self)
+        self._vec_dialog.sync()
+        self._vec_dialog.show()
+        self._vec_dialog.raise_()
+        self._vec_dialog.activateWindow()
+
+    def set_vector_visible(self, name, on):
+        """Переключить один слой (вызывается из окна) и сразу перерисовать."""
+        self._vec_visible[str(name)] = bool(on)
+        self.apply_vector_visibility()
+
+    def vector_visible(self):
+        return dict(self._vec_visible)
+
     def reposition_legends(self):
         """Прижать обе легенды к углам ТЕКУЩЕГО вида: общую — влево вниз, легенду
         приоритета по высоте — вправо вверх.
@@ -1035,16 +1411,66 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             (x0, x1), (y0, y1) = self.vb.viewRange()
         except Exception:
             return
+        kx0, kx1, _ky0, _ky1 = self.bbox_km
+        frac = abs(x1 - x0) / max(abs(kx1 - kx0), 1e-6)          # доля участка в кадре
+        scale = float(np.clip(np.sqrt(min(frac, 1.0)), 0.55, 1.0))
         if self.legend.isVisible():
+            # РАЗМЕР ПОСТОЯННЫЙ — тот, что на общем виде. Мельчание при зуме сделано для
+            # панели «приоритет по высоте» (три цвета, её видно и мелкой), а общая легенда
+            # длинная: ужимаясь, она становилась нечитаемой ровно тогда, когда по ней и
+            # сверяют объекты — на приближении.
             self.legend.setPos(x0 + (x1 - x0) * 0.005, y0 + (y1 - y0) * 0.02)
         if self.relief_legend.isVisible():
-            kx0, kx1, _ky0, _ky1 = self.bbox_km
-            frac = abs(x1 - x0) / max(abs(kx1 - kx0), 1e-6)      # доля участка в кадре
-            scale = float(np.clip(np.sqrt(min(frac, 1.0)), 0.55, 1.0))
-            if abs(scale - self._relief_legend_scale) > 0.03:    # не дёргать setHtml зря
+            if abs(scale - self._relief_legend_scale) > 0.03:
                 self._relief_legend_scale = scale
                 self.relief_legend.setHtml(self._relief_legend_html(scale))
             self.relief_legend.setPos(x1 - (x1 - x0) * 0.005, y1 - (y1 - y0) * 0.02)
+        self._scale_markers(scale)
+
+    # Размер точечных маркеров: на общем виде и мосты, и развилки идут сотнями и
+    # застилают карту сплошным ковром (линии при этом читаются). Уменьшаем их при
+    # отдалении — линии оставляем все, разгружаем именно точки.
+    MARKER_SIZE = {"bridge_scatter": 11.0, "crossing_scatter": 7.0}
+    MARKER_MIN = 0.45              # доля от базового размера при полном участке
+
+    def _scale_markers(self, scale):
+        k = float(np.clip(scale, self.MARKER_MIN, 1.0))
+        if abs(k - self._marker_scale) < 0.05:
+            return                                        # не дёргать setSize на каждый кадр
+        self._marker_scale = k
+        for attr, base in self.MARKER_SIZE.items():
+            it = getattr(self, attr, None)
+            if it is not None:
+                try:
+                    it.setSize(max(3.0, base * k))
+                except Exception:
+                    pass
+        self._scale_line_widths(k)
+
+    # Насколько худеет ОБВОДКА на общем виде. Сама линия почти не меняется (иначе слой
+    # пропадёт), а кант ужимается сильно: вблизи он разделяет линии, а на общем виде,
+    # где дороги идут густой сетью, пятимиллиметровые белые канты соседних дорог
+    # сливаются в сплошное белёсое пятно — заказчик назвал это «странно накладываются».
+    CASING_MIN = 0.35              # доля от базовой ширины канта при полном участке
+    LINE_MIN = 0.75                # доля от базовой ширины самой линии
+
+    def _scale_line_widths(self, k):
+        """Подогнать толщину линий и кантов под масштаб (k = 1 вблизи, меньше — дальше)."""
+        kc = self.LINE_MIN + (1.0 - self.LINE_MIN) * k
+        kg = self.CASING_MIN + (1.0 - self.CASING_MIN) * k
+        for name, item in self._layer_items.items():
+            st = LAYER_STYLE.get(name)
+            if st is None:
+                continue
+            try:
+                item.setPen(pg.mkPen(_qcolor(st["color"], st.get("alpha", 235)),
+                                     width=max(0.8, st["width"] * kc), dash=st["dash"]))
+                cit = self._layer_casing.get(name)
+                if cit is not None:
+                    cit.setPen(pg.mkPen(_qcolor(st["casing"], 210),
+                                        width=max(1.0, st.get("casing_w", 3.0) * kg)))
+            except Exception:
+                pass
 
     def _render_builtup_raster(self, mask, extent):
         """Застройка растровой маской (общий вид). None — скрыть слой."""
@@ -1063,14 +1489,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     def render_threat(self, weight, extent, toggles):
         if not toggles["show_threat"] or weight is None:
-            self.threat_img.setVisible(False); self.cbar.setVisible(False); return
+            self.threat_img.setVisible(False)
+            self._update_scale()                        # шкала перейдёт к тепловой карте
+            return
         vmax = float(np.percentile(weight[weight > 0], 97)) if np.any(weight > 0) else 1.0
         vmax = max(vmax, 1e-6)
         disp = np.clip(weight / vmax, 0.0, 1.0)
         self.threat_img.setImage(disp, levels=(0, 1), lut=self._lut, autoLevels=False)
         x0, x1, y0, y1 = extent
         self.threat_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
-        self.threat_img.setVisible(True); self.cbar.setVisible(True)
+        self.threat_img.setVisible(True)
+        self._update_scale()
 
     def render_relief(self, dem, extent, toggles):
         """КАРТА ВЫСОТ: привычная топография (низины зелёные → вершины светлые) со
@@ -1220,7 +1649,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def render_iter_heat(self, density, extent, toggles):
         """2-я тепловая карта — частота пролёта БПЛА (плотность маршрутов), LUT magma."""
         if not toggles.get("show_iter_heat") or density is None:
-            self.iter_heat_img.setVisible(False); return
+            self.iter_heat_img.setVisible(False)
+            self._update_scale()                        # шкала вернётся к весовой карте
+            return
         d = np.asarray(density, float)
         ds = np.sqrt(np.clip(d, 0.0, 1.0))              # √ поднимает редкие пролёты (виднее)
         lut = _iter_heat_lut()
@@ -1230,6 +1661,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         x0, x1, y0, y1 = extent
         self.iter_heat_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.iter_heat_img.setVisible(True)
+        self._update_scale()
 
     def iter_show_accumulated(self, routes):
         """Отрисовать все накопленные маршруты тонкими линиями (одним item, через NaN)."""
@@ -1319,6 +1751,100 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.frame_bbox()
             self._framed = True
         self._refresh_basemap(force=True)
+
+
+class VectorLayersDialog(QtWidgets.QDialog):
+    """Окно «Векторные слои»: какие именно ориентиры показывать на карте.
+
+    ЧЕМ ОТЛИЧАЕТСЯ ОТ «ВЫБОРА ЦИФРОВЫХ КАРТ». Там решается, какие слои НАКЛАДЫВАТЬ НА
+    СЕТКУ, то есть какие войдут в вес ячеек — смена набора требует пересборки карты и
+    сбрасывает маршруты. Здесь — только ПОКАЗ: веса, маршруты и датчики не меняются
+    вовсе, скрытие слоя ничего не пересчитывает. Поэтому окно не модальное: переключил —
+    и сразу видно на карте.
+
+    Выбор хранится в представлении (`_vec_visible`), а не в окне, поэтому окно можно
+    закрыть и открыть — набор останется. Верхний переключатель — тот же, что чекбокс
+    «Векторные слои» в панели: оба показывают одно состояние."""
+
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+        self.setWindowTitle("Векторные слои — что показывать")
+        self.setMinimumWidth(300)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Tool)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(6)
+
+        self.chk_all = QtWidgets.QCheckBox("Показывать векторные слои")
+        self.chk_all.setToolTip("Тот же переключатель, что в панели: гасит все слои разом, "
+                                "не сбрасывая выбор ниже.")
+        self.chk_all.toggled.connect(self._master_toggled)
+        lay.addWidget(self.chk_all)
+
+        note = QtWidgets.QLabel("Влияет только на показ — веса, маршруты и датчики "
+                                "не пересчитываются.")
+        note.setWordWrap(True); note.setStyleSheet(f"color: {THEME['muted']}; font-size: 10px;")
+        lay.addWidget(note)
+
+        self._checks = {}
+        for name in THREAT_LAYER_ORDER:
+            style = LAYER_STYLE.get(name)
+            if style is None:
+                continue
+            row = QtWidgets.QHBoxLayout(); row.setSpacing(8)
+            swatch = QtWidgets.QLabel()                  # образец цвета — как на карте
+            swatch.setFixedSize(18, 4)
+            swatch.setStyleSheet(f"background: {style['color']}; border-radius: 2px;")
+            spec = THREAT_LAYERS.get(name, {})
+            chk = QtWidgets.QCheckBox(spec.get("label", name))
+            chk.setToolTip("Вес ячейки: %+g" % spec["weight"] if "weight" in spec else name)
+            chk.toggled.connect(lambda on, n=name: self.view.set_vector_visible(n, on))
+            self._checks[name] = chk
+            row.addWidget(swatch); row.addWidget(chk, 1)
+            lay.addLayout(row)
+
+        btns = QtWidgets.QHBoxLayout()
+        b_all = QtWidgets.QPushButton("Показать все")
+        b_none = QtWidgets.QPushButton("Скрыть все")
+        b_all.clicked.connect(lambda: self._set_all(True))
+        b_none.clicked.connect(lambda: self._set_all(False))
+        btns.addWidget(b_all); btns.addWidget(b_none)
+        lay.addLayout(btns)
+
+        close = QtWidgets.QPushButton("Закрыть")
+        close.setToolTip("Выбор сохраняется — окно можно открыть снова.")
+        close.clicked.connect(self.close)
+        lay.addWidget(close)
+
+    def sync(self):
+        """Подтянуть галки из представления (окно открыли повторно или сменили общий
+        чекбокс в панели)."""
+        vis = self.view.vector_visible()
+        for name, chk in self._checks.items():
+            chk.blockSignals(True)
+            chk.setChecked(bool(vis.get(name, True)))
+            chk.blockSignals(False)
+        self.chk_all.blockSignals(True)
+        self.chk_all.setChecked(self.view.chk_layers.isChecked())
+        self.chk_all.blockSignals(False)
+        self._update_enabled()
+
+    def _master_toggled(self, on):
+        self.view.chk_layers.setChecked(bool(on))        # панель и окно — одно состояние
+        self._update_enabled()
+
+    def _update_enabled(self):
+        on = self.chk_all.isChecked()
+        for chk in self._checks.values():
+            chk.setEnabled(on)
+
+    def _set_all(self, on):
+        for name, chk in self._checks.items():
+            chk.blockSignals(True)
+            chk.setChecked(on)
+            chk.blockSignals(False)
+            self.view._vec_visible[name] = bool(on)
+        self.view.apply_vector_visibility()              # одна перерисовка на все слои
 
 
 class DigitalMapsDialog(QtWidgets.QDialog):

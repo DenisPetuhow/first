@@ -404,6 +404,20 @@ FINAL_APPROACH_KM = 10.0
 # препятствия у объекта невозможным (маршрут упирался бы в тупик), четверть километра
 # при шаге сетки 0.5 км позволяет обогнуть помеху, но не развернуться.
 FINAL_DRIFT_KM = 0.25
+# ТРАНЗИТ МИМО ЦЕЛИ. Маршрут, идущий к VIA за целью, не должен приближаться к объекту
+# ближе этого радиуса: иначе он пролетает цель насквозь, отходит на пару километров и
+# возвращается — на карте это «хвост», торчащий из цели. Обход по дуге — то же «зайти с
+# другой стороны», но физически осмысленно. Действует ТОЛЬКО на участке, ведущем к такой
+# VIA (см. `bypass_km` в `_walk_field`); заход в саму цель, понятно, разрешён.
+# Величина: заметно шире «клевка» (в базе маршрут уходил за цель на 2.3 км), но втрое
+# меньше запаса хода на крюк. Замер по радиусам 3/4/5/6 км — 4 км даёт лучший вес под
+# выборкой при той же доле заходов сзади. 0 — правило выключено.
+FINAL_BYPASS_KM = 4.0
+# Проверялось и отвергнуто: отдельный лимит «топтания» у цели — сколько пути в зоне
+# подхода разрешено пройти, не сокращая расстояние до объекта. Механизм оказался мёртвым:
+# значения 0.5, 1.0 и 3.0 км давали побайтово одинаковую выборку. Запрета удаляться
+# (FINAL_DRIFT_KM) достаточно — накопить и полкилометра без прогресса маршрут не успевает,
+# а «отворот перпендикулярно» с карты заказчика был транзитом мимо цели, а не заходом.
 # Насколько маршруту позволено уходить ПОЗАДИ СТАРТА (проекция на ось старт→цель).
 # Немного назад в начале — нормально: БПЛА уходит от точки вылета и ищет коридор.
 # Дальше — уже «полетел не туда»: на карте это видно как полосу в обратную сторону.
@@ -411,6 +425,12 @@ START_BACK_KM = 1.0
 VIA_BEHIND_KM = 1.0     # VIA-точка не должна лежать позади старта дальше этого
 # За цель заходить МОЖНО: облететь объект и зайти с другой стороны — штатный манёвр.
 VIA_BEYOND_KM = 10.0
+# VIA, попавшая вплотную ЗА цель, ОТОДВИГАЕТСЯ на рубеж подхода (FINAL_APPROACH_KM), а не
+# отбрасывается. На реальной сетке такая точка вставала в 2.5 км за объектом — и, будучи
+# ближайшей к прямой вход→цель, выглядела для алгоритма «самой центральной»: через неё шло
+# 29 % маршрутов, каждый пролетал цель насквозь и возвращался. Отодвинутая точка даёт тот
+# же заход с обратной стороны, но нормальной дугой. False — прежнее поведение.
+VIA_BEYOND_PUSH = True
 
 
 def _spend_tau(slack_km, slack0_km, frac_done, profile):
@@ -442,7 +462,7 @@ def _spend_tau(slack_km, slack0_km, frac_done, profile):
 
 def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                 heading0=None, wmode="medium", visited=None, spend="late",
-                done0_km=0.0, tail_km=0.0, dgeo=None, fscale=1.0):
+                done0_km=0.0, tail_km=0.0, dgeo=None, fscale=1.0, bypass_km=0.0):
     """Стохастический спуск по полю расстояний dfield от start к goal (надёжно приходит):
     выбор коридора — по ВЕСУ соседа (тепловая карта, приоритет по режиму wmode) и развилкам.
 
@@ -506,6 +526,15 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     heading = heading0
     dist_since_turn = L_hold                            # на старте курс можно выбрать свободно
     route_len = 0.0
+    # ТРАНЗИТ МИМО ЦЕЛИ: участок ведёт к VIA ЗА целью, и приближаться к объекту ближе
+    # радиуса обхода ему незачем — иначе маршрут протыкает цель и возвращается. Радиус
+    # задаёт вызывающий (`bypass_km`), потому что правило нужно только на таких участках;
+    # поля до этих VIA считаются по той же урезанной маске (см. `pas_via`). Если участок
+    # стартует внутри круга, правило не включаем — первый же шаг был бы в тупик.
+    bypass = 0.0
+    if (bypass_km > 0.0 and tail_km > 1e-9 and dgoal is not None
+            and dgoal[start] >= bypass_km and dgoal[goal] >= bypass_km):
+        bypass = float(bypass_km)
     for _ in range(step_cap):
         if cur == goal or dfield[cur] <= reach_eps:
             break
@@ -543,6 +572,8 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                 continue                           # не уходить назад за точку вылета
             if in_final and dgoal[vy, vx] > dgoal[cur] + FINAL_DRIFT_KM:
                 continue                           # у цели не отворачиваем от неё
+            if bypass > 0.0 and dgoal[vy, vx] < bypass:
+                continue                           # мимо цели идём в обход, а не сквозь неё
             uy, ux = _NB_UNIT[k]
             if heading is None:
                 hf = 1.0
@@ -676,8 +707,27 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
             gt_mix.append(dict(a=float(a), gt=fld, scale=sc, via=[]))
     A = np.asarray(entry_km, float); B = np.asarray(target_km, float)
     ab = float(np.hypot(*(B - A))) or 1.0
+    # Проекция каждой ячейки на ось старт→цель (км): 0 у старта, ab у цели, отрицательная —
+    # ПОЗАДИ старта; и ПРЯМОЕ расстояние ячейки до цели. Именно последнее видно на карте:
+    # расстояние по коридорам (`gt`) может быть вдвое больше, и по нему зона подхода
+    # срабатывала не там, где кажется глазу.
+    gxc, gyc = grid.cell_centers_km()
+    axis_s = ((gxc - A[0]) * (B[0] - A[0]) + (gyc - A[1]) * (B[1] - A[1])) / ab
+    dgoal = np.hypot(gxc - B[0], gyc - B[1])
+    # МАСКА ТРАНЗИТА — только для VIA ЗА ЦЕЛЬЮ. По ней считаются поля до таких точек: путь
+    # к ним ведёт мимо объекта, и приближаться к нему вплотную незачем (то же правило, что
+    # в `_walk_field`). Считать по ней поля ДО ВСЕХ VIA нельзя: обычным маршрутам она
+    # закрывает коридоры у самой цели, и вес под выборкой падает на 12 %.
+    pas_via = pas
+    push_km = FINAL_APPROACH_KM if VIA_BEYOND_PUSH else 0.0   # 0 — не отодвигать (как было)
+    if FINAL_BYPASS_KM > 0.0 and float(dgoal[start]) >= FINAL_BYPASS_KM:
+        pas_via = pas & (dgoal >= FINAL_BYPASS_KM)
+        # VIA за целью ставится ВНЕ круга обхода, с зазором на дискретизацию сетки: точка
+        # ровно на границе попадала бы в ячейку, куда шаг уже запрещён.
+        if VIA_BEYOND_PUSH:
+            push_km = FINAL_BYPASS_KM + 2.0 * grid.h
     via_cell, via_gv, via_gv_geo = [], [], []
-    via_segd, via_minlen, via_togoal = [], [], []
+    via_segd, via_minlen, via_togoal, via_back = [], [], [], []
     if np.isfinite(gt[start]):
         ys, xs = np.nonzero(pas & np.isfinite(gt))     # достижимые проходимые ячейки
         if len(ys):
@@ -701,15 +751,42 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                         continue
                     # VIA рядом с целью, но НЕ за ней, заставляет маршрут отвернуть у
                     # самого объекта и вернуться — на карте это «дёрнулся в сторону в
-                    # пяти километрах от цели». Заход ЗА цель (s_axis > ab) оставляем:
-                    # облететь объект и зайти с другой стороны — штатный манёвр.
-                    if (float(np.hypot(vxk - B[0], vyk - B[1])) < FINAL_APPROACH_KM
-                            and s_axis <= ab):
+                    # пяти километрах от цели». Заход ЗА цель — штатный манёвр, но и он
+                    # должен быть ОБХОДОМ: точка вплотную за объектом (на реальной сетке
+                    # 2.5 км) заставляет маршрут пролететь цель насквозь и вернуться.
+                    # Такую VIA отодвигаем по лучу от цели на рубеж подхода — заход
+                    # остаётся, «клевок» пропадает (см. VIA_BEYOND_PUSH).
+                    d_via_goal = float(np.hypot(vxk - B[0], vyk - B[1]))
+                    if d_via_goal < FINAL_APPROACH_KM and s_axis <= ab:
                         continue
-                    # два поля ОТ этой via: геометрия — для бюджета, стоимость — для спуска
-                    gv_geo = _dijkstra_dist(pas, vc, grid.h)
-                    gv = gv_geo if mul is None else _dijkstra_cost(pas, vc, grid.h, mul)
+                    if d_via_goal < push_km and s_axis > ab:
+                        # Точка ЗА целью, но вплотную к ней: отодвигаем по лучу от цели за
+                        # круг обхода (с зазором на дискретизацию сетки), чтобы маршрут
+                        # огибал объект, а не протыкал его.
+                        d = np.array([vxk - B[0], vyk - B[1]], float)
+                        n = float(np.hypot(*d))
+                        d = d / n if n > 1e-6 else (B - A) / ab   # точно на оси — вдоль неё
+                        out = B + d * push_km
+                        vc2 = _nearest_passable_cell(pas_via, grid, out[1], out[0], max_km=12.0)
+                        if vc2 is None or vc2 in via_cell or vc2 == goal or vc2 == start:
+                            continue
+                        vc = vc2
+                        vxk = grid.ox + (vc[1] + 0.5) * grid.h
+                        vyk = grid.oy + (vc[0] + 0.5) * grid.h
+                        s_axis = float((np.array([vxk, vyk]) - A) @ (B - A)) / ab
+                    # два поля ОТ этой via: геометрия — для бюджета, стоимость — для спуска.
+                    # Для точки ЗА ЦЕЛЬЮ — по маске транзита (обход объекта), для остальных
+                    # по обычной: им закрывать коридоры у цели незачем.
+                    back = bool(s_axis > ab and pas_via is not pas)
+                    pmask = pas_via if back else pas
+                    if not pmask[vc]:
+                        continue                       # сама точка внутри круга обхода
+                    gv_geo = _dijkstra_dist(pmask, vc, grid.h)
+                    gv = gv_geo if mul is None else _dijkstra_cost(pmask, vc, grid.h, mul)
+                    if not np.isfinite(gv_geo[start]):
+                        continue                       # в обход цели до неё не добраться
                     via_cell.append(vc)
+                    via_back.append(back)
                     via_gv.append(gv)
                     via_gv_geo.append(gv_geo)
                     # то же для каждой «жадности» — иначе первый участок через via шёл бы
@@ -721,26 +798,20 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                             f["via"].append(gv)
                         else:
                             f["via"].append(_dijkstra_cost(
-                                pas, vc, grid.h, 1.0 + f["a"] * (np.asarray(mul, float) - 1.0)))
+                                pmask, vc, grid.h,
+                                1.0 + f["a"] * (np.asarray(mul, float) - 1.0)))
                     via_segd.append(_seg_dist_km((vxk, vyk), A, B))
                     # «сколько хода оставить на второй участок» и «уложимся ли вообще» —
-                    # это КИЛОМЕТРЫ, поэтому берутся из геометрического поля
-                    via_togoal.append(float(gv_geo[goal]))
-                    via_minlen.append(float(gv_geo[start] + gv_geo[goal]))
-    # Проекция каждой ячейки на ось старт→цель (км): 0 у старта, ab у цели,
-    # отрицательная — ПОЗАДИ старта. По ней маршрут ограничивается, чтобы не уходить
-    # в сторону, обратную цели (см. START_BACK_KM в _walk_field).
-    gxc, gyc = grid.cell_centers_km()
-    axis_s = ((gxc - A[0]) * (B[0] - A[0]) + (gyc - A[1]) * (B[1] - A[1])) / ab
-    # ПРЯМОЕ расстояние ячейки до цели (км). Именно его видно на карте: расстояние по
-    # коридорам (`gt`) может быть вдвое больше, и по нему зона подхода срабатывала
-    # не там, где кажется глазу.
-    dgoal = np.hypot(gxc - B[0], gyc - B[1])
+                    # это КИЛОМЕТРЫ. Путь via→цель берём из поля ОТ ЦЕЛИ (`gt_geo`): оно
+                    # считано по полной маске, а поле от via — по маске транзита, где сама
+                    # цель вырезана кругом обхода и расстояние до неё было бы бесконечным.
+                    via_togoal.append(float(gt_geo[vc]))
+                    via_minlen.append(float(gv_geo[start] + gt_geo[vc]))
     return dict(grid=grid, pas=pas, gt=gt, gt_geo=gt_geo, wnorm=wnorm,
                 cost_scale=cost_scale, gt_mix=gt_mix, start=start, goal=goal, ab=ab,
                 axis_s=axis_s, dgoal=dgoal, ahead=ahead,
                 via_cell=via_cell, via_gv=via_gv, via_gv_geo=via_gv_geo,
-                via_segd=np.asarray(via_segd),
+                via_back=np.asarray(via_back, bool), via_segd=np.asarray(via_segd),
                 via_minlen=np.asarray(via_minlen), via_togoal=np.asarray(via_togoal),
                 gt_start=float(gt_geo[start]),
                 reachable=bool(np.isfinite(gt_geo[start])))
@@ -854,9 +925,15 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
         gv_geo = ctx.get("via_gv_geo")
         g1 = gv_geo[j] if gv_geo else None
         f1 = via_use[j] if (via_use and j < len(via_use)) else ctx["via_gv"][j]
+        # VIA ЗА ЦЕЛЬЮ: участок к ней обходит объект по дуге (тот же радиус, по которому
+        # считалось поле), а не протыкает его насквозь. Для остальных точек правило не
+        # нужно — им у цели делать нечего и без запрета.
+        vb = ctx.get("via_back")
+        back = bool(vb is not None and len(vb) > j and vb[j])
         r1 = _walk_field(ctx, f1, ctx["start"], via, budget1,
                          turn_interval_km, rng, wmode=wmode, spend=spend,
-                         done0_km=0.0, tail_km=togoal, dgeo=g1, fscale=fmix)
+                         done0_km=0.0, tail_km=togoal, dgeo=g1, fscale=fmix,
+                         bypass_km=(FINAL_BYPASS_KM if back else 0.0))
         if r1 is None:                                  # каждый участок — свой набор visited
             return None
         r2 = _walk_field(ctx, gt_use, via, ctx["goal"], L_max - r1[1],

@@ -54,6 +54,14 @@ class _BasemapTask(QtCore.QRunnable):
 class BasemapMixin:
     """Подмешивается к QWidget-представлению карты. Ожидает self.plot/self.pi/self.vb."""
 
+    # ГАШЕНИЕ ПОДЛОЖКИ (насыщенность, осветление): 0, 0 — оставить как есть.
+    # Нужно там, где поверх карты лежат СВОИ слои того же смысла: OSM рисует свои дороги,
+    # воду и лес, мы кладём сверху свои — оранжевое на оранжевом, синее на синем, и обе
+    # картинки борются за внимание. Выцветшая подложка остаётся контекстом («тут посёлок,
+    # тут лес»), но перестаёт спорить с оверлеями. Подклассы переопределяют по месту:
+    # вкладке 2 гашение не нужно, у неё поверх карты почти ничего нет.
+    BASEMAP_FADE = (0.0, 0.0)
+
     def _init_basemap(self, lon0, lat0, get_layer, get_offline, scheme_points=None,
                       step_deg=0.2):
         """Инициализация тайловой подложки и офлайн-схемы.
@@ -155,9 +163,32 @@ class BasemapMixin:
                 pass
             return
         img8, (ex0, ex1, ey0, ey1) = res
-        self.basemap.setImage(img8, autoLevels=False)
+        self.basemap.setImage(self._fade_basemap(img8), autoLevels=False)
         self.basemap.setRect(QtCore.QRectF(ex0, ey0, ex1 - ex0, ey1 - ey0))
         self.basemap.setVisible(True)
+
+    def _fade_basemap(self, img):
+        """Обесцветить и осветлить тайлы — «выцветшая» подложка под своими слоями.
+
+        Именно ПИКСЕЛИ, а не прозрачность элемента: полупрозрачная подложка на тёмном
+        фоне приложения ушла бы в грязно-тёмное, а нам нужен светлый бледный фон, на
+        котором читаются и линии, и заливки. Сначала тянем к серому (убираем спор цветов),
+        потом к белому (убираем спор яркостей)."""
+        sat, light = self.BASEMAP_FADE
+        if sat <= 0.0 and light <= 0.0:
+            return img
+        a = np.asarray(img)
+        if a.ndim != 3 or a.shape[2] < 3:
+            return img
+        out = a[..., :3].astype(np.float32)
+        if sat > 0.0:
+            grey = out.mean(axis=2, keepdims=True)
+            out += (grey - out) * float(np.clip(sat, 0.0, 1.0))
+        if light > 0.0:
+            out += (255.0 - out) * float(np.clip(light, 0.0, 1.0))
+        res = a.copy()
+        res[..., :3] = np.clip(out, 0, 255).astype(a.dtype)
+        return res
 
     def _set_scheme_visible(self, vis):
         self.graticule.setVisible(vis); self._scheme_scatter.setVisible(vis)

@@ -528,8 +528,8 @@ class Params:
     map_layer: str = "scheme"      # подложка карты (вкладка 2): scheme/osm/topo/satellite/dark
     map_offline: bool = False      # True -> карта читает ТОЛЬКО кэш, сеть не запрашивается
     # --- вкладка 3 (цифровая карта угроз) ---
-    threat_N: int = 12             # число датчиков на весовой карте
-    threat_R: float = 12.0         # радиус обнаружения датчика, км
+    threat_N: int = 15             # число датчиков на весовой карте
+    threat_R: float = 2.0          # радиус обнаружения датчика, км
     threat_k: int = 3              # кратность насыщения (веса клеток на карте угроз)
     threat_cand_step_km: float = 3.0   # шаг сетки кандидатных позиций датчика, км
     threat_min_sep_frac: float = 0.75  # мин. разнос датчиков (доля R) — распределённость
@@ -547,7 +547,7 @@ class Params:
                                    # насколько маршрут отклоняется вбок от реки/дороги,
                                    # вдоль которой идёт. Отдельно от разрыва — нужен для
                                    # обхода холмов, не трогая сшивку коридоров.
-    threat_spend: str = "late"     # профиль расхода запаса хода (THREAT_SPEND_LABELS)
+    threat_spend: str = "even"     # профиль расхода запаса хода (THREAT_SPEND_LABELS)
     threat_L_max_manual: bool = False  # False -> запас хода авто (|AB|+25%); True -> задан руками
     threat_iter_mode: str = "mix"  # приоритет выбора клетки по ВЕСУ (THREAT_ITER_MODE_LABELS)
     threat_iter_spread: str = "mix"  # РАЗБРОС маршрута по карте (THREAT_ITER_SPREAD_LABELS)
