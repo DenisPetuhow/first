@@ -80,12 +80,48 @@ class ThreatController:
             on_iter_spread=self.on_iter_spread, on_iter_spend=self.on_iter_spend,
             on_iter_play=self.on_iter_play, on_iter_step=self.on_iter_step,
             on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed,
-            on_iter_gen_frac=self.on_iter_gen_frac)
+            on_iter_gen_frac=self.on_iter_gen_frac,
+            on_zone_added=self.on_zone_added, on_zone_undo=self.on_zone_undo)
         # перерисовка слоёв при смене масштаба/панораме: прореживание считается по
         # ВИДИМОЙ области, а застройка переключается растр <-> контуры
         self.view.on_view_changed = self._on_view_changed
         self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
         self._idle_metrics()
+
+    # ================= ЗАПРЕТНЫЕ ЗОНЫ =================
+    def on_zone_added(self, poly):
+        """Пользователь нарисовал зону: пролёт там запрещён, всё зависящее — пересчитать."""
+        if not self.model.add_no_fly_zone(poly):
+            return
+        self._after_zone_change()
+
+    def on_zone_undo(self):
+        """Убрать последнюю зону."""
+        if not self.model.undo_no_fly_zone():
+            self.view.set_title("Запретных зон нет")
+            return
+        self._after_zone_change()
+
+    def _after_zone_change(self):
+        """Общее для добавления и отмены: пересчёт и ЧЕСТНОЕ сообщение о последствиях.
+
+        Зона могла перекрыть единственный коридор — тогда маршрутов не будет вовсе. Это
+        законный исход, а не поломка, но молчать о нём нельзя: пустая карта выглядит как
+        сбой программы."""
+        self.model.sensors = np.empty((0, 2), float)
+        self._sensors_at = 0
+        info = self.model.no_fly_check()
+        msg = "Запретных зон: %d (%.0f км²)" % (info["zones"], info["area_km2"])
+        if info["blocked_entry"]:
+            msg += " — ⚠ ТОЧКА ВЫЛЕТА внутри зоны"
+        elif info["blocked_target"]:
+            msg += " — ⚠ ЦЕЛЬ внутри зоны"
+        elif info["unreachable"]:
+            msg += " — ⚠ цель НЕДОСТИЖИМА: зона перекрыла коридор, обхода по весам нет"
+        if info["zones"] == 0:
+            msg = "Запретные зоны убраны"
+        self.view.set_title(msg)
+        self._render_all()
 
     # ================= РЕЛЬЕФ =================
     def on_relief(self):
@@ -426,6 +462,9 @@ class ThreatController:
     def on_reset(self):
         self._anim_stop()
         self.view.iter_clear_current()
+        # ЗАПРЕТНЫЕ ЗОНЫ убираются ТОЛЬКО здесь: пересборка карты и добавление рельефа их
+        # сохраняют — они нарисованы пользователем и от местности не зависят.
+        self.model.clear_no_fly_zones()
         self.model.sensors = np.empty((0, 2), float)
         self.model.target_km = None
         self.model.routes = []
@@ -512,6 +551,7 @@ class ThreatController:
             iter=bool(self.model.iter_routes))
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, target)
+        self.view.render_no_fly(self.model.no_fly_zones, t)
         # |AB| вход->цель (для окна входных данных)
         ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
         self.model.p.ab_distance = round(ab, 1)

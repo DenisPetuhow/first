@@ -170,6 +170,12 @@ def passable_mask(grid, max_gap_km, slack_km=None):
     cut = grid.relief_cut() if hasattr(grid, "relief_cut") else None
     if cut is not None:
         pas &= ~np.asarray(cut, bool)
+    # ЗАПРЕТНЫЕ ЗОНЫ, нарисованные пользователем — такой же запрет, как город, и по той же
+    # причине вычитается ПОСЛЕ буфера: иначе дилатация вернула бы часть зоны в проходимые.
+    # Зон нет -> маска None и здесь ничего не происходит: поведение ровно прежнее.
+    nfz = grid.no_fly_mask() if hasattr(grid, "no_fly_mask") else None
+    if nfz is not None:
+        pas &= ~np.asarray(nfz, bool)
     return pas
 
 

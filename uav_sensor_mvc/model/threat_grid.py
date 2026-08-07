@@ -1042,6 +1042,38 @@ class ThreatGrid:
         self.weight += contrib
         self.layers["intersection"] = contrib
 
+    # ---- ЗАПРЕТНЫЕ ЗОНЫ (рисует пользователь) ----
+    def set_no_fly_zones(self, polys):
+        """Задать запретные зоны — список многоугольников [(x, y), …] в км.
+
+        Зона запрещает ПРОЛЁТ, как город: вычитается из проходимости в `passable_mask`.
+        Датчики в ней ставить можно — им запрещена только вода (правило 1.1а).
+        Веса карты зона НЕ трогает: она про полёт, а не про местность, поэтому пересборка
+        карты её не сбрасывает, а карта остаётся той же."""
+        self._no_fly_polys = [np.asarray(p, float) for p in (polys or [])
+                              if p is not None and len(p) >= 3]
+        self._no_fly = None                     # маска пересчитается по требованию
+
+    def no_fly_polys(self):
+        return list(getattr(self, "_no_fly_polys", []))
+
+    def no_fly_mask(self):
+        """Маска запретных зон (ny, nx) либо None, если зон нет.
+
+        None, а не пустой массив: вызывающий код тогда не делает лишней работы, и при
+        отсутствии зон поведение остаётся ровно прежним."""
+        polys = getattr(self, "_no_fly_polys", None)
+        if not polys:
+            return None
+        if getattr(self, "_no_fly", None) is not None:
+            return self._no_fly
+        gx, gy = self.cell_centers_km()
+        m = np.zeros((self.ny, self.nx), bool)
+        for poly in polys:                          # та же функция, что у контуров НП
+            m |= _points_in_polygon(gx.ravel(), gy.ravel(), poly).reshape(gy.shape)
+        self._no_fly = m
+        return m
+
     # ---- выгрузка ----
     def water_mask(self):
         return self._water
@@ -1844,6 +1876,80 @@ class ThreatModel:
         self._iter_rng = None          # ГПСЧ выборки
         self.route_area = None         # маска ВСЕХ возможных мест пролёта (в пределах L_max)
         self.route_min_len = float("inf")   # мин. длина пути вход->цель, км
+        # ЗАПРЕТНЫЕ ЗОНЫ, нарисованные пользователем. Живут ЗДЕСЬ, а не в сетке: сетка
+        # пересобирается при смене слоёв или добавлении рельефа, а зоны от местности не
+        # зависят и переживать пересборку обязаны (переносятся в сетку в `_sync_no_fly`).
+        self.no_fly_zones = []
+
+    # ---- ЗАПРЕТНЫЕ ЗОНЫ (рисует пользователь на карте) ----
+    def _sync_no_fly(self):
+        """Перенести зоны в сетку (она их вычитает из проходимости) и сбросить то, что
+        от проходимости зависит: контекст выборки, маршруты, область залёта."""
+        if self.grid is not None:
+            self.grid.set_no_fly_zones(self.no_fly_zones)
+        self._iter_ctx = None
+        self._ctx_built_key = None
+        self.routes = []
+        self.iter_routes = []
+        self.iter_iteration = 0
+        self.route_area = None
+
+    def add_no_fly_zone(self, poly):
+        """Добавить зону: список вершин [(x, y), …] в км. Меньше трёх вершин — не зона."""
+        p = [(float(x), float(y)) for x, y in (poly or [])]
+        if len(p) < 3:
+            return False
+        self.no_fly_zones.append(p)
+        self._sync_no_fly()
+        return True
+
+    def clear_no_fly_zones(self):
+        """Убрать все зоны — карта и веса при этом не меняются."""
+        if not self.no_fly_zones:
+            return False
+        self.no_fly_zones = []
+        self._sync_no_fly()
+        return True
+
+    def undo_no_fly_zone(self):
+        """Убрать последнюю зону (для случая «нарисовал не туда»)."""
+        if not self.no_fly_zones:
+            return False
+        self.no_fly_zones.pop()
+        self._sync_no_fly()
+        return True
+
+    def no_fly_check(self):
+        """Что зоны сделали с задачей. Возвращает словарь с полями:
+        `blocked_entry` / `blocked_target` — точка вылета или цель ВНУТРИ зоны;
+        `unreachable` — цель из точки вылета больше не достижима (зона перекрыла коридор
+        целиком, а в обход весов нет); `area_km2` — площадь зон.
+
+        Нужно потому, что «маршрутов нет» — законный исход: большая зона поперёк русла
+        обрывает путь, и это не ошибка программы, а следствие запрета. Но сказать об этом
+        надо явно, иначе пустой экран выглядит как поломка."""
+        out = dict(zones=len(self.no_fly_zones), area_km2=0.0,
+                   blocked_entry=False, blocked_target=False, unreachable=False)
+        if not self.no_fly_zones or self.grid is None:
+            return out
+        m = self.grid.no_fly_mask()
+        if m is None:
+            return out
+        out["area_km2"] = float(m.sum()) * self.grid.h * self.grid.h
+        entry, target = self.entry_target_km()
+        for key, pt in (("blocked_entry", entry), ("blocked_target", target)):
+            ix = int(np.clip((pt[0] - self.grid.ox) / self.grid.h, 0, self.grid.nx - 1))
+            iy = int(np.clip((pt[1] - self.grid.oy) / self.grid.h, 0, self.grid.ny - 1))
+            out[key] = bool(m[iy, ix])
+        # достижима ли цель: тот же критерий, что у самих маршрутов
+        try:
+            from .threat_routes import flight_envelope
+            area, min_len = flight_envelope(self.grid, entry, target, self.p.threat_L_max,
+                                            self._route_gap_km(), slack_km=self._route_slack_km())
+            out["unreachable"] = not np.isfinite(min_len)
+        except Exception:
+            pass
+        return out
 
     # ---- источник данных / выбор слоёв ----
     def set_data_source(self, path):
@@ -1904,6 +2010,9 @@ class ThreatModel:
                                       enabled=self.enabled_layers,
                                       dem=(self.dem if self.relief_on else None),
                                       free_points=free_points)
+        # ЗАПРЕТНЫЕ ЗОНЫ ПЕРЕЖИВАЮТ ПЕРЕСБОРКУ. Они нарисованы пользователем и от слоёв
+        # с рельефом не зависят: сетка новая — зоны те же. Убираются только «Сбросом».
+        self.grid.set_no_fly_zones(self.no_fly_zones)
         if self.dem is not None and self.relief_on:
             self.source += " + рельеф"
         # маркеры переправ — по РЕАЛЬНЫМ координатам мостов, а не по центрам ячеек

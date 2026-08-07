@@ -121,6 +121,25 @@ THREAT_COLORS = {
     # — ПРОЧИЕ ЗНАЧКИ/ЛЕГЕНДА —
     "crossing":    "#ffd166",           # перекрёстки-развилки (ромбы), self.crossing_scatter
     "crossing_edge": "#7a5c00",         # обводка ромбов перекрёстков
+    # ЗАПРЕТНАЯ ЗОНА (рисует пользователь): контур, штриховка и линия рисования.
+    # ЦВЕТ ПОДОБРАН ЗАМЕРОМ, а не на глаз. Задача трудная: зона лежит поверх ВЕСОВОЙ КАРТЫ,
+    # а та в палитре turbo — синий → циан → зелёный → жёлтый → красный, то есть занимает
+    # почти весь спектр. Плюс подложка OSM зелёная. Считалось расстояние до всей палитры
+    # turbo и контраст к фонам: глубокий пурпур даёт 89 единиц RGB до ближайшего цвета
+    # turbo при контрасте 5.22 к лесу и 7.47 к полям (норма 4.5). Красный не годится —
+    # он занят возвышенностями «приоритета высот» и городом; маджента ярче, но на лесу
+    # проваливается (3.53).
+    "zone":        "#8e0e6b",           # контур заданной зоны, self.zone_item
+    "zone_hatch":  (142, 14, 107, 190), # диагональная штриховка внутри, self.zone_hatch
+    "zone_fill":   (142, 14, 107, 45),  # лёгкая подложка под штриховкой, self.zone_fill
+    # Зона, которую рисуют ПРЯМО СЕЙЧАС. Раньше была #ffd166 — ровно цвет перекрёстков,
+    # и при включённых развилках рисуемый контур в них терялся. Взят свободный сектор
+    # тона (бирюзово-зелёный, между лесополосой 107° и маршрутами 186°).
+    "zone_draw":   "#00e0a4",           # линия построения, self.zone_draw_item
+    # Вершины — цветом БУДУЩЕЙ зоны: сразу видно, во что превратится контур. Обводка
+    # цветом линии построения связывает их с ней.
+    "zone_pt":     "#8e0e6b",
+    "zone_pt_edge": "#00e0a4",
     "legend_bg":   "#0b111c",           # фон панели-легенды
     "legend_head": "#36c5f0",           # заголовок легенды
     "legend_area": "#ff4dff",           # квадрат «места пролёта» в легенде (= розовая заливка)
@@ -269,6 +288,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._scale_shown = None
 
         self._target_mode = False
+        self._zone_mode = False           # идёт рисование запретной зоны
+        self._zone_pts = []               # вершины зоны, которую рисуют прямо сейчас
         self._data_path = None            # текущий источник (для префилла окна выбора)
         self._enabled_layers = None       # текущий набор слоёв (None = все)
 
@@ -284,6 +305,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_map_layer = lambda key: None
         self.on_map_offline = lambda flag: None
         self.on_set_target = lambda x, y: None
+        self.on_zone_added = lambda poly: None      # нарисована запретная зона
+        self.on_zone_undo = lambda: None            # убрать последнюю зону
         self.on_choose_data = lambda path, layers: None
         self.on_input_apply = lambda vals: None
         self.on_iter_mode = lambda key: None
@@ -322,6 +345,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.set_title("Кликните точку ЦЕЛИ на карте (вход — фиксирован у реки)")
 
     def _on_scene_click(self, ev):
+        if self._zone_mode:
+            self._zone_click(ev)
+            return
         if not self._target_mode:
             return
         try:
@@ -332,6 +358,125 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         pt = self.vb.mapSceneToView(ev.scenePos())
         self._target_mode = False
         self.on_set_target(float(pt.x()), float(pt.y()))
+
+    # ---- режим рисования ЗАПРЕТНОЙ ЗОНЫ ----
+    def _begin_zone(self):
+        """Включить рисование: клики ставят вершины, нажатие колёсика замыкает зону."""
+        self._zone_mode = True
+        self._zone_pts = []
+        self._draw_zone_preview()
+        self.set_title("Запретная зона: клики — вершины, КОЛЁСИКО — замкнуть, Esc — отмена")
+
+    def _end_zone(self, apply_it):
+        """Закончить рисование. apply_it=False — бросить начатое, ничего не меняя."""
+        pts = list(self._zone_pts)
+        self._zone_mode = False
+        self._zone_pts = []
+        self._draw_zone_preview()
+        self.set_title("")
+        if apply_it and len(pts) >= 3:
+            self.on_zone_added(pts)
+
+    def _zone_click(self, ev):
+        """Клик в режиме рисования: левая кнопка — вершина, КОЛЁСИКО — замкнуть зону."""
+        try:
+            btn = ev.button()
+        except Exception:
+            btn = QtCore.Qt.LeftButton
+        try:
+            ev.accept()                       # не отдавать клик панораме/зуму
+        except Exception:
+            pass
+        if btn == QtCore.Qt.MiddleButton:     # нажатие колеса — замкнуть
+            self._end_zone(True)
+            return
+        if btn != QtCore.Qt.LeftButton:
+            return
+        pt = self.vb.mapSceneToView(ev.scenePos())
+        self._zone_pts.append((float(pt.x()), float(pt.y())))
+        self._draw_zone_preview()
+
+    def keyPressEvent(self, ev):
+        """Esc — бросить начатую зону (обычный способ отменить рисование)."""
+        if self._zone_mode and ev.key() == QtCore.Qt.Key_Escape:
+            self._end_zone(False)
+            return
+        super().keyPressEvent(ev)
+
+    def _draw_zone_preview(self):
+        """Показать зону, которую пользователь рисует прямо сейчас."""
+        pts = self._zone_pts
+        if not pts:
+            self.zone_draw_item.setData([], [])
+            self.zone_draw_pts.setData([], [])
+            return
+        a = np.asarray(pts, float)
+        closed = np.vstack([a, a[:1]]) if len(a) >= 3 else a   # замыкаем от трёх вершин
+        self.zone_draw_item.setData(closed[:, 0], closed[:, 1])
+        self.zone_draw_pts.setData(a[:, 0], a[:, 1])
+
+    # Шаг диагональной штриховки запретной зоны, км. Мельче — плотнее заливка и больше
+    # линий на карте; крупнее — зона хуже читается как «залитая». На общем виде участка
+    # (94 км в ширину) шаг 0.9 км даёт около сотни штрихов на зону средней величины.
+    ZONE_HATCH_STEP_KM = 0.9
+
+    @staticmethod
+    def _hatch_polygon(poly, step_km, angle_deg=45.0):
+        """Диагональные штрихи ВНУТРИ многоугольника: списки x, y с разрывами (NaN).
+
+        Линии проводятся не «поверх» и не по прямоугольнику, а обрезаются по самому
+        контуру: для каждой линии находятся пересечения со всеми сторонами, точки
+        сортируются вдоль неё и соединяются парами. Пара = вход в фигуру и выход из неё,
+        поэтому невыпуклая зона (а пользователь рисует мышью что угодно) штрихуется верно —
+        в вырезах штрихов не будет."""
+        P = np.asarray(poly, float)
+        if len(P) < 3 or step_km <= 0:
+            return [], []
+        a = np.radians(angle_deg)
+        d = np.array([np.cos(a), np.sin(a)])          # вдоль штриха
+        n = np.array([-np.sin(a), np.cos(a)])         # поперёк (по нему идёт шаг)
+        proj_n = P @ n
+        A, B = P, np.roll(P, -1, axis=0)              # стороны замкнутого контура
+        an, bn = A @ n, B @ n
+        xs, ys = [], []
+        c = np.ceil(proj_n.min() / step_km) * step_km
+        while c <= proj_n.max():
+            denom = bn - an
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = (c - an) / denom
+            hit = (np.abs(denom) > 1e-12) & (t >= 0.0) & (t < 1.0)
+            if hit.any():
+                pts = A[hit] + (B[hit] - A[hit]) * t[hit][:, None]
+                order = np.argsort(pts @ d)
+                pts = pts[order]
+                for i in range(0, len(pts) - 1, 2):   # пары «вход — выход»
+                    xs += [pts[i, 0], pts[i + 1, 0], np.nan]
+                    ys += [pts[i, 1], pts[i + 1, 1], np.nan]
+            c += step_km
+        return xs, ys
+
+    def render_no_fly(self, polys, toggles):
+        """Отрисовать УЖЕ ЗАДАННЫЕ запретные зоны (список полигонов в км)."""
+        show = bool(toggles.get("show_zones", True))
+        if not show or not polys:
+            self.zone_item.setData([], [])
+            self.zone_fill.setData([], [])
+            self.zone_hatch.setData([], [])
+            return
+        xs, ys = [], []
+        hx, hy = [], []
+        nan = [np.nan]
+        for p in polys:
+            a = np.asarray(p, float)
+            if len(a) < 3:
+                continue
+            xs += list(a[:, 0]) + [a[0, 0]] + nan     # замкнуть и разорвать перед следующей
+            ys += list(a[:, 1]) + [a[0, 1]] + nan
+            ax, ay = self._hatch_polygon(a, self.ZONE_HATCH_STEP_KM)
+            hx += ax; hy += ay
+        self.zone_item.setData(xs, ys)
+        self.zone_fill.setData(xs, ys)
+        self.zone_hatch.setData(hx, hy)
 
     # ---- окно выбора цифровых карт (источник + слои) ----
     def _open_data_dialog(self):
@@ -554,6 +699,22 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.btn_target.clicked.connect(self._begin_target)
         col.addWidget(self.btn_target)
 
+        row_zone = QtWidgets.QHBoxLayout(); row_zone.setSpacing(6)
+        self.btn_zone = QtWidgets.QPushButton("Запретная зона")
+        self.btn_zone.setToolTip(
+            "Нарисовать на карте область, где пролёт БПЛА НЕВОЗМОЖЕН — маршруты пойдут "
+            "в обход.\n\nКлики задают вершины, нажатие колёсика замыкает зону, Esc — отмена.\n"
+            "Датчики в зоне ставить можно: им запрещена только вода.\n"
+            "ВНИМАНИЕ: большая зона поперёк коридора может сделать цель недостижимой — "
+            "тогда маршрутов не будет вовсе, и программа об этом скажет.")
+        self.btn_zone.clicked.connect(self._begin_zone)
+        self.btn_zone_undo = QtWidgets.QPushButton("Убрать зону")
+        self.btn_zone_undo.setToolTip("Убрать последнюю нарисованную зону. "
+                                      "Все зоны разом убирает «Сброс».")
+        self.btn_zone_undo.clicked.connect(lambda: self.on_zone_undo())
+        row_zone.addWidget(self.btn_zone, 2); row_zone.addWidget(self.btn_zone_undo, 1)
+        col.addLayout(row_zone)
+
         self.btn_place = QtWidgets.QPushButton("Расставить датчики")
         self.btn_place.setToolTip(
             "Разместить N датчиков по весам карты (макс. покрытого веса + разнос), "
@@ -745,6 +906,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         ("датчики и подписи", (
             ("chk_cand", "Позиции датчиков", False,
              "Кандидатные позиции — узлы сетки, из которых жадный алгоритм выбирает N лучших."),
+            ("chk_zones", "Запретные зоны", True,
+             "Области, нарисованные кнопкой «Запретная зона»: пролёт там невозможен, "
+             "маршруты идут в обход. Снятие галки прячет их с карты, но НЕ отменяет — "
+             "убрать зоны можно кнопкой «Убрать зону» или «Сброс»."),
             ("chk_legend", "Легенда", False,
              "Легенда (какой цвет какой объект) — в левом нижнем углу. По умолчанию "
              "скрыта: она занимает место, а нужна не всегда."),
@@ -1063,6 +1228,36 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
                                        pen=pg.mkPen(_qcolor(THREAT_COLORS["route_all"], 100), width=1.6))
         self.route_item.setZValue(3)
+        # ЗАПРЕТНЫЕ ЗОНЫ, нарисованные пользователем. Поверх карты, но ПОД маршрутами и
+        # датчиками: зона — это ограничение задачи, а не результат, заслонять его нечем.
+        self.zone_fill = self.pi.plot([], [], antialias=False, connect="finite",
+                                      pen=None, fillLevel=None,
+                                      brush=pg.mkBrush(THREAT_COLORS["zone_fill"]))
+        self.zone_fill.setZValue(0.4)
+        # ШТРИХОВКА — то, что делает зону «закрашенной», не пряча карту под ней:
+        # диагональные линии того же цвета, что и контур (см. _hatch_polygon)
+        # Толщина линий зоны меняется НЕМНОГО и в обратную сторону, чем у векторных слоёв:
+        # там канты худеют при ОТДАЛЕНИИ (иначе сливаются в кашу), а зона на общем виде
+        # должна быть заметной — она одна-две на карту. Худеет она при ПРИБЛИЖЕНИИ, и
+        # всего на четверть, чтобы толстый контур не закрывал местность (_scale_zone_widths).
+        self.zone_hatch = self.pi.plot([], [], antialias=True, connect="finite",
+                                       pen=pg.mkPen(_qcolor(THREAT_COLORS["zone_hatch"]),
+                                                    width=2.0))
+        self.zone_hatch.setZValue(0.45)
+        self.zone_item = self.pi.plot([], [], antialias=True, connect="finite",
+                                      pen=pg.mkPen(_qcolor(THREAT_COLORS["zone"], 245),
+                                                   width=3.4, dash=[7, 4]))
+        self.zone_item.setZValue(0.5)
+        # то, что рисуется прямо сейчас: ломаная и поставленные вершины
+        self.zone_draw_item = self.pi.plot([], [], antialias=True, connect="finite",
+                                           pen=pg.mkPen(_qcolor(THREAT_COLORS["zone_draw"]),
+                                                        width=3.0, dash=[5, 3]))
+        self.zone_draw_item.setZValue(6)
+        self.zone_draw_pts = pg.ScatterPlotItem(
+            size=10, symbol="o", brush=pg.mkBrush(_qcolor(THREAT_COLORS["zone_pt"])),
+            pen=pg.mkPen(THREAT_COLORS["zone_pt_edge"], width=1.8))
+        self.zone_draw_pts.setZValue(6.1)
+        self.pi.addItem(self.zone_draw_pts)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
         self.iter_heat_img.setZValue(-7); self.iter_heat_img.setOpacity(0.62)
@@ -1148,6 +1343,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_iter_gen=self.chk_iter_gen.isChecked(),
                     show_relief=self.chk_relief.isChecked(),
                     show_relief_k=self.chk_relief_k.isChecked(),
+                    show_zones=self.chk_zones.isChecked(),
                     iter_mode=self._iter_keys[self.combo_iter.currentIndex()],
                     show_legend=self.chk_legend.isChecked())
 
@@ -1446,6 +1642,27 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 except Exception:
                     pass
         self._scale_line_widths(k)
+        self._scale_zone_widths(k)
+
+    def _scale_zone_widths(self, k):
+        """Толщина линий запретной зоны: на общем виде полная, при максимальном
+        приближении — `ZONE_LINE_MIN` от неё (то есть на четверть тоньше). Между
+        соседними уровнями зума разница выходит в доли процента — линия не «прыгает»."""
+        lo = float(self.MARKER_MIN)
+        frac = (float(k) - lo) / max(1.0 - lo, 1e-6)            # 0 вблизи … 1 на общем виде
+        kz = self.ZONE_LINE_MIN + (1.0 - self.ZONE_LINE_MIN) * float(np.clip(frac, 0.0, 1.0))
+        for attr, base in self.ZONE_WIDTH.items():
+            it = getattr(self, attr, None)
+            if it is None:
+                continue
+            pen = it.opts.get("pen")
+            if pen is None:
+                continue
+            try:
+                pen.setWidthF(max(0.8, base * kz))
+                it.setPen(pen)
+            except Exception:
+                pass
 
     # Насколько худеет ОБВОДКА на общем виде. Сама линия почти не меняется (иначе слой
     # пропадёт), а кант ужимается сильно: вблизи он разделяет линии, а на общем виде,
@@ -1453,6 +1670,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # сливаются в сплошное белёсое пятно — заказчик назвал это «странно накладываются».
     CASING_MIN = 0.35              # доля от базовой ширины канта при полном участке
     LINE_MIN = 0.75                # доля от базовой ширины самой линии
+    # ЗАПРЕТНАЯ ЗОНА худеет иначе, чем векторные слои: на ОБЩЕМ виде она должна быть
+    # заметной (зона одна-две на карту, теряться ей нельзя), а при приближении — чуть
+    # тоньше, чтобы толстый контур не закрывал местность под собой. Разница четверть.
+    ZONE_LINE_MIN = 0.75
+    ZONE_WIDTH = dict(zone_item=3.4, zone_hatch=2.0, zone_draw_item=3.0)
 
     def _scale_line_widths(self, k):
         """Подогнать толщину линий и кантов под масштаб (k = 1 вблизи, меньше — дальше)."""
