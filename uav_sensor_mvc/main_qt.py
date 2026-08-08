@@ -15,7 +15,7 @@
 import os
 import sys
 
-from config import Params, THEME
+from config import Params, THEME, DEMO_ONLY_THREAT
 
 
 def _ensure_qt_plugin_path():
@@ -41,7 +41,54 @@ def _ensure_qt_plugin_path():
     return None
 
 
+def selftest():
+    """Самопроверка данных: `UAV_SELFTEST=1` перед запуском — программа печатает, что
+    нашла, и завершается.
+
+    Нужна для собранного `.exe`: ошибки чтения высот и карты гасятся внутри программы
+    (файла может не быть — это не повод падать), поэтому со стороны видно только «рельеф
+    не работает», без причины. Здесь причина печатается прямо."""
+    import importlib.util
+    from model.threat_grid import geo_cache_root, ThreatModel
+    from view_qt import geomap as gm
+    from config import Params
+
+    print("=" * 62)
+    print("САМОПРОВЕРКА ДАННЫХ")
+    print("=" * 62)
+    print("каталог карты  :", geo_cache_root())
+    print("каталог тайлов :", gm.cache_root())
+    for name in ("threat_layers.npz", "dem.tif"):
+        p = os.path.join(geo_cache_root(), name)
+        print("  %-20s %s" % (name, "есть" if os.path.exists(p) else "НЕТ"))
+    for mod in ("rasterio", "numpy", "matplotlib", "pyqtgraph", "PyQt5"):
+        ok = importlib.util.find_spec(mod) is not None
+        print("  модуль %-14s %s" % (mod, "есть" if ok else "НЕТ"))
+    # почему именно не читаются высоты — с полной ошибкой, а не молча
+    try:
+        import rasterio
+        p = os.path.join(geo_cache_root(), "dem.tif")
+        with rasterio.open(p) as ds:
+            # без символа «x» из типографики: консоль Windows его не печатает
+            print("  файл высот открыт: %d x %d, тип %s"
+                  % (ds.width, ds.height, ds.dtypes[0]))
+    except Exception as e:
+        print("  ОШИБКА ЧТЕНИЯ ВЫСОТ: %s: %s" % (type(e).__name__, e))
+    m = ThreatModel(Params())
+    m.ensure_built()
+    print("  карта построена   :", m.grid is not None)
+    print("  высоты загружены  :", m.has_dem())
+    if m.has_dem():
+        m.set_relief(True)
+        m.build()
+        print("  рельеф в весе     :", m.grid.relief_k() is not None)
+    print("=" * 62)
+
+
 def main():
+    if os.environ.get("UAV_SELFTEST"):
+        selftest()
+        return
     if _ensure_qt_plugin_path() is None and sys.platform.startswith("win"):
         print("ВНИМАНИЕ: не найдены платформенные плагины Qt (PyQt5).\n"
               "Переустановите PyQt5:\n"
@@ -91,8 +138,12 @@ def main():
         f"QTabBar::tab {{ background: {THEME['panel']}; color: {THEME['text']};"
         f" padding: 8px 16px; }} "
         f"QTabBar::tab:selected {{ background: {THEME['accent']}; color: white; }}")
-    tabs.addTab(v1, "Маршрут A→B")
-    tabs.addTab(v2, "Зона старта → цель")
+    # РЕЖИМ ПОКАЗА (DEMO_ONLY_THREAT в config.py): для демонстрационной сборки видна
+    # только «Карта угроз». Вкладки 1 и 2 при этом ПОЛНОСТЬЮ РАБОТОСПОСОБНЫ и остаются в
+    # коде — они просто не добавляются в набор. Снять флаг и они вернутся на место.
+    if not DEMO_ONLY_THREAT:
+        tabs.addTab(v1, "Маршрут A→B")
+        tabs.addTab(v2, "Зона старта → цель")
     tabs.addTab(v3, "Карта угроз")
     tabs._controllers = (c1, c2, c3)    # удержать от сборки мусора
     tabs.resize(1380, 800)
