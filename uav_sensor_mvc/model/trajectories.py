@@ -53,13 +53,6 @@ def polyline_length(traj):
 # ======================================================================
 # Дуга по углу отклонения theta (градусы)
 # ======================================================================
-def _sagitta_from_angle(c_len, theta_rad):
-    th = abs(theta_rad)
-    if th < 1e-9:
-        return 0.0
-    return c_len * (1.0 - np.cos(th)) / (2.0 * np.sin(th))
-
-
 def arc_length_from_angle(c_len, theta_rad):
     th = abs(theta_rad)
     if th < 1e-9:

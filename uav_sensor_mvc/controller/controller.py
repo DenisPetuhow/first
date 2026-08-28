@@ -8,7 +8,6 @@ CONTROLLER · Связующее звено между моделью и пре�
 панель показателей.
 """
 from config import MODE_LABELS, TRAJ_LABELS, MOTION_LABELS, MANEUVER_LAW_LABELS
-from view.view import PARAM_SPECS
 
 
 class SimulationController:

@@ -22,6 +22,7 @@ from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS,
                     THREAT_SPEND_LABELS)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
+from .ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
 from . import geomap as gm
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -598,23 +599,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     # ==================================================================
     def _apply_stylesheet(self):
-        self.setStyleSheet(f"""
-            QWidget {{ background: {THEME['bg']}; color: {THEME['text']};
-                       font-size: 12px; }}
-            QFrame#panel {{ background: {THEME['panel']};
-                            border: 1px solid {THEME['grid']}; border-radius: 8px; }}
-            QLabel#header {{ color: {THEME['accent']}; font-weight: bold; }}
-            QLabel#muted {{ color: {THEME['muted']}; font-size: 10px; }}
-            QLineEdit {{ background: #e6edf3; color: #10202f; border-radius: 4px;
-                         padding: 3px; }}
-            QPushButton {{ background: {THEME['grid']}; color: white;
-                           border-radius: 6px; padding: 7px; font-weight: bold; }}
-            QPushButton:hover {{ background: {THEME['accent']}; }}
-            QRadioButton, QCheckBox {{ color: {THEME['text']}; font-size: 12px; }}
-            QPlainTextEdit {{ background: {THEME['axes']}; color: {THEME['text']};
-                              border: 1px solid {THEME['grid']}; border-radius: 6px;
-                              font-family: monospace; font-size: 11px; }}
-        """)
+        """Оформление — общее для трёх вкладок (`view_qt/ui_common.py`)."""
+        apply_dark_theme(self)
 
     def _header(self, text):
         lab = QtWidgets.QLabel(text); lab.setObjectName("header")
@@ -639,14 +625,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.vb = self.pi.getViewBox()
         root.addWidget(self.plot, stretch=1)
 
-        panel = QtWidgets.QFrame(); panel.setObjectName("panel")
-        panel.setMinimumWidth(360)
-        col = QtWidgets.QVBoxLayout(panel)
-        col.setContentsMargins(12, 12, 12, 12); col.setSpacing(8)
-        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(394); scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(panel)
+        scroll, col = make_side_panel()   # общая для трёх вкладок
         root.addWidget(scroll)
 
         col.addWidget(self._header("ПАРАМЕТРЫ  (Enter — пересчёт)"))

@@ -11,7 +11,7 @@ CONTROLLER (Qt) · Вкладка 2 «Зона старта -> цель».
 """
 import numpy as np
 
-from config import (MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS,
+from config import (MOTION_LABELS, AREA_TRAJ_LABELS,
                     WAYPOINT_ZONE_LABELS)
 from .controller_qt import QtSimulationController
 

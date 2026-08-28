@@ -20,6 +20,7 @@ import matplotlib.cm as cm
 
 from config import (MODE_LABELS, TRAJ_LABELS, MOTION_LABELS, MANEUVER_LAW_LABELS, THEME)
 from view.view import PARAM_SPECS          # единый источник списка параметров
+from .ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
 
 # Дополнительные поля Qt-версии: ТТХ БПЛА (-> R_min) и диапазон числа точек маршрута
 QT_EXTRA = [("speed_kmh", "Скорость км/ч", float), ("bank_deg", "Крен °", float),
@@ -95,23 +96,8 @@ class SimulationView(QtWidgets.QWidget):
     # Построение интерфейса
     # ==================================================================
     def _apply_stylesheet(self):
-        self.setStyleSheet(f"""
-            QWidget {{ background: {THEME['bg']}; color: {THEME['text']};
-                       font-size: 12px; }}
-            QFrame#panel {{ background: {THEME['panel']};
-                            border: 1px solid {THEME['grid']}; border-radius: 8px; }}
-            QLabel#header {{ color: {THEME['accent']}; font-weight: bold; }}
-            QLabel#muted {{ color: {THEME['muted']}; font-size: 10px; }}
-            QLineEdit {{ background: #e6edf3; color: #10202f; border-radius: 4px;
-                         padding: 3px; }}
-            QPushButton {{ background: {THEME['grid']}; color: white;
-                           border-radius: 6px; padding: 7px; font-weight: bold; }}
-            QPushButton:hover {{ background: {THEME['accent']}; }}
-            QRadioButton, QCheckBox {{ color: {THEME['text']}; font-size: 12px; }}
-            QPlainTextEdit {{ background: {THEME['axes']}; color: {THEME['text']};
-                              border: 1px solid {THEME['grid']}; border-radius: 6px;
-                              font-family: monospace; font-size: 11px; }}
-        """)
+        """Оформление — общее для трёх вкладок (`view_qt/ui_common.py`)."""
+        apply_dark_theme(self)
 
     def _build_ui(self, params, speed, speed_max):
         root = QtWidgets.QHBoxLayout(self)
@@ -130,14 +116,7 @@ class SimulationView(QtWidgets.QWidget):
 
         # --- панель управления (в прокручиваемой области: не сжимается при
         #     низком окне, появляется вертикальная прокрутка) ---
-        panel = QtWidgets.QFrame(); panel.setObjectName("panel")
-        panel.setMinimumWidth(360)
-        col = QtWidgets.QVBoxLayout(panel)
-        col.setContentsMargins(12, 12, 12, 12); col.setSpacing(8)
-        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(394); scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(panel)
+        scroll, col = make_side_panel()   # общая для трёх вкладок
         root.addWidget(scroll)
 
         col.addWidget(self._header("ПАРАМЕТРЫ  (Enter — пересчёт)"))

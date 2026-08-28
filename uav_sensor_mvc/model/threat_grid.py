@@ -248,17 +248,6 @@ class ThreatGrid:
         if attractor:
             self._attr_count += (acc > 0).astype(np.int32)
 
-    def add_point_layer(self, name, points_km, weight):
-        """Точечный слой (мост): плоский бонус weight в ячейку с точкой."""
-        contrib = np.zeros((self.ny, self.nx), float)
-        for x, y in points_km:
-            ix = int(math.floor((x - self.ox) / self.h))
-            iy = int(math.floor((y - self.oy) / self.h))
-            if 0 <= ix < self.nx and 0 <= iy < self.ny:
-                contrib[iy, ix] += weight
-        self.weight += contrib
-        self.layers[name] = self.layers.get(name, 0.0) + contrib
-
     def add_area_layer(self, name, polygons, weight, attractor=False, mark_urban=False):
         """Площадной слой (застройка): вклад в ячейки внутри полигона. weight обычно
         отрицательный (репеллер). Проверка «точка в полигоне» — только по ячейкам
@@ -979,14 +968,6 @@ class ThreatGrid:
                 water |= w
         self._bridge_mask = m & _dilate(water, 1) if water.any() else m.copy()
 
-    def bridge_cells_km(self):
-        """Центры ячеек-мостов — грубая привязка (шаг сетки 500 м). Для маркеров лучше
-        `bridge_points_km`: тот даёт реальные координаты."""
-        iy, ix = np.nonzero(self._bridge_mask)
-        x = self.ox + (ix + 0.5) * self.h
-        y = self.oy + (iy + 0.5) * self.h
-        return list(zip(x.tolist(), y.tolist()))
-
     def bridge_points_km(self, bridge_polys):
         """ТОЧНЫЕ координаты переправ: середина каждой мостовой линии OSM, проходящей
         над водой. Раньше маркер ставился в центр ЯЧЕЙКИ (500 м), и при приближении
@@ -1054,9 +1035,6 @@ class ThreatGrid:
                               if p is not None and len(p) >= 3]
         self._no_fly = None                     # маска пересчитается по требованию
 
-    def no_fly_polys(self):
-        return list(getattr(self, "_no_fly_polys", []))
-
     def no_fly_mask(self):
         """Маска запретных зон (ny, nx) либо None, если зон нет.
 
@@ -1080,13 +1058,6 @@ class ThreatGrid:
 
     def urban_mask(self):
         return self._urban
-
-    def urban_cells_km(self):
-        """Центры исключённых (городских) ячеек — для показа на карте."""
-        iy, ix = np.nonzero(self._urban)
-        x = self.ox + (ix + 0.5) * self.h
-        y = self.oy + (iy + 0.5) * self.h
-        return np.column_stack([x, y]) if len(ix) else np.empty((0, 2))
 
     def flat_cells(self, positive_only=False):
         """Центры ячеек (M,2) и веса (M,). positive_only — только аттракторные (w>0):
@@ -2171,7 +2142,7 @@ class ThreatModel:
     def count_routes(self):
         """ТОЧНОЕ число возможных маршрутов вход→цель внутри области залёта (без перебора).
         Их порядка 1e107 — отсюда и невозможность «показать все» иначе как областью."""
-        from .threat_routes import count_possible_routes, _cell_of
+        from .threat_routes import count_possible_routes
         if self.grid is None or self.route_area is None or self._iter_ctx is None:
             return 0.0
         ctx = self._iter_ctx

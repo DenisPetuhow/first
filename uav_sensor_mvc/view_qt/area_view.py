@@ -10,12 +10,12 @@ VIEW (Qt) · Вкладка 2 «Зона старта -> цель».
     (A — центр зоны старта; второй клик задаёт направление на цель B);
   * отображение зоны старта (эллипс) и оси A->B.
 """
-import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from config import (MODE_LABELS, MOTION_LABELS, AREA_TRAJ_LABELS,
                     WAYPOINT_ZONE_LABELS, THEME)
+from .ui_common import make_side_panel      # оформление наследуется от SimulationView
 from view.view import PARAM_SPECS
 from .view_qt import SimulationView, _qcolor, QT_EXTRA
 from .basemap_mixin import BasemapMixin
@@ -121,16 +121,7 @@ class AreaStartView(SimulationView, BasemapMixin):
         self.vb = self.pi.getViewBox()
         root.addWidget(self.plot, stretch=1)
 
-        panel = QtWidgets.QFrame(); panel.setObjectName("panel")
-        panel.setMinimumWidth(360)
-        col = QtWidgets.QVBoxLayout(panel)
-        col.setContentsMargins(12, 12, 12, 12); col.setSpacing(8)
-        # панель — в прокручиваемой области: при низком окне поля не сжимаются,
-        # а появляется вертикальная прокрутка (динамическое масштабирование UI).
-        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(394); scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(panel)
+        scroll, col = make_side_panel()   # общая для трёх вкладок
         root.addWidget(scroll)
 
         col.addWidget(self._header("ПАРАМЕТРЫ  (Enter — пересчёт)"))
