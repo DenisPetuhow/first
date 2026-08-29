@@ -69,6 +69,8 @@ class ThreatController:
         self._cur_j = 0                   # индекс точки анимации
         self._speed = 6                   # скорость анимации (точек за кадр)
         self._sensors_at = 0              # при скольких маршрутах датчики пересчитаны
+        # цель/сектор заданы кликом, но маршруты ещё не пересчитаны: ждём «Применить»
+        self._pending_recalc = False
         view.set_callbacks(
             on_build=self.on_build, on_relief=self.on_relief,
             on_place=self.on_place, on_apply=self.on_apply,
@@ -81,7 +83,8 @@ class ThreatController:
             on_iter_play=self.on_iter_play, on_iter_step=self.on_iter_step,
             on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed,
             on_iter_gen_frac=self.on_iter_gen_frac,
-            on_zone_added=self.on_zone_added, on_zone_undo=self.on_zone_undo)
+            on_zone_added=self.on_zone_added, on_zone_undo=self.on_zone_undo,
+            on_set_sector=self.on_set_sector, on_clear_sector=self.on_clear_sector)
         # перерисовка слоёв при смене масштаба/панораме: прореживание считается по
         # ВИДИМОЙ области, а застройка переключается растр <-> контуры
         self.view.on_view_changed = self._on_view_changed
@@ -136,7 +139,11 @@ class ThreatController:
             self.view.flash_title("Идёт расчёт — подождите…")
             return
         if not self.model.has_dem():
-            self.view.flash_title("Нет файла высот: положите geo_cache/dem.tif")
+            # путь называем ПОЛНОСТЬЮ, с папкой участка: файл, положенный не туда,
+            # программа не найдёт, а сообщение «положите dem.tif» это не подскажет
+            from model.threat_grid import area_cache_dir
+            self.view.flash_title("Нет файла высот: положите растр (.tif/.hgt) в "
+                                  f"{area_cache_dir()}")
             return
         want = not self.model.relief_on
         self._anim_stop()
@@ -446,19 +453,49 @@ class ThreatController:
 
     # ---- «указать цель» кликом по карте ----
     def on_set_target(self, x, y):
+        """Клик ТОЛЬКО задаёт цель. Пересчёт — по кнопке «Применить».
+
+        Почему не сразу: цель и сектор задаются подряд («поставил цель — очертил
+        сектор»), и пересчёт после каждого клика шёл дважды, причём первый — по
+        промежуточному состоянию. Теперь оба клика копят изменения, а «Применить»
+        считает один раз по итоговой обстановке."""
         self.model.set_target(x, y)                       # пересчитает авто-запас хода
-        entry, target = self.model.entry_target_km()
-        self.view.render_entry_target(entry, target)
-        ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
-        self.view.set_ab_distance(ab)
-        self.view.refresh_input_dialog()                  # окно покажет новый L_max
-        t = self.view.get_toggles()                       # цель сменилась — пересчитать
+        self._pending_recalc = True
+        self._render_after_input(f"Цель задана: ({x:.0f}, {y:.0f}) км. ")
+
+    # ---- «задать сектор появления» кликом по краю карты ----
+    def on_set_sector(self, x, y):
+        """Клик задаёт ось «цель → точка»; модель отбирает по весам точки входа.
+        Маршруты пересчитываются по «Применить» — см. `on_set_target`."""
         if self.model.grid is None:
-            self.view.set_title(f"Цель задана: ({x:.0f}, {y:.0f}) км. «Построить карту».")
-        elif t.get("show_iter"):
-            self._run_async("iter", self.model.iterate_routes)
-        else:                                             # ВСЕГДА обновляем все возможные маршруты
-            self._run_async("routes", self.model.plan_routes)
+            self.view.set_title("Сектор задаётся по построенной карте — «Построить карту».")
+            return
+        pts = self.model.set_sector(x, y)
+        if not pts:
+            self.view.set_title("В сектор не попал ни один край карты — укажите точку "
+                                "на другой стороне.")
+            return
+        self._pending_recalc = True
+        self._render_after_input("Сектор задан: %d точек входа. " % len(pts))
+
+    def on_clear_sector(self):
+        if not self.model.clear_sector():
+            return
+        self._pending_recalc = True
+        self._render_after_input("Сектор убран: точка появления одна. ")
+
+    def _render_after_input(self, msg):
+        """Показать заданное (цель, сектор, точки входа) и напомнить про «Применить».
+
+        Сам расчёт здесь НЕ запускается: модель уже сбросила маршруты и датчики — они
+        построены по прежней обстановке, показывать их дальше было бы враньём."""
+        # `_render_all` сам рисует цель, сектор, точки входа и обновляет |AB| с запасом
+        # хода в окне входных данных — отдельных вызовов здесь не нужно
+        self._render_all()                                # маршруты сброшены — убрать с карты
+        if self.model.grid is None:
+            self.view.set_title(msg + "Нажмите «Построить карту».")
+        else:
+            self.view.set_title(msg + "Нажмите «Применить» — пересчёт маршрутов.")
 
     # ---- сброс: убрать датчики и заданную цель (карта остаётся) ----
     def on_reset(self):
@@ -469,6 +506,8 @@ class ThreatController:
         self.model.clear_no_fly_zones()
         self.model.sensors = np.empty((0, 2), float)
         self.model.target_km = None
+        self.model.clear_sector()          # сектор отсчитывается от цели — уходит вместе с ней
+        self._pending_recalc = False       # считать после сброса нечего
         self.model.routes = []
         self.model.iter_routes = []
         self.model.iter_iteration = 0
@@ -505,6 +544,16 @@ class ThreatController:
         before = float(self.model.p.threat_cand_step_km)
         if abs(self.model.sync_cand_step() - before) > 1e-9:
             self.view.set_param_values(self.model.p)     # показать пересчитанный шаг
+        # ОТЛОЖЕННЫЙ ПЕРЕСЧЁТ: цель и/или сектор задавали кликом, и маршруты ждут именно
+        # этой кнопки. Считается ОДИН раз по итоговой обстановке, даже если правок было
+        # несколько подряд. Датчики после этого расставит `_on_task_done`.
+        if self._pending_recalc and self.model.grid is not None:
+            self._pending_recalc = False
+            if self.view.get_toggles().get("show_iter"):
+                self._run_async("iter", self.model.iterate_routes)
+            else:
+                self._run_async("routes", self.model.plan_routes)
+            return
         if self.model.grid is None:
             self.on_build()
         elif len(self.model.sensors):
@@ -558,6 +607,8 @@ class ThreatController:
             iter=bool(self.model.iter_routes))
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, target)
+        # сектор появления рисуется здесь же: иначе он пропадал бы при любой перерисовке
+        self.view.render_sector(self.model.sector_edges_km(), self.model.entry_points, t)
         self.view.render_no_fly(self.model.no_fly_zones, t)
         # |AB| вход->цель (для окна входных данных)
         ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))

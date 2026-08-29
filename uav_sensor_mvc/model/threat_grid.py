@@ -30,6 +30,7 @@ import math
 import numpy as np
 
 from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
+                    THREAT_LAYERS_FILE, THREAT_AREA_DIR,
                     THREAT_LAYER_ORDER, THREAT_INTERSECTION_BONUS,
                     THREAT_WATER_BUFFER_M, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_URBAN_MIN_AREA_KM2, THREAT_URBAN_BUFFER_KM,
@@ -49,7 +50,9 @@ from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
                     THREAT_DEM_K_MIN, THREAT_DEM_K_MAX, THREAT_DEM_FLOOR,
                     THREAT_DEM_CUT_AREA_M, THREAT_DEM_CUT_LOCAL_M,
                     THREAT_ENTRY_FREE_KM, THREAT_TARGET_FREE_KM,
-                    THREAT_LMAX_AUTO_FRAC, THREAT_LMAX_CORRIDOR_FRAC)
+                    THREAT_LMAX_AUTO_FRAC, THREAT_LMAX_CORRIDOR_FRAC,
+                    THREAT_SECTOR_HALF_DEG, THREAT_SECTOR_ENTRIES,
+                    THREAT_SECTOR_SPACING_FRAC, THREAT_SECTOR_EDGE_KM)
 
 
 # ----------------------------------------------------------------------
@@ -98,6 +101,27 @@ def geo_cache_root():
         return env
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(here, "geo_cache")
+
+
+def area_cache_dir():
+    """Папка АКТИВНОГО УЧАСТКА внутри кэша: `geo_cache/<THREAT_AREA_DIR>`.
+    У участка без своей папки — сам корень кэша (прежняя раскладка)."""
+    root = geo_cache_root()
+    return os.path.join(root, THREAT_AREA_DIR) if THREAT_AREA_DIR else root
+
+
+def area_file(name):
+    """Путь к файлу участка по имени. Ищется СНАЧАЛА в папке участка, затем в корне
+    кэша — так продолжают работать файлы, положенные в `geo_cache/` по старой
+    раскладке. Если файла нет нигде, возвращается путь в папке участка: именно туда
+    его и надо класть."""
+    if not name:
+        return ""
+    in_area = os.path.join(area_cache_dir(), name)
+    if os.path.exists(in_area):
+        return in_area
+    in_root = os.path.join(geo_cache_root(), name)
+    return in_root if os.path.exists(in_root) else in_area
 
 
 # ----------------------------------------------------------------------
@@ -1220,13 +1244,21 @@ def load_layers(lon0, lat0, data_path=None, bbox_lonlat=None):
             return (layers_from_osm(data_path, lon0, lat0, bbox_lonlat),
                     f"OSM: {os.path.basename(data_path)}")
         raise ValueError(f"Неизвестный формат данных: {ext} (нужен .npz или .osm.pbf)")
-    path = os.path.join(geo_cache_root(), "threat_layers.npz")
+    # файл слоёв СВОЙ у каждого участка (config.THREAT_LAYERS_FILE): при смене куска
+    # карты кэш прежнего участка остаётся лежать рядом и не подменяет новый
+    path = layers_cache_path()
     if os.path.exists(path):
         try:
-            return _load_layers_npz(path), "OSM (офлайн-кэш)"
+            return _load_layers_npz(path), f"OSM (офлайн-кэш: {os.path.basename(path)})"
         except Exception:
             pass
     return _synthetic_layers(lon0, lat0), "СХЕМА (демо, офлайн)"
+
+
+def layers_cache_path():
+    """Путь к кэшу слоёв активного участка: `geo_cache/<участок>/<THREAT_LAYERS_FILE>`
+    (с откатом в корень кэша — см. `area_file`)."""
+    return area_file(THREAT_LAYERS_FILE)
 
 
 # Фильтры тегов OSM по слоям (единый источник правды: используют и офлайн-скрипт
@@ -1364,15 +1396,20 @@ def load_dem_grid(grid, lon0, lat0, path=None):
 
 
 def dem_files():
-    """Файлы рельефа в geo_cache: `THREAT_DEM_FILE` + .tif/.tiff/.hgt, плюс любые тайлы
-    .hgt рядом (N48E038.hgt и т.п.). Пустой список — рельефа нет, и кнопка «Добавить
-    рельеф» должна быть неактивна."""
+    """Файлы рельефа участка: `THREAT_DEM_FILE` + .tif/.tiff/.hgt в папке участка (с
+    откатом в корень кэша), плюс любые тайлы .hgt рядом — и в папке участка, и в корне
+    (N62E040.hgt и т.п.). Пустой список — рельефа нет, и кнопка «Добавить рельеф»
+    должна быть неактивна."""
     root = geo_cache_root()
-    base = os.path.join(root, THREAT_DEM_FILE)
-    cand = [base + ext for ext in (".tif", ".tiff", ".hgt")]
-    if os.path.isdir(root):
-        cand += [os.path.join(root, f) for f in sorted(os.listdir(root))
-                 if f.lower().endswith(".hgt")]
+    area = area_cache_dir()
+    # у участка может не быть своего DEM (THREAT_DEM_FILE = ""): тогда именованного
+    # файла не ищем, но .hgt-тайлы рядом всё равно подхватываем
+    cand = ([area_file(THREAT_DEM_FILE + ext)
+             for ext in (".tif", ".tiff", ".hgt")] if THREAT_DEM_FILE else [])
+    for d in ([area, root] if area != root else [root]):
+        if os.path.isdir(d):
+            cand += [os.path.join(d, f) for f in sorted(os.listdir(d))
+                     if f.lower().endswith(".hgt")]
     seen, out = set(), []
     for p in cand:
         if p not in seen and os.path.exists(p):
@@ -1839,6 +1876,10 @@ class ThreatModel:
         self.data_path = None          # явный источник цифровых карт (.npz/.osm.pbf)
         self.enabled_layers = None     # набор включённых слоёв (None = все)
         self.target_km = None          # цель, заданная кликом («указать цель»)
+        # СЕКТОР ПОЯВЛЕНИЯ БПЛА: точка клика по краю карты задаёт ось «цель → клик»,
+        # раствор ±THREAT_SECTOR_HALF_DEG. None — сектор не задан, вход один (демо-точка).
+        self.sector_point_km = None
+        self.entry_points = []         # отобранные точки входа на краю карты, список (x,y)
         self.routes = []               # примеры коридоров-центров (список (M,2) км)
         self.iter_routes = []          # итерационные (стохастические) маршруты — накопление
         self.iter_iteration = 0        # номер текущей итерации (как t во вкладке 2)
@@ -1969,12 +2010,15 @@ class ThreatModel:
             self.lon0, self.lat0, self.data_path, THREAT_BBOX_LONLAT)
         probe = ThreatGrid(self.bbox_km, THREAT_CELL_M / 1000.0)   # сетка для выборки высот
         self.dem = load_dem_grid(probe, self.lon0, self.lat0)      # None, если файла нет
-        entry, target = self.entry_target_km()
+        target = self.target_only_km()
         # вылет — только круг вокруг точки; цель — ещё и её населённый пункт целиком
-        # плюс буфер (иначе подлёт к цели в центре города остаётся односторонним)
-        free_points = [(entry[0], entry[1], THREAT_ENTRY_FREE_KM, None),
-                       (target[0], target[1], THREAT_TARGET_FREE_KM,
-                        THREAT_TARGET_FREE_KM)]
+        # плюс буфер (иначе подлёт к цели в центре города остаётся односторонним).
+        # При заданном секторе точек вылета пять — свободна окрестность КАЖДОЙ, иначе
+        # часть из них оказалась бы в запрещённой зоне и маршрут оттуда не начался бы.
+        free_points = [(e[0], e[1], THREAT_ENTRY_FREE_KM, None)
+                       for e in self.entry_points_km()]
+        free_points.append((target[0], target[1], THREAT_TARGET_FREE_KM,
+                            THREAT_TARGET_FREE_KM))
         # высоты грузим всегда (их можно показать на карте), но в ВЕС отдаём только по
         # кнопке «Добавить рельеф» — иначе карта менялась бы молча, от факта наличия файла
         self.grid = build_threat_grid(self.layers, self.bbox_km,
@@ -2011,9 +2055,10 @@ class ThreatModel:
 
     def _ctx_key(self):
         """От чего зависит кэш контекста выборки: разрыв и уход от ориентира (оба меняют
-        проходимость) и цель. Запас хода L_max сюда НЕ входит — контекст от него не
-        зависит (см. build_iter_context)."""
-        return (self._route_gap_km(), self._route_slack_km(), self.target_km)
+        проходимость), цель и ТОЧКИ ВХОДА (сектор). Запас хода L_max сюда НЕ входит —
+        контекст от него не зависит (см. build_iter_context)."""
+        return (self._route_gap_km(), self._route_slack_km(), self.target_km,
+                tuple(self.entry_points))
 
     def _ensure_ctx(self, entry, target):
         """Контекст выборки (проходимость, поля расстояний, VIA). Пересобирается, только
@@ -2223,7 +2268,7 @@ class ThreatModel:
         g = self.grid
         gap = self._route_gap_km()                             # тот же порог, что у маршрутов
         slack = self._route_slack_km()                         # и тот же уход от ориентира
-        entry, target = self.entry_target_km()
+        entry, target = self.entries_target_km()               # при секторе — все пять точек
         self.sync_auto_L_max()                                 # предварительно |AB|+25 %
         _, self.route_min_len = flight_envelope(               # кратчайший путь (от L_max не зависит)
             g, entry, target, self.p.threat_L_max, gap, slack_km=slack)
@@ -2238,8 +2283,11 @@ class ThreatModel:
         быть близко, а по коридорам — вдвое дальше; без этого маршрут не уместился бы вовсе).
         Возвращает L_max, км."""
         if not getattr(self.p, "threat_L_max_manual", False):
-            entry, target = self.entry_target_km()
-            ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
+            target = self.target_only_km()
+            # при секторе точек входа пять: запас хода считаем по САМОЙ ДАЛЬНЕЙ, иначе
+            # из неё маршрут не уместился бы и точка вылетала бы из выборки
+            ab = max(float(np.hypot(target[0] - e[0], target[1] - e[1]))
+                     for e in self.entry_points_km())
             lmax = ab * (1.0 + THREAT_LMAX_AUTO_FRAC)
             if min_corridor_km is not None and np.isfinite(min_corridor_km):
                 lmax = max(lmax, min_corridor_km * (1.0 + THREAT_LMAX_CORRIDOR_FRAC))
@@ -2388,6 +2436,7 @@ class ThreatModel:
             sens = cache.greedy(N, weights, anchors=anchors, anchor_sep=sep, min_sep=sep)
         return sens
 
+
     def _sample_for_sensors(self):
         """Выборка маршрутов, по которой считаются датчики и 2-я тепловая карта (§4.6):
         идут ИТЕРАЦИИ → их выборка; иначе → ВСЕ возможные пути (наиболее вероятные)."""
@@ -2505,21 +2554,186 @@ class ThreatModel:
         self.iter_routes = []
         self.iter_iteration = 0
         self._iter_ctx = None                          # цель сменилась — контекст устарел
+        self._ctx_built_key = None
+        # СЕКТОР ОТСЧИТЫВАЕТСЯ ОТ ЦЕЛИ: сменилась цель — сместился и он, точки входа
+        # пересчитываются по той же точке клика
+        if self.sector_point_km is not None:
+            self.entry_points = self.compute_entry_points()
         self.sync_auto_L_max()
         if self.grid is not None:
             self.build()      # свободная зона привязана к цели -> карту пересобрать
 
     def entry_km(self):
+        """ПРЕДСТАВИТЕЛЬ точки входа — для показателей и авто-запаса хода. При заданном
+        секторе это середина отобранных точек, иначе демо-точка участка."""
+        if self.entry_points:
+            p = np.asarray(self.entry_points, float).mean(axis=0)
+            return (float(p[0]), float(p[1]))
         _, elon, elat = THREAT_ENTRY
         ex, ey = lonlat_to_km(elon, elat, self.lon0, self.lat0)
         return (float(ex), float(ey))
 
-    def entry_target_km(self):
-        """(вход, цель) в км. Вход — фиксированный (демо-точка появления у реки); цель —
-        заданная пользователем, иначе дефолтная демо-метка контролируемого объекта."""
-        entry = self.entry_km()
+    def entry_points_km(self):
+        """ВСЕ точки входа списком: пять точек сектора либо одна демо-точка."""
+        return list(self.entry_points) if self.entry_points else [self.entry_km()]
+
+    def target_only_km(self):
+        """Цель в км: заданная кликом либо демо-метка участка."""
         if self.target_km is not None:
-            return entry, self.target_km
+            return self.target_km
         _, tlon, tlat = THREAT_TARGET
         tx, ty = lonlat_to_km(tlon, tlat, self.lon0, self.lat0)
-        return entry, (float(tx), float(ty))
+        return (float(tx), float(ty))
+
+    def entry_target_km(self):
+        """(вход, цель) в км — ОДНОЙ точкой. Вход: представитель (середина точек сектора)
+        либо демо-метка участка. Этим пользуются показатели, |AB| и правила датчиков.
+        Для маршрутов нужен ПОЛНЫЙ список — `entries_target_km`."""
+        return self.entry_km(), self.target_only_km()
+
+    def entries_target_km(self):
+        """(входы, цель): вход — СПИСОК точек, если задан сектор, иначе одна точка.
+        Список принимают и `flight_envelope`, и `build_iter_context`; розыгрыш
+        конкретного старта — в `sample_one_route`."""
+        pts = self.entry_points_km()
+        return (pts if len(pts) > 1 else pts[0]), self.target_only_km()
+
+    # ---- СЕКТОР ПОЯВЛЕНИЯ БПЛА ----
+    def set_sector(self, x_km, y_km):
+        """Задать сектор кликом по краю карты: ось «цель → клик», по
+        `THREAT_SECTOR_HALF_DEG` (30°) в каждую сторону — полный раствор 60°.
+        Пересчитывает точки входа и сбрасывает всё, что от входа зависит."""
+        self.sector_point_km = (float(x_km), float(y_km))
+        self.entry_points = self.compute_entry_points()
+        self._reset_after_entry_change()
+        if self.grid is not None and self.entry_points:
+            self.build()      # свободные зоны привязаны к точкам входа -> пересобрать
+        return self.entry_points
+
+    def clear_sector(self):
+        """Убрать сектор: вход снова один — демо-точка участка."""
+        if self.sector_point_km is None and not self.entry_points:
+            return False
+        self.sector_point_km = None
+        self.entry_points = []
+        self._reset_after_entry_change()
+        return True
+
+    def _reset_after_entry_change(self):
+        """Сброс после смены входа: контекст, маршруты, область залёта, запас хода."""
+        self._iter_ctx = None
+        self._ctx_built_key = None
+        self.routes = []
+        self.iter_routes = []
+        self.iter_iteration = 0
+        self.route_area = None
+        self.sync_auto_L_max()
+
+    def sector_edges_km(self):
+        """Две крайние точки сектора на рамке участка — для отрисовки. None, если
+        сектор не задан. Возвращает (вершина=цель, точка на левой границе, на правой)."""
+        if self.sector_point_km is None:
+            return None
+        B = np.asarray(self.target_only_km(), float)
+        P = np.asarray(self.sector_point_km, float)
+        d = P - B
+        n = float(np.hypot(*d))
+        if n < 1e-9:
+            return None
+        half = np.radians(float(THREAT_SECTOR_HALF_DEG))
+        out = [B]
+        for sign in (+1.0, -1.0):
+            c, s = np.cos(sign * half), np.sin(sign * half)
+            u = np.array([c * d[0] - s * d[1], s * d[0] + c * d[1]]) / n
+            out.append(B + u * self._ray_to_bbox(B, u))
+        return tuple(tuple(map(float, p)) for p in out)
+
+    def _ray_to_bbox(self, origin, u):
+        """Длина луча из `origin` по орту `u` до рамки участка (км)."""
+        x0, x1, y0, y1 = self.bbox_km
+        t = float("inf")
+        for lo, hi, o, d in ((x0, x1, origin[0], u[0]), (y0, y1, origin[1], u[1])):
+            if abs(d) < 1e-12:
+                continue
+            for edge in (lo, hi):
+                tt = (edge - o) / d
+                if tt > 1e-9:
+                    t = min(t, tt)
+        return t if np.isfinite(t) else 0.0
+
+    def compute_entry_points(self):
+        """Отобрать точки входа на краю карты внутри сектора — с учётом весовой карты.
+
+        Порядок: (1) ячейки приграничной полосы; (2) оставить те, чьё направление
+        «цель → ячейка» попало в сектор — проверка через скалярное произведение, без
+        арктангенсов и без разрыва на 180°; (3) выбросить непроходимые и те, ИЗ КОТОРЫХ
+        ЦЕЛЬ НЕДОСТИЖИМА; (4) жадно взять N лучших по весу, разнося их между собой,
+        иначе все пять слипаются в одном «горячем» углу.
+
+        ⚠️ ДОСТИЖИМОСТЬ ПРОВЕРЯЕТСЯ ЗДЕСЬ, а не потом. Из точки, откуда до цели нет
+        пути по коридорам, БПЛА не полетит — значит такая точка не «вариант появления»,
+        а пустое место в выборке: каждая попытка из неё гарантированно провалилась бы.
+        Считается ОДНИМ полем Дейкстры от цели (то же, что потом у маршрутов), поэтому
+        стоит дёшево.
+
+        ВЕС УЧАСТВУЕТ ТОЛЬКО ЗДЕСЬ. Сам старт маршрута разыгрывается между отобранными
+        точками равномерно (решение заказчика) — см. `sample_one_route`."""
+        if self.sector_point_km is None or self.grid is None:
+            return []
+        from .threat_routes import passable_mask, _cell_of, _dijkstra_dist, _open_endpoints
+        g = self.grid
+        B = np.asarray(self.target_only_km(), float)
+        d = np.asarray(self.sector_point_km, float) - B
+        n = float(np.hypot(*d))
+        if n < 1e-9:
+            return []
+        u = d / n
+        cos_half = float(np.cos(np.radians(float(THREAT_SECTOR_HALF_DEG))))
+
+        gx, gy = g.cell_centers_km()
+        x0, x1, y0, y1 = self.bbox_km
+        band = float(THREAT_SECTOR_EDGE_KM)
+        edge = ((gx - x0 <= band) | (x1 - gx <= band) |
+                (gy - y0 <= band) | (y1 - gy <= band))
+        vx, vy = gx - B[0], gy - B[1]
+        r = np.hypot(vx, vy)
+        inside = edge & (r > 1e-6) & ((vx * u[0] + vy * u[1]) >= cos_half * r)
+        if not inside.any():
+            return []
+        # проходимость — теми же правилами, что у маршрутов: разрыв и уход от ориентира
+        pas = passable_mask(g, self._route_gap_km(), self._route_slack_km())
+        goal = _cell_of(g, B)
+        # цель открываем так же, как это сделает построение маршрутов: иначе цель в
+        # непроходимой ячейке обнулила бы поле, и «недостижимо» вышло бы для всего края
+        reach = np.isfinite(_dijkstra_dist(_open_endpoints(pas.copy(), (goal,), g),
+                                           goal, g.h))
+        ok = inside & pas & reach
+        if not ok.any():
+            ok = inside & pas      # весь край недостижим при текущем разрыве — оставляем
+        if not ok.any():
+            ok = inside            # весь край непроходим — не терять сектор совсем:
+                                   # концы всё равно открываются в build_iter_context
+        iy, ix = np.nonzero(ok)
+        wx, wy = gx[iy, ix], gy[iy, ix]
+        w = np.asarray(g.weight, float)[iy, ix]
+        # разнос: доля от длины дуги края, попавшей в сектор
+        span = float(np.hypot(wx.max() - wx.min(), wy.max() - wy.min()))
+        d_min = max(2.0 * g.h, span * float(THREAT_SECTOR_SPACING_FRAC))
+        want = max(1, int(THREAT_SECTOR_ENTRIES))
+        order = np.argsort(-w)                      # лучшие по весу вперёд
+        picked = []
+        for i in order:
+            p = (float(wx[i]), float(wy[i]))
+            if all(np.hypot(p[0] - q[0], p[1] - q[1]) >= d_min for q in picked):
+                picked.append(p)
+                if len(picked) >= want:
+                    break
+        # если разнос не дал нужного числа (короткий край) — добираем ближайшими по весу
+        if len(picked) < want:
+            for i in order:
+                p = (float(wx[i]), float(wy[i]))
+                if p not in picked:
+                    picked.append(p)
+                    if len(picked) >= want:
+                        break
+        return picked

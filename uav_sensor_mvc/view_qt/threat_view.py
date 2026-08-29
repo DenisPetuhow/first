@@ -141,6 +141,15 @@ THREAT_COLORS = {
     # цветом линии построения связывает их с ней.
     "zone_pt":     "#8e0e6b",
     "zone_pt_edge": "#00e0a4",
+    # СЕКТОР ПОЯВЛЕНИЯ БПЛА. Цвет выбран не «красивый», а РАЗЛИЧИМЫЙ: разметка лежит
+    # поверх весовой карты в палитре turbo (синий → циан → зелёный → жёлтый → красный),
+    # то есть поверх почти всего спектра. Белого в turbo нет вовсе — поэтому белый значок
+    # с чёрной обводкой читается на любом её участке и на подложке. Зелёный (THEME['ok'],
+    # он же вход A) не годился: он ровно посередине turbo и на «средних» весах сливался.
+    "sector":      "#ffffff",           # пунктир границ сектора
+    "sector_edge": "#101418",           # тёмная подложка под пунктиром (контраст на светлом)
+    "entry_pt":    "#ffffff",           # точки входа: белая заливка
+    "entry_pt_edge": "#101418",         # и тёмная обводка
     "legend_bg":   "#0b111c",           # фон панели-легенды
     "legend_head": "#36c5f0",           # заголовок легенды
     "legend_area": "#ff4dff",           # квадрат «места пролёта» в легенде (= розовая заливка)
@@ -293,6 +302,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._scale_shown = None
 
         self._target_mode = False
+        self._sector_mode = False         # ждём клик по краю карты: сектор появления
         self._zone_mode = False           # идёт рисование запретной зоны
         self._zone_pts = []               # вершины зоны, которую рисуют прямо сейчас
         self._data_path = None            # текущий источник (для префилла окна выбора)
@@ -310,6 +320,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_map_layer = lambda key: None
         self.on_map_offline = lambda flag: None
         self.on_set_target = lambda x, y: None
+        self.on_set_sector = lambda x, y: None      # задан сектор появления БПЛА
+        self.on_clear_sector = lambda: None         # сектор убран
         self.on_zone_added = lambda poly: None      # нарисована запретная зона
         self.on_zone_undo = lambda: None            # убрать последнюю зону
         self.on_choose_data = lambda path, layers: None
@@ -347,13 +359,21 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # ---- режим «указать цель» (клик по карте) ----
     def _begin_target(self):
         self._target_mode = True
-        self.set_title("Кликните точку ЦЕЛИ на карте (вход — фиксирован у реки)")
+        self._sector_mode = False
+        self.set_title("Кликните точку ЦЕЛИ на карте")
+
+    # ---- режим «задать сектор появления» (клик по краю карты) ----
+    def _begin_sector(self):
+        self._sector_mode = True
+        self._target_mode = False
+        self.set_title("Кликните точку на КРАЮ карты — ось сектора пойдёт от цели к ней "
+                       "(по 30° в каждую сторону)")
 
     def _on_scene_click(self, ev):
         if self._zone_mode:
             self._zone_click(ev)
             return
-        if not self._target_mode:
+        if not (self._target_mode or self._sector_mode):
             return
         try:
             if ev.button() != QtCore.Qt.LeftButton:
@@ -361,6 +381,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         except Exception:
             pass
         pt = self.vb.mapSceneToView(ev.scenePos())
+        if self._sector_mode:
+            self._sector_mode = False
+            self.on_set_sector(float(pt.x()), float(pt.y()))
+            return
         self._target_mode = False
         self.on_set_target(float(pt.x()), float(pt.y()))
 
@@ -682,6 +706,23 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.btn_target.clicked.connect(self._begin_target)
         col.addWidget(self.btn_target)
 
+        row_sector = QtWidgets.QHBoxLayout(); row_sector.setSpacing(6)
+        self.btn_sector = QtWidgets.QPushButton("Задать сектор")
+        self.btn_sector.setToolTip(
+            "Откуда может появиться БПЛА. Кликните точку на КРАЮ карты: от цели к ней "
+            "проводится ось, и от оси откладывается по 30° в каждую сторону — сектор "
+            "возможных направлений раствором 60°.\n\n"
+            "На попавшем в сектор крае карты по весам местности отбираются 5 точек "
+            "входа (разнесённых между собой). Старт каждого маршрута — случайно "
+            "выбранная из этих пяти.")
+        self.btn_sector.clicked.connect(self._begin_sector)
+        self.btn_sector_clear = QtWidgets.QPushButton("Убрать")
+        self.btn_sector_clear.setToolTip(
+            "Убрать сектор: точка появления снова одна (метка участка).")
+        self.btn_sector_clear.clicked.connect(lambda: self.on_clear_sector())
+        row_sector.addWidget(self.btn_sector, 2); row_sector.addWidget(self.btn_sector_clear, 1)
+        col.addLayout(row_sector)
+
         row_zone = QtWidgets.QHBoxLayout(); row_zone.setSpacing(6)
         self.btn_zone = QtWidgets.QPushButton("Запретная зона")
         self.btn_zone.setToolTip(
@@ -893,6 +934,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
              "Области, нарисованные кнопкой «Запретная зона»: пролёт там невозможен, "
              "маршруты идут в обход. Снятие галки прячет их с карты, но НЕ отменяет — "
              "убрать зоны можно кнопкой «Убрать зону» или «Сброс»."),
+            ("chk_entries", "Точки входа", True,
+             "Пять точек, из которых БПЛА появляется на карте (кнопка «Задать сектор»). "
+             "Именно они участвуют в расчёте — маршруты стартуют из них."),
+            ("chk_sector_lines", "Границы сектора", False,
+             "Две линии от цели, задающие сектор направления (по 30° от оси). Служебная "
+             "разметка: показывает, ОТКУДА отбирались точки входа. По умолчанию скрыта — "
+             "на карте важны сами точки. Снятие галок только прячет разметку, сектор "
+             "остаётся заданным; убрать его — кнопка «Убрать»."),
             ("chk_legend", "Легенда", False,
              "Легенда (какой цвет какой объект) — в левом нижнем углу. По умолчанию "
              "скрыта: она занимает место, а нужна не всегда."),
@@ -1311,6 +1360,24 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             brush=pg.mkBrush(_qcolor(THEME["warn"])), pen=pg.mkPen("white", width=2.6))
         self.target_scatter.setZValue(22); self.pi.addItem(self.target_scatter)
 
+        # СЕКТОР ПОЯВЛЕНИЯ: две границы от цели и точки входа на краю карты.
+        # Пунктир, а не заливка: сектор — служебная разметка, он не должен спорить
+        # с тепловой картой и маршрутами за внимание. Рисуется ДВУМЯ линиями — тёмной
+        # сплошной подложкой и белым пунктиром поверх: одиночная линия любого цвета
+        # где-нибудь да совпадёт с весовой картой (turbo занимает почти весь спектр).
+        self.sector_shadow = pg.PlotDataItem(
+            pen=pg.mkPen(_qcolor(THREAT_COLORS["sector_edge"], 190), width=4.2),
+            connect="finite")
+        self.sector_shadow.setZValue(20); self.pi.addItem(self.sector_shadow)
+        self.sector_lines = pg.PlotDataItem(
+            pen=pg.mkPen(_qcolor(THREAT_COLORS["sector"], 235), width=2.0,
+                         style=QtCore.Qt.DashLine), connect="finite")
+        self.sector_lines.setZValue(21); self.pi.addItem(self.sector_lines)
+        self.entries_scatter = pg.ScatterPlotItem(size=18, symbol="t1",
+            brush=pg.mkBrush(_qcolor(THREAT_COLORS["entry_pt"])),
+            pen=pg.mkPen(_qcolor(THREAT_COLORS["entry_pt_edge"]), width=2.2))
+        self.entries_scatter.setZValue(22); self.pi.addItem(self.entries_scatter)
+
     # ==================================================================
     # API для контроллера
     # ==================================================================
@@ -1327,6 +1394,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_relief=self.chk_relief.isChecked(),
                     show_relief_k=self.chk_relief_k.isChecked(),
                     show_zones=self.chk_zones.isChecked(),
+                    show_entries=self.chk_entries.isChecked(),
+                    show_sector_lines=self.chk_sector_lines.isChecked(),
                     iter_mode=self._iter_keys[self.combo_iter.currentIndex()],
                     show_legend=self.chk_legend.isChecked())
 
@@ -1349,7 +1418,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         """Заблокировать кнопки действий на время фонового расчёта (чтобы не запускать
         второй параллельно) и показать курсор ожидания."""
         for b in (self.btn_data, self.btn_build, self.btn_target, self.btn_place,
-                  self.btn_apply, self.btn_reset):
+                  self.btn_apply, self.btn_reset,
+                  self.btn_sector, self.btn_sector_clear):    # ← «Задать сектор»/«Убрать»
             b.setEnabled(not busy)
         # кнопка рельефа отдельно: без файла высот она остаётся недоступной и после расчёта
         self.btn_relief.setEnabled((not busy) and getattr(self, "_relief_enabled", False))
@@ -1949,6 +2019,34 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def render_entry_target(self, entry, target):
         self.entry_scatter.setData([entry[0]], [entry[1]])
         self.target_scatter.setData([target[0]], [target[1]])
+
+    def render_sector(self, sector, entry_points, toggles=None):
+        """Сектор появления БПЛА: `sector` = (вершина-цель, край, край) или None,
+        `entry_points` — отобранные точки входа.
+
+        ДВА НЕЗАВИСИМЫХ СЛОЯ, у каждого своя галка: точки входа (по умолчанию видны —
+        они участвуют в расчёте) и границы сектора (по умолчанию скрыты — это служебная
+        разметка «откуда отбирали»). Галки только ПРЯЧУТ: сектор остаётся заданным, и
+        маршруты по-прежнему стартуют из его точек."""
+        t = toggles or {}
+        show_pts = bool(t.get("show_entries", True))
+        show_lines = bool(t.get("show_sector_lines", False if toggles else True))
+        pts = list(entry_points or [])
+        if sector and show_lines:
+            b, e1, e2 = sector
+            xs, ys = [e1[0], b[0], e2[0]], [e1[1], b[1], e2[1]]
+            self.sector_lines.setData(xs, ys)
+            self.sector_shadow.setData(xs, ys)
+        else:
+            self.sector_lines.setData([], [])
+            self.sector_shadow.setData([], [])
+        if show_pts:
+            self.entries_scatter.setData([p[0] for p in pts], [p[1] for p in pts])
+        else:
+            self.entries_scatter.setData([], [])
+        # при заданном секторе одиночный значок входа лишний — точек несколько
+        if pts:
+            self.entry_scatter.setData([], [])
 
     def showEvent(self, e):
         QtWidgets.QWidget.showEvent(self, e)

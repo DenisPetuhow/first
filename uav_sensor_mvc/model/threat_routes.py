@@ -32,7 +32,7 @@ import numpy as np
 
 from config import (THREAT_LOOKAHEAD_KM, THREAT_LOOKAHEAD_POWER, THREAT_COST_POWER,
                     THREAT_COST_RELIEF, THREAT_COST_MIX_BIAS, THREAT_COST_MIX_STEPS,
-                    THREAT_WEIGHT_GAIN,
+                    THREAT_WEIGHT_GAIN, THREAT_SECTOR_ENTRY_COOLDOWN,
                     THREAT_DEM_K_MIN, THREAT_DEM_K_MAX)
 
 # 8 соседей ячейки: (dy, dx, множитель длины шага). Орт. сосед — шаг h, диагональный — h·√2.
@@ -179,6 +179,15 @@ def passable_mask(grid, max_gap_km, slack_km=None):
     return pas
 
 
+def _as_entry_list(entry_km):
+    """Точки входа списком. Принимает и одну точку (x, y), и список точек — так вызовы
+    с одним входом (вкладка работает без заданного сектора) остаются прежними."""
+    e = np.asarray(entry_km, float)
+    if e.ndim == 1:
+        return [(float(e[0]), float(e[1]))]
+    return [(float(p[0]), float(p[1])) for p in e]
+
+
 def _open_endpoints(pas, cells_yx, grid, radius_km=3.0):
     """Открыть проходимость в окрестности ~radius_km вокруг заданных ячеек (вход/цель),
     чтобы они «дотянулись» до коридорной сети (БПЛА проходит несколько км над полем до
@@ -197,15 +206,27 @@ def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km, slack_km=None)
         envelope = { ячейка : glen_вход(ячейка) + glen_цель(ячейка) ≤ L_max }
 
     Так учитываются и ДЛИННЫЕ обходы (зайти с другой стороны) — лишь бы уложиться в
-    запас хода. Возвращает (mask_возможных_ячеек, min_длина_вход→цель)."""
-    start = _cell_of(grid, entry_km)
+    запас хода.
+
+    `entry_km` — одна точка ИЛИ список точек (сектор появления): область тогда
+    ОБЪЕДИНЯЕТСЯ по входам, а `min_длина` берётся по БЛИЖАЙШЕМУ из них. Объединение,
+    а не пересечение: БПЛА появится из какой-то одной точки, и пролететь он может над
+    всем, что достижимо хотя бы из неё.
+    Возвращает (mask_возможных_ячеек, min_длина_вход→цель)."""
+    entries = _as_entry_list(entry_km)
+    starts = [_cell_of(grid, e) for e in entries]
     goal = _cell_of(grid, target_km)
-    pas = _open_endpoints(passable_mask(grid, max_gap_km, slack_km), (start, goal), grid)
-    ge = _dijkstra_dist(pas, start, grid.h)
+    pas = _open_endpoints(passable_mask(grid, max_gap_km, slack_km),
+                          tuple(starts) + (goal,), grid)
     gt = _dijkstra_dist(pas, goal, grid.h)
-    total = ge + gt
-    env = np.isfinite(total) & (total <= L_max)
-    dmin = float(ge[goal]) if np.isfinite(ge[goal]) else float("inf")
+    env = np.zeros(gt.shape, bool)
+    dmin = float("inf")
+    for s in starts:
+        ge = _dijkstra_dist(pas, s, grid.h)
+        total = ge + gt
+        env |= np.isfinite(total) & (total <= L_max)
+        if np.isfinite(ge[goal]):
+            dmin = min(dmin, float(ge[goal]))
     return env, dmin
 
 
@@ -762,7 +783,21 @@ def _seg_dist_km(pt, a, b):
 
 def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                        slack_km=None):
-    """Подготовить (один раз, кэшируется) контекст выборки. VIA-точки — СЕТКА по всей
+    """Подготовить (один раз, кэшируется) контекст выборки.
+
+    `entry_km` — ОДНА точка входа (x, y) ИЛИ СПИСОК точек: при задании сектора появления
+    БПЛА входов пять, и маршрут стартует из случайно выбранного. Дорогие поля (Дейкстры
+    от цели и от каждой via) от входа НЕ зависят и считаются ОДИН раз на все точки —
+    иначе пять входов стоили бы впятеро дороже. От входа зависит немногое, и это
+    складывается в `ctx["entries"]` — по словарю на точку:
+      * `start`      — ячейка входа;
+      * `axis_s`     — проекция ячеек на ось вход→цель (правило «не уходить за старт»);
+      * `via_minlen` — минимальная длина пути вход→via→цель ИМЕННО ИЗ ЭТОГО входа;
+      * `gt_start`, `reachable` — расстояние до цели и достижима ли она.
+    Поля первой точки продублированы на верхнем уровне — ради кода, который знает про
+    один вход (`ctx["start"]`, показатели интерфейса).
+
+    VIA-точки — СЕТКА по всей
     проходимой области (все стороны, включая юг/восток и «за целью» — заход в Б с ЛЮБОГО
     направления, если хватает хода), с предвычисленными полями расстояний. Каждой via
     сопоставлены:
@@ -776,9 +811,13 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
     Порог мостика через провал = `max_gap_km` (разрыв между весовыми секторами, из
     интерфейса). Контекст зависит от разрыва и от цели, но НЕ от запаса хода L_max —
     поэтому кэшируется и переиспользуется при смене L_max."""
-    start = _cell_of(grid, entry_km)
+    entries_km = _as_entry_list(entry_km)
+    starts = [_cell_of(grid, e) for e in entries_km]
+    start = starts[0]                      # «представитель» для общих полей и совместимости
     goal = _cell_of(grid, target_km)
-    pas = _open_endpoints(passable_mask(grid, max_gap_km, slack_km), (start, goal), grid)
+    # концы открываем у ВСЕХ входов: непроходимая ячейка входа отрезала бы свою точку
+    pas = _open_endpoints(passable_mask(grid, max_gap_km, slack_km),
+                          tuple(starts) + (goal,), grid)
     ahead = _lookahead_fields(grid, THREAT_LOOKAHEAD_KM)   # что ждёт впереди по курсу
     w = np.clip(grid.weight, 0.0, None)                 # нормировка веса по p90 (как в стоимости)
     pos = w[w > 0]
@@ -816,7 +855,11 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                 fld = _dijkstra_cost(pas, goal, grid.h, ma)
                 sc = float(ma[pas].mean()) if pas.any() else 1.0
             gt_mix.append(dict(a=float(a), gt=fld, scale=sc, via=[]))
-    A = np.asarray(entry_km, float); B = np.asarray(target_km, float)
+    # ОСЬ «вход→цель» и «дальность обхода» считаются от ЦЕНТРА входов: при нескольких
+    # точках общая ось одна, а разброс даёт сама стартовая ячейка. Иначе пришлось бы
+    # дублировать via-поля на каждый вход — впятеро дороже при том же результате.
+    A = np.asarray(entries_km, float).mean(axis=0)
+    B = np.asarray(target_km, float)
     ab = float(np.hypot(*(B - A))) or 1.0
     # Проекция каждой ячейки на ось старт→цель (км): 0 у старта, ab у цели, отрицательная —
     # ПОЗАДИ старта; и ПРЯМОЕ расстояние ячейки до цели. Именно последнее видно на карте:
@@ -838,7 +881,7 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
         if VIA_BEYOND_PUSH:
             push_km = FINAL_BYPASS_KM + 2.0 * grid.h
     via_cell, via_gv, via_gv_geo = [], [], []
-    via_segd, via_minlen, via_togoal, via_back = [], [], [], []
+    via_segd, via_togoal, via_back = [], [], []
     if np.isfinite(gt[start]):
         ys, xs = np.nonzero(pas & np.isfinite(gt))     # достижимые проходимые ячейки
         if len(ys):
@@ -894,8 +937,8 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                         continue                       # сама точка внутри круга обхода
                     gv_geo = _dijkstra_dist(pmask, vc, grid.h)
                     gv = gv_geo if mul is None else _dijkstra_cost(pmask, vc, grid.h, mul)
-                    if not np.isfinite(gv_geo[start]):
-                        continue                       # в обход цели до неё не добраться
+                    if not any(np.isfinite(gv_geo[s]) for s in starts):
+                        continue     # в обход цели до неё не добраться НИ ИЗ ОДНОГО входа
                     via_cell.append(vc)
                     via_back.append(back)
                     via_gv.append(gv)
@@ -917,15 +960,36 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                     # считано по полной маске, а поле от via — по маске транзита, где сама
                     # цель вырезана кругом обхода и расстояние до неё было бы бесконечным.
                     via_togoal.append(float(gt_geo[vc]))
-                    via_minlen.append(float(gv_geo[start] + gt_geo[vc]))
-    return dict(grid=grid, pas=pas, gt=gt, gt_geo=gt_geo, wnorm=wnorm,
-                cost_scale=cost_scale, gt_mix=gt_mix, start=start, goal=goal, ab=ab,
-                axis_s=axis_s, dgoal=dgoal, ahead=ahead,
-                via_cell=via_cell, via_gv=via_gv, via_gv_geo=via_gv_geo,
-                via_back=np.asarray(via_back, bool), via_segd=np.asarray(via_segd),
-                via_minlen=np.asarray(via_minlen), via_togoal=np.asarray(via_togoal),
-                gt_start=float(gt_geo[start]),
-                reachable=bool(np.isfinite(gt_geo[start])))
+                    # `via_minlen` здесь НЕ считается: длина вход→via→цель своя у каждой
+                    # точки входа и собирается ниже, в надстройках по входам
+    # НАДСТРОЙКИ ПО ВХОДАМ: всё, что зависит от точки старта. Поля выше общие.
+    togoal_arr = np.asarray(via_togoal, float)
+    entries = []
+    for (ex, ey), sc in zip(entries_km, starts):
+        d = B - np.array([ex, ey], float)
+        abe = float(np.hypot(*d)) or 1.0
+        entries.append(dict(
+            start=sc, entry_km=(float(ex), float(ey)), ab=abe,
+            # своя ось «этот вход → цель»: по ней работает запрет ухода назад за старт
+            axis_s=((gxc - ex) * d[0] + (gyc - ey) * d[1]) / abe,
+            # «уложится ли маршрут через via» — тоже своё: из разных входов путь разный
+            via_minlen=(np.asarray([float(g[sc]) for g in via_gv_geo]) + togoal_arr
+                        if via_gv_geo else np.zeros(0)),
+            gt_start=float(gt_geo[sc]),
+            reachable=bool(np.isfinite(gt_geo[sc]))))
+    live = [e for e in entries if e["reachable"]]
+    ctx = dict(grid=grid, pas=pas, gt=gt, gt_geo=gt_geo, wnorm=wnorm,
+               cost_scale=cost_scale, gt_mix=gt_mix, goal=goal,
+               dgoal=dgoal, ahead=ahead,
+               via_cell=via_cell, via_gv=via_gv, via_gv_geo=via_gv_geo,
+               via_back=np.asarray(via_back, bool), via_segd=np.asarray(via_segd),
+               via_togoal=togoal_arr, entries=entries,
+               # ОСЬ ОТ ЦЕНТРА входов — по ней считались via_segd и «via за целью»
+               axis_center=axis_s, ab_center=ab)
+    # для кода, знающего про один вход (`ctx["start"]`, показатели, `_pick_via`):
+    # представитель — первый ДОСТИЖИМЫЙ вход, иначе просто первый
+    ctx.update(live[0] if live else entries[0])
+    return ctx
 
 
 def _pick_via(ctx, spread, rng, L_max):
@@ -1050,7 +1114,34 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
     (max/medium/min/mix). spread = РАЗБРОС по карте (center/middle/edge/mix) — через какую
     VIA-точку строить (center — вдоль прямой, edge — дальний обход/заход с любой стороны).
     spend = профиль РАСХОДА ЗАПАСА ХОДА (late/early/even, см. `_spend_tau`).
-    None, если не уложились в запас хода."""
+    None, если не уложились в запас хода.
+
+    ТОЧКА ВХОДА разыгрывается здесь: если задан сектор появления, их пять, и каждая
+    имеет РАВНЫЕ шансы (решение заказчика: вес местности участвует при ОТБОРЕ самих
+    пяти точек, а не при выборе старта). Недостижимые точки в розыгрыш не идут — иначе
+    треть попыток тратилась бы впустую.
+
+    ПАУЗА ПОВТОРА (`THREAT_SECTOR_ENTRY_COOLDOWN` = 2): точка, из которой только что
+    стартовали, не берётся следующие два раза. Равномерный розыгрыш сам по себе даёт
+    серии («выпало трижды подряд»), и на коротких прогонах часть точек не отрабатывала
+    вовсе. История последних выборов лежит в самом контексте, поэтому правило работает
+    и в `plan_routes`, и в итерациях — они делят один контекст. Если доступных точек
+    не осталось (недостижимые), пауза снимается: маршрут важнее ровности чередования."""
+    ents = ctx.get("entries")
+    if ents and len(ents) > 1:
+        live = [i for i, e in enumerate(ents) if e["reachable"]]
+        if not live:
+            return None
+        recent = ctx.setdefault("_recent_entries", [])
+        cool = max(0, int(THREAT_SECTOR_ENTRY_COOLDOWN))
+        avail = [i for i in live if i not in recent[-cool:]] if cool else live
+        if not avail:                       # точек меньше, чем длина паузы
+            avail = live
+        # РАВНОМЕРНО: при неизвестном нарушителе это честнее, чем взвешивать по весу
+        pick = avail[int(rng.integers(len(avail)))]
+        recent.append(pick)
+        del recent[:-8]                     # история нужна короткая, не растим список
+        ctx = {**ctx, **ents[pick]}
     if not ctx["reachable"]:
         return None
     wmode = ("max", "medium", "min")[rng.integers(3)] if mode == "mix" else mode

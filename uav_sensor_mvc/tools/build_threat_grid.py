@@ -11,9 +11,14 @@
 же код использует окно «Выбрать цифровые карты» в интерфейсе). Здесь — только CLI-
 обёртка: прочитать → сохранить.
 
+Файл слоёв СВОЙ у каждого участка (`config.THREAT_AREAS[...]["layers"]`): кэш
+прежнего куска карты остаётся лежать рядом и не затирается.
+
 Запуск (на машине пользователя, где установлен геостек):
     pip install pyrosm geopandas shapely pyproj
-    python tools/build_threat_grid.py geo_cache/severodonetsk.osm.pbf
+    python tools/build_threat_grid.py                       # исходник и приёмник — из участка
+    python tools/build_threat_grid.py geo_cache/APX.osm.pbf # явный исходник
+    python tools/build_threat_grid.py <исходник> <имя.npz>  # ещё и явный приёмник
 """
 import os
 import sys
@@ -25,16 +30,19 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import THREAT_BBOX_LONLAT
-from model.threat_grid import bbox_center_lonlat, geo_cache_root, layers_from_osm
+from config import (THREAT_AREA, THREAT_BBOX_LONLAT, THREAT_LAYERS_FILE,
+                    THREAT_SOURCE_FILE)
+from model.threat_grid import (area_cache_dir, area_file, bbox_center_lonlat,
+                               layers_from_osm)
 
 
 def main(argv):
-    if len(argv) < 2:
-        sys.exit("Использование: python tools/build_threat_grid.py <файл.osm.pbf>")
-    pbf = argv[1]
+    pbf = argv[1] if len(argv) > 1 else area_file(THREAT_SOURCE_FILE)
+    out_name = argv[2] if len(argv) > 2 else THREAT_LAYERS_FILE
     if not os.path.exists(pbf):
         sys.exit(f"Файл не найден: {pbf}")
+    print(f"участок: {THREAT_AREA}  bbox={THREAT_BBOX_LONLAT}")
+    print(f"исходник: {pbf}\nприёмник: {out_name}\n")
 
     lon0, lat0 = bbox_center_lonlat()
     try:
@@ -51,7 +59,7 @@ def main(argv):
         sys.exit("Ни одного объекта не извлечено — проверьте, что bbox pbf-файла "
                  "покрывает участок THREAT_BBOX_LONLAT.")
 
-    dst = os.path.join(geo_cache_root(), "threat_layers.npz")
+    dst = os.path.join(area_cache_dir(), out_name)     # кладём в папку участка
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     np.savez_compressed(dst, **out)
     print(f"\nСохранено: {dst}\nВкладка 3 → «Построить карту» теперь возьмёт эти слои.")
