@@ -52,7 +52,15 @@ from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
                     THREAT_ENTRY_FREE_KM, THREAT_TARGET_FREE_KM,
                     THREAT_LMAX_AUTO_FRAC, THREAT_LMAX_CORRIDOR_FRAC,
                     THREAT_SECTOR_HALF_DEG, THREAT_SECTOR_ENTRIES,
-                    THREAT_SECTOR_SPACING_FRAC, THREAT_SECTOR_EDGE_KM)
+                    THREAT_SECTOR_EDGE_KM, THREAT_SECTOR_WIN_ALONG,
+                    THREAT_SECTOR_WIN_ACROSS, THREAT_SECTOR_MIN_SEP_KM,
+                    THREAT_SECTOR_MIN_ANGLE_FRAC)
+# кольцо и угловой разнос БОЛЬШИХ датчиков — поля Params (правятся в окне «Датчики»),
+# поэтому берутся оттуда; здесь только умолчания на случай старого Params
+from config import Params as _P
+THREAT_BIG_RING_LO = getattr(_P, "threat_big_ring_lo", 0.55)
+THREAT_BIG_RING_HI = getattr(_P, "threat_big_ring_hi", 1.0)
+THREAT_BIG_ANGLE_TOL = getattr(_P, "threat_big_angle_tol", 0.55)
 
 
 # ----------------------------------------------------------------------
@@ -1867,7 +1875,8 @@ class ThreatModel:
         self.layers = {}
         self.source = ""
         self.grid = None
-        self.sensors = np.empty((0, 2), float)
+        self.sensors = np.empty((0, 2), float)       # МАЛЫЕ датчики (радиус threat_R)
+        self.sensors_big = np.empty((0, 2), float)   # БОЛЬШИЕ (threat_R_big) — щит у цели
         self.candidates = np.empty((0, 2), float)
         self._metrics = {}
         self.dem = None                # высоты рельефа на сетке (None — файла нет)
@@ -2233,13 +2242,25 @@ class ThreatModel:
         return route
 
     def iter_batch(self):
-        """Сгенерировать T маршрутов сразу (без анимации). T = p.threat_iter_routes."""
+        """Сгенерировать T маршрутов сразу (без анимации). T = p.threat_iter_routes.
+
+        ⚠️ ПОТОЛОК ПОПЫТОК МАСШТАБИРУЕТСЯ ОТ T. Раньше стоял `min(T*6, 800)`, и число
+        800 обрезало заказ: при T = 400 попыток хватало лишь на **234** маршрута —
+        генерация молча останавливалась, а на карте показывалось столько, сколько
+        построилось. Дело не в дедупликации (замер: 0 отбраковок), а в доле отказов
+        «маршрут не уложился в запас хода» — на реальных данных **71 %** попыток.
+        Поэтому попыток нужно примерно вчетверо больше, чем маршрутов; берём восьмикратный
+        запас. Защита от бесконечного цикла остаётся: `stale` — сколько попыток подряд
+        разрешено не давать нового маршрута (тоже от T, иначе крупный заказ обрывался бы
+        на середине)."""
         from .threat_routes import sample_one_route
         if not self.iter_reset():
             return []
         T = max(1, int(self.p.threat_iter_routes))
-        seen, tries, cap, since_new = set(), 0, min(T * 6, 800), 0
-        while len(self.iter_routes) < T and tries < cap and since_new < 350:
+        cap = int(T * 8)                               # было min(T*6, 800) — см. шапку
+        stale = max(350, T)
+        seen, tries, since_new = set(), 0, 0
+        while len(self.iter_routes) < T and tries < cap and since_new < stale:
             tries += 1
             r = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
                                  self.p.threat_L_max, self.p.threat_turn_interval_km,
@@ -2369,6 +2390,8 @@ class ThreatModel:
             self.sensors = self._place_by_routes(self.candidates, sample)
         else:
             self.sensors = self._place_by_weight(self.candidates)
+        # БОЛЬШИЕ датчики — отдельным правилом (круговой щит у цели), по той же выборке
+        self.sensors_big = self._place_big(sample)
         cells_xy, cells_w = g.flat_cells(positive_only=False)
         keep = cells_w != 0.0
         self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
@@ -2388,40 +2411,70 @@ class ThreatModel:
             self.p.threat_N, weights, min_sep=self.p.threat_min_sep_frac * self.p.threat_R)
 
     def _place_by_routes(self, cand, routes):
-        """Расстановка по ВЫБОРКЕ маршрутов (частота пролёта). Правила (как просил):
-        * кандидаты — только МЕЖДУ входом A и целью B по оси (не ЗА B и не ПЕРЕД A);
-        * ДВА якоря — у входа A и у цели B, каждый в ~0.45·R от точки внутрь коридора, из
-          ближних — тот, что накрывает больше всего маршрутов (не «залипают» в самих A/B);
-        * остальные датчики не ближе ~1.6·R к любому уже стоящему (перекрытие зон ≤ ~10 %,
-          не кучкуются) — далее обычный жадный субмодулярный выбор по выборке."""
+        """Расстановка по ВЫБОРКЕ маршрутов (частота пролёта). Правила:
+        * кандидаты — только в ЗОНЕ ПРОЛЁТА (`route_area`): туда, куда БПЛА способен
+          долететь вход→место→цель в пределах запаса хода. Позиции ЗА ЦЕЛЬЮ разрешены,
+          если маршруты туда заходят (заход сзади в модели есть);
+        * якорей НЕТ — все позиции выбирает жадный субмодулярный алгоритм;
+        * датчики не ближе ~1.6·R друг к другу (перекрытие зон ≤ ~10 %, не кучкуются).
+
+        Работает одинаково ДО и ПОСЛЕ итераций: до них выборка — «все возможные пути»
+        (`plan_routes`), после — накопленные пролёты (`_sample_for_sensors`)."""
         from .optimization import CoverageCache
         from config import MODES
         if len(cand) == 0 or not routes:
             return np.empty((0, 2), float)
-        entry, target = self.entry_target_km()
-        A = np.asarray(entry, float); B = np.asarray(target, float)
         R = self.p.threat_R
-        d = B - A; D2 = float(d @ d)
-        if D2 > 1e-9:                                  # оставить кандидатов между A и B (0≤s≤1)
-            s = ((cand - A) @ d) / D2
-            cand = cand[(s >= 0.0) & (s <= 1.0)]
+        # ФИЛЬТР КАНДИДАТОВ — ПО ЗОНЕ ПРОЛЁТА, а не по прямой «вход→цель».
+        #
+        # Прежнее правило (закомментировано ниже) оставляло кандидатов с проекцией на ось
+        # A→B в пределах 0…1, то есть в полосе между входом и целью. Оно писалось под ОДИН
+        # вход и перестало отвечать смыслу, когда точек входа стало пять: ось строится
+        # через их среднюю точку, которой на местности не существует. Замер: фильтр
+        # отсекал 588 позиций, из них 260 лежали в зоне пролёта (то есть выбрасывались
+        # зря), и при этом оставлял ~1260 позиций, недостижимых вовсе; 5.5 % точек
+        # маршрутов оказывались вне полосы — там пролёты есть, а датчик поставить нельзя.
+        # Зона пролёта считается перед расстановкой (`_refresh_envelope` → `flight_envelope`)
+        # и уже учитывает ВСЕ точки входа, запас хода, проходимость и обходы цели.
+        area = self.route_area
+        if area is not None and self.grid is not None:
+            g = self.grid
+            ix = np.clip(((cand[:, 0] - g.ox) / g.h).astype(int), 0, g.nx - 1)
+            iy = np.clip(((cand[:, 1] - g.oy) / g.h).astype(int), 0, g.ny - 1)
+            keep = np.asarray(area)[iy, ix]
+            if keep.any():                             # пустая зона — не терять кандидатов
+                cand = cand[keep]
+        # ПРЕЖНЕЕ ПРАВИЛО (не удалять: вернуть, если зона пролёта окажется хуже):
+        # entry, target = self.entry_target_km()
+        # A = np.asarray(entry, float); B = np.asarray(target, float)
+        # d = B - A; D2 = float(d @ d)
+        # if D2 > 1e-9:                                # оставить кандидатов между A и B
+        #     s = ((cand - A) @ d) / D2
+        #     cand = cand[(s >= 0.0) & (s <= 1.0)]
         if len(cand) == 0:
             return np.empty((0, 2), float)
         cache = CoverageCache(cand, R, self.p.L_seg, self.p.threat_k)
         for r in routes:
             cache.add_trajectory(r)
-        covsum = cache.routes_covered_by_candidate()   # сколько маршрутов накрывает кандидат
-        u = d / np.sqrt(D2) if D2 > 1e-9 else np.array([1.0, 0.0])
-
-        def anchor_near(pt):                           # кандидат у точки, max покрытия маршрутов
-            near = np.linalg.norm(cand - pt, axis=1) < 0.7 * R
-            if near.any():
-                idxs = np.nonzero(near)[0]; return int(idxs[np.argmax(covsum[idxs])])
-            return int(np.argmin(np.linalg.norm(cand - pt, axis=1)))
-
-        anchor_b = anchor_near(B - 0.45 * R * u)       # у цели B (внутрь, к A)
-        anchor_a = anchor_near(A + 0.45 * R * u)       # у входа A (внутрь, к B)
-        anchors = [anchor_b] + ([anchor_a] if anchor_a != anchor_b else [])
+        # ЯКОРЯ ВЫКЛЮЧЕНЫ (проба по решению заказчика 29.08.2026). Раньше принудительно
+        # ставились два: у входа и у цели, каждый в 0.45·R внутрь коридора, и из кандидатов
+        # в круге 0.7·R брался накрывающий больше всего маршрутов. При пяти точках входа
+        # правило выродилось: «вход» — средняя точка пяти, до реальных точек от неё
+        # 1.2…23.7 км, и якорь ловил лишь 24 маршрута из 150 (16 %), то есть стерёг один
+        # вход из пяти. Плюс принуждение снимает гарантию жадного алгоритма (план 6).
+        # covsum = cache.routes_covered_by_candidate()
+        # u = d / np.sqrt(D2) if D2 > 1e-9 else np.array([1.0, 0.0])
+        #
+        # def anchor_near(pt):                         # кандидат у точки, max покрытия
+        #     near = np.linalg.norm(cand - pt, axis=1) < 0.7 * R
+        #     if near.any():
+        #         idxs = np.nonzero(near)[0]; return int(idxs[np.argmax(covsum[idxs])])
+        #     return int(np.argmin(np.linalg.norm(cand - pt, axis=1)))
+        #
+        # anchor_b = anchor_near(B - 0.45 * R * u)     # у цели B (внутрь, к A)
+        # anchor_a = anchor_near(A + 0.45 * R * u)     # у входа A (внутрь, к B)
+        # anchors = [anchor_b] + ([anchor_a] if anchor_a != anchor_b else [])
+        anchors = []
         weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
         # Разнос: ЖЕЛАЕМЫЙ 1.6·R (перекрытие зон ≤ ~10 %), но если при нём полезных
         # позиций не хватило на заказанные N — постепенно ослабляем до нижней границы
@@ -2436,6 +2489,97 @@ class ThreatModel:
             sens = cache.greedy(N, weights, anchors=anchors, anchor_sep=sep, min_sep=sep)
         return sens
 
+    def _place_big(self, routes):
+        """БОЛЬШИЕ датчики — «круговой щит» у цели: `threat_N_big` штук радиусом
+        `threat_R_big`, разнесённые ПО УГЛУ вокруг цели.
+
+        Почему кольцо, а не общий жадный отбор. Требование заказчика — «прикрывают цель
+        со всех сторон, как треугольник (возможно неправильный)» — это про НАПРАВЛЕНИЯ,
+        а не про площадь покрытия. Жадный алгоритм по маршрутам сам такого не даст: он
+        соберёт все три датчика на самом плотном пучке маршрутов, и с одной стороны цель
+        останется открытой. Поэтому позиция ищется в кольце вокруг цели, а угол между
+        соседними датчиками ограничен снизу.
+
+        ⚠️ «Не пересекаться» и «накрывать цель» одновременно НЕДОСТИЖИМЫ. Чтобы зоны не
+        пересекались, центры должны стоять дальше `2·R_big` друг от друга; тогда при трёх
+        датчиках цель оказывается дальше `R_big` от каждого — то есть вне зон. Поэтому
+        принято «МИНИМАЛЬНОЕ перекрытие»: датчики стоят у внешней границы кольца
+        (`threat_big_ring_hi` ≈ R_big), и при 120° между ними расстояние выходит
+        1.73·R_big — перекрытие небольшое, а цель под наблюдением у каждого.
+
+        Внутри допустимого кольца и угла позиция выбирается ПО МАРШРУТАМ: берётся
+        кандидат, накрывающий больше всего пролётов."""
+        from .optimization import CoverageCache
+        n_big = int(getattr(self.p, "threat_N_big", 0) or 0)
+        R_big = float(getattr(self.p, "threat_R_big", 0.0) or 0.0)
+        if n_big <= 0 or R_big <= 0.0 or not routes:
+            return np.empty((0, 2), float)
+        cand = self.candidates if len(self.candidates) else self.candidate_positions()
+        if not len(cand):
+            return np.empty((0, 2), float)
+        B = np.asarray(self.target_only_km(), float)
+        d = np.linalg.norm(cand - B, axis=1)
+        lo = float(THREAT_BIG_RING_LO) * R_big
+        hi = float(THREAT_BIG_RING_HI) * R_big
+        ring = (d >= lo) & (d <= hi)
+        if not ring.any():                      # кольцо вне карты — берём что ближе к нему
+            ring = d <= max(hi, float(d.min()) * 1.05)
+        sub = cand[ring]
+        if not len(sub):
+            return np.empty((0, 2), float)
+        # ЧЕМ МЕРИТЬ ПОЗИЦИЮ. «Сколько маршрутов накрывает» здесь бесполезно: радиус
+        # 15 км так велик, что почти любой кандидат кольца накрывает ВСЮ выборку —
+        # замер: 250 из 250 маршрутов у всех 459 кандидатов, критерий не различает ничего,
+        # и `argmax` брал первого по порядку сетки. Поэтому берётся ПЛОТНОСТЬ пролётов:
+        # сколько ячеек-проходов маршрутов попадает в зону обзора.
+        dens = self.route_density_field()
+        g = self.grid
+        if dens is None:
+            score_pos = np.zeros(len(sub))
+        else:
+            gx, gy = g.cell_centers_km()
+            hot = dens > 0
+            hx, hy, hw = gx[hot], gy[hot], np.asarray(dens)[hot]
+            score_pos = np.array([
+                float(hw[(hx - s[0]) ** 2 + (hy - s[1]) ** 2 <= R_big * R_big].sum())
+                for s in sub])
+        # РАЗБИЕНИЕ КРУГА НА N СЕКТОРОВ, по датчику в каждом. Так щит равномерен ПО
+        # ПОСТРОЕНИЮ. Отбор «жадно, но не ближе допуска по углу» этого не давал: первые
+        # два датчика садились на самый плотный пучок маршрутов, упирались в допуск и
+        # оставляли перекос — замер на участке дал углы 155° / 68° / 137° при идеале 120°.
+        #
+        # Сектора нужно ещё и ПОВЕРНУТЬ: их границы, поставленные наугад, могут разрезать
+        # плотный пучок маршрутов пополам. Поэтому фаза перебирается, и берётся та, при
+        # которой суммарное покрытие маршрутов максимально.
+        ang = np.arctan2(sub[:, 1] - B[1], sub[:, 0] - B[0])
+        step = 2.0 * np.pi / max(1, n_big)
+        best, best_score = None, -1.0
+        for ph in np.linspace(0.0, step, 12, endpoint=False):
+            k = np.floor(((ang - ph) % (2.0 * np.pi)) / step).astype(int)
+            take, score = [], 0.0
+            for s_i in range(n_big):
+                in_sec = np.nonzero(k == s_i)[0]
+                if not len(in_sec):
+                    continue
+                # В СЕКТОРЕ датчик ставится НА ЕГО ОСЬ — так щит равномерен по
+                # построению (углы ≈ 360°/N). Маршруты влияют не здесь, а на ПОВОРОТ
+                # всей тройки: по ним выбирается фаза `ph`. Обратный порядок (сначала
+                # плотность, потом ось) уже пробовался и давал перекос: датчики садились
+                # у границ секторов и оказывались в 25–68° друг от друга — формально в
+                # разных секторах, а на карте рядом.
+                axis = ph + step * (s_i + 0.5)           # ось этого сектора
+                off = np.abs((ang[in_sec] - axis + np.pi) % (2 * np.pi) - np.pi)
+                near = in_sec[off <= off.min() + np.radians(4.0)]   # почти на оси
+                j = int(near[int(np.argmax(score_pos[near]))])      # из них — где гуще пролёты
+                take.append(j); score += float(score_pos[j])
+            # предпочитаем расстановку, где ЗАПОЛНЕНЫ ВСЕ сектора: щит с дырой хуже,
+            # чем щит из тех же датчиков, но по кругу
+            score += 1e6 * len(take)
+            if score > best_score:
+                best, best_score = take, score
+        if not best:
+            return np.empty((0, 2), float)
+        return np.asarray([sub[j] for j in best], float)
 
     def _sample_for_sensors(self):
         """Выборка маршрутов, по которой считаются датчики и 2-я тепловая карта (§4.6):
@@ -2707,7 +2851,14 @@ class ThreatModel:
         # непроходимой ячейке обнулила бы поле, и «недостижимо» вышло бы для всего края
         reach = np.isfinite(_dijkstra_dist(_open_endpoints(pas.copy(), (goal,), g),
                                            goal, g.h))
-        ok = inside & pas & reach
+        # ТОЧКА ВХОДА СТОИТ НА ВЕСОВОЙ ЯЧЕЙКЕ. Ячейка с нулевым весом — это чистое поле
+        # без единого ориентира: БПЛА неоткуда там взяться и не за чем туда идти, такие
+        # места из рассмотрения исключаются. Замер: на краю в секторе нулевой вес у
+        # ПОЛОВИНЫ кандидатов, и прежний отбор мог поставить точку ровно на такую.
+        has_w = np.asarray(g.weight, float) > 0.0
+        ok = inside & pas & reach & has_w
+        if not ok.any():
+            ok = inside & pas & reach   # на краю нет ни одной весовой ячейки
         if not ok.any():
             ok = inside & pas      # весь край недостижим при текущем разрыве — оставляем
         if not ok.any():
@@ -2715,25 +2866,70 @@ class ThreatModel:
                                    # концы всё равно открываются в build_iter_context
         iy, ix = np.nonzero(ok)
         wx, wy = gx[iy, ix], gy[iy, ix]
-        w = np.asarray(g.weight, float)[iy, ix]
-        # разнос: доля от длины дуги края, попавшей в сектор
-        span = float(np.hypot(wx.max() - wx.min(), wy.max() - wy.min()))
-        d_min = max(2.0 * g.h, span * float(THREAT_SECTOR_SPACING_FRAC))
+        score = self._entry_window_score(wx, wy, B)  # перспектива движения, а не вес точки
         want = max(1, int(THREAT_SECTOR_ENTRIES))
-        order = np.argsort(-w)                      # лучшие по весу вперёд
-        picked = []
-        for i in order:
-            p = (float(wx[i]), float(wy[i]))
-            if all(np.hypot(p[0] - q[0], p[1] - q[1]) >= d_min for q in picked):
-                picked.append(p)
-                if len(picked) >= want:
+        # УГЛОВОЙ разнос: доля от идеального шага (раствор сектора / число точек)
+        ideal = 2.0 * np.radians(float(THREAT_SECTOR_HALF_DEG)) / want
+        need_ang = ideal * float(THREAT_SECTOR_MIN_ANGLE_FRAC)
+        sep = float(THREAT_SECTOR_MIN_SEP_KM)
+        ang = np.arctan2(wy - B[1], wx - B[0])
+
+        def take(min_sep, min_ang):
+            out, outa = [], []
+            for i in np.argsort(-score):            # лучшие по перспективе вперёд
+                q = (float(wx[i]), float(wy[i]))
+                if any(np.hypot(q[0] - s[0], q[1] - s[1]) < min_sep for s in out):
+                    continue
+                if min_ang > 0.0 and any(
+                        abs((ang[i] - a + np.pi) % (2 * np.pi) - np.pi) < min_ang
+                        for a in outa):
+                    continue
+                out.append(q); outa.append(float(ang[i]))
+                if len(out) >= want:
                     break
-        # если разнос не дал нужного числа (короткий край) — добираем ближайшими по весу
+            return out
+
+        picked = take(sep, need_ang)
+        # край короткий или беден — ослабляем угловое условие, затем километровое:
+        # лучше пять точек рядом, чем три с идеальным разносом
+        while len(picked) < want and need_ang > 1e-4:
+            need_ang *= 0.6
+            picked = take(sep, need_ang)
         if len(picked) < want:
-            for i in order:
-                p = (float(wx[i]), float(wy[i]))
-                if p not in picked:
-                    picked.append(p)
-                    if len(picked) >= want:
-                        break
+            picked = take(0.0, 0.0)
         return picked
+
+    def _entry_window_score(self, xs, ys, target_km):
+        """ПЕРСПЕКТИВА ДВИЖЕНИЯ из точки: средний вес прямоугольника, вытянутого от неё
+        В СТОРОНУ ЦЕЛИ (`THREAT_SECTOR_WIN_ALONG` ячеек вдоль курса ×
+        `THREAT_SECTOR_WIN_ACROSS` поперёк).
+
+        Зачем не вес самой ячейки: приграничная ячейка отражает лишь то, попал ли край
+        карты на дорогу или реку. Замер на участке: у ПОЛОВИНЫ кандидатов вес ячейки
+        ровно 0, а лучшая по ячейке точка (29.1) по перспективе оказалась только
+        13-й — впереди у неё пусто. Совпадение первых пятёрок двух рейтингов — 2 из 5."""
+        g = self.grid
+        W = np.asarray(g.weight, float)
+        ny, nx = W.shape
+        B = np.asarray(target_km, float)
+        n_al = max(1, int(THREAT_SECTOR_WIN_ALONG))
+        n_ac = max(1, int(THREAT_SECTOR_WIN_ACROSS))
+        half = n_ac // 2
+        out = np.zeros(len(xs))
+        for t, (px, py) in enumerate(zip(xs, ys)):
+            d = B - np.array([px, py], float)
+            n = float(np.hypot(*d))
+            if n < 1e-9:
+                continue
+            a = d / n                                # орт «на цель»
+            b = np.array([-a[1], a[0]])              # поперёк курса
+            acc = cnt = 0
+            for i in range(n_al):
+                for j in range(-half, half + 1):
+                    q = np.array([px, py]) + a * (i * g.h) + b * (j * g.h)
+                    jx = int((q[0] - g.ox) / g.h)
+                    jy = int((q[1] - g.oy) / g.h)
+                    if 0 <= jx < nx and 0 <= jy < ny:
+                        acc += W[jy, jx]; cnt += 1
+            out[t] = acc / max(1, cnt)
+        return out

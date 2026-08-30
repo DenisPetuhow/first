@@ -118,7 +118,13 @@ THREAT_COLORS = {
     "uav":         "#ff4dff",           # маркер летящего БПЛА, self.uav_marker
     # — ОГИБАЮЩАЯ И ДАТЧИКИ —
     "envelope":    (255, 70, 245, 120),  # «все места пролёта» (розовая заливка), render_routes
-    "sensor":      "#ff8c1a",           # датчики: кольцо зоны обзора + центр, render_sensors
+    "sensor":      "#ff8c1a",           # МАЛЫЕ датчики: кольцо зоны обзора + центр
+    # БОЛЬШИЕ датчики (радиус 15 км против 2) — свой цвет, иначе их зоны читались бы как
+    # «раздутые малые». Взят холодный сине-фиолетовый: он далеко от оранжевого малых, от
+    # красного возвышенностей и от пурпура запретных зон, а заливка даётся слабой (30 из
+    # 255) — круг вчетверо больше по радиусу и при обычной заливке накрыл бы полкарты.
+    "sensor_big":  "#7b61ff",
+
     # — ПРОЧИЕ ЗНАЧКИ/ЛЕГЕНДА —
     "crossing":    "#ffd166",           # перекрёстки-развилки (ромбы), self.crossing_scatter
     "crossing_edge": "#7a5c00",         # обводка ромбов перекрёстков
@@ -336,6 +342,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_iter_gen_frac = lambda v: None
         self._params_ref = params         # для префилла окна входных данных
         self._input_dlg = None
+        self._sensors_dlg = None          # окно «Датчики» (два типа)
+        self.on_sensors_apply = lambda vals: None
 
         self.setWindowTitle("Цифровая карта угроз — вкладка 3")
         self._apply_stylesheet()
@@ -521,6 +529,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                                               self.on_input_apply)
         self._input_dlg.refresh(self._params_ref)
         self._input_dlg.show(); self._input_dlg.raise_()
+
+    def _open_sensors_dialog(self):
+        """Окно «Датчики» — параметры обоих типов. Не блокирует основное окно."""
+        if self._sensors_dlg is None:
+            self._sensors_dlg = SensorsDialog(self, self._params_ref,
+                                              self.on_sensors_apply)
+        self._sensors_dlg.refresh(self._params_ref)
+        self._sensors_dlg.show(); self._sensors_dlg.raise_()
+
+    def refresh_sensors_dialog(self):
+        """Обновить поля окна «Датчики» (шаг сетки мог пересчитаться под радиус)."""
+        if self._sensors_dlg is not None and self._sensors_dlg.isVisible():
+            self._sensors_dlg.refresh(self._params_ref)
 
     def set_ab_distance(self, km):
         if self._input_dlg is not None:
@@ -739,10 +760,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         row_zone.addWidget(self.btn_zone, 2); row_zone.addWidget(self.btn_zone_undo, 1)
         col.addLayout(row_zone)
 
+        self.btn_sensors = QtWidgets.QPushButton("Датчики: параметры…")
+        self.btn_sensors.setToolTip(
+            "Отдельное окно (не блокирует программу): количество и радиус МАЛЫХ и "
+            "БОЛЬШИХ датчиков, кратность засечки, шаг сетки позиций.")
+        self.btn_sensors.clicked.connect(self._open_sensors_dialog)
+        col.addWidget(self.btn_sensors)
+
         self.btn_place = QtWidgets.QPushButton("Расставить датчики")
         self.btn_place.setToolTip(
-            "Разместить N датчиков по весам карты (макс. покрытого веса + разнос), "
-            "не ставя их на воду.")
+            "Разместить датчики обоих типов: малые — по выборке маршрутов, большие — "
+            "кольцевым щитом вокруг цели. На воду не ставятся.")
         self._tint(self.btn_place, THEME["ok"])
         self.btn_place.clicked.connect(lambda: self.on_place())
         col.addWidget(self.btn_place)
@@ -1418,7 +1446,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         """Заблокировать кнопки действий на время фонового расчёта (чтобы не запускать
         второй параллельно) и показать курсор ожидания."""
         for b in (self.btn_data, self.btn_build, self.btn_target, self.btn_place,
-                  self.btn_apply, self.btn_reset,
+                  self.btn_apply, self.btn_reset, self.btn_sensors,
                   self.btn_sector, self.btn_sector_clear):    # ← «Задать сектор»/«Убрать»
             b.setEnabled(not busy)
         # кнопка рельефа отдельно: без файла высот она остаётся недоступной и после расчёта
@@ -1995,26 +2023,40 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     SENSOR_COLOR = THREAT_COLORS["sensor"]   # цвет датчиков — см. палитру THREAT_COLORS
 
-    def render_sensors(self, sensors, R):
-        """Нарисовать датчики: у каждого — КОЛЬЦО зоны обзора радиуса R (залитый круг) и
+    def render_sensors(self, sensors, R, sensors_big=None, R_big=0.0):
+        """Нарисовать датчики ДВУХ типов: у каждого — КОЛЬЦО зоны обзора (залитый круг) и
         яркая точка-центр. Старые убираем и создаём заново (число меняется). Стоят поверх
-        всех слоёв (Z=20/21), чтобы маршруты их не перекрывали. Цвет — THREAT_COLORS['sensor']."""
+        всех слоёв (Z=20/21), чтобы маршруты их не перекрывали.
+
+        Малые (радиус `R`) — оранжевые, большие (`R_big`) — сине-фиолетовые и с более
+        слабой заливкой: их круги вчетверо больше по радиусу, при обычной заливке они
+        закрыли бы карту. Большие рисуются НИЖЕ малых (Z=18/19) — иначе крупная зона
+        накрывала бы мелкие значки."""
         for it in self._sensor_items:
             self.pi.removeItem(it)
         self._sensor_items.clear()
-        for i, s in enumerate(sensors, 1):
-            e = QtWidgets.QGraphicsEllipseItem(s[0] - R, s[1] - R, 2 * R, 2 * R)
-            e.setPen(pg.mkPen(_qcolor(self.SENSOR_COLOR, 245), width=2.2))
-            e.setBrush(pg.mkBrush(_qcolor(self.SENSOR_COLOR, 70)))   # залитая зона обзора
-            e.setZValue(20)                                          # НАД всем: маршруты не перекрывают
-            self.pi.addItem(e, ignoreBounds=True)
-            self._sensor_items.append(e)
-        if len(sensors):
-            dots = pg.ScatterPlotItem(
-                [p[0] for p in sensors], [p[1] for p in sensors], size=15, symbol="o",
-                brush=pg.mkBrush(_qcolor(self.SENSOR_COLOR)), pen=pg.mkPen("white", width=1.6))
-            dots.setZValue(21); self.pi.addItem(dots)               # центры — поверх колец
-            self._sensor_items.append(dots)
+        # ⚠️ `sensors_big or []` ЗДЕСЬ НЕЛЬЗЯ: датчики приходят массивом numpy, а его
+        # истинность неопределена — выражение бросает ValueError, и датчики пропадают
+        # с карты целиком (обе группы, вместе с малыми). Проверяем на None явно.
+        big = [] if sensors_big is None else sensors_big
+        for pts, rad, color, fill, z, size in (
+                (big, float(R_big), THREAT_COLORS["sensor_big"], 30, 18, 17),
+                (sensors, float(R), self.SENSOR_COLOR, 70, 20, 15)):
+            if rad <= 0.0:
+                continue
+            for s in pts:
+                e = QtWidgets.QGraphicsEllipseItem(s[0] - rad, s[1] - rad, 2 * rad, 2 * rad)
+                e.setPen(pg.mkPen(_qcolor(color, 245), width=2.2))
+                e.setBrush(pg.mkBrush(_qcolor(color, fill)))      # залитая зона обзора
+                e.setZValue(z)                                    # НАД слоями карты
+                self.pi.addItem(e, ignoreBounds=True)
+                self._sensor_items.append(e)
+            if len(pts):
+                dots = pg.ScatterPlotItem(
+                    [p[0] for p in pts], [p[1] for p in pts], size=size, symbol="o",
+                    brush=pg.mkBrush(_qcolor(color)), pen=pg.mkPen("white", width=1.6))
+                dots.setZValue(z + 1); self.pi.addItem(dots)      # центры — поверх колец
+                self._sensor_items.append(dots)
 
     def render_entry_target(self, entry, target):
         self.entry_scatter.setData([entry[0]], [entry[1]])
@@ -2031,7 +2073,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         t = toggles or {}
         show_pts = bool(t.get("show_entries", True))
         show_lines = bool(t.get("show_sector_lines", False if toggles else True))
-        pts = list(entry_points or [])
+        pts = [] if entry_points is None else list(entry_points)   # numpy: см. render_sensors
         if sector and show_lines:
             b, e1, e2 = sector
             xs, ys = [e1[0], b[0], e2[0]], [e1[1], b[1], e2[1]]
@@ -2334,4 +2376,97 @@ class InputDataDialog(QtWidgets.QDialog):
         vals["threat_L_max_manual"] = (not auto)
         if auto:
             vals.pop("threat_L_max", None)
+        self._on_apply(vals)
+
+
+class SensorsDialog(QtWidgets.QDialog):
+    """НЕмодальное окно «Датчики»: параметры ДВУХ типов сразу.
+
+    Зачем отдельным окном, а не полями в панели: типов стало два, у каждого свой радиус
+    и количество, плюс шаг сетки кандидатов и кратность — в узкой панели это уже не
+    читается. Окно не блокирует программу (`setModal(False)`): карту можно двигать и
+    смотреть, не закрывая настройки. Enter в любом поле применяет всё разом.
+
+    ⚠️ Оба типа считаются ОДНОЙ моделью на ОДНОЙ выборке маршрутов — здесь только ввод.
+    """
+    GROUPS = (
+        ("МАЛЫЕ датчики — сеть по маршрутам", (
+            ("threat_N", "Количество, шт.",
+             "Сколько малых датчиков расставить по выборке маршрутов."),
+            ("threat_R", "Радиус обзора, км",
+             "Радиус зоны обнаружения малого датчика. Шаг сетки кандидатов "
+             "пересчитывается под него автоматически."),
+            ("threat_k", "Кратность засечки k",
+             "Сколько РАЗНЫХ датчиков должны увидеть маршрут, чтобы он считался "
+             "надёжно засечённым."),
+            ("threat_cand_step_km", "Шаг сетки позиций, км",
+             "Через сколько километров стоят кандидатные позиции. Мельче шаг — точнее "
+             "расстановка, но дольше расчёт."),
+        )),
+        ("БОЛЬШИЕ датчики — круговой щит у цели", (
+            ("threat_N_big", "Количество, шт.",
+             "Сколько больших датчиков ставить вокруг цели. 0 — не ставить вовсе."),
+            ("threat_R_big", "Радиус обзора, км",
+             "Радиус зоны обнаружения большого датчика."),
+            ("threat_big_ring_lo", "Кольцо, ближняя доля R",
+             "Ближняя граница кольца вокруг цели, в долях радиуса: не даёт датчикам "
+             "сбиться в кучу над самой целью."),
+            ("threat_big_ring_hi", "Кольцо, дальняя доля R",
+             "Дальняя граница кольца. 1.0 — цель оказывается ровно на краю зоны "
+             "обзора; больше 1.0 цель выйдет из-под наблюдения."),
+        )),
+    )
+    INT_FIELDS = {"threat_N", "threat_k", "threat_N_big"}
+
+    def __init__(self, parent, params, on_apply):
+        super().__init__(parent)
+        self.setWindowTitle("Датчики — два типа")
+        self.setModal(False)                      # НЕ блокирует основное окно
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Tool)
+        self._on_apply = on_apply
+        self._params = params
+        self._edits = {}
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(8)
+        for title, fields in self.GROUPS:
+            box = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QFormLayout(box)
+            for name, label, tip in fields:
+                e = QtWidgets.QLineEdit(self._fmt(getattr(params, name, 0)))
+                e.setToolTip(tip)
+                e.returnPressed.connect(self._apply)
+                self._edits[name] = e
+                form.addRow(label, e)
+            lay.addWidget(box)
+        note = QtWidgets.QLabel(
+            "Большие датчики ставятся в кольце вокруг цели и разносятся по углу "
+            "(щит со всех сторон). Зоны при этом слегка перекрываются: полностью "
+            "развести их и одновременно держать цель под наблюдением нельзя.")
+        note.setWordWrap(True); note.setStyleSheet(f"color:{THEME['muted']};")
+        lay.addWidget(note)
+        row = QtWidgets.QHBoxLayout()
+        btn = QtWidgets.QPushButton("Применить")
+        btn.clicked.connect(self._apply)
+        row.addStretch(1); row.addWidget(btn)
+        lay.addLayout(row)
+
+    @staticmethod
+    def _fmt(v):
+        return f"{int(v)}" if isinstance(v, int) else f"{float(v):g}"
+
+    def refresh(self, params):
+        self._params = params
+        for name, e in self._edits.items():
+            e.setText(self._fmt(getattr(params, name, 0)))
+
+    def _apply(self):
+        """Собрать поля. Нечисловое значение берётся из текущих параметров — ошибка
+        ввода в одном поле не должна ронять остальные."""
+        vals = {}
+        for name, e in self._edits.items():
+            txt = e.text().strip().replace(",", ".")
+            try:
+                vals[name] = int(float(txt)) if name in self.INT_FIELDS else float(txt)
+            except ValueError:
+                vals[name] = getattr(self._params, name)
         self._on_apply(vals)

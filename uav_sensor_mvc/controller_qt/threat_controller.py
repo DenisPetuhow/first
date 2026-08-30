@@ -84,7 +84,8 @@ class ThreatController:
             on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed,
             on_iter_gen_frac=self.on_iter_gen_frac,
             on_zone_added=self.on_zone_added, on_zone_undo=self.on_zone_undo,
-            on_set_sector=self.on_set_sector, on_clear_sector=self.on_clear_sector)
+            on_set_sector=self.on_set_sector, on_clear_sector=self.on_clear_sector,
+            on_sensors_apply=self.on_sensors_apply)
         # перерисовка слоёв при смене масштаба/панораме: прореживание считается по
         # ВИДИМОЙ области, а застройка переключается растр <-> контуры
         self.view.on_view_changed = self._on_view_changed
@@ -182,8 +183,13 @@ class ThreatController:
         lab = THREAT_ITER_MODE_LABELS.get(self.model.p.threat_iter_mode,
                                           self.model.p.threat_iter_mode)
         T = int(self.model.p.threat_iter_routes)
+        # без `or ()`: sensors_big — массив numpy, его истинность неопределена
+        big_arr = getattr(self.model, "sensors_big", None)
+        n_big = 0 if big_arr is None else len(big_arr)
+        big = (f" + {n_big}/{getattr(self.model.p, 'threat_N_big', 0)} больших"
+               if getattr(self.model.p, "threat_N_big", 0) else "")
         return (f"Итерация {len(self.model.iter_routes)}/{T}  |  режим «{lab}»  |  "
-                f"датчиков {len(self.model.sensors)}/{self.model.p.threat_N}  |  "
+                f"датчиков {len(self.model.sensors)}/{self.model.p.threat_N}{big}  |  "
                 f"L_max={self.model.p.threat_L_max:g} км")
 
     # ▶ Пуск / ⏸ Пауза — пошаговая анимация с движением БПЛА
@@ -220,7 +226,9 @@ class ThreatController:
             return False
         self.model.place_sensors()
         self._sensors_at = n
-        self.view.render_sensors(self.model.sensors, self.model.p.threat_R)
+        self.view.render_sensors(self.model.sensors, self.model.p.threat_R,
+                                 getattr(self.model, 'sensors_big', None),
+                                 getattr(self.model.p, 'threat_R_big', 0.0))
         return True
 
     def _anim_stop(self):
@@ -301,6 +309,28 @@ class ThreatController:
         self._run_async("iter", self.model.iter_batch)
 
     # ---- окно «Входные данные»: применить сразу (не блокирует программу) ----
+    def on_sensors_apply(self, vals):
+        """Окно «Датчики»: применить параметры ОБОИХ типов и переставить датчики.
+
+        Карту не пересобираем и маршруты не трогаем — датчики от них зависят, а они от
+        датчиков нет. Меняется только расстановка, поэтому достаточно `on_place`."""
+        r_before = float(getattr(self.model.p, "threat_R", 0.0))
+        for n, v in vals.items():
+            setattr(self.model.p, n, v)
+        if self.model.p.threat_N < 1 or self.model.p.threat_R <= 0:
+            self.view.flash_title("Малых датчиков должно быть ≥ 1, радиус > 0.")
+            return
+        # шаг сетки кандидатов подгоняется под радиус — но только если радиус СМЕНИЛСЯ,
+        # иначе затирали бы значение, которое пользователь только что ввёл в этом окне
+        if abs(float(self.model.p.threat_R) - r_before) > 1e-9:
+            self.model.sync_cand_step()
+        self.view.set_param_values(self.model.p)
+        self.view.refresh_sensors_dialog()
+        if self.model.grid is None:
+            self.view.set_title("Параметры датчиков приняты. Нажмите «Построить карту».")
+            return
+        self.on_place()
+
     def on_input_apply(self, vals):
         gap_before = getattr(self.model.p, "threat_max_gap_km", None)
         for n, v in vals.items():
@@ -646,7 +676,9 @@ class ThreatController:
             self.view.render_crossings(g.crossing_cells_km(), t)
         else:
             self.view.render_crossings(None, t)
-        self.view.render_sensors(self.model.sensors, self.model.p.threat_R)
+        self.view.render_sensors(self.model.sensors, self.model.p.threat_R,
+                                 getattr(self.model, 'sensors_big', None),
+                                 getattr(self.model.p, 'threat_R_big', 0.0))
 
     def on_iter_gen_frac(self, frac):
         """Пользователь сменил долю обобщённой выборки (поле «обобщ. %»). Запоминаем и, если

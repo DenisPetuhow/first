@@ -85,8 +85,11 @@ EXTERNAL = {
     "grep", "sed", "awk", "head", "tail",
     # ПЛАНЫ описывают то, чего в коде ЕЩЁ НЕТ: имена будущих параметров и библиотеки,
     # которые предстоит подключить. До реализации это не расхождение, а замысел —
-    # после реализации имена появятся в коде и фильтр перестанет быть нужен
-    "threat_N_big", "threat_R_big", "threat_k_big",
+    # после реализации имена появятся в коде и фильтр перестанет быть нужен.
+    # `threat_N_big` / `threat_R_big` из этого списка УБРАНЫ: реализованы 29.08.2026.
+    "threat_k_big",
+    # план 7 (адаптивный порог «город» по данным участка) — ещё не реализован
+    "city_area_threshold", "THREAT_CITY_MIN_KM2", "THREAT_CITY_GAP_MIN",
     "pyshp", "fiona", "geopandas", "fastkml", "ezdxf", "shapefile", "json",
     "cp1251", "d_min",          # кодировка и обозначение из формулы плана
 }
@@ -156,6 +159,8 @@ def is_noise(tok, names, strings, modules):
         return True                                   # True, None, except, ValueError
     if re.match(r"^Q[A-Z]", tok):
         return True                                   # QGraphicsScene, QWebEngineView
+    if re.match(r"^[NS]\d{2}[EW]\d{3}$", tok):
+        return True     # имя тайла рельефа SRTM (N62E040) — файл, а не имя в коде
     return False
 
 
