@@ -162,8 +162,10 @@ class ThreatController:
         if g is None:
             return
         t = self.view.get_toggles()
-        if not t.get("show_layers"):
-            return
+        # ⚠️ РАНЬШЕ ЗДЕСЬ БЫЛ ВЫХОД ПРИ СНЯТОЙ ГАЛКЕ «векторные слои». Теперь перерисовка
+        # нужна и без слоёв: от масштаба зависят ещё и ПОДПИСИ пунктов (какие показывать и
+        # какие попали в кадр), а они живут по своей галке. Пустой проход дёшев — слои
+        # получают пустые массивы и прячутся.
         self.view.render_layers(self.model.layers,
                                 self.model.layers.get("bridge_pts", []), t,
                                 built_mask=g._built_cells, extent=g.extent_km())

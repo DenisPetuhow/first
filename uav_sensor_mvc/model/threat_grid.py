@@ -26,6 +26,7 @@ CoverageCache.greedy_weighted).
 """
 import os
 import re
+import json
 import math
 import numpy as np
 
@@ -95,10 +96,24 @@ def bbox_lonlat_to_km(bbox_lonlat, lon0, lat0):
             float(min(y0, y1)), float(max(y0, y1)))
 
 
-def bbox_center_lonlat():
-    """Якорь локального км-фрейма вкладки 3 = центр bbox."""
+def bbox_anchor_lonlat():
+    """Якорь локального км-фрейма вкладки 3 = ЮГО-ЗАПАДНЫЙ УГОЛ участка.
+
+    Отсчёт идёт от левого нижнего угла рамки: x — на восток, y — на север, обе
+    координаты ПОЛОЖИТЕЛЬНЫЕ, от 0 до размера участка (≈95 × 55 км). Так подпись на оси
+    прямо отвечает на вопрос «сколько километров от края участка», а расстояние между
+    двумя точками читается вычитанием без оглядки на знак.
+
+    Прежде якорем был ЦЕНТР bbox, и координаты шли от −47 до +47: у любой точки половина
+    участка имела минус, а «−12.4 км» ни о чём не говорит, пока не вспомнишь, что ноль
+    посередине. На саму математику якорь не влияет (все расчёты — в разностях), это
+    вопрос читаемости.
+
+    ⚠️ ПРИ СМЕНЕ ЯКОРЯ КЭШ СЛОЁВ `.npz` НУЖНО ПЕРЕСОБРАТЬ: в нём лежат уже пересчитанные
+    километры, и слои, собранные при другом якоре, окажутся сдвинуты на пол-участка
+    (`python tools/build_threat_grid.py`)."""
     lo, la, ho, ha = THREAT_BBOX_LONLAT
-    return (0.5 * (lo + ho), 0.5 * (la + ha))
+    return (lo, la)
 
 
 def geo_cache_root():
@@ -1291,6 +1306,10 @@ OSM_LAYER_FILTERS = {
 OSM_PLACE_FILTER = {"place": ["city", "town", "village", "hamlet", "suburb", "borough"]}
 PLACE_LAYER = "place_pts"          # метки-точки: массив (N,3) — x_км, y_км, код типа
 PLACE_POLY_LAYER = "place_poly"    # контуры НП: массивы (M,3) — x_км, y_км, код типа
+# НАЗВАНИЯ пунктов: массив строк, i-я строка отвечает i-й точке PLACE_LAYER. Нужны только
+# для ПОДПИСЕЙ на карте (на расчёт не влияют): подписи подложки впечатаны в тайлы кеглем
+# ~10 px и при обзоре всего участка нечитаемы, поэтому названия рисуются своим шрифтом.
+PLACE_NAME_LAYER = "place_names"
 # Коды типов населённых пунктов. Всё, что `>= 3`, — город (пролёт запрещён), но РАЙОН
 # города (suburb/borough) и сам город различаются: район не самостоятельный пункт и в
 # СТАТИСТИКУ собственной градации не входит — иначе он её ломает. Замер: класс `city`
@@ -1361,9 +1380,13 @@ def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
         parts = _clip_parts(parts, clip)
         if parts:
             out[layer] = parts
-    place_pts, place_poly = _places_from_osm(osm, lon0, lat0, clip)
+    place_pts, place_poly, place_names = _places_from_osm(osm, lon0, lat0, clip)
     if len(place_pts):
         out[PLACE_LAYER] = [place_pts]
+        # имена идут ОТДЕЛЬНЫМ слоем в том же порядке, что и точки: массив строк рядом
+        # с числовым (N,3) не положишь, а в вес этот слой не входит — как и place_pts,
+        # он служебный (сборка веса идёт по списку THREAT_LAYERS, чужие ключи не видит)
+        out[PLACE_NAME_LAYER] = [np.asarray(place_names, dtype="U")]
     if place_poly:
         out[PLACE_POLY_LAYER] = place_poly
     return out
@@ -1636,7 +1659,7 @@ def _places_from_osm(osm, lon0, lat0, clip):
     пятна застройки (внутри города парки, площади и промзоны не размечены как
     landuse=residential, и по одной застройке в центре зияли дыры). Для остальных
     пунктов остаётся точка, а границы даёт пятно застройки вокруг неё."""
-    empty = (np.empty((0, 3), np.float32), [])
+    empty = (np.empty((0, 3), np.float32), [], np.empty(0, "<U1"))
     try:
         gdf = osm.get_data_by_custom_criteria(
             custom_filter=OSM_PLACE_FILTER, filter_type="keep",
@@ -1646,8 +1669,9 @@ def _places_from_osm(osm, lon0, lat0, clip):
     if gdf is None or len(gdf) == 0 or "place" not in gdf.columns:
         return empty
     x0, x1, y0, y1 = clip
-    pts, polys = [], []
-    for geom, kind in zip(gdf.geometry, gdf["place"]):
+    tags = gdf["tags"] if "tags" in gdf.columns else [None] * len(gdf)
+    pts, polys, names = [], [], []
+    for geom, kind, tg in zip(gdf.geometry, gdf["place"], tags):
         code = PLACE_CODES.get(str(kind), -1)
         if code < 0 or geom is None or geom.is_empty:
             continue
@@ -1656,6 +1680,7 @@ def _places_from_osm(osm, lon0, lat0, clip):
         if not (x0 <= x <= x1 and y0 <= y <= y1):
             continue
         pts.append((float(x), float(y), float(code)))
+        names.append(_place_name(tg))
         if geom.geom_type in ("Polygon", "MultiPolygon"):
             for ring in _geom_to_kms(geom, lon0, lat0):
                 R = np.asarray(ring, float)
@@ -1668,7 +1693,26 @@ def _places_from_osm(osm, lon0, lat0, clip):
                 polys.append(np.column_stack(
                     [R, np.full(len(R), float(code))]).astype(np.float32))
     return (np.asarray(pts, np.float32) if pts else np.empty((0, 3), np.float32),
-            polys)
+            polys, np.asarray(names, dtype=object if names else "<U1"))
+
+
+def _place_name(tags):
+    """Название населённого пункта из тегов OSM. Пустая строка — имени нет.
+
+    pyrosm отдаёт теги ОДНОЙ JSON-СТРОКОЙ в колонке `tags`, отдельной колонки `name`
+    у этой выборки нет (проверено на ARX_1: колонки lon/tags/place/geometry/…).
+    Предпочитается `name:ru`: у части пунктов основное имя записано на латинице."""
+    if not tags:
+        return ""
+    try:
+        d = json.loads(tags) if isinstance(tags, str) else dict(tags)
+    except Exception:
+        return ""
+    for key in ("name:ru", "name"):
+        v = d.get(key)
+        if v:
+            return str(v)
+    return ""
 
 
 def _geom_to_kms(geom, lon0, lat0):
@@ -1870,7 +1914,7 @@ class ThreatModel:
 
     def __init__(self, params):
         self.p = params
-        self.lon0, self.lat0 = bbox_center_lonlat()
+        self.lon0, self.lat0 = bbox_anchor_lonlat()
         self.bbox_km = bbox_lonlat_to_km(THREAT_BBOX_LONLAT, self.lon0, self.lat0)
         self.layers = {}
         self.source = ""

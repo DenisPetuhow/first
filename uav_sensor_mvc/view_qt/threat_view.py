@@ -20,7 +20,7 @@ import matplotlib.cm as cm
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS,
-                    THREAT_SPEND_LABELS)
+                    THREAT_SPEND_LABELS, THREAT_VIEW_PAD_KM)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from .ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
 from . import geomap as gm
@@ -123,6 +123,8 @@ THREAT_COLORS = {
     # «раздутые малые». Взят холодный сине-фиолетовый: он далеко от оранжевого малых, от
     # красного возвышенностей и от пурпура запретных зон, а заливка даётся слабой (30 из
     # 255) — круг вчетверо больше по радиусу и при обычной заливке накрыл бы полкарты.
+    # ⚠️ 31.08.2026 пробовали красный (#e01b3c) — заказчик вернул прежний цвет: красным
+    # уже залиты и тяжёлые ячейки весовой карты (turbo), и возвышенности рельефа.
     "sensor_big":  "#7b61ff",
 
     # — ПРОЧИЕ ЗНАЧКИ/ЛЕГЕНДА —
@@ -156,6 +158,12 @@ THREAT_COLORS = {
     "sector_edge": "#101418",           # тёмная подложка под пунктиром (контраст на светлом)
     "entry_pt":    "#ffffff",           # точки входа: белая заливка
     "entry_pt_edge": "#101418",         # и тёмная обводка
+    # НАЗВАНИЯ НАСЕЛЁННЫХ ПУНКТОВ — свой текст поверх подложки. Тёмная буква на светлой
+    # плашке: подложка OSM светлая, весовая карта под ней — палитра turbo (тёмно-синий →
+    # красный), и цветной текст без плашки читался бы через раз. Плашка полупрозрачная,
+    # чтобы не закрывать карту.
+    "place_label":    "#101418",        # цвет букв
+    "place_label_bg": (255, 255, 255, 190),   # плашка под текстом
     "legend_bg":   "#0b111c",           # фон панели-легенды
     "legend_head": "#36c5f0",           # заголовок легенды
     "legend_area": "#ff4dff",           # квадрат «места пролёта» в легенде (= розовая заливка)
@@ -352,7 +360,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._init_basemap(lon0, lat0, lambda: self._map_layer,
                            lambda: self._map_offline,
                            scheme_points=self._orient_points())
-        self._set_view_limits(self.bbox_km)
+        self._set_view_limits(self.bbox_km, THREAT_VIEW_PAD_KM)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
         # смена масштаба/панорама -> перерисовать слои под новый кадр (прореживание по
         # видимой области + переключение застройки растр/контуры). С задержкой, чтобы
@@ -604,7 +612,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         rows.append(f'<span style="color:{c["legend_main"]};font-size:{sq:.1f}pt;">&#9644;&#9644;</span> '
                     f'основной &nbsp; <span style="color:{c["route_gen"]};font-size:{sq:.1f}pt;">'
                     '&#9644;&#9644;</span> выборка<br>')
-        rows.append(f'<span style="color:{c["sensor"]};">&#9679;</span> датчик<br>')
+        rows.append(f'<span style="color:{c["sensor"]};">&#9679;</span> датчик малый &nbsp; '
+                    f'<span style="color:{c["sensor_big"]};">&#9679;</span> большой<br>')
         # рельеф — два независимых слоя показа; цвета те же, что в RELIEF_* выше
         rows.append(f'<span style="color:{c["legend_relief"]};">&#9632;</span> высоты &nbsp; '
                     f'<span style="color:{c["legend_hide"]};">&#9632;</span> укрытие &nbsp; '
@@ -970,6 +979,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
              "разметка: показывает, ОТКУДА отбирались точки входа. По умолчанию скрыта — "
              "на карте важны сами точки. Снятие галок только прячет разметку, сектор "
              "остаётся заданным; убрать его — кнопка «Убрать»."),
+            ("chk_places", "Названия пунктов", True,
+             "Названия населённых пунктов СВОИМ шрифтом поверх карты. Подписи на самой "
+             "подложке впечатаны в картинки-тайлы кеглем около 10 пикселей и при обзоре "
+             "всего участка нечитаемы; эти же — одного размера на любом масштабе. "
+             "Издали показаны только города и посёлки, деревни появляются при "
+             "приближении."),
             ("chk_legend", "Легенда", False,
              "Легенда (какой цвет какой объект) — в левом нижнем углу. По умолчанию "
              "скрыта: она занимает место, а нужна не всегда."),
@@ -1367,9 +1382,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.relief_legend.setHtml(self._relief_legend_html())
         self.pi.addItem(self.relief_legend); self.relief_legend.setVisible(False)
 
-        # рамка bbox
-        self.bbox_item = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["accent"], 180),
-                                                           width=1.6, dash=[8, 5]))
+        self._place_labels = []          # пул подписей НП (см. _render_place_labels)
+
+        # РАМКА УЧАСТКА. Была тонкой и полупрозрачной (1.6 px, alpha 180) и на плотной
+        # весовой карте терялась — граница района читалась как случайная линия слоя.
+        # Теперь полная непрозрачность, вдвое толще и крупнее штрих: рамка ограничивает
+        # ВСЁ, что считает программа, и должна быть видна с первого взгляда.
+        self.bbox_item = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["accent"], 255),
+                                                           width=3.0, dash=[12, 6]))
         self.bbox_item.setZValue(-4)
         kx0, kx1, ky0, ky1 = self.bbox_km
         self.bbox_item.setData([kx0, kx1, kx1, kx0, kx0], [ky0, ky0, ky1, ky1, ky0])
@@ -1424,6 +1444,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_zones=self.chk_zones.isChecked(),
                     show_entries=self.chk_entries.isChecked(),
                     show_sector_lines=self.chk_sector_lines.isChecked(),
+                    show_places=self.chk_places.isChecked(),
                     iter_mode=self._iter_keys[self.combo_iter.currentIndex()],
                     show_legend=self.chk_legend.isChecked())
 
@@ -1470,7 +1491,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         рамка bbox не липла к краям; при широком экране участок помещается полностью
         (пределы вида это теперь допускают, см. _set_view_limits)."""
         kx0, kx1, ky0, ky1 = self.bbox_km
-        self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.06)
+        # отступ — те же километры, что и предел отдаления (_set_view_limits): иначе
+        # «Весь участок» просил бы кадр шире предела, и камера упиралась бы в ограничитель
+        pad = THREAT_VIEW_PAD_KM / max(1e-6, (kx1 - kx0))
+        self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=pad)
 
     def process_pending(self):
         QtWidgets.QApplication.processEvents()
@@ -1579,9 +1603,91 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         else:
             self.bridge_scatter.setData([], [])
             self.bridge_scatter.setVisible(False)
+        self._render_place_labels(layers, toggles)
         # легенда — в левом НИЖНЕМ углу вида, по своему чекбоксу (независимо от слоёв)
         self.legend.setVisible(toggles.get("show_legend", False))
         self.reposition_legends()
+
+    # ── НАЗВАНИЯ НАСЕЛЁННЫХ ПУНКТОВ ────────────────────────────────────────────────
+    # Кегль ПОСТОЯННЫЙ на экране: TextItem живёт в пиксельных координатах, поэтому
+    # подпись читается одинаково и на полном участке, и при увеличении — в отличие от
+    # подписей подложки, которые впечатаны в тайлы и мельчают вместе с картинкой.
+    PLACE_LABEL_PT = 9.5        # кегль подписи, пункты
+    PLACE_LABEL_MAX = 60        # сколько подписей показывать сразу (крупнейшие вперёд)
+    # ПОРОГ ПОКАЗА ПО МАСШТАБУ: ранг пункта (см. _label_rank) против ширины видимой
+    # области в км. Издали подписей должно быть немного, иначе они сливаются в сплошную
+    # полосу текста; вблизи показываются все.
+    PLACE_ZOOM_STEPS = ((60.0, 2),      # шире 60 км — только города и посёлки (town+)
+                        (25.0, 1),      # 25…60 км — плюс сёла
+                        (0.0, 0))       # ближе — все, включая хутора и микрорайоны
+    PLACE_DUP_KM = 6.0          # одно и то же имя ближе этого — один и тот же пункт
+
+    def _render_place_labels(self, layers, toggles):
+        """Подписать населённые пункты своим шрифтом. Имена приходят слоем `place_names`
+        (массив строк) параллельно точкам `place_pts` — см. model/threat_grid.py."""
+        show = bool(toggles.get("show_places", True))
+        pts = layers.get("place_pts") or []
+        names = layers.get("place_names") or []
+        if not show or not len(pts) or not len(names):
+            self._set_place_labels([])
+            return
+        P = np.asarray(pts[0], float)
+        N = np.asarray(names[0])
+        if P.ndim != 2 or P.shape[1] < 3 or len(N) != len(P):
+            self._set_place_labels([])       # рассинхрон имён и точек — молча без подписей
+            return
+        vb = self._view_box_km()
+        width_km = (vb[1] - vb[0]) if vb else float("inf")
+        min_rank = next(c for w, c in self.PLACE_ZOOM_STEPS if width_km > w)
+        rank = np.array([self._label_rank(c) for c in P[:, 2]], float)
+        out = []
+        order = np.argsort(-rank)            # крупные пункты первыми: их подписи важнее
+        for i in order:
+            name = str(N[i]).strip()
+            if not name or rank[i] < min_rank:
+                continue
+            x, y = float(P[i, 0]), float(P[i, 1])
+            if vb and not (vb[0] <= x <= vb[1] and vb[2] <= y <= vb[3]):
+                continue                     # за кадром — не тратить элементы
+            # ОДИН ПУНКТ — ОДНА ПОДПИСЬ. В OSM у пункта бывают и узел `place`, и контур:
+            # оба попадают в слой, и «Мирный» подписывался дважды в полукилометре друг
+            # от друга. Одноимённые точки рядом считаем одним пунктом (первая — старшая
+            # по рангу — и остаётся); одноимённые деревни в разных концах участка при
+            # этом обе подписываются.
+            if any(nm == name and abs(x - px) < self.PLACE_DUP_KM
+                   and abs(y - py) < self.PLACE_DUP_KM for px, py, nm in out):
+                continue
+            out.append((x, y, name))
+            if len(out) >= self.PLACE_LABEL_MAX:
+                break
+        self._set_place_labels(out)
+
+    @staticmethod
+    def _label_rank(code):
+        """Ранг пункта ДЛЯ ПОДПИСИ (не то же, что код типа в расчёте).
+
+        В расчёте код 3 — район города (suburb/borough), и он намеренно стоит ВЫШЕ
+        посёлка: тип пятна берётся максимумом кодов, иначе город с размеченными внутри
+        районами получил бы код района. Для подписей порядок обратный: «Стадион» и
+        «Площадка» — микрорайоны Мирного, и на общем виде они вытесняли собой сам
+        Мирный. Поэтому району даётся ранг 0 — он подписывается только вблизи."""
+        c = int(code)
+        return 0 if c == 3 else c
+
+    def _set_place_labels(self, items):
+        """Обновить пул текстовых элементов. Пул переиспользуется: создавать и удалять
+        QGraphicsItem на каждой перерисовке дороже, чем спрятать лишние."""
+        while len(self._place_labels) < len(items):
+            t = pg.TextItem(anchor=(0.5, -0.25), color=THREAT_COLORS["place_label"],
+                            fill=pg.mkBrush(*THREAT_COLORS["place_label_bg"]))
+            f = t.textItem.font(); f.setPointSizeF(self.PLACE_LABEL_PT); f.setBold(True)
+            t.textItem.setFont(f)
+            t.setZValue(24)                  # поверх слоёв и подложки, под датчиками
+            self.pi.addItem(t); self._place_labels.append(t)
+        for t, (x, y, name) in zip(self._place_labels, items):
+            t.setText(name); t.setPos(x, y); t.setVisible(True)
+        for t in self._place_labels[len(items):]:
+            t.setVisible(False)
 
     # ЦВЕТОВАЯ ШКАЛА — одна на две тепловые карты. Обе рисуются полупрозрачной заливкой
     # по всей области, и держать две шкалы разом негде: они займут правый край вдвое.

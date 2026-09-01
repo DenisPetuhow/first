@@ -21,6 +21,7 @@
   venv в каталоге типа C:\\uav_build\\venv.
 """
 import os
+import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 block_cipher = None
@@ -34,20 +35,71 @@ ROOT = os.path.abspath(os.getcwd())
 rasterio_hidden = collect_submodules("rasterio")
 rasterio_datas = collect_data_files("rasterio")
 
-# ДАННЫЕ, которые кладутся рядом с .exe. Без threat_layers.npz программа бесполезна;
+# ДАННЫЕ, которые кладутся рядом с .exe. Без файла слоёв программа бесполезна;
 # tile_cache даёт карту-подложку без интернета (в кэше зумы 7…15 — весь рабочий диапазон).
+#
+# ⚠️ ПАПКА УЧАСТКА, А НЕ КОРЕНЬ geo_cache. С 29.08.2026 у каждого куска карты своя папка
+# (`geo_cache/<участок>/`: исходник, слои .npz, рельеф). Кладём папку ТОЛЬКО активного
+# участка: чужие данные — это лишние сотни мегабайт, а перепутанный рельеф выглядит как
+# «карта высот не та», без единой ошибки на экране.
+sys.path.insert(0, ROOT)
+from config import THREAT_AREA, THREAT_AREAS      # noqa: E402  (после sys.path)
+
+_area_dir = THREAT_AREAS[THREAT_AREA].get("dir", "")
+_geo_src = os.path.join(ROOT, "geo_cache", _area_dir) if _area_dir \
+    else os.path.join(ROOT, "geo_cache")
+_geo_dst = os.path.join("geo_cache", _area_dir) if _area_dir else "geo_cache"
+
+_area = THREAT_AREAS[THREAT_AREA]
 datas = [
-    (os.path.join(ROOT, "geo_cache", "threat_layers.npz"), "geo_cache"),
-    (os.path.join(ROOT, "geo_cache", "dem.tif"), "geo_cache"),
-    (os.path.join(ROOT, "tile_cache", "osm"), os.path.join("tile_cache", "osm")),
-    (os.path.join(ROOT, "tile_cache", "osm_hot"), os.path.join("tile_cache", "osm_hot")),
+    # только рабочие файлы участка: слои и рельеф. Исходный .osm.pbf нужен лишь для
+    # пересборки карты, в показе бесполезен
+    (os.path.join(_geo_src, _area["layers"]), _geo_dst),
+    # ЗАСТАВКА: без неё программа не упадёт, а просто запустится без эмблемы — молча
+    (os.path.join(ROOT, "resurce", "Эмблема.png"), "resurce"),
     (os.path.join(ROOT, "docs", "Методичка_пользователя.docx"), "docs"),
 ]
+if _area.get("dem"):
+    for _ext in (".tif", ".tiff", ".hgt"):
+        _p = os.path.join(_geo_src, _area["dem"] + _ext)
+        if os.path.exists(_p):
+            datas.append((_p, _geo_dst))
+
+# ТАЙЛЫ ПОДЛОЖКИ — ТОЛЬКО ТЕ, ЧТО НАКРЫВАЮТ УЧАСТОК. Кэш общий и хранит ещё и прежние
+# районы: копировать его целиком — это лишние сотни мегабайт картинок, которые в этой
+# сборке никогда не покажутся (камера ограничена рамкой участка).
+from config import THREAT_BBOX_LONLAT              # noqa: E402
+
+
+def _tile_xy(lon, lat, z):
+    import math
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.log(math.tan(math.radians(lat))
+                            + 1 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n)
+    return x, y
+
+
+_lo, _la, _ho, _ha = THREAT_BBOX_LONLAT
+for _layer in ("osm", "osm_hot"):
+    for _z in range(7, 16):                        # тот же диапазон, что у программы
+        _x0, _y0 = _tile_xy(_lo, _ha, _z)
+        _x1, _y1 = _tile_xy(_ho, _la, _z)
+        for _x in range(_x0, _x1 + 1):
+            _src_dir = os.path.join(ROOT, "tile_cache", _layer, str(_z), str(_x))
+            if not os.path.isdir(_src_dir):
+                continue
+            for _y in range(_y0, _y1 + 1):
+                _f = os.path.join(_src_dir, "%d.png" % _y)
+                if os.path.exists(_f):
+                    datas.append((_f, os.path.join("tile_cache", _layer,
+                                                   str(_z), str(_x))))
+
 datas = [(src, dst) for src, dst in datas if os.path.exists(src)]
 datas += rasterio_datas                     # файлы данных GDAL (см. выше)
 
-# НЕ КЛАДЁМ: severodonetsk.osm.pbf (23 МБ) и старые копии .npz (53 МБ) — они нужны только
-# для пересборки карты, для показа бесполезны.
+# НЕ КЛАДЁМ: исходные .osm.pbf (23 МБ) и старые копии .npz — они нужны только для
+# пересборки карты, для показа бесполезны. Папка `<участок>/архив/` тоже не нужна.
 
 excludes = [
     # ⚠️ RASTERIO ИСКЛЮЧАТЬ НЕЛЬЗЯ: им читается geo_cache/dem.tif (GeoTIFF с высотами).

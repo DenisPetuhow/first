@@ -93,9 +93,12 @@ EXTERNAL = {
     "pyshp", "fiona", "geopandas", "fastkml", "ezdxf", "shapefile", "json",
     "cp1251", "d_min",          # кодировка и обозначение из формулы плана
 }
-# ВЕТКА demo-build: этих имён в рабочей ветке нет намеренно — не расхождение
+# ВЕТКА demo-build: этих имён в рабочей ветке нет намеренно — не расхождение.
+# `UAV_SELFTEST` — режим самопроверки собранной программы: остался в `demo-build`
+# (коммит c547ccc), в `exe-build` и рабочей ветке его нет, и методичка сборки прямо
+# оговаривает это (СБОРКА_EXE §3.2а). Скрипт же видит только «в коде нет».
 DEMO_BRANCH = {"HELP_HTML", "HelpDialog", "DEMO_ONLY_THREAT", "DEMO_MAP_LAYERS",
-               "DEMO_FORCE_OFFLINE", "DEMO_CONSOLE"}
+               "DEMO_FORCE_OFFLINE", "DEMO_CONSOLE", "UAV_SELFTEST"}
 
 
 def collect_code_names():
@@ -161,6 +164,10 @@ def is_noise(tok, names, strings, modules):
         return True                                   # QGraphicsScene, QWebEngineView
     if re.match(r"^[NS]\d{2}[EW]\d{3}$", tok):
         return True     # имя тайла рельефа SRTM (N62E040) — файл, а не имя в коде
+    if re.fullmatch(r"[0-9a-f]{7,40}", tok) and re.search(r"\d", tok):
+        return True     # ХЭШ КОММИТА (c547ccc, 33e86a0): журнал ссылается на точки
+                        # восстановления, и это не имя в коде. Обязательна цифра —
+                        # иначе под правило попало бы обычное слово из букв a…f
     return False
 
 

@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (THREAT_AREA, THREAT_BBOX_LONLAT, THREAT_LAYERS_FILE,
                     THREAT_SOURCE_FILE)
-from model.threat_grid import (area_cache_dir, area_file, bbox_center_lonlat,
+from model.threat_grid import (area_cache_dir, area_file, bbox_anchor_lonlat,
                                layers_from_osm)
 
 
@@ -44,7 +44,7 @@ def main(argv):
     print(f"участок: {THREAT_AREA}  bbox={THREAT_BBOX_LONLAT}")
     print(f"исходник: {pbf}\nприёмник: {out_name}\n")
 
-    lon0, lat0 = bbox_center_lonlat()
+    lon0, lat0 = bbox_anchor_lonlat()
     try:
         layers = layers_from_osm(pbf, lon0, lat0, THREAT_BBOX_LONLAT)
     except RuntimeError as e:
@@ -53,7 +53,10 @@ def main(argv):
     out = {}
     for name, parts in layers.items():
         for i, arr in enumerate(parts):
-            out[f"{name}__{i}"] = np.asarray(arr, np.float32)
+            a = np.asarray(arr)
+            # НАЗВАНИЯ пунктов — массив строк, приводить его к float32 нельзя: слой
+            # сохраняется как есть, остальные (координаты) — в float32, как раньше
+            out[f"{name}__{i}"] = a if a.dtype.kind in "US" else a.astype(np.float32)
         print(f"  [{name}] объектов (частей): {len(parts)}")
     if not out:
         sys.exit("Ни одного объекта не извлечено — проверьте, что bbox pbf-файла "

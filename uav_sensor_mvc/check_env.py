@@ -34,10 +34,10 @@ print("qt ok:", app.platformName(), flush=True)
 # смоук-тест вкладки 3: создать view, отдать ему РЕАЛЬНЫЕ слои и прогнать отрисовку
 import numpy as np
 from view_qt.threat_view import ThreatMapView
-from model.threat_grid import bbox_center_lonlat, bbox_lonlat_to_km, load_layers
+from model.threat_grid import bbox_anchor_lonlat, bbox_lonlat_to_km, load_layers
 from config import THREAT_BBOX_LONLAT, Params
 
-lon0, lat0 = bbox_center_lonlat()
+lon0, lat0 = bbox_anchor_lonlat()
 bbox_km = bbox_lonlat_to_km(THREAT_BBOX_LONLAT, lon0, lat0)
 v = ThreatMapView(bbox_km, lon0, lat0, Params())
 print("ThreatMapView создан; лимиты отрисовки:", v.MAX_LAYER_PTS, v.MAX_LAYER_POLYS,
