@@ -174,7 +174,80 @@ def _make_splash(QtWidgets, QtGui, QtCore, screen_size=None):
     return splash
 
 
+def selftest():
+    """Самопроверка данных: `UAV_SELFTEST=1` перед запуском — программа печатает, что
+    нашла, и завершается, не открывая окна.
+
+    Нужна для СОБРАННОЙ программы: ошибки чтения высот и карты гасятся внутри (файла
+    может не быть — это не повод падать), поэтому снаружи видно только «рельеф не
+    работает», без причины. Здесь причина печатается прямо — именно так нашлась
+    незаметная потеря `rasterio.sample` в первой сборке.
+
+    ⚠️ В `.exe` вывод виден только у сборки с консолью (`DEMO_CONSOLE=1`): у обычной
+    консоли нет вовсе. Из исходников работает всегда.
+
+    ⚠️ Имена файлов НЕ ЗАШИТЫ: участок задаёт их сам (`THREAT_AREAS`), и лежат они в
+    своей папке `geo_cache/<участок>/`. Прежняя версия этой проверки искала
+    `threat_layers.npz` и `dem.tif` в корне кэша и после перехода на папки участков
+    сообщала бы «НЕТ» о файлах, которые на месте."""
+    import importlib.util
+    from model.threat_grid import (geo_cache_root, area_cache_dir, area_file,
+                                   dem_files, ThreatModel)
+    from view_qt import geomap as gm
+    from config import (Params, THREAT_AREA, THREAT_LAYERS_FILE, THREAT_SOURCE_FILE,
+                        THREAT_DEM_FILE, THREAT_BBOX_LONLAT)
+
+    line = "=" * 62
+    print(line)
+    print("САМОПРОВЕРКА ДАННЫХ")
+    print(line)
+    print("участок        :", THREAT_AREA, THREAT_BBOX_LONLAT)
+    print("каталог карты  :", geo_cache_root())
+    print("папка участка  :", area_cache_dir())
+    print("каталог тайлов :", gm.cache_root())
+    for name in (THREAT_LAYERS_FILE, THREAT_SOURCE_FILE):
+        if not name:
+            continue
+        p = area_file(name)
+        print("  %-24s %s" % (name, "есть" if os.path.exists(p) else "НЕТ"))
+    dems = dem_files()
+    print("  файлов рельефа           %d %s"
+          % (len(dems), os.path.basename(dems[0]) if dems else "(нет)"))
+    for mod in ("rasterio", "numpy", "matplotlib", "pyqtgraph", "PyQt5"):
+        ok = importlib.util.find_spec(mod) is not None
+        print("  модуль %-18s %s" % (mod, "есть" if ok else "НЕТ"))
+    # почему именно не читаются высоты — с полной ошибкой, а не молча
+    try:
+        import rasterio
+        if not dems:
+            raise FileNotFoundError("файл рельефа участка не найден: "
+                                    + (THREAT_DEM_FILE or "имя не задано"))
+        with rasterio.open(dems[0]) as ds:
+            # без символа «x» из типографики: консоль Windows его не печатает
+            print("  файл высот открыт: %d x %d, тип %s"
+                  % (ds.width, ds.height, ds.dtypes[0]))
+    except Exception as e:
+        print("  ОШИБКА ЧТЕНИЯ ВЫСОТ: %s: %s" % (type(e).__name__, e))
+    m = ThreatModel(Params())
+    m.ensure_built()
+    print("  слои взяты из     :", m.source)
+    print("  карта построена   :", m.grid is not None)
+    if m.grid is not None:
+        print("  сетка             : %d x %d" % (m.grid.nx, m.grid.ny))
+    print("  высоты загружены  :", m.has_dem())
+    if m.has_dem():
+        m.set_relief(True)
+        m.ensure_built()
+        print("  рельеф в весе     :", m.grid.relief_k() is not None)
+    print(line)
+
+
 def main():
+    # САМОПРОВЕРКА — до всего остального: она не поднимает Qt и не открывает окон,
+    # поэтому работает и там, где интерфейс запуститься не может
+    if os.environ.get("UAV_SELFTEST"):
+        selftest()
+        return
     if _ensure_qt_plugin_path() is None and sys.platform.startswith("win"):
         print("ВНИМАНИЕ: не найдены платформенные плагины Qt (PyQt5).\n"
               "Переустановите PyQt5:\n"

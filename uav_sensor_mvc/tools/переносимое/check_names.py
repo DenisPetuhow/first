@@ -93,12 +93,12 @@ EXTERNAL = {
     "pyshp", "fiona", "geopandas", "fastkml", "ezdxf", "shapefile", "json",
     "cp1251", "d_min",          # кодировка и обозначение из формулы плана
 }
-# ВЕТКА demo-build: этих имён в рабочей ветке нет намеренно — не расхождение.
-# `UAV_SELFTEST` — режим самопроверки собранной программы: остался в `demo-build`
-# (коммит c547ccc), в `exe-build` и рабочей ветке его нет, и методичка сборки прямо
-# оговаривает это (СБОРКА_EXE §3.2а). Скрипт же видит только «в коде нет».
+# ВЕТКА demo-build / exe-build: этих имён в рабочей ветке нет намеренно — не расхождение.
+# ⚠️ `UAV_SELFTEST` из списка УБРАН 02.09.2026: режим перенесён в общий код
+# (`main_qt.py` :: `selftest`), и теперь скрипт обязан его находить. Фильтр, оставленный
+# после переноса, молча скрыл бы настоящую пропажу имени.
 DEMO_BRANCH = {"HELP_HTML", "HelpDialog", "DEMO_ONLY_THREAT", "DEMO_MAP_LAYERS",
-               "DEMO_FORCE_OFFLINE", "DEMO_CONSOLE", "UAV_SELFTEST"}
+               "DEMO_FORCE_OFFLINE", "DEMO_CONSOLE"}
 
 
 def collect_code_names():

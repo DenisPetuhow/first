@@ -380,13 +380,11 @@ KURSK_CITIES = [
 OBLAST_BBOX = (34.05, 50.90, 38.45, 52.35)   # lon_min, lat_min, lon_max, lat_max
 
 
-def city_points_km(lon0=KURSK_LON, lat0=KURSK_LAT):
-    """Города области в локальных км: список (имя, x, y)."""
-    out = []
-    for name, lon, lat in KURSK_CITIES:
-        x, y = lonlat_to_km(lon, lat, lon0, lat0)
-        out.append((name, float(x), float(y)))
-    return out
+# ⚠️ `city_points_km` УДАЛЕНА 02.09.2026 как мёртвая: она переводила `KURSK_CITIES` в
+# км, но вкладка 2 передаёт сам список в `_init_basemap(scheme_points=...)`, а перевод
+# делает миксин подложки. Единственная функция без единого вызова во всём проекте
+# (журнал п. 210). Сами `KURSK_CITIES` и `oblast_outline_km` ЖИВЫЕ — их рисует
+# оффлайн-схема вкладки 2, когда тайлов нет.
 
 
 def oblast_outline_km(lon0=KURSK_LON, lat0=KURSK_LAT):
