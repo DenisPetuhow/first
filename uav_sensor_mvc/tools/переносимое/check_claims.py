@@ -108,9 +108,17 @@ LIMITS = re.compile(r"честные ограничения|чего .{0,20}не
                     r"осознанные упрощения", re.IGNORECASE)
 
 
+# ⚠️ СГЕНЕРИРОВАННЫЕ файлы в смысловых проверках не участвуют. Карта кода — это
+# оглавление исходников: в неё попадают первые строки докстрингов, и фразы вроде
+# «не применено» или «задел» там описывают КОД, а не состояние работ. Без этого
+# исключения число «тем с расхождениями» выросло с 3 до 5 — все новые ложные.
+GENERATED_DIRS = {"карта_кода"}
+
+
 def docs(include_history):
     out = []
     for root, dirs, files in os.walk(os.path.join(ROOT, "теория")):
+        dirs[:] = [d for d in dirs if d not in GENERATED_DIRS]
         if not include_history:
             dirs[:] = [d for d in dirs if d not in HIST_DIRS]
         out += [os.path.join(root, f) for f in files if f.endswith(".md")]
