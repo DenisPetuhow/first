@@ -67,6 +67,9 @@ EXTERNAL = {
     # библиотеки, УПОМЯНУТЫЕ как варианты, но в проект не взятые
     "folium", "mercantile", "osmium", "pyqtlet2", "QtLocation", "QtWebEngine",
     "Leaflet", "MapLibre", "geopandas", "Pillow",
+    # QtSvg — модуль PyQt5 для вектора; в проекте пока не используется, описан
+    # как задел (план 8, §8.5.0)
+    "QtSvg", "QGraphicsSvgItem",
     # инструменты чтения файлов помощником (CLAUDE.md), не код проекта
     "limit", "offset",
     # параметры чужих библиотек, встречающиеся в примерах вызовов
