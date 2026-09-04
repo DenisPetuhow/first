@@ -30,23 +30,49 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import (THREAT_AREA, THREAT_BBOX_LONLAT, THREAT_LAYERS_FILE,
-                    THREAT_SOURCE_FILE)
+from config import (THREAT_AREA, THREAT_AREAS, THREAT_BBOX_LONLAT,
+                    THREAT_LAYERS_FILE, THREAT_SOURCE_FILE)
 from model.threat_grid import (area_cache_dir, area_file, bbox_anchor_lonlat,
-                               layers_from_osm)
+                               geo_cache_root, layers_from_osm)
 
 
 def main(argv):
-    pbf = argv[1] if len(argv) > 1 else area_file(THREAT_SOURCE_FILE)
-    out_name = argv[2] if len(argv) > 2 else THREAT_LAYERS_FILE
+    # `--area <имя>` — собрать слои ДРУГОГО участка, не активируя его в config.
+    # Нужно, когда область заводится заранее (её данные готовят до переключения) —
+    # иначе пришлось бы менять THREAT_AREA туда-обратно и легко забыть вернуть.
+    area_key = THREAT_AREA
+    argv = list(argv)
+    if "--area" in argv:
+        i = argv.index("--area")
+        area_key = argv[i + 1]
+        del argv[i:i + 2]
+        if area_key not in THREAT_AREAS:
+            sys.exit(f"участок '{area_key}' не найден в config.THREAT_AREAS")
+
+    rec = THREAT_AREAS[area_key]
+    bbox = rec["bbox"]
+    lon0, lat0 = bbox[0], bbox[1]          # якорь = ЮГО-ЗАПАДНЫЙ угол (ОГРАНИЧЕНИЯ 5.1г)
+    area_dir = rec.get("dir", "")
+    if area_key == THREAT_AREA:
+        pbf_default = area_file(THREAT_SOURCE_FILE)
+        out_default = THREAT_LAYERS_FILE
+        dst_dir = area_cache_dir()
+    else:
+        dst_dir = os.path.join(geo_cache_root(), area_dir) if area_dir else geo_cache_root()
+        pbf_default = os.path.join(dst_dir, rec["source"])
+        out_default = rec["layers"]
+
+    pbf = argv[1] if len(argv) > 1 else pbf_default
+    out_name = argv[2] if len(argv) > 2 else out_default
     if not os.path.exists(pbf):
         sys.exit(f"Файл не найден: {pbf}")
-    print(f"участок: {THREAT_AREA}  bbox={THREAT_BBOX_LONLAT}")
+    print(f"участок: {area_key}  bbox={bbox}")
     print(f"исходник: {pbf}\nприёмник: {out_name}\n")
 
-    lon0, lat0 = bbox_anchor_lonlat()
+    if area_key == THREAT_AREA:
+        lon0, lat0 = bbox_anchor_lonlat()
     try:
-        layers = layers_from_osm(pbf, lon0, lat0, THREAT_BBOX_LONLAT)
+        layers = layers_from_osm(pbf, lon0, lat0, bbox)
     except RuntimeError as e:
         sys.exit(str(e))
 
@@ -62,7 +88,7 @@ def main(argv):
         sys.exit("Ни одного объекта не извлечено — проверьте, что bbox pbf-файла "
                  "покрывает участок THREAT_BBOX_LONLAT.")
 
-    dst = os.path.join(area_cache_dir(), out_name)     # кладём в папку участка
+    dst = os.path.join(dst_dir, out_name)              # кладём в папку своего участка
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     np.savez_compressed(dst, **out)
     print(f"\nСохранено: {dst}\nВкладка 3 → «Построить карту» теперь возьмёт эти слои.")

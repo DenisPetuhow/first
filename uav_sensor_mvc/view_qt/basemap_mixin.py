@@ -30,11 +30,13 @@ class _BasemapTask(QtCore.QRunnable):
     """Сборка растровой подложки в ФОНОВОМ потоке (чтение/декод/склейка тайлов),
     чтобы интерфейс не подвисал при панораме/зуме/смене слоя."""
 
-    def __init__(self, req_id, layer, box, target_px, allow_net, lon0, lat0, signals):
+    def __init__(self, req_id, layer, box, target_px, allow_net, lon0, lat0, signals,
+                 area=None):
         super().__init__()
         self._req = req_id; self._layer = layer; self._box = box
         self._target_px = target_px; self._allow_net = allow_net
         self._lon0 = lon0; self._lat0 = lat0; self._sig = signals
+        self._area = area
 
     def run(self):
         try:
@@ -42,7 +44,8 @@ class _BasemapTask(QtCore.QRunnable):
             res = gm.build_raster_basemap(kx0, kx1, ky0, ky1, layer=self._layer,
                                           allow_net=self._allow_net,
                                           target_px=self._target_px,
-                                          lon0=self._lon0, lat0=self._lat0)
+                                          lon0=self._lon0, lat0=self._lat0,
+                                          area=self._area)
         except Exception:
             res = None
         try:
@@ -63,15 +66,20 @@ class BasemapMixin:
     BASEMAP_FADE = (0.0, 0.0)
 
     def _init_basemap(self, lon0, lat0, get_layer, get_offline, scheme_points=None,
-                      step_deg=0.2):
+                      step_deg=0.2, tile_area=None):
         """Инициализация тайловой подложки и офлайн-схемы.
 
         lon0/lat0 — якорь км-фрейма; get_layer/get_offline — колбэки текущего слоя и
         офлайн-флага (инверсия зависимостей: миксин не знает, откуда их брать);
         scheme_points — список (имя, lon, lat) ориентиров для схемы; step_deg — шаг
         сетки широт/долгот. Подклассы могут доопределить `_draw_scheme_extra` и
-        `_set_scheme_extra_visible` (напр. вкладка 2 — рамка области)."""
+        `_set_scheme_extra_visible` (напр. вкладка 2 — рамка области).
+
+        tile_area — ПАПКА УЧАСТКА в кэше тайлов (ОГРАНИЧЕНИЯ 5.1д). Вкладка 3 передаёт
+        имя своего участка, вкладка 2 не передаёт ничего и работает со старой общей
+        раскладкой: у неё свой район (Курск) и свои уже скачанные тайлы."""
         self._geo_lon0 = float(lon0); self._geo_lat0 = float(lat0)
+        self._tile_area = tile_area
         self._get_layer = get_layer            # callable -> ключ слоя
         self._get_offline = get_offline        # callable -> bool
         self._scheme_step_deg = float(step_deg)
@@ -134,6 +142,13 @@ class BasemapMixin:
         # по дебаунсу 180 мс). Радикальное решение — послойная отрисовка тайлов
         # отдельными QGraphicsPixmapItem (как slippy-map) или веб-виджет с Leaflet;
         # оставлено на будущее (см. МЕТОДИЧКА_ВКЛАДКА3_ДОРАБОТКИ.md, §4). TODO(map-blur).
+        # РЕЖИМ «ТОЛЬКО СВОЯ КАРТА» (план 8, задача 8.5): подложка не собирается вовсе.
+        # Флаг проверяется здесь, а не в месте включения, потому что перерисовка идёт по
+        # сигналу изменения вида — иначе тайлы вернулись бы при первом же движении мыши.
+        if getattr(self, "_basemap_off", False):
+            self.basemap.setVisible(False)
+            self._set_scheme_visible(False)
+            return
         try:
             (kx0, kx1), (ky0, ky1) = self.vb.viewRange()
         except Exception:
@@ -154,7 +169,8 @@ class BasemapMixin:
         self._map_pool.start(_BasemapTask(self._map_req, layer,
                                           (kx0, kx1, ky0, ky1), target_px, allow_net,
                                           self._geo_lon0, self._geo_lat0,
-                                          self._map_signals))
+                                          self._map_signals,
+                                          getattr(self, "_tile_area", None)))
 
     def _on_basemap_ready(self, payload):
         req_id, layer, res = payload

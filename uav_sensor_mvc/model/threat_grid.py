@@ -35,10 +35,12 @@ import os
 import re
 import json
 import math
+import threading
+
 import numpy as np
 
-from config import (THREAT_BBOX_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
-                    THREAT_LAYERS_FILE, THREAT_AREA_DIR,
+from config import (THREAT_BBOX_LONLAT, THREAT_WORK_LONLAT, THREAT_CELL_M, THREAT_LAYERS,
+                    THREAT_LAYERS_FILE, THREAT_AREA_DIR, THREAT_SOURCE_FILE,
                     THREAT_LAYER_ORDER, THREAT_INTERSECTION_BONUS,
                     THREAT_WATER_BUFFER_M, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_URBAN_MIN_AREA_KM2, THREAT_URBAN_BUFFER_KM,
@@ -79,28 +81,13 @@ THREAT_BIG_ANGLE_TOL = getattr(_P, "threat_big_angle_tol", 0.55)
 _KM_PER_DEG_LAT = 110.574
 
 
-def _km_per_deg_lon(lat0):
-    """Сколько км в одном градусе ДОЛГОТЫ на широте lat0. Меридианы сходятся к полюсам,
-    поэтому длина градуса долготы = 111.32 км × cos(широта) (по широте она почти постоянна,
-    _KM_PER_DEG_LAT). Это и есть локальная равнопромежуточная проекция «градусы → км»."""
-    return 111.320 * math.cos(math.radians(lat0))
-
-
-def lonlat_to_km(lon, lat, lon0, lat0):
-    """Перевод (долгота, широта) → (x, y) в км относительно опорной точки (lon0, lat0).
-    Работает и со скалярами, и с массивами numpy. Единая км-система для сетки/маршрутов/датчиков."""
-    return ((np.asarray(lon, float) - lon0) * _km_per_deg_lon(lat0),
-            (np.asarray(lat, float) - lat0) * _KM_PER_DEG_LAT)
-
-
-def bbox_lonlat_to_km(bbox_lonlat, lon0, lat0):
-    """Прямоугольник участка из градусов (lon_min,lat_min,lon_max,lat_max) → в км
-    (x0,x1,y0,y1), с сортировкой границ по возрастанию."""
-    lo, la, ho, ha = bbox_lonlat
-    x0, y0 = lonlat_to_km(lo, la, lon0, lat0)
-    x1, y1 = lonlat_to_km(ho, ha, lon0, lat0)
-    return (float(min(x0, x1)), float(max(x0, x1)),
-            float(min(y0, y1)), float(max(y0, y1)))
+# ПЕРЕВОД ГРАДУСОВ В КИЛОМЕТРЫ ЖИВЁТ В `model/geo_frame.py` — одна формула на весь
+# проект (план 8, задача 8.3). Раньше он был здесь и, ОТДЕЛЬНОЙ КОПИЕЙ, в
+# `view_qt/geomap.py`: формулы совпадали, но правка одной не доходила до другой, а
+# расхождение проявилось бы не ошибкой, а тихим сдвигом карты относительно данных.
+# Имена ниже оставлены прежними — на них ссылается весь остальной код и документация.
+from .geo_frame import (km_per_deg_lon as _km_per_deg_lon,   # noqa: E402
+                        lonlat_to_km, bbox_lonlat_to_km)
 
 
 def bbox_anchor_lonlat():
@@ -1285,6 +1272,37 @@ def load_layers(lon0, lat0, data_path=None, bbox_lonlat=None):
     return _synthetic_layers(lon0, lat0), "СХЕМА (демо, офлайн)"
 
 
+def _clip_layers_km(layers, bbox_km, margin_km):
+    """Оставить в слоях только то, что попало в рамку района плюс запас (всё в км).
+
+    Кэш `.npz` собран на всю ОБЛАСТЬ показа, а работаем в РАЙОНЕ внутри неё. Режем по
+    габаритам каждого объекта: линия или контур остаётся целиком, если хоть чем-то задел
+    рамку. Разрезать геометрию по границе не нужно — сетка всё равно считает только свои
+    ячейки, а целая линия у края выглядит естественнее обрубка.
+
+    ⚠️ Слой имён (`place_names`) идёт ПАРОЙ к `place_pts`: у них общий порядок, и резать
+    их поодиночке нельзя — подписи разъедутся с точками. Оба оставляем как есть."""
+    x0, x1, y0, y1 = bbox_km
+    x0 -= margin_km; x1 += margin_km
+    y0 -= margin_km; y1 += margin_km
+    out = {}
+    for name, parts in layers.items():
+        if name in ("place_names", "place_pts"):        # связанная пара — не трогаем
+            out[name] = parts
+            continue
+        kept = []
+        for arr in parts:
+            a = np.asarray(arr)
+            if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] < 2 or a.dtype.kind in "US":
+                kept.append(arr)                        # не координаты — оставляем как есть
+                continue
+            if (a[:, 0].max() >= x0 and a[:, 0].min() <= x1 and
+                    a[:, 1].max() >= y0 and a[:, 1].min() <= y1):
+                kept.append(arr)
+        out[name] = kept
+    return out
+
+
 def layers_cache_path():
     """Путь к кэшу слоёв активного участка: `geo_cache/<участок>/<THREAT_LAYERS_FILE>`
     (с откатом в корень кэша — см. `area_file`)."""
@@ -1345,7 +1363,13 @@ PLACE_BUILT_MIN_KM2 = 2.0
 # Запас обрезки геометрии вокруг участка, км. complete_relations=True тянет объекты
 # далеко за bbox (замер: трубопровод от −94 до +94 км при участке ±37) — без клипа это
 # лишний вес в кэше и линии, уходящие за карту.
-OSM_CLIP_MARGIN_KM = 10.0
+#
+# ⚠️ 04.09.2026: было 10 км, стало 3. С разделением «область показа / район расчёта»
+# (план 8, задача 8.2) слои читаются по РАЙОНУ, и запас в 10 км выводил за его границу
+# заметную полосу дорог и рек — карта выглядела так, будто район больше, чем он есть.
+# Три километра оставлены намеренно: линия, чуть выходящая за рамку, не должна
+# обрываться ровно по ней, иначе край района выглядит обрезанным ножницами.
+OSM_CLIP_MARGIN_KM = 3.0
 
 
 def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
@@ -1399,6 +1423,18 @@ def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
     return out
 
 
+# ⚠️ ЧТЕНИЕ РАСТРА ВЫСОТ — ПО ОДНОМУ ПОТОКУ ЗА РАЗ.
+#
+# Растр открывается из ДВУХ мест: `load_dem_grid` — в фоновом потоке пересборки карты
+# (`_run_async("build", …)`), `load_dem_display` — в основном, при отрисовке. GDAL, на
+# котором стоит rasterio, не рассчитан на одновременную работу с одним файлом из разных
+# потоков: это не исключение, а падение процесса целиком — программа просто закрывается.
+# Симптом заказчика 04.09.2026: «при повторном добавлении рельефа программа падает»,
+# причём в самой модели те же четыре цикла включения-выключения проходят без ошибок.
+# Замок дешёвый: чтение и так идёт секунды, а параллельным оно быть не должно.
+_DEM_LOCK = threading.Lock()
+
+
 def load_dem_grid(grid, lon0, lat0, path=None):
     """Высоты рельефа, приведённые к ячейкам сетки: массив (ny,nx) в метрах, NaN — нет
     данных. None, если файла нет (тогда слой рельефа просто не участвует).
@@ -1422,9 +1458,10 @@ def load_dem_grid(grid, lon0, lat0, path=None):
     for p in files:
         try:
             if p.lower().endswith((".tif", ".tiff")):
-                vals = _sample_geotiff(p, lon, lat, cell_deg)
+                with _DEM_LOCK:                    # GDAL — по одному потоку за раз
+                    vals = _sample_geotiff(p, lon, lat, cell_deg)
             else:
-                vals = _sample_hgt(p, lon, lat)
+                vals = _sample_hgt(p, lon, lat)    # .hgt читается чистым numpy, замок не нужен
         except Exception:
             continue
         if vals is not None:
@@ -1478,7 +1515,7 @@ def load_dem_display(lon0, lat0, bbox_km, max_px=1400):
     lon_w, lat_s = km_to_lonlat(np.array(x0), np.array(y0), lon0, lat0)
     lon_e, lat_n = km_to_lonlat(np.array(x1), np.array(y1), lon0, lat0)
     try:
-        with rasterio.open(files[0]) as ds:
+        with _DEM_LOCK, rasterio.open(files[0]) as ds:        # GDAL — по одному потоку
             inv = ~ds.transform
             c_w, r_n = inv * (float(lon_w), float(lat_n))     # север -> меньший row
             c_e, r_s = inv * (float(lon_e), float(lat_s))
@@ -1506,10 +1543,7 @@ def load_dem_display(lon0, lat0, bbox_km, max_px=1400):
     return np.flipud(band), (float(ex0), float(ex1), float(ey0), float(ey1))
 
 
-def km_to_lonlat(x_km, y_km, lon0, lat0):
-    """Обратное к lonlat_to_km: км в локальном фрейме -> (долгота, широта)."""
-    return (np.asarray(x_km, float) / _km_per_deg_lon(lat0) + lon0,
-            np.asarray(y_km, float) / _KM_PER_DEG_LAT + lat0)
+from .geo_frame import km_to_lonlat            # noqa: E402,F401 — общий фрейм (8.3)
 
 
 def _sample_geotiff(path, lon, lat, cell_deg=None):
@@ -1921,8 +1955,20 @@ class ThreatModel:
 
     def __init__(self, params):
         self.p = params
+        # РАМКА РАЙОНА МОДЕЛИРОВАНИЯ. По умолчанию — рамка участка из config, но её можно
+        # задать мышью прямо в программе (план 8, задача 8.2), поэтому она ЖИВЁТ В МОДЕЛИ,
+        # а не читается из константы при каждом построении.
+        # ЯКОРЬ — ЮГО-ЗАПАДНЫЙ УГОЛ ОБЛАСТИ ПОКАЗА, один на весь сеанс (ОГРАНИЧЕНИЯ 5.1г).
+        # Рабочий район его НЕ меняет: иначе уже нарисованное (тайлы, своя карта, рамка)
+        # осталось бы в прежних километрах и разъехалось со слоями.
         self.lon0, self.lat0 = bbox_anchor_lonlat()
-        self.bbox_km = bbox_lonlat_to_km(THREAT_BBOX_LONLAT, self.lon0, self.lat0)
+        self.bbox_lonlat = tuple(THREAT_WORK_LONLAT)
+        self.bbox_km = bbox_lonlat_to_km(self.bbox_lonlat, self.lon0, self.lat0)
+        # РАЙОН НЕ ЗАДАН, пока пользователь его не выбрал (мышью) и не загрузил свою
+        # карту. До этого карта не строится: считать не по чему, а рисовать рамку и
+        # слои «по умолчанию» — обманывать (правило заказчика 04.09.2026).
+        self.area_ready = tuple(THREAT_WORK_LONLAT) != tuple(THREAT_BBOX_LONLAT)
+        self.area_custom = self.area_ready
         self.layers = {}
         self.source = ""
         self.grid = None
@@ -1952,6 +1998,161 @@ class ThreatModel:
         # пересобирается при смене слоёв или добавлении рельефа, а зоны от местности не
         # зависят и переживать пересборку обязаны (переносятся в сетку в `_sync_no_fly`).
         self.no_fly_zones = []
+        # КЭШ ТОГО, ЧТО ЧИТАЕТСЯ С ДИСКА (слои .osm.pbf и высоты). Сбрасывается вместе с
+        # районом и источником — см. `_drop_read_cache`.
+        self._read_key = None
+        self._layers_cache = None
+        self._source_cache = ""
+        self._dem_cache = None
+        # РАЙОН ИЗ config ПРОХОДИТ ТУ ЖЕ ПРИВОДКУ, что и заданный мышью: округление к
+        # целому числу ячеек живёт в `set_area`, и рамка, записанная руками, без него
+        # оставалась дробной. Замер: `work` давал 120.3 км при 241 ячейке (120.5) —
+        # неполная ячейка по краю получала вес по куску своей площади. Найдено
+        # `tools/flow_check.py` с первого же запуска.
+        if self.area_ready:
+            self.set_area(self.bbox_lonlat)
+
+    def _drop_read_cache(self):
+        """Забыть прочитанное с диска: район или источник сменились."""
+        self._read_key = None
+        self._layers_cache = None
+        self._source_cache = ""
+        self._dem_cache = None
+
+    # ---- РАБОЧИЙ РАЙОН (план 8, задача 8.2) ----
+    #
+    # РАЗДЕЛЕНИЕ, о котором просил заказчик: «задаём рабочий район, но не ограничиваем
+    # перемещение по большой области — просто не применяем вне района векторные слои и
+    # рельеф, а саму карту показываем».
+    #
+    #   область ПОКАЗА  — участок из config (`arh`: Плесецк + 100 км, 291 × 250 км):
+    #                     на неё скачаны тайлы и по ней грузятся векторные слои;
+    #   район РАСЧЁТА   — прямоугольник внутри неё: сетка 500 м, веса, маршруты, датчики.
+    #
+    # Почему нельзя считать по всей области: сетка 500 м на 291 × 250 км — это
+    # 582 × 499 = 290 тыс. ячеек против рабочих 21 тыс., в четырнадцать раз больше.
+    def set_area(self, bbox_lonlat):
+        """Задать РАБОЧИЙ РАЙОН (lon_min, lat_min, lon_max, lat_max).
+
+        Пересчитывает якорь км-фрейма (юго-западный угол нового района) и сбрасывает всё,
+        что от рамки зависит: сетку, слои, маршруты, датчики, контекст выборки. Сама карта
+        пересобирается следующим `build()`.
+
+        ⚠️ ЯКОРЬ МЕНЯЕТСЯ ВМЕСТЕ С РАЙОНОМ, а в кэше `.npz` лежат уже посчитанные
+        километры — от ПРЕЖНЕГО якоря. Поэтому при своём районе слои читаются из
+        `.osm.pbf` напрямую (`build`), иначе они легли бы со сдвигом молча."""
+        lo, la, ho, ha = (float(v) for v in bbox_lonlat)
+        lo, ho = min(lo, ho), max(lo, ho)
+        la, ha = min(la, ha), max(la, ha)
+        # ⚠️ ЯКОРЬ НЕ МЕНЯЕТСЯ ВМЕСТЕ С РАЙОНОМ. Сначала он переносился в угол нового
+        # района — и всё, что уже нарисовано в прежнем фрейме (тайлы, своя карта, рамка,
+        # подписи), оставалось на старых километрах: слои легли со сдвигом относительно
+        # карты (замечание заказчика 04.09.2026). Якорь один на ОБЛАСТЬ ПОКАЗА, а район —
+        # просто прямоугольник в тех же километрах. Заодно исчезла морока с округлением:
+        # масштаб «градусы → км» больше не меняется под ногами.
+        x0, y0 = lonlat_to_km(lo, la, self.lon0, self.lat0)
+        x1, y1 = lonlat_to_km(ho, ha, self.lon0, self.lat0)
+        # РАМКА — ЦЕЛОЕ ЧИСЛО ЯЧЕЕК: сетка шагает по 500 м, и неполная ячейка по краю
+        # получила бы вес по куску своей площади. Округляем ВВЕРХ — район не станет меньше.
+        cell = THREAT_CELL_M / 1000.0
+        w = max(cell, math.ceil((float(x1) - float(x0)) / cell - 1e-9) * cell)
+        h = max(cell, math.ceil((float(y1) - float(y0)) / cell - 1e-9) * cell)
+        self.bbox_km = (float(x0), float(x0) + w, float(y0), float(y0) + h)
+        ho2, ha2 = km_to_lonlat(self.bbox_km[1], self.bbox_km[3], self.lon0, self.lat0)
+        self.bbox_lonlat = (lo, la, float(ho2), float(ha2))
+        self.area_custom = True                    # район задан пользователем
+        self.area_ready = True
+        # всё, что считалось по прежней рамке, больше не годится
+        self._drop_read_cache()                     # район сменился — читать заново
+        self.grid = None
+        self.layers = {}
+        self.dem = None
+        self._dem_display = None
+        self.sensors = np.empty((0, 2), float)
+        self.sensors_big = np.empty((0, 2), float)
+        self.candidates = np.empty((0, 2), float)
+        self.routes = []
+        self.iter_routes = []
+        self.iter_iteration = 0
+        self._iter_ctx = None
+        self.route_area = None
+        self.target_km = None                       # цель задавалась в прежних км
+        self.sector_point_km = None
+        self.entry_points = []
+        return self.bbox_km
+
+    def clear_area(self):
+        """Убрать рабочий район: карта, слои, датчики и маршруты обнуляются.
+
+        Возврат к стартовому состоянию — «район не задан»: на экране остаются только
+        подложка и своя карта-картинка, а считать снова не по чему, пока район не задан
+        заново (правило заказчика 04.09.2026)."""
+        self.area_ready = False
+        self.area_custom = False
+        self._drop_read_cache()        # освободить память: слои и высоты больше не нужны
+        self.bbox_lonlat = tuple(THREAT_WORK_LONLAT)
+        self.bbox_km = bbox_lonlat_to_km(self.bbox_lonlat, self.lon0, self.lat0)
+        self.grid = None
+        self.layers = {}
+        self.source = ""
+        self.dem = None
+        self._dem_display = None
+        # ⚠️ РЕЛЬЕФ ТОЖЕ СБРАСЫВАЕТСЯ. Он оставался включённым после снятия района, и
+        # следующее построение шло уже «с рельефом» — при том, что кнопка обещала
+        # обратное, а высоты грузились по другой рамке (заказчик 04.09.2026: «после
+        # моделирования рельеф не сбросился и при повторном построении карты упала
+        # программа»).
+        self.relief_on = bool(THREAT_DEM_ON_START)
+        self.sensors = np.empty((0, 2), float)
+        self.sensors_big = np.empty((0, 2), float)
+        self.candidates = np.empty((0, 2), float)
+        self.routes = []
+        self.iter_routes = []
+        self.iter_iteration = 0
+        self._iter_ctx = None
+        self.route_area = None
+        self.target_km = None
+        self.sector_point_km = None
+        self.entry_points = []
+        self._metrics = {}
+
+    def area_size_km(self):
+        """Размер рабочего района (ширина, высота) в км — для проверок и подписей."""
+        x0, x1, y0, y1 = self.bbox_km
+        return (x1 - x0, y1 - y0)
+
+    # ---- КООРДИНАТЫ НАРУЖУ (план 8, задача 8.3) ----
+    #
+    # Внутри всё считается в километрах локального фрейма — так короче и быстрее. Но
+    # наружу (выгрузка истории полётов, выгрузка позиций датчиков, показ по клику)
+    # координаты обязаны уходить в градусах: километры без якоря бессмысленны, а якорь
+    # меняется вместе с районом. Перевод — единой формулой из `model/geo_frame.py`.
+    def km_to_lonlat_arr(self, pts_km):
+        """Массив (N,2) км -> массив (N,2) градусов (долгота, широта)."""
+        a = np.asarray(pts_km, float).reshape(-1, 2)
+        if len(a) == 0:
+            return np.empty((0, 2), float)
+        lon, lat = km_to_lonlat(a[:, 0], a[:, 1], self.lon0, self.lat0)
+        return np.column_stack([np.asarray(lon, float), np.asarray(lat, float)])
+
+    def sensors_lonlat(self, big=False):
+        """Позиции датчиков в градусах: малые (по умолчанию) или большие."""
+        return self.km_to_lonlat_arr(self.sensors_big if big else self.sensors)
+
+    def routes_lonlat(self, routes=None):
+        """Маршруты в градусах: список массивов (M,2). По умолчанию — накопленные."""
+        src = self.iter_routes if routes is None else routes
+        return [self.km_to_lonlat_arr(r) for r in src]
+
+    def cells_lonlat(self):
+        """ЦЕНТРЫ ячеек сетки в градусах, (M,2) — вместе с `flat_cells` дают
+        «координата ячейки → её вес». Именно центры, а не углы: вес приписан центру."""
+        if self.grid is None:
+            return np.empty((0, 2), float)
+        cx, cy = self.grid.cell_centers_km()
+        pts = np.column_stack([np.asarray(cx, float).ravel(),
+                               np.asarray(cy, float).ravel()])
+        return self.km_to_lonlat_arr(pts)
 
     # ---- ЗАПРЕТНЫЕ ЗОНЫ (рисует пользователь на карте) ----
     def _sync_no_fly(self):
@@ -2052,6 +2253,11 @@ class ThreatModel:
             return False
         self.relief_on = want
         self.grid = None                               # потребуется пересборка
+        # ⚠️ КАРТИНКА ВЫСОТ ТОЖЕ УСТАРЕЛА. `_dem_display` — вырезка растра по рамке, и
+        # она кэшируется. Если рамка успела смениться (район задан заново), в памяти
+        # лежит кусок ПРЕЖНЕГО района: рельеф «не воспроизводится» — на деле показывается
+        # не то место или не показывается вовсе (заказчик 04.09.2026).
+        self._dem_display = None
         return True
 
     def relief_display(self):
@@ -2066,10 +2272,52 @@ class ThreatModel:
         """Загрузить цифровые слои (из файла/кэша/демо) и наложить их на сетку 500 м —
         получить весовую (тепловую) карту. Сбрасывает прежние маршруты/датчики/контекст
         выборки (карта пересобрана). Возвращает готовую ThreatGrid."""
-        self.layers, self.source = load_layers(
-            self.lon0, self.lat0, self.data_path, THREAT_BBOX_LONLAT)
-        probe = ThreatGrid(self.bbox_km, THREAT_CELL_M / 1000.0)   # сетка для выборки высот
-        self.dem = load_dem_grid(probe, self.lon0, self.lat0)      # None, если файла нет
+        # ВСЁ РАСЧЁТНОЕ — ТОЛЬКО В РАБОЧЕМ РАЙОНЕ (правило заказчика 04.09.2026).
+        # Векторные слои, весовая карта и рельеф считаются и рисуются по `bbox_lonlat`,
+        # а не по области показа. За его пределами остаётся только подложка: тайлы и своя
+        # карта-картинка. Так «район моделирования» и на карте виден как район: где есть
+        # слои — там идёт работа.
+        #
+        # ⚠️ ПРИ СВОЁМ РАЙОНЕ КЭШ `.npz` НЕ ГОДИТСЯ: в нём готовые километры от ПРЕЖНЕГО
+        # якоря, а свой район ставит якорь в свой юго-западный угол — слои легли бы со
+        # сдвигом, молча и без единой ошибки. Поэтому читаем исходный `.osm.pbf`.
+        # ⚠️ ЧИТАЕМ КЭШ `.npz`, А НЕ `.osm.pbf` — даже когда район свой.
+        #
+        # Сначала при своём районе принудительно читался исходный `.osm.pbf`: кэш хранит
+        # готовые километры, и при СМЕНЕ ЯКОРЯ они оказались бы сдвинуты. Но якорь больше
+        # не меняется вместе с районом (ОГРАНИЧЕНИЯ 5.1л) — он один на область показа,
+        # тот же, с которым собирался кэш. Значит кэш подходит, а лишнее отрежет сетка.
+        #
+        # Цена ошибки была высокой: чтение `.osm.pbf` требует `pyrosm`, и на машине, где
+        # его нет, построение карты падало с «нужен pyrosm/geopandas» — хотя раньше та же
+        # программа работала на одном numpy (заказчик 04.09.2026). Теперь геостек нужен
+        # ТОЛЬКО для подготовки кэша (`tools/build_threat_grid.py`), один раз на участок.
+        src_path = self.data_path
+        # КЭШ ЧТЕНИЯ С ДИСКА (04.09.2026). Слои и высоты зависят только от РАЙОНА и
+        # ИСТОЧНИКА, а `build()` вызывается на каждый чих: включили рельеф, сменили набор
+        # слоёв, нажали «Применить». Замер до кэша: чтение `.osm.pbf` 4.3 с + чтение
+        # высот 6.0 с = 9.6 с НА КАЖДОЕ построение, причём высоты читались даже когда
+        # рельеф выключен. С кэшем повторное построение — доли секунды.
+        key = (self.bbox_lonlat, src_path, THREAT_SOURCE_FILE)
+        if getattr(self, "_read_key", None) == key and self._layers_cache is not None:
+            self.layers, self.source = dict(self._layers_cache), self._source_cache
+            self.dem = self._dem_cache
+        else:
+            self.layers, self.source = load_layers(
+                self.lon0, self.lat0, src_path, self.bbox_lonlat)
+            if self.area_custom:
+                # Кэш собран на ВСЮ область, а работаем в районе: режем по нему с запасом
+                # OSM_CLIP_MARGIN_KM, иначе за границей района тянулась бы вся область —
+                # он выглядел бы больше, чем есть (заказчик 04.09.2026).
+                self.layers = _clip_layers_km(self.layers, self.bbox_km,
+                                              OSM_CLIP_MARGIN_KM)
+                self.source += " · свой район"
+            probe = ThreatGrid(self.bbox_km, THREAT_CELL_M / 1000.0)   # сетка для высот
+            self.dem = load_dem_grid(probe, self.lon0, self.lat0)      # None, если файла нет
+            self._read_key = key
+            self._layers_cache = dict(self.layers)
+            self._source_cache = self.source
+            self._dem_cache = self.dem
         target = self.target_only_km()
         # вылет — только круг вокруг точки; цель — ещё и её населённый пункт целиком
         # плюс буфер (иначе подлёт к цели в центре города остаётся односторонним).

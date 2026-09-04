@@ -229,6 +229,15 @@ def selftest():
     except Exception as e:
         print("  ОШИБКА ЧТЕНИЯ ВЫСОТ: %s: %s" % (type(e).__name__, e))
     m = ThreatModel(Params())
+    # РАЙОН МОДЕЛИРОВАНИЯ при запуске может быть не задан (план 8, задача 8.2): в
+    # программе его задают мышью или загрузкой своей карты. Самопроверке нужен хоть
+    # какой-то — берём середину области, 40 % её размера: проверяем, что слои читаются и
+    # сетка строится, а не считаем всерьёз.
+    if not m.area_ready:
+        lo, la, ho, ha = m.bbox_lonlat
+        dx, dy = (ho - lo) * 0.3, (ha - la) * 0.3
+        m.set_area((lo + dx, la + dy, ho - dx, ha - dy))
+        print("  район (самопроверка): %.2f x %.2f км" % m.area_size_km())
     m.ensure_built()
     print("  слои взяты из     :", m.source)
     print("  карта построена   :", m.grid is not None)
@@ -301,7 +310,12 @@ def main():
     # Вкладка 3 — цифровая карта угроз (весовая сетка + датчики по весам)
     p3 = Params()
     m3 = ThreatModel(p3)
-    v3 = ThreatMapView(m3.bbox_km, m3.lon0, m3.lat0, p3)
+    # area_max_km — ЧЁРНАЯ рамка: предел, за которым нет ни векторных данных, ни рельефа.
+    # Синяя рамка (район моделирования) появится, когда район зададут (план 8, задача 8.2).
+    from model.geo_frame import bbox_lonlat_to_km as _bb2km
+    from config import THREAT_BBOX_LONLAT as _AREA_BBOX
+    v3 = ThreatMapView(m3.bbox_km, m3.lon0, m3.lat0, p3,
+                       area_max_km=_bb2km(_AREA_BBOX, m3.lon0, m3.lat0))
     c3 = ThreatController(m3, v3)
 
     tabs = QtWidgets.QTabWidget()

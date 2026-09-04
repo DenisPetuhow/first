@@ -18,6 +18,8 @@ VIEW (Qt) · Вкладка 3 «Цифровая карта угроз».
 
 Карта кода — теория/карта_кода/README.md (генерируется codemap.py).
 """
+import math
+
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -26,10 +28,14 @@ import matplotlib.cm as cm
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS,
-                    THREAT_SPEND_LABELS, THREAT_VIEW_PAD_KM)
+                    THREAT_SPEND_LABELS, THREAT_VIEW_PAD_KM, THREAT_AREA_DIR,
+                    THREAT_CELL_M)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from .ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
 from . import geomap as gm
+from . import map_image as mi              # своя карта картинкой (план 8, задача 8.5)
+from .map_image import MapImageDialog
+from model import geo_frame as gf          # общий координатный фрейм (план 8, задача 8.3)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЦВЕТА ВКЛАДКИ 3 — ПРАВИТЬ ЗДЕСЬ (одно место на всю вкладку)
@@ -221,6 +227,35 @@ def _hillshade(h, az_deg=315.0, alt_deg=45.0, z=6.0, lo=0.72, hi=1.22):
     return lo + (hi - lo) * np.clip(shade, 0.0, 1.0)
 
 
+class ShiftedAxis(pg.AxisItem):
+    """Ось, у которой ноль можно перенести в произвольную точку (план 8, задача 8.2).
+
+    ЗАЧЕМ. Расчёт живёт в километрах от юго-западного угла ОБЛАСТИ показа — один фрейм на
+    всё, иначе слои разъезжаются при смене района (ОГРАНИЧЕНИЯ 5.1л). Но человеку, который
+    работает в районе 120 км внутри области 291 км, подписи «135…255 км» ни о чём не
+    говорят: ему нужно «сколько от угла МОЕГО района».
+
+    Сдвигаются только ПОДПИСИ. Данные, сетка, датчики и координаты по клику остаются в
+    общем фрейме — иначе это была бы вторая система отсчёта со всеми её ошибками.
+    За пределами района подписи уходят в минус, и это правильно: минус честно говорит
+    «вы левее (ниже) начала района»."""
+
+    def __init__(self, orientation, **kwargs):
+        super().__init__(orientation, **kwargs)
+        self.origin = 0.0
+
+    def set_origin(self, value):
+        self.origin = float(value)
+        self.picture = None                  # сбросить отрисованный кэш подписей
+        self.update()
+
+    def tickStrings(self, values, scale, spacing):
+        shifted = [v - self.origin for v in values]
+        # шаг сетки не меняется от сдвига, поэтому число знаков берём по нему
+        digits = max(0, int(-math.floor(math.log10(spacing))) if spacing > 0 else 0)
+        return [("%.*f" % (digits, v)) for v in shifted]
+
+
 def _threat_cmap():
     try:
         return pg.colormap.getFromMatplotlib("turbo")
@@ -292,9 +327,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             "шаг 6 км — 17.3 %.",
     }
 
-    def __init__(self, model_bbox_km, lon0, lat0, params):
+    def __init__(self, model_bbox_km, lon0, lat0, params, area_max_km=None):
         super().__init__()
         self.bbox_km = model_bbox_km
+        # МАКСИМАЛЬНАЯ ОБЛАСТЬ РАСЧЁТА — чёрная рамка на карте. За ней нет ни векторных
+        # данных, ни рельефа, поэтому район моделирования дальше неё не имеет смысла.
+        # Не задана — совпадает с рамкой (так у прежних участков, где область и район одно).
+        self.area_max_km = tuple(area_max_km or model_bbox_km)
         self._lon0, self._lat0 = lon0, lat0
         self._map_layer = getattr(params, "map_layer3", "osm")
         self._map_offline = bool(getattr(params, "map_offline3", False))
@@ -325,6 +364,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._sector_mode = False         # ждём клик по краю карты: сектор появления
         self._zone_mode = False           # идёт рисование запретной зоны
         self._zone_pts = []               # вершины зоны, которую рисуют прямо сейчас
+        self._area_mode = False           # идёт задание РАЙОНА МОДЕЛИРОВАНИЯ (8.2)
+        self._area_pts = []               # два угла района, которые тянут сейчас
         self._data_path = None            # текущий источник (для префилла окна выбора)
         self._enabled_layers = None       # текущий набор слоёв (None = все)
 
@@ -345,6 +386,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_zone_added = lambda poly: None      # нарисована запретная зона
         self.on_zone_undo = lambda: None            # убрать последнюю зону
         self.on_choose_data = lambda path, layers: None
+        self.on_set_area = None                    # задан РАБОЧИЙ РАЙОН (план 8, 8.2)
+        self.on_clear_area = None                  # район убран — всё обнулить
+        self._area_ready = False                   # пока район не задан, расчёт закрыт
         self.on_input_apply = lambda vals: None
         self.on_iter_mode = lambda key: None
         self.on_iter_spread = lambda key: None
@@ -357,15 +401,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._params_ref = params         # для префилла окна входных данных
         self._input_dlg = None
         self._sensors_dlg = None          # окно «Датчики» (два типа)
+        self._map_img_dlg = None          # окно «Своя карта» (картинкой)
+        self._map_img_info = None         # что показано: путь и координаты углов
         self.on_sensors_apply = lambda vals: None
 
         self.setWindowTitle("Цифровая карта угроз — вкладка 3")
         self._apply_stylesheet()
         self._build_ui(params)
         self._build_scene_items()
+        # tile_area: тайлы этого участка ложатся в свою папку кэша (ОГРАНИЧЕНИЯ 5.1д).
+        # Уже скачанное остаётся в старой общей раскладке и продолжает находиться.
         self._init_basemap(lon0, lat0, lambda: self._map_layer,
                            lambda: self._map_offline,
-                           scheme_points=self._orient_points())
+                           scheme_points=self._orient_points(),
+                           tile_area=THREAT_AREA_DIR)
         self._set_view_limits(self.bbox_km, THREAT_VIEW_PAD_KM)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
         # смена масштаба/панорама -> перерисовать слои под новый кадр (прореживание по
@@ -391,7 +440,26 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.set_title("Кликните точку на КРАЮ карты — ось сектора пойдёт от цели к ней "
                        "(по 30° в каждую сторону)")
 
+    def _show_click_coords(self, ev):
+        """Координаты точки клика — в строку под картой (план 8, задача 8.3).
+
+        Работает ВСЕГДА и не мешает режимам «указать цель» / «сектор» / «зона»: клик
+        обрабатывают оба обработчика, этот только показывает. Точка одна и та же и в
+        километрах, и в градусах — фрейм общий (`model/geo_frame.py`), поэтому координаты
+        верны и поверх своей карты-картинки, и поверх тайлов."""
+        try:
+            pt = self.vb.mapSceneToView(ev.scenePos())
+            x_km, y_km = float(pt.x()), float(pt.y())
+        except Exception:
+            return
+        lon, lat = gf.km_to_lonlat(x_km, y_km, self._geo_lon0, self._geo_lat0)
+        self.lbl_coords.setText(gf.format_point(float(lon), float(lat), x_km, y_km))
+
     def _on_scene_click(self, ev):
+        self._show_click_coords(ev)
+        if self._area_mode:               # режимы взаимно исключают друг друга:
+            self._area_click(ev)          # иначе один клик колёсиком замкнул бы и
+            return                        # район, и запретную зону
         if self._zone_mode:
             self._zone_click(ev)
             return
@@ -409,6 +477,80 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             return
         self._target_mode = False
         self.on_set_target(float(pt.x()), float(pt.y()))
+
+    # ---- режим «ЗАДАТЬ РАЙОН МОДЕЛИРОВАНИЯ» (план 8, задача 8.2) ----
+    #
+    # Механика повторяет рисование запретной зоны: клики ставят точки, КОЛЁСИКО
+    # принимает. Разница в том, что точек ровно две — противоположные углы, а по ним
+    # строится прямоугольник: сетка 500 м прямоугольная, и никакой другой формы район
+    # принимать не может.
+    def _begin_area(self):
+        self._area_mode = True
+        self._area_pts = []
+        self._draw_area_preview()
+        self.set_title("Район моделирования: два клика — противоположные углы, "
+                       "КОЛЁСИКО — принять, Esc — отмена")
+
+    def _end_area(self, apply_it):
+        pts = list(self._area_pts)
+        self._area_mode = False
+        self._area_pts = []
+        self._draw_area_preview()
+        if not (apply_it and len(pts) >= 2):
+            self.set_title("")
+            return
+        (x0, y0), (x1, y1) = pts[0], pts[-1]
+        kx0, kx1 = min(x0, x1), max(x0, x1)
+        ky0, ky1 = min(y0, y1), max(y0, y1)
+        # Отдаём ровно то, что очертили. Приведение к целому числу ячеек делает МОДЕЛЬ
+        # (`set_area`) — после смены якоря, иначе округление снова становится дробным:
+        # масштаб «градусы → км» зависит от опорной широты (замер — в комментарии там).
+        lon0, lat0 = gf.km_to_lonlat(kx0, ky0, self._geo_lon0, self._geo_lat0)
+        lon1, lat1 = gf.km_to_lonlat(kx1, ky1, self._geo_lon0, self._geo_lat0)
+        if self.on_set_area is not None:
+            self.on_set_area((float(lon0), float(lat0), float(lon1), float(lat1)))
+
+    def _area_click(self, ev):
+        try:
+            btn = ev.button()
+        except Exception:
+            btn = QtCore.Qt.LeftButton
+        try:
+            ev.accept()
+        except Exception:
+            pass
+        if btn == QtCore.Qt.MiddleButton:
+            self._end_area(True)
+            return
+        if btn != QtCore.Qt.LeftButton:
+            return
+        pt = self.vb.mapSceneToView(ev.scenePos())
+        p = (float(pt.x()), float(pt.y()))
+        if len(self._area_pts) >= 2:          # третий клик заменяет второй угол
+            self._area_pts[-1] = p
+        else:
+            self._area_pts.append(p)
+        self._draw_area_preview()
+        if len(self._area_pts) == 2:
+            (ax, ay), (bx, by) = self._area_pts
+            self.set_title("Район %.1f × %.1f км — КОЛЁСИКО принять, клик — сдвинуть угол"
+                           % (abs(bx - ax), abs(by - ay)))
+
+    def _clear_area(self):
+        """Кнопка «Убрать» рядом с районом — сброс к состоянию «район не задан»."""
+        if self.on_clear_area is not None:
+            self.on_clear_area()
+
+    def _draw_area_preview(self):
+        """Прямоугольник, который пользователь тянет прямо сейчас."""
+        pts = self._area_pts
+        if len(pts) < 2:
+            self.area_draw_item.setData([], [])
+            return
+        (ax, ay), (bx, by) = pts[0], pts[-1]
+        xs = [ax, bx, bx, ax, ax]
+        ys = [ay, ay, by, by, ay]
+        self.area_draw_item.setData(xs, ys)
 
     # ---- режим рисования ЗАПРЕТНОЙ ЗОНЫ ----
     def _begin_zone(self):
@@ -448,10 +590,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._draw_zone_preview()
 
     def keyPressEvent(self, ev):
-        """Esc — бросить начатую зону (обычный способ отменить рисование)."""
-        if self._zone_mode and ev.key() == QtCore.Qt.Key_Escape:
-            self._end_zone(False)
-            return
+        """Esc — бросить начатое рисование (зоны или района)."""
+        if ev.key() == QtCore.Qt.Key_Escape:
+            if self._area_mode:
+                self._end_area(False)
+                return
+            if self._zone_mode:
+                self._end_zone(False)
+                return
         super().keyPressEvent(ev)
 
     def _draw_zone_preview(self):
@@ -535,6 +681,81 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             self._data_path, self._enabled_layers = dlg.result_choices()
             self.on_choose_data(self._data_path, self._enabled_layers)
+
+    # ---- своя карта картинкой (план 8, задача 8.5) ----
+    def _open_map_image_dialog(self):
+        """Окно «Своя карта». Не модальное: координаты углов сверяют по самой карте."""
+        from model.threat_grid import geo_cache_root
+        if self._map_img_dlg is None:
+            self._map_img_dlg = MapImageDialog(
+                self, mi.images_dir(geo_cache_root()),
+                self._apply_map_image, self._clear_map_image, self._map_img_info)
+        self._map_img_dlg.show(); self._map_img_dlg.raise_()
+
+    def _apply_map_image(self, path, lon_min, lat_min, lon_max, lat_max,
+                         hide_tiles=False, as_area=False):
+        """Показать картинку по координатам углов. Возвращает строку для окна.
+
+        Углы переводятся в километры ТЕМ ЖЕ преобразованием, что и всё остальное на
+        вкладке, поэтому картинка садится на своё место без отдельной привязки.
+        `hide_tiles` — погасить тайловую подложку под картинкой (она всё равно не видна
+        там, где картинка непрозрачна; смысл — не тратить сеть и не мигать при зуме).
+
+        ⚠️ ПРЕДЕЛЫ ВИДА НЕ ТРОГАЕМ. Сперва режим «только картинка» сжимал район показа до
+        её рамки — и зум с перемещением переставали вести себя как обычно (замечание
+        заказчика 04.09.2026). Картинка живёт в тех же километрах, что и всё остальное,
+        поэтому она ездит и масштабируется вместе с картой сама, без особых правил."""
+        try:
+            rgba, (src_w, src_h) = mi.load_image_rgba(path)
+        except Exception as e:                       # битый файл, нет прав, не картинка
+            return "⚠️ Не удалось прочитать файл: %s" % e
+        kx0, ky0 = gm.lonlat_to_km(lon_min, lat_min, self._geo_lon0, self._geo_lat0)
+        kx1, ky1 = gm.lonlat_to_km(lon_max, lat_max, self._geo_lon0, self._geo_lat0)
+        mi.place_image(self.map_img_item, rgba, (kx0, kx1, ky0, ky1))
+        self._map_img_info = dict(path=path, lon_min=lon_min, lat_min=lat_min,
+                                  lon_max=lon_max, lat_max=lat_max,
+                                  hide_tiles=bool(hide_tiles))
+        self._basemap_off = bool(hide_tiles)
+
+        # ГРАНИЦЫ ПОКАЗА — ДВА РЕЖИМА, по галочке «скрыть тайловую подложку»:
+        #
+        # галочка СТОИТ  — работаем только по этой карте: край картинки и есть граница
+        #                  перемещения, а вид сразу вписывается в неё по размеру окна;
+        # галочка СНЯТА  — картинка лежит внутри большой области: пределы расширяем так,
+        #                  чтобы её края было видно целиком, но ходить можно и вокруг.
+        #
+        # Раньше пределы всегда были по рамке участка (+5 км), и картинка 116.8 км на
+        # участке 95.9 км ОБРЕЗАЛАСЬ краем вида — края нельзя было посмотреть
+        # (снимок заказчика 04.09.2026). Район РАСЧЁТА ни в одном из режимов не меняется:
+        # он задаётся отдельно (задача 8.2).
+        if hide_tiles:
+            self._set_view_limits((kx0, kx1, ky0, ky1), 0.0)
+            self.vb.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.0)
+        else:
+            bx0, bx1, by0, by1 = self.bbox_km
+            self._set_view_limits((min(bx0, kx0), max(bx1, kx1),
+                                   min(by0, ky0), max(by1, ky1)), THREAT_VIEW_PAD_KM)
+        self._refresh_basemap(force=True)
+
+        w_km, h_km = abs(kx1 - kx0), abs(ky1 - ky0)
+        note = " (прорежена с %d×%d)" % (src_w, src_h) if max(src_w, src_h) > mi.MAX_PX else ""
+        tail = (" Тайлы скрыты, перемещение и зум — по краям карты."
+                if hide_tiles else " Тайлы остались фоном вокруг картинки.")
+        # РАМКА КАРТИНКИ КАК РАБОЧИЙ РАЙОН — тяжёлый пересчёт, поэтому отдельной галочкой
+        # и через контроллер (он умеет считать в фоне, не подвешивая окно).
+        if as_area and self.on_set_area is not None:
+            self.on_set_area((lon_min, lat_min, lon_max, lat_max))
+            tail += " Рамка карты назначена рабочим районом — идёт пересчёт."
+        return ("Карта показана: %.1f × %.1f км, %d×%d точек%s. Она лежит ПОД слоями — "
+                "векторные слои, весовая карта, датчики и маршруты рисуются поверх.%s"
+                % (w_km, h_km, rgba.shape[1], rgba.shape[0], note, tail))
+
+    def _clear_map_image(self):
+        """Убрать картинку и вернуть тайловую подложку."""
+        self.map_img_item.setVisible(False)
+        self._map_img_info = None
+        self._basemap_off = False
+        self._refresh_basemap(force=True)
 
     # ---- окно «Входные данные» (не блокирует программу) ----
     def _open_input_dialog(self):
@@ -676,16 +897,36 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         root = QtWidgets.QHBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8); root.setSpacing(8)
 
-        self.plot = pg.PlotWidget()
+        # ОСИ СО СДВИГАЕМЫМ НУЛЁМ: ноль ставится в угол района либо в угол всей области
+        # (чекбокс «отсчёт от угла района» в блоке ПОКАЗ).
+        self._axis_x = ShiftedAxis("bottom")
+        self._axis_y = ShiftedAxis("left")
+        self.plot = pg.PlotWidget(axisItems={"bottom": self._axis_x, "left": self._axis_y})
         self.pi = self.plot.getPlotItem()
         self.pi.setAspectLocked(True)
         self.pi.showGrid(x=True, y=True, alpha=0.12)
         self.pi.setLabel("bottom", "X, км", color=THEME["muted"])
         self.pi.setLabel("left", "Y, км", color=THEME["muted"])
         self.vb = self.pi.getViewBox()
-        root.addWidget(self.plot, stretch=1)
+
+        # КАРТА + СТРОКА КООРДИНАТ ПОД НЕЙ (план 8, задача 8.3). Заказчик просил показ
+        # «справа снизу»: клик по карте — и видно широту с долготой той точки. Строка
+        # отдельным виджетом, а не текстом на сцене: на сцене она ездила бы вместе с
+        # картой при панораме и попадала бы в кадр поверх слоёв.
+        map_box = QtWidgets.QVBoxLayout()
+        map_box.setContentsMargins(0, 0, 0, 0); map_box.setSpacing(2)
+        map_box.addWidget(self.plot, stretch=1)
+        self.lbl_coords = QtWidgets.QLabel("клик по карте — координаты точки")
+        self.lbl_coords.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.lbl_coords.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.lbl_coords.setStyleSheet(
+            "color: %s; font-family: Consolas, monospace; font-size: 11px;"
+            % THEME["muted"])
+        map_box.addWidget(self.lbl_coords)
+        root.addLayout(map_box, stretch=1)
 
         scroll, col = make_side_panel()   # общая для трёх вкладок
+        self._panel = scroll              # по нему гасим панель, пока район не задан
         root.addWidget(scroll)
 
         col.addWidget(self._header("ПАРАМЕТРЫ  (Enter — пересчёт)"))
@@ -711,12 +952,42 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         col.addWidget(self.btn_input)
 
         col.addWidget(self._header("КАРТА УГРОЗ"))
+        # РАЙОН МОДЕЛИРОВАНИЯ — первым: пока он не задан, считать не по чему, и все
+        # остальные кнопки недоступны. Два способа задать: очертить мышью либо загрузить
+        # свою карту — её рамка станет районом (правило заказчика 04.09.2026).
+        row_area = QtWidgets.QHBoxLayout(); row_area.setSpacing(6)
+        self.btn_area = QtWidgets.QPushButton("Задать район моделирования")
+        self.btn_area.setToolTip(
+            "Очертить прямоугольник мышью: два клика — противоположные углы, "
+            "КОЛЁСИКО — принять, Esc — отмена.\n"
+            "Внутри него строятся сетка, весовая карта, рельеф и векторные слои; "
+            "снаружи остаётся только подложка и своя карта-картинка.")
+        self._tint(self.btn_area, THEME["accent2"])
+        self.btn_area.clicked.connect(self._begin_area)
+        self.btn_area_clear = QtWidgets.QPushButton("Убрать")
+        self.btn_area_clear.setToolTip(
+            "Убрать район: карта, слои, датчики и маршруты обнуляются. "
+            "Останется только подложка и своя карта-картинка.")
+        self.btn_area_clear.clicked.connect(self._clear_area)
+        row_area.addWidget(self.btn_area, 3); row_area.addWidget(self.btn_area_clear, 1)
+        col.addLayout(row_area)
+
         self.btn_data = QtWidgets.QPushButton("Выбрать цифровые карты…")
         self.btn_data.setToolTip(
             "Отдельное окно: выбрать источник данных (файл .npz / .osm.pbf либо "
             "авто) и какие слои (реки/дороги/…) накладывать на сетку.")
         self.btn_data.clicked.connect(self._open_data_dialog)
         col.addWidget(self.btn_data)
+
+        # СВОЯ КАРТА КАРТИНКОЙ (план 8, задача 8.5): ложится поверх слоёв, расчёт не
+        # трогает — веса по-прежнему считаются по векторным слоям и рельефу.
+        self.btn_map_img = QtWidgets.QPushButton("Добавить карту (картинкой)…")
+        self.btn_map_img.setToolTip(
+            "Своя карта местности картинкой (.png / .jpg) с координатами углов. "
+            "Ложится ПОВЕРХ векторных слоёв и рельефа; датчики и маршруты остаются "
+            "сверху. Папка по умолчанию — geo_cache/карты_картинки.")
+        self.btn_map_img.clicked.connect(self._open_map_image_dialog)
+        col.addWidget(self.btn_map_img)
 
         self.btn_build = QtWidgets.QPushButton("Построить карту")
         self.btn_build.setToolTip(
@@ -936,6 +1207,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # выдавливают вниз и управление итерациями, и показатели.
     LAYER_GROUPS = (
         ("местность", (
+            ("chk_axes_area", "Отсчёт от угла района", True,
+             "Ноль осей — в юго-западном (левом нижнем) углу РАЙОНА моделирования: видно, "
+             "сколько километров от его края. За пределами района подписи уходят в минус — "
+             "так и должно быть. Снять галочку — ноль вернётся в угол всей области, и все "
+             "координаты станут положительными. Включается сама, когда задан район."),
             ("chk_layers", "Векторные слои", True,
              "Реки, дороги, ЛЭП, железные дороги — то, по чему БПЛА ориентируется."),
             ("chk_relief", "Карта высот", False,
@@ -1120,9 +1396,25 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         раз в конце, а не по разу на каждый слой группы."""
         if self._group_busy:
             return
+        self._apply_axis_origin()            # «отсчёт от угла района» — не слой, а оси
         if self._vec_dialog is not None and self._vec_dialog.isVisible():
             self._vec_dialog.sync()          # окно «Векторные слои» и панель — одно состояние
         self.on_toggle()
+
+    def _apply_axis_origin(self):
+        """Перенести ноль осей: в угол района или в угол всей области.
+
+        Сдвигаются ТОЛЬКО подписи (`ShiftedAxis`). Ни данные, ни координаты по клику от
+        этого не меняются — иначе получилась бы вторая система отсчёта."""
+        chk = getattr(self, "chk_axes_area", None)
+        by_area = bool(chk.isChecked()) if chk is not None else False
+        x0, _x1, y0, _y1 = self.bbox_km if by_area else self.area_max_km
+        self._axis_x.set_origin(x0)
+        self._axis_y.set_origin(y0)
+        self.pi.setLabel("bottom", "X от угла %s, км"
+                         % ("района" if by_area else "области"), color=THEME["muted"])
+        self.pi.setLabel("left", "Y от угла %s, км"
+                         % ("района" if by_area else "области"), color=THEME["muted"])
 
     def _toggle_group(self, kids, on):
         """Переключатель группы: гасит/зажигает детей одной перерисовкой."""
@@ -1259,6 +1551,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             pass
         self.cbar.setVisible(False)
 
+        # СВОЯ КАРТА КАРТИНКОЙ (план 8, задача 8.5). Z = −1: поверх всех слоёв карты,
+        # но под зонами, маршрутами и датчиками — иначе картинка закрыла бы результат.
+        self.map_img_item = mi.make_image_item()
+        self.pi.addItem(self.map_img_item)
+
         # запрет воды (маска)
         self.water_img = pg.ImageItem(); self.water_img.setOpts(axisOrder="row-major")
         self.water_img.setZValue(-7); self.water_img.setOpacity(0.5)
@@ -1338,6 +1635,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             size=10, symbol="o", brush=pg.mkBrush(_qcolor(THREAT_COLORS["zone_pt"])),
             pen=pg.mkPen(THREAT_COLORS["zone_pt_edge"], width=1.8))
         self.zone_draw_pts.setZValue(6.1)
+        # РАЙОН МОДЕЛИРОВАНИЯ, который очерчивают прямо сейчас (план 8, задача 8.2).
+        # Поверх всего (Z = 7): его тянут мышью и должны видеть на фоне любых слоёв.
+        self.area_draw_item = self.pi.plot([], [], antialias=True, connect="all",
+                                           pen=pg.mkPen(_qcolor(THEME["accent"]),
+                                                        width=2.5, dash=[10, 5]))
+        self.area_draw_item.setZValue(7)
         self.pi.addItem(self.zone_draw_pts)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
@@ -1390,6 +1693,23 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         self._place_labels = []          # пул подписей НП (см. _render_place_labels)
 
+        # ДВЕ РАМКИ, И ИХ НЕЛЬЗЯ ПУТАТЬ (правило заказчика 04.09.2026):
+        #
+        #   ЧЁРНАЯ  — предел, дальше которого расчёт невозможен в принципе: за ним нет ни
+        #             векторных данных, ни рельефа. Видна всегда, не зависит от района;
+        #   СИНЯЯ   — РАЙОН МОДЕЛИРОВАНИЯ: где реально строится сетка. Появляется, когда
+        #             район задан, и перерисовывается при каждой его смене.
+        #
+        # Раньше рамка была одна и рисовалась по рамке участка из config — она обещала
+        # район там, где его нет, а настоящий район ничем не обозначался (снимок
+        # заказчика 04.09.2026: слои посчитаны в одном прямоугольнике, рамка вокруг
+        # другого).
+        self.area_max_item = self.pi.plot([], [], pen=pg.mkPen(_qcolor("#000000", 210),
+                                                               width=2.0, dash=[16, 8]))
+        self.area_max_item.setZValue(-4.1)
+        mx0, mx1, my0, my1 = self.area_max_km
+        self.area_max_item.setData([mx0, mx1, mx1, mx0, mx0], [my0, my0, my1, my1, my0])
+
         # РАМКА УЧАСТКА. Была тонкой и полупрозрачной (1.6 px, alpha 180) и на плотной
         # весовой карте терялась — граница района читалась как случайная линия слоя.
         # Теперь полная непрозрачность, вдвое толще и крупнее штрих: рамка ограничивает
@@ -1397,8 +1717,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.bbox_item = self.pi.plot([], [], pen=pg.mkPen(_qcolor(THEME["accent"], 255),
                                                            width=3.0, dash=[12, 6]))
         self.bbox_item.setZValue(-4)
-        kx0, kx1, ky0, ky1 = self.bbox_km
-        self.bbox_item.setData([kx0, kx1, kx1, kx0, kx0], [ky0, ky0, ky1, ky1, ky0])
+        self.bbox_item.setVisible(False)         # появится вместе с районом
 
         # кандидатные позиции
         self.cand_scatter = pg.ScatterPlotItem(
@@ -1469,16 +1788,92 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         finally:
             self._suppress = False
 
+    def _work_buttons(self):
+        """Кнопки, которым нужен заданный РАЙОН МОДЕЛИРОВАНИЯ (план 8, задача 8.2)."""
+        return (self.btn_data, self.btn_build, self.btn_target, self.btn_place,
+                self.btn_apply, self.btn_reset, self.btn_sensors,
+                self.btn_sector, self.btn_sector_clear, self.btn_zone,
+                self.btn_zone_undo, self.btn_input)
+
+    def _panel_widgets(self):
+        """ВСЕ управляющие элементы правой панели: кнопки, галочки, поля, списки.
+
+        Нужны целиком, а не одними кнопками: пока район не задан, менять нельзя ничего —
+        ни галочку слоя, ни число итераций (правило заказчика 04.09.2026). Показывать
+        текущие значения при этом можно, поэтому элементы гасятся, а не прячутся."""
+        types = (QtWidgets.QPushButton, QtWidgets.QCheckBox, QtWidgets.QLineEdit,
+                 QtWidgets.QComboBox, QtWidgets.QSlider, QtWidgets.QRadioButton,
+                 QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)
+        panel = getattr(self, "_panel", None)
+        return panel.findChildren(types) if panel is not None else []
+
     def set_busy(self, busy):
         """Заблокировать кнопки действий на время фонового расчёта (чтобы не запускать
         второй параллельно) и показать курсор ожидания."""
-        for b in (self.btn_data, self.btn_build, self.btn_target, self.btn_place,
-                  self.btn_apply, self.btn_reset, self.btn_sensors,
-                  self.btn_sector, self.btn_sector_clear):    # ← «Задать сектор»/«Убрать»
-            b.setEnabled(not busy)
+        ready = getattr(self, "_area_ready", True)
+        for b in self._work_buttons():
+            b.setEnabled((not busy) and ready)
         # кнопка рельефа отдельно: без файла высот она остаётся недоступной и после расчёта
-        self.btn_relief.setEnabled((not busy) and getattr(self, "_relief_enabled", False))
+        self.btn_relief.setEnabled((not busy) and ready
+                                   and getattr(self, "_relief_enabled", False))
         self.setCursor(QtCore.Qt.WaitCursor if busy else QtCore.Qt.ArrowCursor)
+
+    def set_relief_shown(self, on):
+        """Включить/выключить показ рельефа вместе с самим рельефом.
+
+        Две галочки: «карта высот» (сама местность) и «приоритет по высоте» (что рельеф
+        сделал с весом). Вторая и есть ответ на вопрос «применился ли рельеф», поэтому
+        зажигается именно она; первая — по желанию, её пользователь ставит сам."""
+        chk = getattr(self, "chk_relief_k", None)
+        if chk is None:
+            return
+        self._suppress = True                 # не дёргать перерисовку на программную галку
+        try:
+            chk.setChecked(bool(on))
+        finally:
+            self._suppress = False
+
+    def set_area_rect(self, bbox_km):
+        """Перерисовать СИНЮЮ рамку по текущему району и перенести на него ноль осей."""
+        kx0, kx1, ky0, ky1 = bbox_km
+        self.bbox_km = tuple(bbox_km)
+        self.bbox_item.setData([kx0, kx1, kx1, kx0, kx0], [ky0, ky0, ky1, ky1, ky0])
+        # ГАЛОЧКА ВКЛЮЧАЕТСЯ САМА: район задан — значит отсчёт от него и нужен (правило
+        # заказчика 04.09.2026). Снять её можно вручную, тогда ноль вернётся в угол области.
+        chk = getattr(self, "chk_axes_area", None)
+        if chk is not None and not chk.isChecked():
+            self._group_busy = True          # не дёргать перерисовку слоёв на это
+            try:
+                chk.setChecked(True)
+            finally:
+                self._group_busy = False
+        self._apply_axis_origin()
+
+    def set_area_ready(self, ready, size_km=None, bbox_km=None):
+        """Район задан или нет: от этого зависит вся остальная панель.
+
+        Пока район не задан, активны РОВНО ДВЕ кнопки — «Задать район» и «Добавить карту»
+        (правило заказчика 04.09.2026): работать не с чем, и любое другое действие либо
+        бессмысленно, либо обещает расчёт, которого не будет. Рамка на карте тоже не
+        рисуется — она обозначала бы район, которого нет."""
+        self._area_ready = bool(ready)
+        keep = {self.btn_area, self.btn_map_img}      # ровно две кнопки-входа
+        for w in self._panel_widgets():
+            if w not in keep:
+                w.setEnabled(bool(ready))
+        for w in keep:
+            w.setEnabled(True)
+        if ready and bbox_km is not None:
+            self.set_area_rect(bbox_km)
+        self.bbox_item.setVisible(bool(ready))
+        if ready:
+            self.set_busy(False)                      # вернуть обычную доступность
+            if size_km:
+                self.btn_area.setText("Изменить район (%.0f × %.0f км)" % size_km)
+        else:
+            self.btn_area.setText("Задать район моделирования")
+            self.set_title("Район не задан: очертите его мышью либо загрузите свою карту "
+                           "— её рамка станет районом")
 
     def set_source(self, text):
         self.src_label.setText(f"источник данных: {text}")
@@ -1492,15 +1887,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def set_title(self, text):
         self.pi.setTitle(text, color=THEME["text"], size="10pt")
 
-    def frame_bbox(self):
-        """Показать ВЕСЬ участок целиком (кнопка «Весь участок»). Небольшой отступ, чтобы
-        рамка bbox не липла к краям; при широком экране участок помещается полностью
-        (пределы вида это теперь допускают, см. _set_view_limits)."""
-        kx0, kx1, ky0, ky1 = self.bbox_km
-        # отступ — те же километры, что и предел отдаления (_set_view_limits): иначе
-        # «Весь участок» просил бы кадр шире предела, и камера упиралась бы в ограничитель
-        pad = THREAT_VIEW_PAD_KM / max(1e-6, (kx1 - kx0))
-        self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=pad)
+    def frame_bbox(self, whole_area=False):
+        """Вписать в окно район (по умолчанию) или ВСЮ область показа.
+
+        ⚠️ ОТСТУП — ДОЛЯ КАДРА, А НЕ КИЛОМЕТРЫ. Он был завязан на предел отдаления
+        (`THREAT_VIEW_PAD_KM`), и когда тот вырос с 5 до 100 км, отступ стал 100/120 =
+        83 % ширины: вид отъезжал почти втрое, а на небольшом экране карта превращалась
+        в марку посреди пустого поля (заказчик 04.09.2026). Три процента одинаково
+        уместны и на 13", и на большом мониторе — доля не зависит ни от размера окна,
+        ни от размера района."""
+        kx0, kx1, ky0, ky1 = self.area_max_km if whole_area else self.bbox_km
+        self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.03)
 
     def process_pending(self):
         QtWidgets.QApplication.processEvents()
@@ -2205,7 +2602,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def showEvent(self, e):
         QtWidgets.QWidget.showEvent(self, e)
         if not self._framed:
-            self.frame_bbox()
+            # ПРИ ЗАПУСКЕ ПОКАЗЫВАЕМ ВСЮ ОБЛАСТЬ — чтобы чёрная рамка (предел расчётов)
+            # была видна целиком с первой секунды и на любом экране. Район внутри неё
+            # найдётся по синей рамке; кнопка «Весь участок» вписывает именно район.
+            self.frame_bbox(whole_area=True)
             self._framed = True
         self._refresh_basemap(force=True)
 

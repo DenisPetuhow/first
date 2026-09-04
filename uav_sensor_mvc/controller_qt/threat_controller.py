@@ -91,7 +91,12 @@ class ThreatController:
             on_iter_gen_frac=self.on_iter_gen_frac,
             on_zone_added=self.on_zone_added, on_zone_undo=self.on_zone_undo,
             on_set_sector=self.on_set_sector, on_clear_sector=self.on_clear_sector,
-            on_sensors_apply=self.on_sensors_apply)
+            on_sensors_apply=self.on_sensors_apply, on_set_area=self.on_set_area,
+            on_clear_area=self.on_clear_area)
+        # СТАРТ: район не задан — расчётные кнопки закрыты, синей рамки нет
+        view.set_area_ready(model.area_ready,
+                            model.area_size_km() if model.area_ready else None,
+                            model.bbox_km if model.area_ready else None)
         # перерисовка слоёв при смене масштаба/панораме: прореживание считается по
         # ВИДИМОЙ области, а застройка переключается растр <-> контуры
         self.view.on_view_changed = self._on_view_changed
@@ -157,6 +162,10 @@ class ThreatController:
         self.view.iter_clear_current()
         self.model.set_relief(want)
         self.view.set_relief_button(self.model.relief_on, True)
+        # ПОКАЗ ВКЛЮЧАЕТСЯ ВМЕСТЕ С РЕЛЬЕФОМ. Иначе рельеф применялся к весам, а на карте
+        # ничего не менялось — галка показа осталась снятой, и выглядело это как «рельеф
+        # не воспроизводится» (заказчик 04.09.2026). Выключаем — гасим и показ.
+        self.view.set_relief_shown(self.model.relief_on)
         self._sensors_at = 0
         self._run_async("build", self.model.build)
 
@@ -424,13 +433,20 @@ class ThreatController:
             # файл высот мог появиться (или исчезнуть) между запусками — сверить кнопку
             self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
             self._render_all()
-            self.view.set_title("Карта построена. Считаю все возможные маршруты…")
             self._full_metrics()
             tg = self.view.get_toggles()
             if tg.get("show_iter"):                      # идут итерации — их и обновить
                 self._run_async("iter", self.model.iterate_routes)
-            else:                                        # ВСЕГДА считаем все возможные маршруты
-                self._run_async("routes", self.model.plan_routes)
+            else:
+                # ⚠️ МАРШРУТЫ ПОСЛЕ ПОСТРОЕНИЯ НЕ СЧИТАЕМ (правило заказчика 04.09.2026).
+                # Раньше здесь безусловно запускался `plan_routes` — самая тяжёлая часть
+                # конвейера (два поля Дейкстры, огибающая, выборка путей), и она уходила
+                # в работу при каждом построении карты: включили рельеф, сменили слои,
+                # поправили район. А нужна она только для датчиков и итераций, и там
+                # считается сама, если выборки ещё нет (см. `_work_place`, `on_iter_*`).
+                self.view.set_title(
+                    "Карта построена. «Расставить датчики» или «Пуск» — "
+                    "маршруты посчитаются при первом обращении.")
         elif kind == "place":
             self._render_all()
             me = self.model.metrics()
@@ -472,10 +488,62 @@ class ThreatController:
         self.model.candidates = self.model.candidate_positions()
 
     def _work_place(self):
+        # ВЫБОРКА СЧИТАЕТСЯ ЗДЕСЬ, ЕСЛИ ЕЁ ЕЩЁ НЕТ. Датчики ставятся по маршрутам
+        # (`_sample_for_sensors`): до итераций — по «всем возможным», после — по
+        # накопленным пролётам. Раз маршруты больше не считаются при построении карты
+        # (04.09.2026), первым их спрашивает тот, кому они нужны.
+        if not self.model.iter_routes and not self.model.routes:
+            self.model.plan_routes()
         self.model.place_sensors()
 
     def on_build(self):
         self._run_async("build", self._work_build)
+
+    # ---- РАБОЧИЙ РАЙОН (план 8, задача 8.2) ----
+    def on_set_area(self, bbox_lonlat):
+        """Задать рабочий район: сетка, веса, маршруты и датчики — только по нему.
+
+        Область ПОКАЗА при этом не меняется: подложка и своя карта видны и за его
+        пределами, туда просто не заходит расчёт. Пересборка тяжёлая (чтение `.osm.pbf`
+        и наложение слоёв — десятки секунд), поэтому идёт в фоновом потоке."""
+        self.model.set_area(bbox_lonlat)
+        w_km, h_km = self.model.area_size_km()
+        # синяя рамка — по НОВОМУ району: иначе она осталась бы вокруг прежнего
+        self.view.set_area_ready(True, (w_km, h_km), self.model.bbox_km)
+        # ⚠️ ПРЕДЕЛ РАЙОНА. Дальше ~150 км по широте подложка расходится с векторными
+        # слоями сильнее радиуса малого датчика (план 8 §0.4): тайлы в Меркаторе,
+        # наши слои — в равнопромежуточной проекции, привязка идёт по углам.
+        warn = ""
+        if h_km > 150.0 or w_km > 150.0:
+            warn = (" ⚠️ Район %.0f×%.0f км — больше 150 км: подложка и слои разойдутся, "
+                    "смотрите план 8 §0.4." % (w_km, h_km))
+        # ⚠️ КАРТА НЕ СТРОИТСЯ САМА (правило заказчика 04.09.2026). Район задают, глядя на
+        # местность, и часто поправляют два-три раза подряд; автоматический пересчёт после
+        # каждого движения — это десятки секунд чтения `.osm.pbf` впустую. Считает кнопка
+        # «Построить карту» — как и с выбором цифровых карт (`on_choose_data`).
+        self.view.set_title("Район %.1f × %.1f км задан. Нажмите «Построить карту».%s"
+                            % (w_km, h_km, warn))
+        self.view.set_source("район задан · карта не построена")
+        self.view.set_metrics(["Район %.1f × %.1f км." % (w_km, h_km),
+                               "Нажмите «Построить карту», чтобы наложить слои",
+                               "и посчитать веса."])
+        self._render_all()          # показать новую рамку и убрать старые слои
+
+    def on_clear_area(self):
+        """Убрать рабочий район: всё расчётное обнуляется, остаётся только показ."""
+        self._anim_stop()                      # остановить анимацию полёта, если шла
+        self.view.iter_clear_current()
+        self.view.set_iter_checked(False)
+        self._sensors_at = 0
+        self.model.clear_area()
+        # кнопка рельефа возвращается в исходное «Добавить рельеф»: сам рельеф сброшен
+        self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
+        self.view.set_area_ready(False)
+        self.view.set_source("район не задан")
+        self.view.set_metrics(["Район не задан.",
+                               "Очертите его мышью либо загрузите свою карту —",
+                               "её рамка станет районом моделирования."])
+        self._render_all()
 
     # ---- выбор цифровых карт (источник + слои) из отдельного окна ----
     def on_choose_data(self, path, enabled):
@@ -654,16 +722,44 @@ class ThreatController:
         self.view.set_ab_distance(ab)
         self.view.refresh_input_dialog()                  # окно «Входные данные» — актуальный L_max
         if g is None:
+            # СЕТКИ НЕТ (район не задан или убран) — карту нужно ОЧИСТИТЬ, а не просто
+            # выйти. Раньше здесь стоял голый `return`, и уже нарисованные весовая карта,
+            # рельеф и векторные слои оставались на экране после снятия района: данных
+            # нет, а картинка есть (замечание заказчика 04.09.2026).
+            self.view.render_threat(None, None, t)
+            self.view.render_relief(None, None, t)
+            self.view.render_relief_priority(None, None, None, t)
+            self.view.render_exclusions(None, None, None, t)
+            self.view.render_layers({}, [], t, built_mask=None, extent=None)
+            self.view.render_candidates(None, t)
+            self.view.render_routes([], None, None, t)
+            self.view.render_iter_routes([], t)
+            self.view.render_generalized([], t)
+            self.view.render_iter_heat(None, None, t)
+            self.view.render_crossings(None, t)
+            self.view.render_sensors(np.empty((0, 2), float), self.model.p.threat_R,
+                                     np.empty((0, 2), float), self.model.p.threat_R_big)
             return
         extent = g.extent_km()
         # рельеф: карта высот берётся в РОДНОМ разрешении (сетка 500 м для показа груба),
         # приоритет — с сетки, потому что он показывает ровно то, что ушло в вес
+        # ⚠️ ЧТЕНИЕ РЕЛЬЕФА ЗАЩИЩЕНО try. Растр читается с диска ПРИ ОТРИСОВКЕ, и на
+        # большом файле (у активной области `arh_hh.tif` — 568 МБ, 20908 × 8256) любая
+        # беда — нехватка памяти, битый тайл, срезанный край — валила бы всю перерисовку,
+        # а с ней и окно. Показ высот — не то, ради чего стоит терять карту: при сбое
+        # гасим слой и пишем причину в заголовок (заказчик 04.09.2026: «при выборе
+        # рельефа программа крашится»).
         if t.get("show_relief"):
-            disp = self.model.relief_display()
-            if disp is None:
-                self.view.render_relief(g.relief_height(), extent, t)
-            else:
-                self.view.render_relief(disp[0], disp[1], t)
+            try:
+                disp = self.model.relief_display()
+                if disp is None:
+                    self.view.render_relief(g.relief_height(), extent, t)
+                else:
+                    self.view.render_relief(disp[0], disp[1], t)
+            except Exception as e:                       # noqa: BLE001 — донесём в UI
+                self.view.render_relief(None, None, t)
+                self.view.flash_title("Не удалось показать высоты: %s: %s"
+                                      % (type(e).__name__, e))
         else:
             self.view.render_relief(None, None, t)
         self.view.render_relief_priority(g.relief_k(), g.relief_cut(), extent, t)

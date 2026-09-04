@@ -90,6 +90,31 @@ EXTERNAL = {
     "threat_k_big",
     # план 7 (адаптивный порог «город» по данным участка) — ещё не реализован
     "city_area_threshold", "THREAT_CITY_MIN_KM2", "THREAT_CITY_GAP_MIN",
+    # предложение задачи З2: сделать источник разброса и профиля расхода явным, как уже
+    # сделано для приоритета по весу (THREAT_ROUTE_MODE_SRC). В коде появятся, когда
+    # решение будет принято; до тех пор это замысел, а не расхождение
+    "THREAT_ROUTE_SPREAD_SRC", "THREAT_ROUTE_SPEND_SRC",
+    # ПЛАН 8 (карта, координаты, интерфейс): имена ЧУЖИХ API и имя будущего состояния.
+    # `linear_sum_assignment` и `savetxt` названы там как то, чего в проекте НЕТ
+    # (scipy не установлен, выгрузки нет вовсе) — это и есть суть абзацев; `ZValue`,
+    # `anchor`, `devicePixelRatio` — методы Qt/pyqtgraph; `area_defined` — состояние,
+    # которое появится вместе с заданием района мышью (задача 8.2).
+    "linear_sum_assignment", "savetxt", "ZValue", "devicePixelRatio", "area_defined",
+    "anchor",
+    # то же — имена, которые план 8 ЗАВОДИТ: класс окна ввода (задача 8.7) и переменная
+    # окружения с именем участка для кэша тайлов (8.1). Появятся в коде при реализации
+    "InputWindow", "UAV_TILE_AREA",
+    # ПОДПИСИ С КАРТИНКИ ЗАКАЗЧИКА (МЕТОДИЧКА_ЗАГРУЗКА_КАРТ, проверка привязки):
+    # это надписи на самой карте, латиницей, а не имена в коде
+    "MIRNY", "PLESETSK", "SAVINSKIY",
+    # ИМЕНА ПАКЕТОВ из УСТАНОВКА_БИБЛИОТЕК.md — это содержимое папки
+    # offline_packages, зависимости зависимостей. В коде проекта они не
+    # импортируются напрямую (их тянут pyrosm, geopandas, rasterio, matplotlib)
+    "PyQt5_Qt5", "pyqt5_sip", "affine", "certifi", "click", "cligj", "colorama",
+    "contourpy", "cycler", "cykhash", "fonttools", "kiwisolver", "lxml",
+    "packaging", "pandas", "pillow", "pyogrio", "pyparsing", "python_dateutil",
+    "python_docx", "python_rapidjson", "setuptools", "typing_extensions",
+    "tzdata", "protobuf",
     "pyshp", "fiona", "geopandas", "fastkml", "ezdxf", "shapefile", "json",
     "cp1251", "d_min",          # кодировка и обозначение из формулы плана
 }

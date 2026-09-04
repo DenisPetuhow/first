@@ -26,25 +26,29 @@ KURSK_LAT = 51.7306
 _KM_PER_DEG_LAT = 110.574
 
 
-def _km_per_deg_lon(lat0):
-    """Км на градус долготы на широте lat0. РАНЬШЕ это была модульная константа от
-    KURSK_LAT, из-за чего lonlat_to_km(..., lat0=...) игнорировал переданную широту —
-    для Курска (по умолчанию) верно, но для чужого участка (вкладка 3, ~48.7°) давало
-    ~6% ошибку масштаба по X и рассинхрон векторных слоёв с подложкой. Теперь масштаб
-    считается от фактического якоря."""
-    return 111.320 * math.cos(math.radians(lat0))
+# ФОРМУЛА ПЕРЕВОДА — ОДНА НА ПРОЕКТ, в `model/geo_frame.py` (план 8, задача 8.3).
+# Здесь лежала её ВТОРАЯ КОПИЯ: числа совпадали с моделью, но ничто этого не
+# гарантировало — правка одной копии не дошла бы до другой, и векторные слои разъехались
+# бы с подложкой молча, без единой ошибки. Импорт модели из представления допустим:
+# `geo_frame` — чистый модуль без Qt и без config (MVC не нарушается, зависимость идёт
+# в разрешённую сторону «представление → модель»).
+#
+# Историческая мель, ради которой это писалось: `_km_per_deg_lon` когда-то была
+# КОНСТАНТОЙ от KURSK_LAT, и `lonlat_to_km(..., lat0=...)` игнорировал переданную
+# широту — для Курска верно, а для участка вкладки 3 давало ~6 % ошибки масштаба по X.
+from model.geo_frame import (km_per_deg_lon as _km_per_deg_lon,   # noqa: E402
+                             lonlat_to_km as _ll_to_km,
+                             km_to_lonlat as _km_to_ll)
 
 
 def km_to_lonlat(x_km, y_km, lon0=KURSK_LON, lat0=KURSK_LAT):
-    """Локальные км (восток, север от центра) -> (долгота, широта)."""
-    return (lon0 + np.asarray(x_km) / _km_per_deg_lon(lat0),
-            lat0 + np.asarray(y_km) / _KM_PER_DEG_LAT)
+    """Локальные км (восток, север от якоря) -> (долгота, широта)."""
+    return _km_to_ll(x_km, y_km, lon0, lat0)
 
 
 def lonlat_to_km(lon, lat, lon0=KURSK_LON, lat0=KURSK_LAT):
-    """(долгота, широта) -> локальные км (восток, север от центра)."""
-    return ((np.asarray(lon) - lon0) * _km_per_deg_lon(lat0),
-            (np.asarray(lat) - lat0) * _KM_PER_DEG_LAT)
+    """(долгота, широта) -> локальные км (восток, север от якоря)."""
+    return _ll_to_km(lon, lat, lon0, lat0)
 
 
 # ----------------------------------------------------------------------
@@ -119,8 +123,20 @@ def discover_local_layers():
     for name in sorted(os.listdir(root)):
         if name in TILE_LAYERS or name == "scheme":
             continue
-        if os.path.isdir(os.path.join(root, name)):
-            out.append(name)
+        p = os.path.join(root, name)
+        if not os.path.isdir(p):
+            continue
+        # ⚠️ ОТЛИЧИТЬ СЛОЙ ОТ ПАПКИ УЧАСТКА. С 03.09.2026 в корне кэша лежат и папки
+        # участков (<cache>/plesetsk/osm/…), а они не слои: внутри слоя первым уровнем
+        # идут ЗУМЫ (числа), внутри участка — имена слоёв (буквы). Без этой проверки
+        # «plesetsk» попал бы в список слоёв и предлагался бы в выпадающем списке карт.
+        try:
+            kids = os.listdir(p)
+        except OSError:
+            continue
+        if kids and not any(k.isdigit() for k in kids):
+            continue                                  # это папка участка, а не слой
+        out.append(name)
     return out
 
 
@@ -139,15 +155,38 @@ def cache_root():
 
 _TILE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
+# ПАПКА УЧАСТКА В КЭШЕ ТАЙЛОВ (правило «данные участка — в папке участка», ОГРАНИЧЕНИЯ
+# 5.1д). Новая раскладка: <cache>/<участок>/<слой>/{z}/{x}/{y}. Старая — <cache>/<слой>/…
+#
+# ⚠️ СТАРОЕ НЕ ПЕРЕКЛАДЫВАЕМ (решение заказчика 03.09.2026): уже скачанные 13 273 тайла
+# остаются на месте и продолжают находиться — старая раскладка служит ЗАПАСНЫМ местом
+# поиска, ровно как корень geo_cache/ для файлов участка (threat_grid.area_file).
+# В папку участка пишется только то, что качается заново.
+#
+# Имя участка передаётся ПАРАМЕТРОМ, а не берётся из config: этот модуль намеренно не
+# зависит от config (только stdlib + numpy), и у вкладок разные районы — вкладка 2
+# работает по Курску, вкладка 3 по своему участку. area=None -> прежнее поведение.
+TILE_AREA_ENV = os.environ.get("UAV_TILE_AREA", "").strip()
+
+
+def _area_dir(area):
+    """Имя папки участка: явный аргумент, иначе UAV_TILE_AREA, иначе '' (старая
+    раскладка). Пустая строка означает «без папки участка»."""
+    name = TILE_AREA_ENV if area is None else str(area or "")
+    return name.strip().strip("/\\")
+
 
 def _tms_y(z, y):
     """XYZ <-> TMS: ось Y инвертирована (TMS считает строки снизу вверх)."""
     return (2 ** int(z)) - 1 - int(y)
 
 
-def tile_cache_path(layer, z, x, y, ext=".png"):
-    """Путь тайла в кэше. y уже в РАСКЛАДКЕ КЭША (если слой TMS — см. _cache_y)."""
-    return os.path.join(cache_root(), layer, str(z), str(x), f"{y}{ext}")
+def tile_cache_path(layer, z, x, y, ext=".png", area=None):
+    """Путь тайла в кэше. y уже в РАСКЛАДКЕ КЭША (если слой TMS — см. _cache_y).
+    area — папка участка; пусто -> старая раскладка <cache>/<слой>/…"""
+    a = _area_dir(area)
+    parts = [cache_root()] + ([a] if a else []) + [layer, str(z), str(x), f"{y}{ext}"]
+    return os.path.join(*parts)
 
 
 def _cache_y(layer, z, y, layer_tms=None):
@@ -159,14 +198,20 @@ def _cache_y(layer, z, y, layer_tms=None):
     return _tms_y(z, y) if tms else y
 
 
-def find_cached_tile(layer, z, x, y):
+def find_cached_tile(layer, z, x, y, area=None):
     """Найти файл тайла в кэше, перебирая известные расширения и XYZ/TMS.
-    Возвращает путь или None."""
+    Возвращает путь или None.
+
+    ДВА МЕСТА ПОИСКА, по порядку: папка участка (новая раскладка) и корень кэша
+    (старая). Второе — не «на всякий случай», а рабочий путь: там лежат все тайлы,
+    скачанные до 03.09.2026, и перекладывать их не будем."""
     cy = _cache_y(layer, z, y)
-    for ext in _TILE_EXTS:
-        p = tile_cache_path(layer, z, x, cy, ext)
-        if os.path.exists(p):
-            return p
+    a = _area_dir(area)
+    for folder in ([a] if a else []) + [""]:
+        for ext in _TILE_EXTS:
+            p = tile_cache_path(layer, z, x, cy, ext, area=folder)
+            if os.path.exists(p):
+                return p
     return None
 
 
@@ -201,12 +246,16 @@ def _decode_tile(data):
     return arr.astype(np.float32)
 
 
-def fetch_tile_bytes(layer, z, x, y, allow_net=True, timeout=6):
+def fetch_tile_bytes(layer, z, x, y, allow_net=True, timeout=6, area=None):
     """Байты тайла: сперва оффлайн-кэш (перебор расширений + XYZ/TMS для слоя),
     затем (если разрешено и слой известен в TILE_LAYERS) сеть с кешированием.
     Возвращает bytes или None. Слои НЕ из TILE_LAYERS (локальные, например 'Sat')
-    читаются ТОЛЬКО из кэша — сеть для них не запрашивается."""
-    found = find_cached_tile(layer, z, x, y)
+    читаются ТОЛЬКО из кэша — сеть для них не запрашивается.
+
+    ⚠️ Скачанный тайл кладётся в ПАПКУ УЧАСТКА (area), а ищется — и там, и в старой
+    общей раскладке. Так детальные уровни z13–15 докачиваются сами при приближении и
+    сразу ложатся правильно (план 8, задача 8.1)."""
+    found = find_cached_tile(layer, z, x, y, area=area)
     if found:
         try:
             with open(found, "rb") as f:
@@ -226,7 +275,8 @@ def fetch_tile_bytes(layer, z, x, y, allow_net=True, timeout=6):
         req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         data = urllib.request.urlopen(req, context=ctx, timeout=timeout).read()
         cy = _cache_y(layer, z, y)                        # онлайн-источники всегда XYZ,
-        path = tile_cache_path(layer, z, x, cy, _sniff_ext(data))  # но пишем в раскладке слоя
+        path = tile_cache_path(layer, z, x, cy, _sniff_ext(data),   # но пишем в раскладке слоя
+                               area=area)                 # и в папку своего участка
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:                       # кешируем для оффлайна
             f.write(data)
@@ -243,15 +293,17 @@ _TILE_MEM_MAX = 512
 _TILE_MEM_LOCK = threading.Lock()
 
 
-def _decoded_tile_u8(layer, z, x, y, allow_net):
+def _decoded_tile_u8(layer, z, x, y, allow_net, area=None):
     """Тайл как uint8 RGBA (256,256,4) из памяти/диска/сети, либо None."""
-    key = (layer, int(z), int(x), int(y))
+    # участок — ЧАСТЬ КЛЮЧА: у двух участков могут совпасть (z, x, y) на общих зумах,
+    # и без участка в ключе вкладка получила бы чужую картинку из памяти
+    key = (_area_dir(area), layer, int(z), int(x), int(y))
     with _TILE_MEM_LOCK:
         hit = _TILE_MEM.get(key)
         if hit is not None:
             _TILE_MEM.move_to_end(key)
             return hit
-    data = fetch_tile_bytes(layer, z, x, y, allow_net)
+    data = fetch_tile_bytes(layer, z, x, y, allow_net, area=area)
     if data is None:
         return None
     try:
@@ -301,7 +353,7 @@ def _pick_zoom(lon_min, lon_max, zmin=ZOOM_MIN, zmax=ZOOM_MAX,
 
 def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
                          max_tiles=192, target_px=None, lon0=KURSK_LON,
-                         lat0=KURSK_LAT):
+                         lat0=KURSK_LAT, area=None):
     """Собрать подложку для км-окна [kx0,kx1]×[ky0,ky1].
 
     Возвращает (rgba (H,W,4) uint8, (ex0,ex1,ey0,ey1) км-экстент картинки) либо
@@ -342,7 +394,7 @@ def build_raster_basemap(kx0, kx1, ky0, ky1, layer="osm", allow_net=True,
     got = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(jobs) or 1)) as pool:
         fut_map = {pool.submit(_decoded_tile_u8, layer, z, x0 + ix, y0 + iy,
-                               allow_net): (ix, iy) for ix, iy in jobs}
+                               allow_net, area): (ix, iy) for ix, iy in jobs}
         for fut in concurrent.futures.as_completed(fut_map):
             ix, iy = fut_map[fut]
             try:
