@@ -1972,8 +1972,7 @@ class ThreatModel:
         self.layers = {}
         self.source = ""
         self.grid = None
-        self.sensors = np.empty((0, 2), float)       # МАЛЫЕ датчики (радиус threat_R)
-        self.sensors_big = np.empty((0, 2), float)   # БОЛЬШИЕ (threat_R_big) — щит у цели
+        self._reset_sensors()          # sensors, sensors_big и их спутники — см. метод
         self.candidates = np.empty((0, 2), float)
         self._metrics = {}
         self.dem = None                # высоты рельефа на сетке (None — файла нет)
@@ -1998,6 +1997,13 @@ class ThreatModel:
         # пересобирается при смене слоёв или добавлении рельефа, а зоны от местности не
         # зависят и переживать пересборку обязаны (переносятся в сетку в `_sync_no_fly`).
         self.no_fly_zones = []
+        # ДАТЧИКИ, ЗАДАННЫЕ ЧЕЛОВЕКОМ (мышью, строкой в таблице или из файла) — список
+        # `model.sensors.ManualSensor`. По той же причине, что и зоны выше: заданы
+        # человеком, от местности не зависят и переживают и пересборку карты, и смену
+        # района. Якорь области при смене района не двигается, поэтому их километры
+        # остаются верными. Расстановка читает их в `_place_by_routes` (статические —
+        # принудительные позиции, см. `manual_of_type`).
+        self.manual_sensors = []
         # КЭШ ТОГО, ЧТО ЧИТАЕТСЯ С ДИСКА (слои .osm.pbf и высоты). Сбрасывается вместе с
         # районом и источником — см. `_drop_read_cache`.
         self._read_key = None
@@ -2068,8 +2074,7 @@ class ThreatModel:
         self.layers = {}
         self.dem = None
         self._dem_display = None
-        self.sensors = np.empty((0, 2), float)
-        self.sensors_big = np.empty((0, 2), float)
+        self._reset_sensors()
         self.candidates = np.empty((0, 2), float)
         self.routes = []
         self.iter_routes = []
@@ -2103,8 +2108,7 @@ class ThreatModel:
         # моделирования рельеф не сбросился и при повторном построении карты упала
         # программа»).
         self.relief_on = bool(THREAT_DEM_ON_START)
-        self.sensors = np.empty((0, 2), float)
-        self.sensors_big = np.empty((0, 2), float)
+        self._reset_sensors()
         self.candidates = np.empty((0, 2), float)
         self.routes = []
         self.iter_routes = []
@@ -2341,7 +2345,11 @@ class ThreatModel:
         # маркеры переправ — по РЕАЛЬНЫМ координатам мостов, а не по центрам ячеек
         self.layers["bridge_pts"] = self.grid.bridge_points_km(
             self.layers.get("bridge", []))
-        self.sensors = np.empty((0, 2), float)
+        # ⚠️ СБРАСЫВАЮТСЯ И БОЛЬШИЕ ТОЖЕ. Раньше здесь обнулялись только малые, и после
+        # пересборки карты большие оставались висеть по координатам прежней расстановки —
+        # асимметрия, заметная глазом на карте. На контрольный прогон не влияет: там
+        # `build()` идёт ДО расстановки, обнулять нечего.
+        self._reset_sensors()
         self.routes = []
         self.iter_routes = []
         self.iter_iteration = 0
@@ -2622,8 +2630,15 @@ class ThreatModel:
 
     # ---- кандидатные позиции датчика (сетка минус вода) ----
     def auto_cand_step_km(self):
-        """Каким шаг сетки ДОЛЖЕН быть при текущем радиусе: половина R, 0.5…6 км."""
-        return round(float(np.clip(0.5 * float(self.p.threat_R), 0.5, 6.0)), 2)
+        """Каким шаг сетки ДОЛЖЕН быть при текущих радиусах: половина R, 0.5…6 км.
+
+        ⚠️ R берётся НАИМЕНЬШИЙ среди работающих малых типов (1–3), а не радиус типа 1.
+        Типы живут в одной сетке кандидатов, и шаг, годный для крупного типа, для мелкого
+        окажется грубым: дыра между кандидатами станет шире, чем тот видит (замер при
+        R = 2 км — засечка 96.7 % при шаге 0.5 км против 82.7 % при 3 км). Пока работает
+        один тип 1, значение то же, что и раньше."""
+        from .sensors import min_small_radius
+        return round(float(np.clip(0.5 * min_small_radius(self.p), 0.5, 6.0)), 2)
 
     def sync_cand_step(self, force=False):
         """Подогнать шаг сетки под радиус — но только КОГДА РАДИУС СМЕНИЛСЯ.
@@ -2639,7 +2654,15 @@ class ThreatModel:
         Чем шире обзор и чем больше датчиков, тем меньше значит шаг — при R = 6 км разницы
         нет вовсе. Половина радиуса — компромисс по цене: при R = 2 км это 4 436 кандидатов
         и 0.8 с против 17 847 и 3.2 с у шага 0.5 км, а выигрыш последнего — доли процента."""
-        R = float(self.p.threat_R)
+        from .sensors import min_small_radius
+        R = float(min_small_radius(self.p))
+        # ⚠️ ГАЛОЧКА «АВТО» СНЯТА — шаг задан руками и держится, что бы ни менялось.
+        # Раньше введённое значение жило только до следующей смены радиуса, и человек,
+        # сознательно выбравший мелкий шаг, молча его терял (по образцу
+        # `threat_L_max_manual`, где та же развилка решена флагом).
+        if getattr(self.p, "threat_cand_step_manual", False):
+            self._cand_step_for_R = R
+            return float(self.p.threat_cand_step_km)
         if force or getattr(self, "_cand_step_for_R", None) != R:
             self.p.threat_cand_step_km = self.auto_cand_step_km()
             self._cand_step_for_R = R
@@ -2675,12 +2698,165 @@ class ThreatModel:
         out[ok] = wm[iy[ok], ix[ok]]
         return out
 
+    # ---- датчики, заданные человеком (задача 8.7) ----
+    def _reset_sensors(self):
+        """Обнулить расстановку — координаты И ИХ СПУТНИКИ разом.
+
+        ⚠️ ОДНИМ МЕТОДОМ, а не тремя присваиваниями в каждом месте сброса. У массива
+        `sensors` есть спутники той же длины (`sensors_type` — чей это тип, 1–3;
+        `sensors_static` — закреплён ли человеком), и разойтись им нельзя: таблица в
+        окне и подписи на карте читают их по одному индексу с координатами. Сбросов
+        три (смена района, снятие района, пересборка карты), и рассинхрон был бы
+        вопросом времени.
+
+        ⚠️ `manual_sensors` ЗДЕСЬ НЕ ТРОГАЕТСЯ. Это не результат расчёта, а задание
+        человека: оно переживает и пересборку карты, и смену района — как запретные
+        зоны. Убирается только явно, из таблицы окна."""
+        self.sensors = np.empty((0, 2), float)       # МАЛЫЕ датчики (типы 1–3)
+        self.sensors_big = np.empty((0, 2), float)   # БОЛЬШИЕ (тип 4) — щит у цели
+        self.sensors_type = np.empty(0, int)         # тип каждого малого: 1, 2 или 3
+        self.sensors_static = np.empty(0, bool)      # закреплён человеком
+        self.sensors_big_static = np.empty(0, bool)  # то же для больших
+
+    def _tag_sensors(self):
+        """Проставить спутники расстановки: тип каждого датчика и признак «статический».
+
+        Тип заполняется, только если его не выставила сама расстановка (пока типы 2–3
+        пусты, всё, что она вернула, — тип 1). Статическим считается датчик, чья позиция
+        СОВПАЛА с заданной человеком: сравнение по координате, а не по индексу, потому
+        что жадный алгоритм возвращает позиции, а не номера кандидатов.
+
+        ⚠️ Допуск сравнения 1 м. Точное равенство float здесь ненадёжно: позиция
+        проходит через массив кандидатов и обратно, и последний бит мантиссы может не
+        совпасть, а расхождение в метр на карте с ячейкой 500 м ничего не значит."""
+        n, nb = len(self.sensors), len(self.sensors_big)
+        if len(self.sensors_type) != n:
+            self.sensors_type = np.ones(n, int)        # пока все малые — тип 1
+        self.sensors_static = self._match_manual(self.sensors, small=True)
+        self.sensors_big_static = self._match_manual(self.sensors_big, small=False)
+        if len(self.sensors_big_static) != nb:         # страховка от рассинхрона
+            self.sensors_big_static = np.zeros(nb, bool)
+
+    def _match_manual(self, pts, small=True, tol_km=0.001):
+        """Маска: какие из позиций `pts` поставил ЧЕЛОВЕК.
+
+        ⚠️ Все ручные, а не только помеченные «статический»: с 05.09.2026 якорем служит
+        любая заданная человеком позиция, и на карте квадратом отмечается именно это —
+        «место выбрал человек, программа его не двигала»."""
+        pts = np.asarray(pts, float)
+        out = np.zeros(len(pts), bool)
+        if not len(pts):
+            return out
+        want = [m for m in self.manual_sensors
+                if ((m.type_id != 4) if small else (m.type_id == 4))]
+        for m in want:
+            d = np.hypot(pts[:, 0] - m.x_km, pts[:, 1] - m.y_km)
+            j = int(np.argmin(d))
+            if d[j] <= tol_km:
+                out[j] = True
+        return out
+
+    def sensors_table(self):
+        """ВСЕ датчики на карте одной таблицей — то, что показывает окно «Исходные
+        данные» (задача 8.7) и что уходит в файл (8.7.7).
+
+        Возвращает список словарей: номер, тип, режим, координаты в градусах и в км.
+        Собирается из результата расстановки, поэтому таблица заполняется В ОБОИХ
+        режимах работы окна: и когда позиции считает алгоритм, и когда их задал человек.
+        Нумерация сквозная — сперва малые (типы 1–3), потом большие (тип 4)."""
+        rows = []
+        for pts, static, big in ((self.sensors, self.sensors_static, False),
+                                 (self.sensors_big, self.sensors_big_static, True)):
+            pts = np.asarray(pts, float)
+            for i in range(len(pts)):
+                if big:
+                    tid = 4
+                elif i < len(self.sensors_type):
+                    tid = int(self.sensors_type[i])
+                else:
+                    tid = 1
+                st = bool(static[i]) if i < len(static) else False
+                lon, lat = km_to_lonlat(pts[i, 0], pts[i, 1], self.lon0, self.lat0)
+                rows.append(dict(n=len(rows) + 1, type_id=tid, static=st,
+                                 lon=float(lon), lat=float(lat),
+                                 x_km=float(pts[i, 0]), y_km=float(pts[i, 1])))
+        return rows
+
+    def add_manual_sensor(self, type_id, static, x_km, y_km):
+        """Добавить датчик, заданный человеком (клик по карте, строка таблицы, файл).
+
+        Возвращает добавленную запись — окну нужно её показать в таблице."""
+        from .sensors import ManualSensor, TYPE_IDS
+        tid = int(type_id)
+        if tid not in TYPE_IDS:
+            raise ValueError("нет типа датчика %r (есть %s)" % (type_id, list(TYPE_IDS)))
+        rec = ManualSensor(type_id=tid, static=bool(static),
+                           x_km=float(x_km), y_km=float(y_km))
+        self.manual_sensors.append(rec)
+        return rec
+
+    def remove_manual_sensor(self, index):
+        """Убрать запись по номеру строки таблицы. Неверный номер — молча ничего."""
+        i = int(index)
+        if 0 <= i < len(self.manual_sensors):
+            return self.manual_sensors.pop(i)
+        return None
+
+    def clear_manual_sensors(self):
+        """Убрать все заданные вручную датчики (кнопка «очистить» в таблице)."""
+        n = len(self.manual_sensors)
+        self.manual_sensors = []
+        return n
+
+    def manual_of_type(self, type_id, static_only=False):
+        """Заданные вручную датчики одного типа. `static_only` — только закреплённые."""
+        tid = int(type_id)
+        return [m for m in self.manual_sensors
+                if m.type_id == tid and (m.static or not static_only)]
+
+    def manual_lonlat(self):
+        """Заданные вручную датчики в градусах — для таблицы и для записи в файл.
+
+        Возвращает список `(тип, статический, lon, lat)`. Перевод идёт по якорю ОБЛАСТИ,
+        том же, что у всей сцены, поэтому координаты не зависят от выбранного района."""
+        out = []
+        for m in self.manual_sensors:
+            lon, lat = km_to_lonlat(m.x_km, m.y_km, self.lon0, self.lat0)
+            out.append((m.type_id, m.static, float(lon), float(lat)))
+        return out
+
+    def add_manual_lonlat(self, type_id, static, lon, lat):
+        """Добавить датчик по ГРАДУСАМ — так приходят записи из файла (формат 8.7.7)."""
+        x, y = lonlat_to_km(float(lon), float(lat), self.lon0, self.lat0)
+        return self.add_manual_sensor(type_id, static, x, y)
+
+    def manual_outside_area(self):
+        """Сколько заданных вручную датчиков лежит ВНЕ рабочего района.
+
+        Не ошибка: человек мог задать позиции заранее, до выбора района, или намеренно
+        поставить датчик за краем. Но знать об этом он должен — окно показывает число."""
+        if not self.manual_sensors or not self.area_ready:
+            return 0
+        x0, x1, y0, y1 = self.bbox_km
+        return sum(1 for m in self.manual_sensors
+                   if not (x0 <= m.x_km <= x1 and y0 <= m.y_km <= y1))
+
     # ---- расстановка датчиков (ЭТАП 4: по тепловой карте МАРШРУТОВ, §4.6) ----
     def place_sensors(self):
         """Расставить датчики по тепловой карте МАРШРУТОВ (где реально/вероятно летает БПЛА),
         а не по сырому весу — поэтому минус-города датчикам не мешают. Выборка: идут ИТЕРАЦИИ
         → их пролёты; иначе → ВСЕ возможные пути (строятся, если их нет). Правила A/B и разнос."""
         g = self.ensure_built()
+        # РЕЖИМ «ЗАДАТЬ ПОЗИЦИИ» (задача 8.7): позиции не подбираются — датчики стоят
+        # ровно там, где их задал человек, и кнопка «Расставить датчики» их НЕ ДВИГАЕТ.
+        # ⚠️ Но ПОКАЗАТЕЛИ считаются: засечку и кратность заданной расстановки не по чему
+        # мерить без выборки пролётов, и без неё отчёт показывал бы «засечено 0 %» просто
+        # оттого, что маршрутов ещё нет. Поэтому выборка при необходимости строится —
+        # ровно как в обычном режиме.
+        if bool(getattr(self.p, "threat_manual_mode", False)):
+            if len(self.iter_routes) < 5 and len(self.routes) < 5:
+                self.plan_routes()
+            return self._place_manual()
         self.candidates = self.candidate_positions()
         if len(self.iter_routes) < 5 and len(self.routes) < 5:
             self.plan_routes()                         # до итераций — по всем возможным путям
@@ -2691,7 +2867,34 @@ class ThreatModel:
             self.sensors = self._place_by_weight(self.candidates)
         # БОЛЬШИЕ датчики — отдельным правилом (круговой щит у цели), по той же выборке
         self.sensors_big = self._place_big(sample)
+        self._tag_sensors()                            # спутники: тип и «статический»
         cells_xy, cells_w = g.flat_cells(positive_only=False)
+        keep = cells_w != 0.0
+        self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
+        return self.sensors
+
+    def _place_manual(self):
+        """Датчики РОВНО ТАМ, где их задал человек (режим «Задать позиции»).
+
+        Ни жадного отбора, ни разноса, ни проверки воды: всё это — правила подбора, а
+        подбора здесь нет. Оптимальность расстановки в этом режиме не гарантируется
+        вовсе, и это принято сознательно (требование заказчика 04.09.2026): режим нужен
+        для проверки и для случаев, когда место установки определяется не расчётом."""
+        small, small_t, big = [], [], []
+        for m in self.manual_sensors:
+            if m.type_id == 4:
+                big.append([m.x_km, m.y_km])
+            else:
+                small.append([m.x_km, m.y_km])
+                small_t.append(m.type_id)
+        self.sensors = (np.asarray(small, float) if small
+                        else np.empty((0, 2), float))
+        self.sensors_type = np.asarray(small_t, int) if small_t else np.empty(0, int)
+        self.sensors_big = np.asarray(big, float) if big else np.empty((0, 2), float)
+        # в этом режиме ЗАКРЕПЛЕНО ВСЁ: позиция каждого датчика названа человеком
+        self.sensors_static = np.ones(len(self.sensors), bool)
+        self.sensors_big_static = np.ones(len(self.sensors_big), bool)
+        cells_xy, cells_w = self.grid.flat_cells(positive_only=False)
         keep = cells_w != 0.0
         self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
         return self.sensors
@@ -2752,6 +2955,31 @@ class ThreatModel:
         #     cand = cand[(s >= 0.0) & (s <= 1.0)]
         if len(cand) == 0:
             return np.empty((0, 2), float)
+        # ЧЕТЫРЕ ТИПА ДАТЧИКОВ (задача 8.7): типы 1–3 — малые, каждый со своим числом,
+        # радиусом и кратностью. Работающих типов может быть несколько, и тогда проход
+        # идёт по каждому, в порядке номеров: так человек видит в таблице тот же порядок,
+        # что и в окне.
+        from .sensors import active_small
+        types = active_small(self.p)
+        # ⚠️ ДАТЧИКИ, ПОСТАВЛЕННЫЕ ЧЕЛОВЕКОМ, — ЭТО УСЛОВИЯ МОДЕЛИРОВАНИЯ, НЕ ЯКОРЯ
+        # (уточнение заказчика 05.09.2026). Разница принципиальная:
+        #
+        #   ЯКОРЬ — механизм ВНУТРИ жадного алгоритма, позиция, которую он назначает себе
+        #           сам. Такие якоря (у входа и цели) отключены 29.08.2026, и расстановка
+        #           работает без них — правило 1.3 ОГРАНИЧЕНИЙ в силе;
+        #   УСЛОВИЯ МОДЕЛИРОВАНИЯ — входные данные задачи: «смоделировать вот такую
+        #           обстановку». Человек назвал часть решения, алгоритм ДОБИРАЕТ остаток
+        #           до заказанного N.
+        #
+        # Технически они передаются тем же аргументом `anchors` — это способ передачи, а
+        # не суть. Для обоснования гарантии разница важна: самоограничение алгоритма её
+        # ломает, а заданная извне часть решения просто сокращает задачу (см. 1.14).
+        if len(types) > 1 or any(m.type_id != 4 for m in self.manual_sensors):
+            return self._place_multi_type(cand, routes, types)
+        # ⚠️ ОДИН РАБОТАЮЩИЙ ТИП И НИ ОДНОГО ЗАКРЕПЛЁННОГО ДАТЧИКА — ПРЕЖНИЙ КОД БЕЗ
+        # ЕДИНОГО ИЗМЕНЕНИЯ. Обычный случай обязан считаться ровно как раньше, иначе
+        # контрольный прогон перестанет что-либо доказывать: расхождение с эталоном
+        # нельзя будет отличить от настоящей поломки.
         cache = CoverageCache(cand, R, self.p.L_seg, self.p.threat_k)
         for r in routes:
             cache.add_trajectory(r)
@@ -2788,6 +3016,78 @@ class ThreatModel:
             sens = cache.greedy(N, weights, anchors=anchors, anchor_sep=sep, min_sep=sep)
         return sens
 
+    def _place_multi_type(self, cand, routes, types):
+        """Расстановка, когда работает НЕ ОДИН малый тип либо есть закреплённые датчики.
+
+        Проход по типам в порядке номеров, у каждого свой радиус и своя кратность.
+        Результат складывается в `self.sensors`, а тип каждого датчика — в
+        `self.sensors_type`.
+
+        ⚠️ ПОЧЕМУ ПО ТИПАМ, А НЕ ОДНИМ ОБЩИМ ЖАДНЫМ ПРОХОДОМ. `CoverageCache` строится
+        под ОДИН радиус: в нём заранее посчитано, какие точки маршрутов видит каждый
+        кандидат. При разных радиусах у типов такой кэш общим быть не может, и «увидеть
+        друг друга» полностью типы не могут. Учёт всё же есть, и он главный на практике:
+        кандидаты, попавшие в зону разноса уже поставленных датчиков ДРУГОГО типа,
+        исключаются, поэтому типы не садятся друг на друга. Чего не хватает — общей
+        кратности: датчик типа 2 не знает, что этот кусок маршрута уже перекрыт типом 1
+        трижды. Это осознанное упрощение, см. ОГРАНИЧЕНИЯ §7.
+
+        ⚠️ РАЗНОС МЕЖДУ ДАТЧИКАМИ РАЗНЫХ ТИПОВ — полусумма их радиусов. Брать радиус
+        одного из них нельзя: у типа 1 (R = 2 км) и типа 3 (R = 5 км) «не ближе 1.6·R»
+        означало бы 3.2 км по мерке первого и 8 км по мерке второго — то есть разное
+        расстояние для одной и той же пары."""
+        from .optimization import CoverageCache
+        from config import MODES
+        weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
+        placed = np.empty((0, 2), float)     # уже поставленные, всех типов
+        placed_r = np.empty(0, float)        # их радиусы — для разноса между типами
+        out_xy, out_tid = [], []
+        for spec in types:
+            R = float(spec.r_km)
+            c = np.asarray(cand, float)
+            # не даём типам садиться друг на друга: полусумма радиусов пары
+            if len(placed):
+                d = np.linalg.norm(c[:, None, :] - placed[None, :, :], axis=2)
+                keep = (d >= 0.5 * (R + placed_r)[None, :]).all(axis=1)
+                if keep.any():               # все позиции заняты — не терять тип совсем
+                    c = c[keep]
+            # ЗАКРЕПЛЁННЫЕ ПОЗИЦИИ ЭТОГО ТИПА — прямо в список кандидатов.
+            # ⚠️ Именно ДОБАВЛЯЕМ, а не «ищем ближайший узел сетки»: датчик обязан
+            # остаться ровно там, куда его поставил человек, а привязка к сетке сдвинула
+            # бы его на полшага (до 0.5 км при шаге 1 км — четверть радиуса типа 1).
+            # заданные человеком позиции этого типа — условия моделирования
+            st = self.manual_of_type(spec.type_id)
+            anchors = []
+            if st:
+                extra = np.array([[m.x_km, m.y_km] for m in st], float)
+                anchors = list(range(len(c), len(c) + len(extra)))
+                c = np.vstack([c, extra])
+            if len(c) == 0:
+                continue
+            cache = CoverageCache(c, R, self.p.L_seg, int(spec.k))
+            for r in routes:
+                cache.add_trajectory(r)
+            N = int(spec.n)
+            sep_min = max(0.1, float(self.p.threat_min_sep_frac)) * R
+            sep = max(1.6 * R, sep_min)
+            sens = cache.greedy(N, weights, anchors=anchors,
+                                anchor_sep=sep, min_sep=sep)
+            while len(sens) < N and sep > sep_min:
+                sep = max(sep_min, sep * 0.85)
+                sens = cache.greedy(N, weights, anchors=anchors,
+                                    anchor_sep=sep, min_sep=sep)
+            if not len(sens):
+                continue
+            out_xy.append(sens)
+            out_tid.append(np.full(len(sens), spec.type_id, int))
+            placed = np.vstack([placed, sens])
+            placed_r = np.concatenate([placed_r, np.full(len(sens), R)])
+        if not out_xy:
+            self.sensors_type = np.empty(0, int)
+            return np.empty((0, 2), float)
+        self.sensors_type = np.concatenate(out_tid)
+        return np.vstack(out_xy)
+
     def _place_big(self, routes):
         """БОЛЬШИЕ датчики — «круговой щит» у цели: `threat_N_big` штук радиусом
         `threat_R_big`, разнесённые ПО УГЛУ вокруг цели.
@@ -2811,11 +3111,20 @@ class ThreatModel:
         from .optimization import CoverageCache
         n_big = int(getattr(self.p, "threat_N_big", 0) or 0)
         R_big = float(getattr(self.p, "threat_R_big", 0.0) or 0.0)
+        # ЗАКРЕПЛЁННЫЕ БОЛЬШИЕ (задача 8.7) ставятся ПЕРВЫМИ и не проходят через кольцо:
+        # их позиции названы человеком. Кольцом добираются только оставшиеся места —
+        # закреплённые входят в общее число N, иначе заказ «три больших» превращался бы
+        # в четыре при одном закреплённом.
+        fixed = np.array([[m.x_km, m.y_km] for m in self.manual_of_type(4)], float)
+        if len(fixed):
+            n_big -= len(fixed)
+            if n_big <= 0 or R_big <= 0.0 or not routes:
+                return fixed                    # все места заняты закреплёнными
         if n_big <= 0 or R_big <= 0.0 or not routes:
             return np.empty((0, 2), float)
         cand = self.candidates if len(self.candidates) else self.candidate_positions()
         if not len(cand):
-            return np.empty((0, 2), float)
+            return fixed if len(fixed) else np.empty((0, 2), float)
         B = np.asarray(self.target_only_km(), float)
         d = np.linalg.norm(cand - B, axis=1)
         lo = float(THREAT_BIG_RING_LO) * R_big
@@ -2825,7 +3134,7 @@ class ThreatModel:
             ring = d <= max(hi, float(d.min()) * 1.05)
         sub = cand[ring]
         if not len(sub):
-            return np.empty((0, 2), float)
+            return fixed if len(fixed) else np.empty((0, 2), float)
         # ЧЕМ МЕРИТЬ ПОЗИЦИЮ. «Сколько маршрутов накрывает» здесь бесполезно: радиус
         # 15 км так велик, что почти любой кандидат кольца накрывает ВСЮ выборку —
         # замер: 250 из 250 маршрутов у всех 459 кандидатов, критерий не различает ничего,
@@ -2877,8 +3186,9 @@ class ThreatModel:
             if score > best_score:
                 best, best_score = take, score
         if not best:
-            return np.empty((0, 2), float)
-        return np.asarray([sub[j] for j in best], float)
+            return fixed if len(fixed) else np.empty((0, 2), float)
+        out = np.asarray([sub[j] for j in best], float)
+        return np.vstack([fixed, out]) if len(fixed) else out
 
     def _sample_for_sensors(self):
         """Выборка маршрутов, по которой считаются датчики и 2-я тепловая карта (§4.6):
@@ -2945,34 +3255,85 @@ class ThreatModel:
         mx = dens.max()
         return (dens / mx if mx > 0 else dens).reshape(g.ny, g.nx)
 
+    def _sensor_radii(self):
+        """Радиус КАЖДОГО малого датчика — по его типу.
+
+        ⚠️ РАНЬШЕ ВЕЗДЕ БРАЛСЯ `threat_R`, радиус типа 1. Пока тип был один, это было
+        одно и то же; с четырьмя типами (задача 8.7) показатели врали: датчик типа 3 с
+        радиусом 5 км засчитывался как двухкилометровый, и засечка с покрытием выходили
+        заниженными тем сильнее, чем крупнее типы. Заметно на отчёте заказчика
+        05.09.2026: N=10 у каждого из трёх типов, а кратность считалась по 2 км."""
+        from .sensors import sensor_types
+        n = len(self.sensors)
+        r1 = float(self.p.threat_R)
+        if not n:
+            return np.empty(0, float)
+        by_type = {s.type_id: float(s.r_km) for s in sensor_types(self.p)}
+        if len(self.sensors_type) != n:
+            return np.full(n, r1)
+        return np.array([by_type.get(int(t), r1) for t in self.sensors_type], float)
+
     def _evaluate(self, cells_xy, cells_w):
         """Показатели: суммарный вес карты, покрытый вес, доля, разбивка по слоям и
         ЗАСЕЧКА МАРШРУТОВ. Последняя — прямая мера качества расстановки: датчики
         ставятся по выборке пролётов, а «покрытый вес» считается по СЫРОЙ весовой карте
-        и потому не отражает цель оптимизации (может быть высоким при плохой засечке)."""
+        и потому не отражает цель оптимизации (может быть высоким при плохой засечке).
+
+        ⚠️ У КАЖДОГО ДАТЧИКА СВОЙ РАДИУС (см. `_sensor_radii`), поэтому сравнение идёт
+        не с одним числом, а с вектором. Разбивка по типам (`by_type`) отвечает на
+        вопрос, который при одном типе не стоял вовсе: какой ТИП сколько ловит. Без неё
+        по общей кратности 16.7 нельзя понять, работают ли все три типа или два из них
+        стоят впустую."""
         g = self.grid
         total = float(np.sum(np.clip(g.weight, 0, None)))
         covered = 0.0
+        rad = self._sensor_radii()
         if len(self.sensors) and len(cells_xy):
             pos = cells_w > 0
             xy, w = cells_xy[pos], cells_w[pos]
             d = np.linalg.norm(xy[:, None, :] - self.sensors[None, :, :], axis=2)
-            seen = (d <= self.p.threat_R).any(axis=1)
+            seen = (d <= rad[None, :]).any(axis=1)
             covered = float(np.sum(w[seen]))
         det1 = detk = mean_hits = 0.0
+        by_type = {}
         sample = self._sample_for_sensors()
         if len(self.sensors) and sample:
-            hits = np.array([int((np.linalg.norm(
-                r[:, None, :] - self.sensors[None, :, :], axis=2).min(axis=0)
-                <= self.p.threat_R).sum()) for r in sample])
+            # для каждого маршрута — какие датчики его видят (маска по датчикам)
+            seen_by = np.array([
+                (np.linalg.norm(r[:, None, :] - self.sensors[None, :, :],
+                                axis=2).min(axis=0) <= rad)
+                for r in sample])                      # (маршрутов, датчиков)
+            hits = seen_by.sum(axis=1)
             det1 = float((hits >= 1).mean())
             detk = float((hits >= self.p.threat_k).mean())
             mean_hits = float(hits.mean())
+            from .sensors import sensor_types
+            k_of = {s.type_id: int(s.k) for s in sensor_types(self.p)}
+            tids = (self.sensors_type if len(self.sensors_type) == len(self.sensors)
+                    else np.ones(len(self.sensors), int))
+            for t in sorted(set(int(v) for v in tids)):
+                col = (tids == t)
+                h_t = seen_by[:, col].sum(axis=1)
+                # ⚠️ КРАТНОСТЬ У КАЖДОГО ТИПА СВОЯ (режим «у каждого своя» в окне):
+                # одна общая строка «засечено ≥ k» в этом случае отвечала бы на вопрос,
+                # которого никто не задавал. Здесь — выполнение СОБСТВЕННОГО k типа.
+                k_t = max(1, int(k_of.get(t, self.p.threat_k)))
+                by_type[t] = dict(n=int(col.sum()),
+                                  r_km=float(rad[col][0]) if col.any() else 0.0,
+                                  k=k_t,
+                                  detect_frac=float((h_t >= 1).mean()),
+                                  detect_k_frac=float((h_t >= k_t).mean()),
+                                  mean_hits=float(h_t.mean()),
+                                  idle=int((seen_by[:, col].sum(axis=0) == 0).sum()))
         return dict(total_weight=total, covered_weight=covered,
                     covered_frac=(covered / total if total > 0 else 0.0),
                     detect_frac=det1, detect_k_frac=detk, mean_hits=mean_hits,
                     n_routes_eval=len(sample) if sample else 0,
                     n_sensors=int(len(self.sensors)),
+                    n_big=int(len(self.sensors_big)),
+                    n_static=int(np.asarray(self.sensors_static).sum())
+                    + int(np.asarray(self.sensors_big_static).sum()),
+                    by_type=by_type,
                     n_candidates=int(len(self.candidates)),
                     by_layer=g.totals_by_layer())
 

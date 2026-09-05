@@ -92,7 +92,11 @@ class ThreatController:
             on_zone_added=self.on_zone_added, on_zone_undo=self.on_zone_undo,
             on_set_sector=self.on_set_sector, on_clear_sector=self.on_clear_sector,
             on_sensors_apply=self.on_sensors_apply, on_set_area=self.on_set_area,
-            on_clear_area=self.on_clear_area)
+            on_clear_area=self.on_clear_area,
+            # датчики, заданные человеком (задача 8.7)
+            on_manual_add=self.on_manual_add, on_manual_remove=self.on_manual_remove,
+            on_manual_clear=self.on_manual_clear, on_manual_mode=self.on_manual_mode,
+            on_sensor_rows=self._sensor_rows)
         # СТАРТ: район не задан — расчётные кнопки закрыты, синей рамки нет
         view.set_area_ready(model.area_ready,
                             model.area_size_km() if model.area_ready else None,
@@ -243,9 +247,7 @@ class ThreatController:
             return False
         self.model.place_sensors()
         self._sensors_at = n
-        self.view.render_sensors(self.model.sensors, self.model.p.threat_R,
-                                 getattr(self.model, 'sensors_big', None),
-                                 getattr(self.model.p, 'threat_R_big', 0.0))
+        self._render_sensors()
         return True
 
     def _anim_stop(self):
@@ -325,34 +327,70 @@ class ThreatController:
         self._sensors_at = 0                             # iter_batch начинает выборку заново
         self._run_async("iter", self.model.iter_batch)
 
-    # ---- окно «Входные данные»: применить сразу (не блокирует программу) ----
+    # ---- окно «Исходные данные»: применить сразу (не блокирует программу) ----
+    # ⚠️ ОДИН ОБРАБОТЧИК НА ВСЁ ОКНО (задача 8.7). Прежде их было два — «Датчики» и
+    # «Входные данные», каждый со своим окном. Теперь окно одно и отдаёт все поля разом,
+    # а что пересчитывать, решается по тому, ЧТО именно изменилось: правка радиуса
+    # датчика не должна пересчитывать маршруты, а правка разрыва — обязана.
+    ROUTE_KEYS = ("threat_L_max", "threat_L_max_manual", "threat_speed_kmh",
+                  "threat_bank_deg", "threat_turn_interval_km", "threat_max_gap_km",
+                  "threat_corridor_slack_km")
+
     def on_sensors_apply(self, vals):
-        """Окно «Датчики»: применить параметры ОБОИХ типов и переставить датчики.
+        """Применить поля окна «Исходные данные».
 
-        Карту не пересобираем и маршруты не трогаем — датчики от них зависят, а они от
-        датчиков нет. Меняется только расстановка, поэтому достаточно `on_place`."""
-        r_before = float(getattr(self.model.p, "threat_R", 0.0))
+        ⚠️ РАССТАНОВКУ НЕ ЗАПУСКАЕТ (правило заказчика 05.09.2026). «Применить» здесь
+        значит «принять введённые данные», и не более: дальше они учитываются там, где
+        нужны — при добавлении датчика мышью, при расстановке по кнопке основного окна,
+        при расчёте маршрутов. Раньше кнопка сама расставляла датчики, и правка одного
+        радиуса запускала секундный пересчёт, которого никто не просил.
+
+        Исключение — параметры МАРШРУТА (запас хода, разрыв и т. п.): они меняют саму
+        проходимость карты и область залёта, поэтому пересчёт остаётся."""
+        p = self.model.p
+        before = {n: getattr(p, n, None) for n in self.ROUTE_KEYS}
+        r_before = float(getattr(p, "threat_R", 0.0))
         for n, v in vals.items():
-            setattr(self.model.p, n, v)
-        if self.model.p.threat_N < 1 or self.model.p.threat_R <= 0:
-            self.view.flash_title("Малых датчиков должно быть ≥ 1, радиус > 0.")
+            setattr(p, n, v)
+        if p.threat_N < 1 or p.threat_R <= 0:
+            self.view.flash_title("Датчиков типа 1 должно быть ≥ 1, радиус > 0.")
             return
-        # шаг сетки кандидатов подгоняется под радиус — но только если радиус СМЕНИЛСЯ,
-        # иначе затирали бы значение, которое пользователь только что ввёл в этом окне
-        if abs(float(self.model.p.threat_R) - r_before) > 1e-9:
+        # Шаг сетки кандидатов подгоняется под радиус — но только если радиус СМЕНИЛСЯ,
+        # иначе затирали бы значение, которое пользователь только что ввёл в этом окне.
+        if abs(float(p.threat_R) - r_before) > 1e-9:
             self.model.sync_cand_step()
-        self.view.set_param_values(self.model.p)
-        self.view.refresh_sensors_dialog()
-        if self.model.grid is None:
-            self.view.set_title("Параметры датчиков приняты. Нажмите «Построить карту».")
+        self.view.set_param_values(p)
+        route_changed = any(getattr(p, n, None) != before[n] for n in self.ROUTE_KEYS)
+        if route_changed:
+            # ⚠️ ПРИЗНАК СМЕНЫ РАЗРЫВА СЧИТАЕМ ЗДЕСЬ и передаём готовым: значения уже
+            # проставлены выше, и внутри `on_input_apply` сравнивать было бы не с чем —
+            # «до» и «после» там совпали бы всегда, и сброс маршрутов молча не сработал.
+            self.on_input_apply({}, gap_changed=(
+                getattr(p, "threat_max_gap_km", None) != before["threat_max_gap_km"]))
             return
-        self.on_place()
+        if self.model.grid is None:
+            self.view.set_title("Исходные данные приняты. Нажмите «Построить карту».")
+            return
+        # Датчики НЕ переставляем — только обновляем показатели и карту под новые числа.
+        self._full_metrics()
+        self._render_all()
+        n = len(self.model.sensors) + len(self.model.sensors_big)
+        self.view.set_title(
+            "Исходные данные приняты." + (
+                " Датчики на карте прежние — нажмите «Расставить датчики», чтобы "
+                "пересчитать их по новым данным." if n else
+                " Нажмите «Расставить датчики»."))
 
-    def on_input_apply(self, vals):
+    def on_input_apply(self, vals, gap_changed=None):
+        """Пересчёт после правки параметров МАРШРУТА (запас хода, разрыв, скорость…).
+
+        `vals` может быть пустым: значения уже проставлены вызывающим — тогда это просто
+        «пересчитай под новые параметры», а `gap_changed` приходит готовым."""
         gap_before = getattr(self.model.p, "threat_max_gap_km", None)
         for n, v in vals.items():
             setattr(self.model.p, n, v)
-        gap_changed = (getattr(self.model.p, "threat_max_gap_km", None) != gap_before)
+        if gap_changed is None:
+            gap_changed = (getattr(self.model.p, "threat_max_gap_km", None) != gap_before)
         # РАЗРЫВ меняет саму проходимость: коридоры сшиваются/рвутся, а значит меняются и
         # область залёта, и набор возможных маршрутов. Всё накопленное построено по старой
         # проходимости — сбрасываем и считаем заново (контекст выборки модель пересоберёт
@@ -376,6 +414,123 @@ class ThreatController:
             self._render_all()
         self.view.set_title("Входные данные применены — пересчёт области, маршрутов и датчиков."
                             + (" Разрыв изменён." if gap_changed else ""))
+
+    def _render_sensors(self, empty=False):
+        """Отдать датчики на отрисовку вместе с типами и признаком «закреплён».
+
+        ⚠️ ОДНО МЕСТО НА ВСЕ ВЫЗОВЫ. Раньше вызовов было три, с разными наборами
+        аргументов; теперь у каждого датчика есть ещё тип, признак закрепления и свой
+        радиус, и рассинхрон между вызовами (где-то передали, где-то нет) означал бы,
+        что на карте датчики выглядят по-разному в зависимости от того, что их
+        обновило."""
+        import numpy as _np
+        from model.sensors import sensor_types
+        m, p = self.model, self.model.p
+        if empty:
+            # ⚠️ ДАЖЕ КОГДА РАСЧЁТА НЕТ, поставленные мышью датчики показываем: карта
+            # может быть ещё не построена, а человек уже расставляет — и он должен
+            # видеть, куда попал клик.
+            self.view.render_sensors(
+                _np.empty((0, 2), float), p.threat_R,
+                _np.empty((0, 2), float), p.threat_R_big,
+                pending=[(s.x_km, s.y_km, s.type_id) for s in m.manual_sensors])
+            return
+        radii = {s.type_id: s.r_km for s in sensor_types(p)}
+        # ПОСТАВЛЕННЫЕ МЫШЬЮ, НО ЕЩЁ НЕ УЧТЁННЫЕ РАСЧЁТОМ — показываем сразу. Отбираем
+        # тех, кого нет в текущей расстановке: после «Расставить датчики» они уже там, и
+        # рисовать их вторично значило бы удваивать значки.
+        placed = list(_np.asarray(m.sensors, float)) + list(_np.asarray(m.sensors_big, float))
+        pending = []
+        for mm in m.manual_sensors:
+            near = any(abs(pt[0] - mm.x_km) < 1e-3 and abs(pt[1] - mm.y_km) < 1e-3
+                       for pt in placed)
+            if not near:
+                pending.append((mm.x_km, mm.y_km, mm.type_id))
+        self.view.render_sensors(
+            m.sensors, p.threat_R, getattr(m, "sensors_big", None),
+            getattr(p, "threat_R_big", 0.0),
+            types=getattr(m, "sensors_type", None),
+            static=getattr(m, "sensors_static", None),
+            big_static=getattr(m, "sensors_big_static", None),
+            type_radii=radii, pending=pending)
+
+    # ================= ДАТЧИКИ, ЗАДАННЫЕ ЧЕЛОВЕКОМ (задача 8.7) =================
+    def on_manual_add(self, type_id, static, lon, lat):
+        """Добавить датчик по координатам (клик по карте, строка таблицы или файл)."""
+        self.model.add_manual_lonlat(type_id, static, lon, lat)
+        self._after_manual_change()
+
+    def on_manual_remove(self, index):
+        """Убрать датчик по номеру строки таблицы.
+
+        ⚠️ НОМЕР СТРОКИ — НЕ НОМЕР В `manual_sensors`. В режиме расчёта таблица
+        показывает результат расстановки, где заданные вручную вперемешку с
+        подобранными: удалять по такому номеру значит удалить не тот датчик. Поэтому
+        строка сперва переводится в позицию, а позиция — в запись."""
+        rows = self._sensor_rows()
+        if not (0 <= int(index) < len(rows)):
+            return
+        r = rows[int(index)]
+        best, best_d = None, 1e-3
+        for i, m in enumerate(self.model.manual_sensors):
+            d = ((m.x_km - r["x_km"]) ** 2 + (m.y_km - r["y_km"]) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = i, d
+        if best is None:
+            self.view.flash_title("Этот датчик поставила программа — его нельзя убрать "
+                                  "из таблицы: измените число датчиков типа.")
+            return
+        self.model.remove_manual_sensor(best)
+        self._after_manual_change()
+
+    def on_manual_clear(self):
+        self.model.clear_manual_sensors()
+        self._after_manual_change()
+
+    def on_manual_mode(self, manual):
+        """Переключение «Рассчитать позиции» ⇄ «Задать позиции»."""
+        self.model.p.threat_manual_mode = bool(manual)
+        self._after_manual_change()
+
+    def _sensor_rows(self):
+        """Чем заполнять таблицу окна.
+
+        В режиме «Задать позиции» и до расстановки показываем ЗАДАННЫЕ датчики: иначе
+        таблица была бы пуста и человеку некуда было бы добавлять строки. После
+        расстановки в режиме расчёта — её РЕЗУЛЬТАТ (требование заказчика: таблица
+        заполняется в обоих режимах)."""
+        manual = bool(getattr(self.model.p, "threat_manual_mode", False))
+        if not manual and len(self.model.sensors) + len(self.model.sensors_big):
+            return self.model.sensors_table()
+        rows = []
+        for m, (tid, static, lon, lat) in zip(self.model.manual_sensors,
+                                              self.model.manual_lonlat()):
+            rows.append(dict(n=len(rows) + 1, type_id=tid, static=static,
+                             lon=lon, lat=lat, x_km=m.x_km, y_km=m.y_km))
+        return rows
+
+    def _after_manual_change(self):
+        """Список заданных датчиков изменился: обновить таблицу и карту.
+
+        ⚠️ В РУЧНОМ РЕЖИМЕ ДАТЧИКИ ПОКАЗЫВАЮТСЯ СРАЗУ. Там расстановка ничего не считает
+        (позиции уже названы), это доли секунды — и человек видит результат клика тут же.
+        В режиме расчёта пересчитывать на каждый клик нельзя: расстановка занимает
+        секунды, а датчики ставят подряд по одному. Поэтому там — подсказка, что нужно
+        нажать «Расставить датчики»."""
+        manual = bool(getattr(self.model.p, "threat_manual_mode", False))
+        if manual and self.model.grid is not None:
+            self.model.place_sensors()
+        self.view.refresh_sensor_table(self._sensor_rows())
+        n = len(self.model.manual_sensors)
+        n_fix = sum(1 for m in self.model.manual_sensors if m.static)
+        out = self.model.manual_outside_area()
+        msg = "Задано датчиков вручную: %d%s%s." % (
+            n, ", закреплённых: %d" % n_fix if n_fix else "",
+            ", ВНЕ РАЙОНА: %d" % out if out else "")
+        if not manual and n_fix and self.model.grid is not None:
+            msg += " Нажмите «Расставить датчики», чтобы закрепить их в расчёте."
+        self.view.set_title(msg)
+        self._render_all()
 
     # ---- смена приоритета по весу (max/medium/min/mix) ----
     def on_iter_mode(self, key):
@@ -449,9 +604,16 @@ class ThreatController:
                     "маршруты посчитаются при первом обращении.")
         elif kind == "place":
             self._render_all()
+            self.view.refresh_sensor_table(self._sensor_rows())   # таблица окна
             me = self.model.metrics()
+            # В ручном режиме кнопка ничего не переставляла — она посчитала показатели
+            # заданной расстановки. Об этом и пишем, иначе слово «расставлено» вводило бы
+            # в заблуждение: позиции задал человек, программа их не выбирала.
+            manual = bool(getattr(self.model.p, "threat_manual_mode", False))
+            head = ("Задано датчиков %d (позиции ваши, расчёт по ним)" % me["n_sensors"]
+                    if manual else "Датчиков %d" % me["n_sensors"])
             self.view.set_title(
-                f"Датчиков {me['n_sensors']} · засечено пролётов "
+                f"{head} · засечено пролётов "
                 f"{me.get('detect_k_frac', 0)*100:.0f}% (кратность ≥{self.model.p.threat_k}) · "
                 f"покрыто веса {me['covered_frac']*100:.0f}% · "
                 f"режим {MODE_LABELS[self.model.p.mode]}")
@@ -610,7 +772,12 @@ class ThreatController:
         # ЗАПРЕТНЫЕ ЗОНЫ убираются ТОЛЬКО здесь: пересборка карты и добавление рельефа их
         # сохраняют — они нарисованы пользователем и от местности не зависят.
         self.model.clear_no_fly_zones()
-        self.model.sensors = np.empty((0, 2), float)
+        # ⚠️ ДАТЧИКИ СБРАСЫВАЮТСЯ ВСЕ. Здесь обнулялись только малые, и большие
+        # оставались висеть на карте после «Сброса» (замечание заказчика 05.09.2026).
+        # Заодно уходят и поставленные вручную: иначе следующая расстановка вернула бы
+        # их обратно как якоря, и сброс выглядел бы неполным.
+        self.model._reset_sensors()
+        self.model.clear_manual_sensors()
         self.model.target_km = None
         self.model.clear_sector()          # сектор отсчитывается от цели — уходит вместе с ней
         self._pending_recalc = False       # считать после сброса нечего
@@ -622,7 +789,9 @@ class ThreatController:
         self.model._metrics = {}
         self._cur_route = None
         self._render_all()
-        self.view.set_title("Сброшено: датчики и цель убраны. Карта сохранена.")
+        self.view.refresh_sensor_table([])          # таблица в окне тоже пустеет
+        self.view.set_title("Сброшено: датчики (малые, большие и заданные вручную), "
+                            "цель и зоны убраны. Карта сохранена.")
         if self.model.grid is None:
             self._idle_metrics()
         else:
@@ -737,8 +906,7 @@ class ThreatController:
             self.view.render_generalized([], t)
             self.view.render_iter_heat(None, None, t)
             self.view.render_crossings(None, t)
-            self.view.render_sensors(np.empty((0, 2), float), self.model.p.threat_R,
-                                     np.empty((0, 2), float), self.model.p.threat_R_big)
+            self._render_sensors(empty=True)
             return
         extent = g.extent_km()
         # рельеф: карта высот берётся в РОДНОМ разрешении (сетка 500 м для показа груба),
@@ -780,9 +948,7 @@ class ThreatController:
             self.view.render_crossings(g.crossing_cells_km(), t)
         else:
             self.view.render_crossings(None, t)
-        self.view.render_sensors(self.model.sensors, self.model.p.threat_R,
-                                 getattr(self.model, 'sensors_big', None),
-                                 getattr(self.model.p, 'threat_R_big', 0.0))
+        self._render_sensors()
 
     def on_iter_gen_frac(self, frac):
         """Пользователь сменил долю обобщённой выборки (поле «обобщ. %»). Запоминаем и, если
@@ -860,11 +1026,7 @@ class ThreatController:
             f"  запас хода L_max: {p.threat_L_max:g} км", "",
         ]
         lines += self._relief_lines()
-        lines += [
-            "РЕСУРС",
-            f"  N={p.threat_N}  R={p.threat_R:g} км  k={p.threat_k}",
-            f"  режим: {MODE_LABELS[p.mode]}",
-        ]
+        lines += self._resource_lines(p)
         if me:
             lines += [
                 f"  кандидатов: {me.get('n_candidates', 0)}", "",
@@ -874,10 +1036,8 @@ class ThreatController:
             for name in sorted(by, key=lambda n: -abs(by[n])):
                 lab = THREAT_LAYERS.get(name, {}).get("label", name)
                 lines.append(f"  {lab:<18}{by[name]:+8.0f}")
+            lines += ["", "РАССТАНОВКА"] + self._placement_lines(me)
             lines += [
-                "",
-                "РАССТАНОВКА",
-                f"  датчиков: {me.get('n_sensors', 0)}",
                 f"  покрытый вес: {me.get('covered_weight', 0):.0f} / "
                 f"{me.get('total_weight', 0):.0f}",
                 f"  доля покрытия: {me.get('covered_frac', 0)*100:.0f}%",
@@ -886,8 +1046,72 @@ class ThreatController:
                 f"  засечено ≥1 датчиком: {me.get('detect_frac', 0)*100:.0f}%",
                 f"  засечено ≥k({p.threat_k}): {me.get('detect_k_frac', 0)*100:.0f}%",
                 f"  средняя кратность: {me.get('mean_hits', 0):.1f}",
-            ]
+            ] + self._by_type_lines(me)
         self.view.set_metrics(lines)
+
+    # ---- отчёт по ТИПАМ датчиков (задача 8.7) ----
+    # ⚠️ ПОЧЕМУ РАЗБИВКА ОБЯЗАТЕЛЬНА. Пока тип был один, «N=10, R=2, k=3» описывало
+    # расстановку целиком. С четырьмя типами те же три числа описывают только первый из
+    # них, а строка «датчиков: 30» не отвечает на главный вопрос — работают ли все типы
+    # или два из них стоят впустую. Общая кратность 16.7 этого тоже не показывает.
+    def _resource_lines(self, p):
+        """Блок РЕСУРС: строка на каждый работающий тип."""
+        from model.sensors import sensor_types, KIND_LABEL
+        out = ["РЕСУРС"]
+        specs = sensor_types(p)
+        total = 0
+        for s in specs:
+            if not s.active:
+                continue
+            total += s.n
+            kind = KIND_LABEL.get(s.kind, s.kind)
+            # у больших кратность в расстановке не участвует (кольцо по углу)
+            k_txt = "" if s.kind == "big" else f"  k={s.k}"
+            out.append(f"  тип {s.type_id} · {kind:<7} N={s.n:<4} R={s.r_km:g} км{k_txt}")
+        if not any(s.active for s in specs):
+            out.append("  типы не заданы: N = 0 у всех")
+        elif len([s for s in specs if s.active]) > 1:
+            out.append(f"  всего заказано: {total}")
+        if bool(getattr(p, "threat_manual_mode", False)):
+            out.append("  режим: ЗАДАННЫЕ ПОЗИЦИИ (алгоритм не подбирает)")
+        else:
+            out.append(f"  режим: {MODE_LABELS[p.mode]}")
+        return out
+
+    def _placement_lines(self, me):
+        """Блок РАССТАНОВКА: сколько поставлено, по типам и сколько закреплено."""
+        by = me.get("by_type") or {}
+        n_small, n_big = me.get("n_sensors", 0), me.get("n_big", 0)
+        out = [f"  датчиков: {n_small + n_big}"
+               + (f"  (малых {n_small} + больших {n_big})" if n_big else "")]
+        if len(by) > 1:
+            parts = " · ".join(f"тип {t}: {by[t]['n']}" for t in sorted(by))
+            out.append(f"  по типам: {parts}")
+        n_fix = me.get("n_static", 0)
+        if n_fix:
+            out.append(f"  закреплено человеком: {n_fix}")
+        return out
+
+    def _by_type_lines(self, me):
+        """Засечка ОТДЕЛЬНО ПО ТИПАМ: свой радиус, своя доля, свои простаивающие.
+
+        `простаивает` — датчики этого типа, не увидевшие ни одного пролёта. Именно этот
+        показатель отвечает, зачем тип вообще стоит на карте: у закреплённых вручную
+        датчиков он законно бывает ненулевым (человек поставил, где считает нужным),
+        у подобранных программой — признак, что типу не хватило места."""
+        by = me.get("by_type") or {}
+        if len(by) < 2:
+            return []
+        out = ["", "ПО ТИПАМ ДАТЧИКОВ (свой радиус и своя кратность)"]
+        for t in sorted(by):
+            d = by[t]
+            out.append(f"  тип {t}: {d['n']} шт. · R={d['r_km']:g} км · k={d.get('k', 0)}")
+            out.append(f"     ловит ≥1: {d['detect_frac']*100:.0f}% · "
+                       f"≥k: {d.get('detect_k_frac', 0)*100:.0f}% · "
+                       f"кратность {d['mean_hits']:.1f}")
+            if d.get("idle"):
+                out.append(f"     ⚠ простаивает: {d['idle']} (не видят ни одного пролёта)")
+        return out
 
     def run(self):
         self.view.show()

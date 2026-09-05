@@ -24,6 +24,7 @@ VIEW (Qt) · СВОЯ КАРТИНКА КАРТЫ поверх слоёв (пл�
 Связанные документы: [план 8, задача 8.5](../теория/планы/8_ПЛАН_КАРТА_И_ИНТЕРФЕЙС.md),
 раскладка данных участка — ОГРАНИЧЕНИЯ 5.1б.
 """
+import io
 import os
 import re
 
@@ -42,11 +43,187 @@ IMAGE_DIR_NAME = "карты_картинки"
 # `threat_grid.load_dem_display` для рельефа.
 MAX_PX = 4000
 
+# ⚠️ ПОТОЛОК ЧИСЛА ПИКСЕЛЕЙ — 400 млн (примерно 20 000 × 20 000).
+#
+# Зачем он вообще нужен. Pillow сам отказывается открывать картинки больше ~179 млн
+# пикселей: он не знает, кто прислал файл, и защищается от «архивной бомбы» — крошечного
+# файла, который при распаковке съедает всю память. Ошибка выглядит так:
+# «Image size (237219680 pixels) exceeds limit of 178956970 pixels, could be
+# decompression bomb DOS attack» — ровно это заказчик и получил 05.09.2026, выгрузив
+# карту из CorelDRAW.
+#
+# Почему поднимаем, но НЕ снимаем совсем (`MAX_IMAGE_PIXELS = None`). Карту приносит сам
+# пользователь, а не сеть, так что «бомбы» тут ждать неоткуда — но за защитой стоит и
+# настоящая беда: 237 млн пикселей в RGBA это ≈950 МБ, и программа может просто упасть
+# по памяти. Поэтому предел остаётся, только осмысленный: до него картинка читается
+# УМЕНЬШЕННОЙ (см. `load_image_rgba`), а выше — человеку честно говорится, что файл
+# нужно пересохранить помельче.
+MAX_PIXELS_ALLOWED = 400_000_000
+
 _EXTS = (".png", ".jpg", ".jpeg")
 
 # имя вида map_39.8794_62.5901_41.7516_63.0869.png -> координаты берутся из имени
 _NAME_COORDS = re.compile(
     r"(-?\d+\.\d+)[_,\s]+(-?\d+\.\d+)[_,\s]+(-?\d+\.\d+)[_,\s]+(-?\d+\.\d+)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ДЕТАЛИЗАЦИЯ ПО ВИДИМОЙ ОБЛАСТИ (05.09.2026)
+#
+# ЗАЧЕМ. Карта заказчика — 17 944 × 13 220 (237 млн пикселей) на район 156 км, то есть
+# 8.7 м на пиксель. Показывали её ужатой до 4 000 px — 39 м на пиксель, вчетверо грубее
+# оригинала: подписи топокарты высотой 20 px превращались в 4.5 px и переставали
+# читаться (снимки заказчика 05.09.2026 — в «фото пример/»).
+#
+# ПОЧЕМУ НЕЛЬЗЯ ПРОСТО ПОКАЗАТЬ ЦЕЛИКОМ. Замер на этом файле: 8 000 px — 189 МБ,
+# 12 000 — 424 МБ, 16 000 (≈оригинал) — 754 МБ, и столько же ещё держит Qt под свою
+# копию. Полтора гигабайта ради картинки, которая на экран целиком всё равно не влезает.
+#
+# КАК СДЕЛАНО. Экран показывает 2–3 тысячи пикселей, поэтому в полном разрешении нужен
+# только ВИДИМЫЙ КУСОК. Картинка один раз разворачивается в несжатый файл рядом с ней, и
+# дальше нужный кусок читается прямо с диска через `numpy.memmap` — без распаковки,
+# мгновенно и ровно в том объёме, который виден. При отдалении берётся тот же кусок с
+# прореживанием, при приближении — один к одному.
+#
+# ЦЕНА. Файл кэша — ширина × высота × 3 байта, лежит рядом с картинкой и удаляется
+# вместе с ней. Строится один раз. Замеры на картах заказчика (05.09.2026):
+#
+#   12 042 × 9 686  (116 млн, CMYK JPEG) — 1.6 с, файл 350 МБ
+#   17 944 × 13 220 (237 млн, PNG RGBA)  — 2.5 с, файл 712 МБ
+#
+# Чтение куска после этого: 0.003…0.11 с — на глаз незаметно. Качество на той же карте
+# 237 млн: видно 156 км — 43 м/пиксель, 39 км — 17 м/пиксель, 16 км — 8.7 м/пиксель,
+# то есть ровно разрешение оригинала.
+DETAIL_DIR = "детализация"
+# Ниже этого порога кэш не нужен: картинка и так показывается почти без потерь
+# (4 000 px хватает при 16 млн пикселей и меньше).
+DETAIL_MIN_PIXELS = 30_000_000
+# Сколько точек разрешено держать в ОДНОМ показанном куске: 40 млн — это 160 МБ в RGBA
+# и около 0.2 с на чтение. Ограничение нужно на больших экранах, где запрошенный кусок
+# иначе доходил до 85 млн точек (342 МБ).
+MAX_WINDOW_PIXELS = 40_000_000
+
+
+def detail_paths(image_path):
+    """Пути кэша детализации: (файл данных, файл описания). Кладутся в подпапку рядом
+    с картинкой — по правилу «данные участка лежат в своей папке» (ОГРАНИЧЕНИЯ 5.1б)."""
+    d = os.path.join(os.path.dirname(image_path), DETAIL_DIR)
+    base = os.path.splitext(os.path.basename(image_path))[0]
+    return os.path.join(d, base + ".dat"), os.path.join(d, base + ".json")
+
+
+def detail_ready(image_path):
+    """Готов ли кэш детализации и не устарел ли он (сверяется с размером картинки)."""
+    return read_detail_meta(image_path) is not None
+
+
+def read_detail_meta(image_path):
+    """Описание кэша либо None. Проверяет, что данные на месте и того самого размера."""
+    import json
+    dat, js = detail_paths(image_path)
+    try:
+        with io.open(js, encoding="utf-8") as f:
+            meta = json.load(f)
+        w, h = int(meta["w"]), int(meta["h"])
+        if os.path.getsize(dat) != w * h * 3:
+            return None                    # оборвалось на середине — считаем, что нет
+        if os.path.getmtime(dat) < os.path.getmtime(image_path):
+            return None                    # картинку заменили новой под тем же именем
+        meta["dat"] = dat
+        return meta
+    except Exception:                      # нет файла, битый json, нет прав
+        return None
+
+
+def build_detail(image_path, on_progress=None):
+    """Развернуть картинку в несжатый файл для быстрого чтения кусками.
+
+    ⚠️ ОДИН РАЗ И НАДОЛГО. Полная распаковка большого файла стоит дорого (для 237 млн
+    пикселей это около гигабайта памяти на несколько секунд), поэтому делается однократно,
+    а результат остаётся на диске: дальше любой кусок читается без распаковки вовсе.
+
+    `on_progress(доля, текст)` — необязательный отчёт о ходе работы."""
+    import json
+    from PIL import Image, ImageFile
+
+    if (Image.MAX_IMAGE_PIXELS or 0) < MAX_PIXELS_ALLOWED:
+        Image.MAX_IMAGE_PIXELS = MAX_PIXELS_ALLOWED
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    dat, js = detail_paths(image_path)
+    os.makedirs(os.path.dirname(dat), exist_ok=True)
+    if on_progress:
+        on_progress(0.0, "чтение картинки")
+    with Image.open(image_path) as im:
+        w, h = im.size
+        if w * h > MAX_PIXELS_ALLOWED:
+            raise ValueError("картинка больше допустимого: %.0f млн пикселей"
+                             % (w * h / 1e6))
+        rgb = im.convert("RGB")
+        if on_progress:
+            on_progress(0.5, "запись кэша (%.0f МБ)" % (w * h * 3 / 1e6))
+        # ПИШЕМ ПОЛОСАМИ. Один `tobytes()` на всю картинку создал бы ВТОРУЮ копию рядом с
+        # уже распакованной — лишние сотни мегабайт на ровном месте.
+        band = max(1, 8_000_000 // max(1, w))          # ~8 МБ на полосу
+        tmp = dat + ".part"                             # готовый файл появляется целиком
+        with io.open(tmp, "wb") as f:
+            for y in range(0, h, band):
+                y2 = min(h, y + band)
+                f.write(rgb.crop((0, y, w, y2)).tobytes())
+                if on_progress:
+                    on_progress(0.5 + 0.5 * y2 / h, "запись кэша")
+        del rgb
+    if os.path.exists(dat):
+        os.remove(dat)
+    os.rename(tmp, dat)
+    with io.open(js, "w", encoding="utf-8") as f:
+        json.dump(dict(w=w, h=h, src=os.path.basename(image_path)), f,
+                  ensure_ascii=False)
+    if on_progress:
+        on_progress(1.0, "готово")
+    return dict(w=w, h=h, dat=dat)
+
+
+def read_detail_window(meta, box_frac, max_px=MAX_PX):
+    """Кусок картинки в полном разрешении -> (RGBA (H, W, 4), фактическая доля кадра).
+
+    `box_frac` — видимая область в долях картинки `(x0, y0, x1, y1)`, где 0 — левый
+    ВЕРХНИЙ угол исходной картинки. Возвращается кусок, прореженный ровно настолько,
+    чтобы уложиться в `max_px`: вблизи это один к одному, издали — то же, что и раньше.
+
+    Строка 0 результата — ЮГ (как и в `load_image_rgba`)."""
+    w, h = int(meta["w"]), int(meta["h"])
+    x0 = int(np.clip(box_frac[0], 0.0, 1.0) * w)
+    x1 = int(np.ceil(np.clip(box_frac[2], 0.0, 1.0) * w))
+    y0 = int(np.clip(box_frac[1], 0.0, 1.0) * h)
+    y1 = int(np.ceil(np.clip(box_frac[3], 0.0, 1.0) * h))
+    x1, y1 = max(x0 + 1, x1), max(y0 + 1, y1)
+    # ⚠️ ШАГ ОКРУГЛЯЕТСЯ ВНИЗ, В СТОРОНУ ДЕТАЛИ. Шаг целый — брать можно каждый второй
+    # пиксель или каждый третий, но не «два с половиной», и между соседними шагами
+    # разрешение меняется скачком. Округление вверх (было) один раз промахнулось мимо
+    # экрана: при видимых 39 км и экране 2400 точек шаг 3 давал 17.4 м на пиксель, тогда
+    # как экран показывает 16.2 — карта выглядела чуть мягче, чем могла. Округление вниз
+    # берёт следующий, более подробный шаг; данных при этом не больше чем вчетверо
+    # (сторона не более двух `max_px`), а замер даёт 130 МБ в худшем случае и доли
+    # секунды на чтение.
+    step = max(1, int(max(x1 - x0, y1 - y0) // float(max_px)))
+    # ⚠️ ПОТОЛОК ПО ПАМЯТИ. Округление вниз на большом экране может затребовать кусок в
+    # 85 млн точек — это 342 МБ и 0.4 с на чтение (замер на 4K, видно 94 км). Дальше
+    # шаг увеличивается, пока кусок не уложится в потолок: качество при этом остаётся
+    # не хуже экранного, потому что запас у нас и так двукратный.
+    while ((x1 - x0) // step) * ((y1 - y0) // step) > MAX_WINDOW_PIXELS:
+        step += 1
+    mm = np.memmap(meta["dat"], dtype=np.uint8, mode="r", shape=(h, w, 3))
+    try:
+        sub = np.array(mm[y0:y1:step, x0:x1:step, :])   # копия — memmap не держим
+    finally:
+        del mm
+    out = np.empty((sub.shape[0], sub.shape[1], 4), np.uint8)
+    out[:, :, :3] = sub
+    out[:, :, 3] = 255
+    # фактические границы куска (шаг мог их чуть урезать) — по ним ставится setRect
+    got = (x0 / float(w), y0 / float(h),
+           (x0 + sub.shape[1] * step) / float(w), (y0 + sub.shape[0] * step) / float(h))
+    return out[::-1].copy(), got
 
 
 def images_dir(geo_root):
@@ -80,15 +257,48 @@ def load_image_rgba(path, max_px=MAX_PX):
 
     Строка 0 массива — ЮГ: сцена вкладки идёт осью Y вверх, и `setRect` кладёт первую
     строку внизу. Тайловая подложка переворачивается ровно так же
-    (`geomap.build_raster_basemap`: `canvas = canvas[::-1]`)."""
-    from PIL import Image
+    (`geomap.build_raster_basemap`: `canvas = canvas[::-1]`).
+
+    ⚠️ БОЛЬШАЯ КАРТА УМЕНЬШАЕТСЯ ПРИ ДЕКОДИРОВАНИИ, а не после него. Экспорт из
+    CorelDRAW легко даёт 20 000 пикселей по стороне; развернуть такое целиком — почти
+    гигабайт памяти, и всё это ради картинки, которую мы всё равно ужимаем до 4 000 px.
+    У JPEG есть `draft()`: библиотека распаковывает сразу в 1/2, 1/4 или 1/8 размера,
+    почти не тратя ни памяти, ни времени. Для PNG такого нет — там помогает `reduce()`,
+    целочисленное прореживание, которое дешевле полноценного `resize`. Окончательный
+    размер в обоих случаях доводится `resize` с хорошим фильтром.
+
+    Бросает `ValueError` с понятным текстом, если картинка больше `MAX_PIXELS_ALLOWED`:
+    вместо системной ошибки про «decompression bomb» человек должен прочитать, что
+    именно ему сделать."""
+    from PIL import Image, ImageFile
+
+    # Порог Pillow поднимаем до своего (см. MAX_PIXELS_ALLOWED). Ставится ДО `open`:
+    # проверка размера срабатывает именно там.
+    if (Image.MAX_IMAGE_PIXELS or 0) < MAX_PIXELS_ALLOWED:
+        Image.MAX_IMAGE_PIXELS = MAX_PIXELS_ALLOWED
+    # Обрезанный при копировании файл лучше показать по то место, докуда он цел, чем
+    # не показать вовсе: карта — подложка для глаз, расчёт от неё не зависит.
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 
     with Image.open(path) as im:
         src_w, src_h = im.size
-        k = max(src_w, src_h) / float(max_px)
-        if k > 1.0:                       # прореживаем большой скан
-            im = im.resize((max(1, int(src_w / k)), max(1, int(src_h / k))),
-                           Image.LANCZOS)
+        if src_w * src_h > MAX_PIXELS_ALLOWED:
+            raise ValueError(
+                "Картинка слишком большая: %d × %d = %.0f млн пикселей (предел %.0f млн).\n"
+                "Пересохраните её меньшего размера — для карты района достаточно "
+                "4000 пикселей по длинной стороне: при участке 120 км это 30 м на "
+                "пиксель, мельче деталей на карте всё равно нет."
+                % (src_w, src_h, src_w * src_h / 1e6, MAX_PIXELS_ALLOWED / 1e6))
+        target = (max(1, int(max_px)), max(1, int(max_px)))
+        im.draft(None, target)            # JPEG: распаковать сразу уменьшенным
+        w, h = im.size                    # draft мог уже уменьшить картинку
+        k = max(w, h) / float(max_px)
+        if k >= 2.0:                      # PNG и всё, что draft не взял
+            im = im.reduce(int(k))        # целочисленное прореживание — дёшево
+            w, h = im.size
+            k = max(w, h) / float(max_px)
+        if k > 1.0:
+            im = im.resize((max(1, int(w / k)), max(1, int(h / k))), Image.LANCZOS)
         arr = np.asarray(im.convert("RGBA"), dtype=np.uint8)
     return arr[::-1].copy(), (src_w, src_h)
 
@@ -167,6 +377,19 @@ class MapImageDialog(QtWidgets.QDialog):
             "Рамка карты станет РАЙОНОМ МОДЕЛИРОВАНИЯ.\n"
             "Потом его можно изменить кнопкой «Задать район моделирования»."))
 
+        # РЕЗКОСТЬ ПРИ ПРИБЛИЖЕНИИ (05.09.2026). Отдельной кнопкой, а не молча при
+        # загрузке: подготовка занимает минуту-две и оставляет на диске файл размером с
+        # саму карту. Нужна она только большим картам — у мелких и так всё видно.
+        self.btn_detail = QtWidgets.QPushButton("Подготовить резкость при приближении…")
+        self.btn_detail.setToolTip(
+            "Разворачивает карту в служебный файл рядом с ней, и дальше при "
+            "приближении видимый кусок показывается в ПОЛНОМ разрешении — подписи "
+            "и мелкие значки читаются как в просмотрщике.\n\n"
+            "Делается один раз на карту: замер на карте 237 млн точек — 2.5 секунды. "
+            "Занимает место на диске: ширина × высота × 3 байта.")
+        self.btn_detail.clicked.connect(self._build_detail)
+        lay.addWidget(self.btn_detail)
+
         btns = QtWidgets.QHBoxLayout()
         b_apply = QtWidgets.QPushButton("Показать карту")
         b_apply.clicked.connect(self._apply)
@@ -182,6 +405,67 @@ class MapImageDialog(QtWidgets.QDialog):
                 if current.get(k) is not None:
                     self.ed[k].setText("%.6f" % current[k])
 
+    def _build_detail(self):
+        """Построить кэш детализации для выбранной карты (см. `build_detail`)."""
+        path = self.ed_path.text().strip()
+        if not path or not os.path.exists(path):
+            self.lbl_info.setText("⚠️ Сначала выберите файл картинки.")
+            return
+        if detail_ready(path):
+            self.lbl_info.setText(
+                "Резкость уже подготовлена для этой карты — просто покажите её.")
+            return
+        try:
+            from PIL import Image
+            Image.MAX_IMAGE_PIXELS = max(Image.MAX_IMAGE_PIXELS or 0, MAX_PIXELS_ALLOWED)
+            with Image.open(path) as im:
+                w, h = im.size
+        except Exception as e:
+            self.lbl_info.setText("⚠️ Файл не читается: %s" % e)
+            return
+        need_mb = w * h * 3 / 1e6
+        if QtWidgets.QMessageBox.question(
+                self, "Резкость при приближении",
+                "Карта %d × %d (%.0f млн точек).\n\n"
+                "Будет создан служебный файл на %.0f МБ рядом с картинкой, в папке «%s». "
+                "Обычно это несколько секунд, и делается один раз.\n\n"
+                "После этого при приближении карта показывается в полном разрешении.\n\n"
+                "Продолжить?" % (w, h, w * h / 1e6, need_mb, DETAIL_DIR),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes) != QtWidgets.QMessageBox.Yes:
+            return
+        # ⚠️ ОКНО НЕ ДОЛЖНО ВЫГЛЯДЕТЬ ЗАВИСШИМ. Работа идёт в основном потоке (Pillow и
+        # так держит GIL на распаковке, фоновый поток выигрыша не даст), поэтому просто
+        # показываем ход работы и отдаём Qt время на перерисовку.
+        dlg = QtWidgets.QProgressDialog("Подготовка резкости…", "", 0, 100, self)
+        dlg.setCancelButton(None)
+        dlg.setWindowTitle("Своя карта")
+        dlg.setWindowModality(QtCore.Qt.WindowModal)
+        dlg.show()
+
+        def report(frac, text):
+            dlg.setValue(int(100 * frac))
+            dlg.setLabelText("%s…" % text)
+            QtWidgets.QApplication.processEvents()
+
+        try:
+            build_detail(path, on_progress=report)
+        except MemoryError:
+            dlg.close()
+            self.lbl_info.setText(
+                "⚠️ Не хватило памяти на подготовку. Пересохраните карту меньшего "
+                "размера — 8000 точек по длинной стороне обычно достаточно.")
+            return
+        except Exception as e:
+            dlg.close()
+            self.lbl_info.setText("⚠️ Не получилось: %s" % e)
+            return
+        dlg.close()
+        self.btn_detail.setText("Резкость подготовлена ✓")
+        self.lbl_info.setText(
+            "Готово. Нажмите «Показать карту» — при приближении видимый кусок будет "
+            "показан в полном разрешении (%d × %d)." % (w, h))
+
     # ------------------------------------------------------------------
     def _pick(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -190,6 +474,7 @@ class MapImageDialog(QtWidgets.QDialog):
         if not fn:
             return
         self.ed_path.setText(fn)
+        self._sync_detail_button()
         got = coords_from_name(fn)
         if got:                              # координаты прямо в имени файла
             lo, la, ho, ha = got
@@ -198,6 +483,14 @@ class MapImageDialog(QtWidgets.QDialog):
             self.ed["lon_max"].setText("%.6f" % ho)
             self.ed["lat_max"].setText("%.6f" % ha)
             self.lbl_info.setText("Координаты взяты из имени файла — сверьте по карте.")
+
+    def _sync_detail_button(self):
+        """Подпись кнопки под выбранный файл: подготовлена резкость или ещё нет."""
+        path = self.ed_path.text().strip()
+        if path and detail_ready(path):
+            self.btn_detail.setText("Резкость подготовлена ✓")
+        else:
+            self.btn_detail.setText("Подготовить резкость при приближении…")
 
     def _values(self):
         """Числа из полей либо None, если что-то не заполнено или не число."""
