@@ -16,36 +16,36 @@
 
 | | |
 |---|---|
-| файлов кода | 57 |
-| строк кода | 24748 ≈ 321 тыс. токенов |
-| строк карты | 1013 ≈ 9 тыс. токенов |
+| файлов кода | 58 |
+| строк кода | 25325 ≈ 329 тыс. токенов |
+| строк карты | 1021 ≈ 9 тыс. токенов |
 | частей | 1 (порог деления — 1500 строк) |
 
 ## Модули: где искать
 
 | Модуль | Строк | ≈токенов | Классов | Функций | Где в карте |
 |---|---|---|---|---|---|
-| `model/threat_grid.py` | 3916 | 50908 | 2 | 159 | [КАРТА_1.md](КАРТА_1.md) стр. **10** |
-| `view_qt/threat_view.py` | 3664 | 47632 | 4 | 158 | [КАРТА_1.md](КАРТА_1.md) стр. **198** |
-| `controller_qt/threat_controller.py` | 1413 | 18369 | 3 | 73 | [КАРТА_1.md](КАРТА_1.md) стр. **381** |
-| `model/threat_routes.py` | 1217 | 15821 | 0 | 26 | [КАРТА_1.md](КАРТА_1.md) стр. **487** |
-| `tools/переносимое/make_figures.py` | 1090 | 14170 | 0 | 26 | [КАРТА_1.md](КАРТА_1.md) стр. **521** |
-| `view_qt/input_window.py` | 936 | 12168 | 2 | 41 | [КАРТА_1.md](КАРТА_1.md) стр. **553** |
-| `config.py` | 877 | 11401 | 1 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **610** |
-| `view_qt/map_image.py` | 757 | 9841 | 1 | 24 | [КАРТА_1.md](КАРТА_1.md) стр. **631** |
-| `tools/gui_check.py` | 744 | 9672 | 0 | 2 | [КАРТА_1.md](КАРТА_1.md) стр. **662** |
-| `model/trajectories.py` | 708 | 9204 | 0 | 39 | [КАРТА_1.md](КАРТА_1.md) стр. **671** |
-| `model/map_fit.py` | 541 | 7033 | 0 | 16 | [КАРТА_1.md](КАРТА_1.md) стр. **716** |
-| `view_qt/view_qt.py` | 514 | 6682 | 2 | 45 | [КАРТА_1.md](КАРТА_1.md) стр. **738** |
-| `view_qt/geomap.py` | 481 | 6253 | 0 | 20 | [КАРТА_1.md](КАРТА_1.md) стр. **793** |
-| `tools/переносимое/codemap.py` | 451 | 5863 | 0 | 15 | [КАРТА_1.md](КАРТА_1.md) стр. **819** |
-| `view/view.py` | 414 | 5382 | 1 | 33 | [КАРТА_1.md](КАРТА_1.md) стр. **842** |
-| `model/area_start.py` | 396 | 5148 | 1 | 28 | [КАРТА_1.md](КАРТА_1.md) стр. **889** |
-| `tools/reference_cases.py` | 390 | 5070 | 0 | 6 | [КАРТА_1.md](КАРТА_1.md) стр. **931** |
-| `tools/flow_check.py` | 357 | 4641 | 0 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **945** |
-| `main_qt.py` | 354 | 4602 | 0 | 5 | [КАРТА_1.md](КАРТА_1.md) стр. **954** |
-| `model/optimization.py` | 337 | 4381 | 1 | 11 | [КАРТА_1.md](КАРТА_1.md) стр. **965** |
-| `view_qt/area_view.py` | 306 | 3978 | 1 | 18 | [КАРТА_1.md](КАРТА_1.md) стр. **985** |
+| `model/threat_grid.py` | 3960 | 51480 | 2 | 160 | [КАРТА_1.md](КАРТА_1.md) стр. **10** |
+| `view_qt/threat_view.py` | 3815 | 49595 | 4 | 163 | [КАРТА_1.md](КАРТА_1.md) стр. **199** |
+| `controller_qt/threat_controller.py` | 1427 | 18551 | 3 | 74 | [КАРТА_1.md](КАРТА_1.md) стр. **388** |
+| `model/threat_routes.py` | 1217 | 15821 | 0 | 26 | [КАРТА_1.md](КАРТА_1.md) стр. **495** |
+| `tools/переносимое/make_figures.py` | 1090 | 14170 | 0 | 26 | [КАРТА_1.md](КАРТА_1.md) стр. **529** |
+| `view_qt/input_window.py` | 960 | 12480 | 2 | 41 | [КАРТА_1.md](КАРТА_1.md) стр. **561** |
+| `tools/gui_check.py` | 916 | 11908 | 0 | 2 | [КАРТА_1.md](КАРТА_1.md) стр. **618** |
+| `config.py` | 877 | 11401 | 1 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **627** |
+| `view_qt/map_image.py` | 757 | 9841 | 1 | 24 | [КАРТА_1.md](КАРТА_1.md) стр. **648** |
+| `model/trajectories.py` | 708 | 9204 | 0 | 39 | [КАРТА_1.md](КАРТА_1.md) стр. **679** |
+| `model/map_fit.py` | 541 | 7033 | 0 | 16 | [КАРТА_1.md](КАРТА_1.md) стр. **724** |
+| `view_qt/view_qt.py` | 514 | 6682 | 2 | 45 | [КАРТА_1.md](КАРТА_1.md) стр. **746** |
+| `view_qt/geomap.py` | 481 | 6253 | 0 | 20 | [КАРТА_1.md](КАРТА_1.md) стр. **801** |
+| `tools/переносимое/codemap.py` | 451 | 5863 | 0 | 15 | [КАРТА_1.md](КАРТА_1.md) стр. **827** |
+| `view/view.py` | 414 | 5382 | 1 | 33 | [КАРТА_1.md](КАРТА_1.md) стр. **850** |
+| `model/area_start.py` | 396 | 5148 | 1 | 28 | [КАРТА_1.md](КАРТА_1.md) стр. **897** |
+| `tools/reference_cases.py` | 390 | 5070 | 0 | 6 | [КАРТА_1.md](КАРТА_1.md) стр. **939** |
+| `tools/flow_check.py` | 357 | 4641 | 0 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **953** |
+| `main_qt.py` | 354 | 4602 | 0 | 5 | [КАРТА_1.md](КАРТА_1.md) стр. **962** |
+| `model/optimization.py` | 337 | 4381 | 1 | 11 | [КАРТА_1.md](КАРТА_1.md) стр. **973** |
+| `view_qt/area_view.py` | 306 | 3978 | 1 | 18 | [КАРТА_1.md](КАРТА_1.md) стр. **993** |
 
 ## Мелкие модули — читаются целиком
 
@@ -64,6 +64,7 @@
 | `model/simulation.py` | 217 | `SimulationModel`, `__init__`, `reset`, `_compute_view_bbox`, `set_traj_model`, `corridor_bbox`, `corridor_outline`, `view_bbox`, `sample_trajectory`, `_anchor_idx`, `frequent_paths`, `fan_paths`, … (15 всего) |
 | `tools/переносимое/check_dead_code.py` | 206 | `find_root`, `py_files`, `collect_defs`, `collect_uses`, `unused_functions`, `unused_config`, `main` |
 | `tools/area_bounds.py` | 179 | `_varint`, `_zigzag`, `_fields`, `pbf_bbox`, `raster_bounds`, `main` |
+| `model/sensor_track.py` | 172 | `hungarian`, `_hungarian_square`, `match_by_type`, `total_movement` |
 | `tools/download_tiles.py` | 166 | `_area_bbox`, `_area_tile_dir`, `_pad_km`, `main` |
 | `model/flight_log.py` | 163 | `routes_dir`, `default_file_name`, `_route_length_km`, `save_flights`, `load_flights`, `check_compatible` |
 | `view_qt/route_viewer.py` | 156 | `RouteViewerDialog`, `__init__`, `set_data`, `_current_source`, `_refresh_list`, `_show_route`, `_show_on_map`, `_reset_preview` |

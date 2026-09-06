@@ -366,6 +366,9 @@ class InputDataWindow(QtWidgets.QDialog):
         self.on_manual_remove = lambda index: None
         self.on_manual_edit = lambda index, tid, static, lon, lat: None
         self.on_manual_clear = lambda: None
+        # ⚠️ ОТДЕЛЬНО ОТ on_manual_clear (см. _clear_rows): та убирает только заданные
+        # вручную, эта — ВСЮ расстановку (нужна в режиме «Рассчитать позиции»).
+        self.on_clear_sensors = lambda: None
         self.on_mode_changed = lambda manual: None
         self.on_pick_mode = lambda: None           # «ставить датчики кликом по карте»
         self.on_view_routes = lambda: None         # «Посмотреть маршруты» (задача 8.6)
@@ -639,7 +642,10 @@ class InputDataWindow(QtWidgets.QDialog):
         self.btn_del.setToolTip("Убрать выбранный датчик из таблицы и с карты.")
         self.btn_del.clicked.connect(self._del_row)
         self.btn_clear = QtWidgets.QPushButton("Очистить")
-        self.btn_clear.setToolTip("Убрать ВСЕ заданные вручную датчики.")
+        self.btn_clear.setToolTip(
+            "«Задать позиции» — убрать ВСЕ заданные вручную датчики.\n"
+            "«Рассчитать позиции» — таблица показывает результат расстановки, "
+            "поэтому убирает ВСЮ расстановку (как «Очистить датчики» на панели).")
         self.btn_clear.clicked.connect(self._clear_rows)
         side.addWidget(self.btn_edit); side.addWidget(self.btn_del)
         side.addWidget(self.btn_clear); side.addStretch(1)
@@ -850,13 +856,31 @@ class InputDataWindow(QtWidgets.QDialog):
         self.on_manual_remove(i)
 
     def _clear_rows(self):
+        """Кнопка «Очистить» под таблицей.
+
+        ⚠️ ДЕЙСТВИЕ ЗАВИСИТ ОТ РЕЖИМА (заказчик 06.09.2026: «кнопка очистить не
+        убирает данные о датчиках в таблице»). В «Задать позиции» все строки —
+        заданные человеком, «убрать вручную заданные» и «очистить таблицу» — одно и
+        то же. В «Рассчитать позиции» таблица показывает РЕЗУЛЬТАТ расстановки
+        (§8.7.1): вручную заданных там обычно нет вовсе, и старое поведение
+        (`on_manual_clear`) убирало ноль строк — кнопка выглядела сломанной. Там нужно
+        убирать ВСЮ расстановку — то же самое, что «Очистить датчики» на панели."""
         if not self._rows:
             return
-        if QtWidgets.QMessageBox.question(
-                self, "Очистить", "Убрать все заданные вручную датчики?",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes:
-            self.on_manual_clear()
+        if self.is_manual_mode():
+            if QtWidgets.QMessageBox.question(
+                    self, "Очистить", "Убрать все заданные вручную датчики?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes:
+                self.on_manual_clear()
+        else:
+            if QtWidgets.QMessageBox.question(
+                    self, "Очистить",
+                    "Убрать С КАРТЫ ВСЕ датчики — и подобранные алгоритмом, и "
+                    "заданные вручную?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes:
+                self.on_clear_sensors()
 
     def _pick_mode(self):
         self.on_pick_mode()

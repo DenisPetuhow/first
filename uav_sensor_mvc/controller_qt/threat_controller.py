@@ -1195,6 +1195,7 @@ class ThreatController:
             self.view.render_iter_heat(None, None, t)
             self.view.render_crossings(None, t)
             self._render_sensors(empty=True)
+            self.view.render_sensor_track([], {})
             return
         extent = g.extent_km()
         # рельеф: карта высот берётся в РОДНОМ разрешении (сетка 500 м для показа груба),
@@ -1238,6 +1239,19 @@ class ThreatController:
         else:
             self.view.render_crossings(None, t)
         self._render_sensors()
+        self._render_sensor_track(t)
+
+    def _render_sensor_track(self, toggles):
+        """«Анализ размещения» (задача 8.9) — сравнение ПЕРВОГО построения с ТЕКУЩИМ.
+        Считает модель (`sensor_movement`, венгерское сопоставление по типам); здесь
+        только решаем, показывать ли (галка в панели режимов), и достаём радиусы типов
+        для серых кругов первого построения — те же, что у обычной отрисовки датчиков."""
+        if not toggles.get("show_sensor_track"):
+            self.view.render_sensor_track([], {})
+            return
+        from model.sensors import sensor_types
+        radii = {s.type_id: s.r_km for s in sensor_types(self.model.p)}
+        self.view.render_sensor_track(self.model.sensor_movement(), radii)
 
     def on_iter_gen_frac(self, frac):
         """Пользователь сменил долю обобщённой выборки (поле «обобщ. %»). Запоминаем и, если

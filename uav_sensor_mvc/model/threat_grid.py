@@ -2779,6 +2779,11 @@ class ThreatModel:
         # режиме, чёрная окантовка — о том, что место выбрал человек (заказчик 05.09.2026).
         self.sensors_manual = np.empty(0, bool)      # позицию назвал человек
         self.sensors_big_manual = np.empty(0, bool)
+        # ПЕРВОЕ ПОСТРОЕНИЕ — снимок для «анализа размещения» (задача 8.9). `None`
+        # значит «ещё не снят»: следующая расстановка ДО итераций его установит заново.
+        self.initial_sensors = None       # (N,2) км — малые, на момент первой расстановки
+        self.initial_sensors_type = None  # тип каждого (1–3)
+        self.initial_sensors_big = None   # (K,2) км — большие (тип 4)
 
     def _tag_sensors(self):
         """Проставить спутники расстановки: тип датчика, его режим и кто выбрал место.
@@ -3083,10 +3088,49 @@ class ThreatModel:
         self.sensors_big = self._place_big(sample)
         self._tag_sensors()                            # спутники: тип и «статический»
         self._mark_manual_placed()                     # заявки учтены этой расстановкой
+        if self.initial_sensors is None:
+            # ПЕРВОЕ ПОСТРОЕНИЕ для «анализа размещения» (задача 8.9) — снимок ровно
+            # ОДИН РАЗ за цикл, на самом первом расчёте датчиков, дальше НЕ перезаписы-
+            # вается: иначе «до» и «после» совпали бы и сравнивать было бы нечего.
+            #
+            # ⚠️ БЕЗ УСЛОВИЯ «len(iter_routes) < 5» (было раньше, найден баг 06.09.2026).
+            # Датчики вообще в первый раз считаются НЕ обязательно «до итераций» кнопкой
+            # «Расставить датчики» — если сразу нажать «Пуск», `_maybe_refresh_sensors`
+            # впервые вызовет это место уже при len(iter_routes) == 5 (порог
+            # THREAT_SENSOR_REFRESH_EVERY), и с прежним условием снимок не брался НИКОГДА
+            # за весь сеанс: заказчик увидел это как «датчики для анализа перемещаются
+            # каждые 5 итераций» — на деле снимка не было вовсе, и сравнивать было не с
+            # чем. Первый РЕАЛЬНО посчитанный набор — всегда лучшая точка отсчёта,
+            # даже если он уже частично учитывает итерации.
+            self.initial_sensors = np.array(self.sensors, float, copy=True)
+            self.initial_sensors_type = np.array(self.sensors_type, int, copy=True)
+            self.initial_sensors_big = np.array(self.sensors_big, float, copy=True)
         cells_xy, cells_w = g.flat_cells(positive_only=False)
         keep = cells_w != 0.0
         self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
         return self.sensors
+
+    def sensor_movement(self):
+        """Сопоставление ПЕРВОГО построения с ТЕКУЩИМ — «анализ размещения» (задача 8.9).
+
+        Пусто, если снимок ещё не снят (`initial_sensors is None`) — до первой
+        расстановки анализировать нечего. Большие датчики (тип 4) идут В ТУ ЖЕ задачу
+        о назначениях под своим кодом типа — сопоставляются только между собой
+        (§8.9.4: типы не смешивать)."""
+        from . import sensor_track
+        if self.initial_sensors is None:
+            return []
+        old_xy = np.vstack([self.initial_sensors, self.initial_sensors_big]) \
+            if len(self.initial_sensors_big) else np.asarray(self.initial_sensors, float)
+        old_types = np.concatenate([self.initial_sensors_type,
+                                    np.full(len(self.initial_sensors_big), 4, int)])
+        new_xy = np.vstack([self.sensors, self.sensors_big]) \
+            if len(self.sensors_big) else np.asarray(self.sensors, float)
+        new_types = np.concatenate([self.sensors_type,
+                                    np.full(len(self.sensors_big), 4, int)])
+        if len(old_xy) == 0 and len(new_xy) == 0:
+            return []
+        return sensor_track.match_by_type(old_xy, old_types, new_xy, new_types)
 
     def _manual_dynamic_count(self):
         """Сколько заданных человеком датчиков — ДИНАМИЧЕСКИЕ (их место можно менять)."""

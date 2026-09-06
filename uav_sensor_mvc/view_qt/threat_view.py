@@ -23,7 +23,7 @@ import os
 
 import numpy as np
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 import matplotlib.cm as cm
 
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
@@ -225,6 +225,14 @@ THREAT_COLORS = {
     "legend_hide":   "#3aa0ff",         # образец «укрытие» в легенде (= RELIEF_HIDE_RGB)
     "legend_cut":    "#101016",         # образец «коридор снят» (= RELIEF_CUT_RGBA)
     "legend_cut_edge": "#8a93a6",       # обводка чёрного образца: на тёмном фоне иначе не видно
+    # — АНАЛИЗ РАЗМЕЩЕНИЯ (задача 8.9): ПЕРВОЕ построение серым, стрелка к текущему —
+    # ⚠️ Оба цвета затемнены по замечанию заказчика 06.09.2026 («серым более тёмным,
+    # стрелки тоже чёрным») — светлый серый и жёлтая стрелка терялись на пёстрой карте.
+    "track_initial": "#5a6272",         # позиции и радиусы первого построения (потемнее)
+    "track_arrow":   "#0a0a0a",         # линия и наконечник «куда переехал» — чёрным,
+                                        # тот же тон, что у route_main (виден на любом фоне)
+    "track_label":   "#101418",         # текст расстояния — тёмный на светлой плашке
+    "track_label_bg": (230, 230, 230, 225),  # светлая плашка — читается и на чёрной стрелке
 }
 # Карта высот — привычная топографическая шкала «низины зелёные → вершины светлые».
 # Ступени равномерны по ПЕРЦЕНТИЛЯМ высоты, а не по метрам: иначе на участке с размахом
@@ -360,6 +368,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._layer_items = {}
         self._layer_casing = {}            # обводка слоя (широкая светлая линия под ним)
         self._sensor_items = []
+        self._track_items = []            # анализ размещения (задача 8.9) — свои элементы
         self._framed = False
         # ВИДИМОСТЬ КАЖДОГО ВЕКТОРНОГО СЛОЯ по отдельности (окно «Векторные слои…»).
         # Живёт здесь, а не в диалоге: окно можно закрыть и открыть, набор остаётся.
@@ -1010,6 +1019,41 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             return
         super().keyPressEvent(ev)
 
+    # ================= ПАНЕЛЬ РЕЖИМОВ (задел на будущее, заказчик 06.09.2026) =========
+    # Три небольших чекбокса ПОВЕРХ карты, в правом верхнем углу, одной строкой: «режим
+    # моделирования» / «режим анализа» / «построение маршрутов». ⚠️ ПОКА ЧИСТО
+    # ВИЗУАЛЬНАЯ ЗАГОТОВКА — выбор ни на что не влияет (заказчик 06.09.2026: «панель
+    # чекбоксов оставь, просто её выбор пока не влияет ни на что»). Рабочий переключатель
+    # «анализа размещения» — обычная галочка в группе «датчики и подписи» (`chk_sensor_
+    # track`), рядом с «Датчики», «Кандидатные позиции» и т.п.
+    def _build_mode_bar(self):
+        self._mode_bar = QtWidgets.QWidget(self.plot)
+        self._mode_bar.setStyleSheet(
+            "QWidget { background: rgba(11,17,28,195); border-radius: 4px; } "
+            "QCheckBox { font-size: 10px; color: %s; padding: 1px 3px; }" % THEME["text"])
+        mb = QtWidgets.QHBoxLayout(self._mode_bar)
+        mb.setContentsMargins(6, 2, 6, 2); mb.setSpacing(8)
+        self.chk_mode_sim = QtWidgets.QCheckBox("режим моделирования")
+        self.chk_mode_sim.setChecked(True)
+        self.chk_mode_analysis = QtWidgets.QCheckBox("режим анализа")
+        self.chk_mode_routes = QtWidgets.QCheckBox("построение маршрутов")
+        for chk in (self.chk_mode_sim, self.chk_mode_analysis, self.chk_mode_routes):
+            chk.setToolTip("Задел на будущее — пока не реализовано, выбор ни на что не влияет.")
+            mb.addWidget(chk)
+        self._mode_bar.adjustSize()
+        self.plot.installEventFilter(self)      # переносить плашку при изменении размера
+
+    def eventFilter(self, obj, event):
+        if obj is self.plot and event.type() == QtCore.QEvent.Resize:
+            self._position_mode_bar()
+        return super().eventFilter(obj, event)
+
+    def _position_mode_bar(self):
+        self._mode_bar.adjustSize()
+        w, h = self._mode_bar.width(), self._mode_bar.height()
+        self._mode_bar.move(max(0, self.plot.width() - w - 8), 6)
+        self._mode_bar.raise_()
+
     def _draw_zone_preview(self):
         """Показать зону, которую пользователь рисует прямо сейчас."""
         pts = self._zone_pts
@@ -1395,6 +1439,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             dlg.on_manual_edit = (lambda i, tid, st, lon, lat:
                                   self.on_manual_edit(i, tid, st, lon, lat))
             dlg.on_manual_clear = lambda: self.on_manual_clear()
+            dlg.on_clear_sensors = lambda: self.on_clear_sensors()
             dlg.on_mode_changed = lambda manual: self.on_manual_mode(manual)
             dlg.on_pick_mode = self._begin_pick_sensor
             dlg.on_view_routes = self._open_route_viewer
@@ -1584,6 +1629,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.pi.setLabel("bottom", "X, км", color=THEME["muted"])
         self.pi.setLabel("left", "Y, км", color=THEME["muted"])
         self.vb = self.pi.getViewBox()
+        self._build_mode_bar()
 
         # КАРТА + СТРОКА КООРДИНАТ ПОД НЕЙ (план 8, задача 8.3). Заказчик просил показ
         # «справа снизу»: клик по карте — и видно широту с долготой той точки. Строка
@@ -1955,6 +2001,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.metrics = QtWidgets.QPlainTextEdit(); self.metrics.setReadOnly(True)
         self.metrics.setMinimumHeight(200)
         col.addWidget(self.metrics, stretch=1)
+        self._position_mode_bar()          # плашка режимов — сразу в угол, до первого resize
 
     # Слои показа: (атрибут, подпись, включён ли сразу, подсказка). Подпись короткая —
     # подробности живут в подсказке, иначе двенадцать строк во всю ширину панели
@@ -2034,6 +2081,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             ("chk_legend", "Легенда", False,
              "Легенда (какой цвет какой объект) — в левом нижнем углу. По умолчанию "
              "скрыта: она занимает место, а нужна не всегда."),
+            ("chk_sensor_track", "Анализ размещения", False,
+             "Сравнение расстановки ДО и ПОСЛЕ моделирования (задача 8.9): серым — "
+             "позиции и радиусы первого построения, стрелка — куда датчик переехал, "
+             "подпись — на сколько километров. Старые и новые места сопоставлены "
+             "ОТДЕЛЬНО ПО ТИПАМ так, чтобы суммарное перемещение было наименьшим "
+             "(венгерский алгоритм), а не по порядку номеров — иначе датчик слева "
+             "оказался бы связан стрелкой с датчиком у другого края карты."),
         )),
     )
 
@@ -2541,6 +2595,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_iter_heat=self.chk_iter_heat.isChecked(),
                     show_iter_gen=self.chk_iter_gen.isChecked(),
                     show_loaded_routes=self.chk_loaded_routes.isChecked(),
+                    show_sensor_track=self.chk_sensor_track.isChecked(),
                     show_relief=self.chk_relief.isChecked(),
                     show_relief_k=self.chk_relief_k.isChecked(),
                     show_zones=self.chk_zones.isChecked(),
@@ -3446,6 +3501,102 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 lbl.setZValue(z + 2)
                 self.pi.addItem(lbl, ignoreBounds=True)
                 self._sensor_items.append(lbl)
+
+    # ⚠️ Дистанция ниже которой стрелка не рисуется вовсе (§8.9.4 «стрелка нулевой
+    # длины») — датчик, по сути, не двигался, а точка-клякса поверх своей же нынешней
+    # позиции только мешает.
+    TRACK_MIN_ARROW_KM = 0.05
+    # НАСКОЛЬКО СЕРЫЙ КРУГ ШИРЕ НАСТОЯЩЕГО РАДИУСА (заказчик 07.09.2026) — иначе он
+    # совпадает с текущим кругом того же датчика и не виден вовсе, если тот не двигался.
+    TRACK_RADIUS_MARGIN = 1.22
+
+    def render_sensor_track(self, matches, type_radii):
+        """«Анализ размещения» (задача 8.9): серым — позиции и радиусы ПЕРВОГО
+        построения, стрелка — куда датчик переехал к ТЕКУЩЕМУ, подпись — на сколько
+        километров. `matches` — из `ThreatModel.sensor_movement()`, `type_radii` —
+        радиус каждого типа (как у `render_sensors`).
+
+        Сопоставление старое↔новое уже сделано моделью (по типам, минимальным
+        суммарным перемещением) — здесь только рисуем то, что она посчитала."""
+        for it in self._track_items:
+            self.pi.removeItem(it)
+        self._track_items.clear()
+        if not matches:
+            return
+        gray = THREAT_COLORS["track_initial"]
+        arrow_c = THREAT_COLORS["track_arrow"]
+        for m in matches:
+            old_xy, new_xy = m["old_xy"], m["new_xy"]
+            rad = float(type_radii.get(m["type_id"], 0.0))
+            if old_xy is not None:
+                ox, oy = old_xy
+                if rad > 0.0:
+                    # ⚠️ РАДИУС ШИРЕ НАСТОЯЩЕГО (заказчик 07.09.2026). Если датчик не
+                    # переехал, серый круг и текущий (тот же радиус, та же точка)
+                    # совпадают ТОЧНО — серый целиком прячется под текущим, и по карте
+                    # не видно, что снимок вообще был. Запас `TRACK_RADIUS_MARGIN`
+                    # оставляет ободок серого видимым, даже когда датчик стоит на месте.
+                    rad_draw = rad * self.TRACK_RADIUS_MARGIN
+                    e = QtWidgets.QGraphicsEllipseItem(
+                        ox - rad_draw, oy - rad_draw, 2 * rad_draw, 2 * rad_draw)
+                    e.setPen(pg.mkPen(_qcolor(gray, 220), width=2.6,
+                                      style=QtCore.Qt.DashLine))
+                    e.setBrush(pg.mkBrush(_qcolor(gray, 35)))
+                    e.setZValue(15)                        # ПОД текущими датчиками (18+)
+                    self.pi.addItem(e, ignoreBounds=True)
+                    self._track_items.append(e)
+                dot = pg.ScatterPlotItem([ox], [oy], size=13, symbol="o",
+                                         brush=pg.mkBrush(_qcolor(gray, 230)),
+                                         pen=pg.mkPen(_qcolor("#101418"), width=1.8))
+                dot.setZValue(16)
+                self.pi.addItem(dot)
+                self._track_items.append(dot)
+            if old_xy is None or new_xy is None or m["dist_km"] is None:
+                continue
+            if m["dist_km"] < self.TRACK_MIN_ARROW_KM:
+                continue                                  # не двигался — не мешать кляксой
+            ox, oy = old_xy
+            nx, ny = new_xy
+            line = self.pi.plot([ox, nx], [oy, ny], pen=pg.mkPen(_qcolor(arrow_c, 235),
+                                                                  width=3.2))
+            line.setZValue(17)
+            self._track_items.append(line)
+            head = self._track_arrow_head((nx, ny), (nx - ox, ny - oy))
+            if head is not None:
+                head.setBrush(pg.mkBrush(_qcolor(arrow_c, 235)))
+                head.setPen(pg.mkPen(_qcolor("#101418"), width=1.6))
+                head.setZValue(17)
+                self.pi.addItem(head)
+                self._track_items.append(head)
+            lbl = pg.TextItem("%.1f км" % m["dist_km"],
+                              color=_qcolor(THREAT_COLORS["track_label"]),
+                              fill=pg.mkBrush(_qcolor(THREAT_COLORS["track_label_bg"])),
+                              anchor=(0.5, 0.5))
+            lbl.setPos((ox + nx) / 2.0, (oy + ny) / 2.0)
+            lbl.setZValue(19)
+            self.pi.addItem(lbl, ignoreBounds=True)
+            self._track_items.append(lbl)
+
+    # Наконечник стрелки — треугольник в КМ (данные, не пиксели): при аспекте 1:1
+    # масштабируется вместе с картой, как и сама линия, а не «отклеивается» при зуме.
+    TRACK_HEAD_LEN_KM = 0.65
+    TRACK_HEAD_W_KM = 0.30
+
+    def _track_arrow_head(self, tip, direction):
+        dx, dy = direction
+        norm = (dx * dx + dy * dy) ** 0.5
+        if norm < 1e-9:
+            return None
+        dx, dy = dx / norm, dy / norm
+        px, py = -dy, dx
+        L, W = self.TRACK_HEAD_LEN_KM, self.TRACK_HEAD_W_KM
+        back_x, back_y = tip[0] - L * dx, tip[1] - L * dy
+        poly = QtGui.QPolygonF([
+            QtCore.QPointF(tip[0], tip[1]),
+            QtCore.QPointF(back_x + W * px, back_y + W * py),
+            QtCore.QPointF(back_x - W * px, back_y - W * py),
+        ])
+        return QtWidgets.QGraphicsPolygonItem(poly)
 
     def render_entry_target(self, entry, target):
         self.entry_scatter.setData([entry[0]], [entry[1]])

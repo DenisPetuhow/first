@@ -414,6 +414,19 @@ def main():
     w.rb_calc.setChecked(True)
     check(not _n1.isReadOnly(), "в режиме расчёта количество снова задаётся руками")
 
+    # «ОЧИСТИТЬ» В РЕЖИМЕ «РАССЧИТАТЬ ПОЗИЦИИ» (заказчик 06.09.2026: «кнопка очистить
+    # не убирает данные о датчиках в таблице») — таблица показывает РЕЗУЛЬТАТ
+    # расстановки, «убрать вручную заданные» там убирать нечего; кнопка обязана
+    # убрать ВСЮ расстановку — как «Очистить датчики» на панели
+    c._work_place()
+    _n_before_clear = len(m.sensors) + len(m.sensors_big)
+    check(_n_before_clear > 0, "датчики на карте есть перед проверкой «Очистить»",
+          "%d" % _n_before_clear)
+    w.on_clear_sensors()
+    check(len(m.sensors) == 0 and len(m.sensors_big) == 0,
+          "«Очистить» в режиме «Рассчитать позиции» убирает ВСЮ расстановку",
+          "было %d, стало %d" % (_n_before_clear, len(m.sensors) + len(m.sensors_big)))
+
     # ⚠️ ДАТЧИКИ ЗАНОВО: проверка «Сброса» выше очистила всё, и файл записывался бы из
     # пустой таблицы — «принято 0 из 0» проходит, но ничего не доказывает.
     c.on_manual_add(1, True, float(lon), float(lat))
@@ -624,8 +637,8 @@ def main():
     check(m.sensor_source == "loaded",
           "модель помечает источник расстановки «loaded» (заказчик: показать в заголовке)")
     # …а с накоплением ≥5 своих итераций — снова СВОЮ (заказчик: «с пуском не работает»)
-    m.p.threat_iter_routes = 6
-    for _attempt in range(3):                    # та же стохастика, что и выше (журнал п. 202)
+    m.p.threat_iter_routes = 8
+    for _attempt in range(5):                    # та же стохастика, что и выше (журнал п. 202)
         m.iter_reset(); m.iter_batch()
         if len(m.iter_routes) >= 5:
             break
@@ -731,12 +744,171 @@ def main():
 
     os.remove(_flights_path)
 
+    # ================================================================
+    # 8. АНАЛИЗ РАЗМЕЩЕНИЯ: стрелки, устойчивые номера (задача 8.9)
+    # ================================================================
+    print("\n8. АНАЛИЗ РАЗМЕЩЕНИЯ (задача 8.9)")
+    from model import sensor_track as trk
+    import itertools as _it
+
+    # ВЕНГЕРСКИЙ АЛГОРИТМ — сверка с ПОЛНЫМ ПЕРЕБОРОМ (план §8.9.5): своя реализация
+    # задачи о назначениях без такой сверки опасна — даёт правдоподобный, но не
+    # оптимальный ответ, и по картинке на карте это не видно.
+    _rng = np.random.default_rng(7)
+    _worst = 0.0
+    for _ in range(200):
+        _n, _mm_ = int(_rng.integers(1, 6)), int(_rng.integers(1, 6))
+        _cost = _rng.uniform(0, 50, size=(_n, _mm_))
+        _rows, _cols = trk.hungarian(_cost)
+        _got = float(_cost[_rows, _cols].sum()) if len(_rows) else 0.0
+        if _n <= _mm_:
+            _best = min(_cost[range(_n), _perm].sum()
+                       for _perm in _it.permutations(range(_mm_), _n))
+        else:
+            _best = min(_cost[list(_rp), range(_mm_)].sum()
+                       for _rp in _it.permutations(range(_n), _mm_))
+        _worst = max(_worst, abs(_got - _best))
+    check(_worst < 1e-9, "венгерский алгоритм совпадает с полным перебором",
+          "200 матриц до 5x5/5x6, худшее расхождение %.1e" % _worst)
+
+    # СОПОСТАВЛЕНИЕ ТОЛЬКО ВНУТРИ ТИПА (§8.9.4) — типы 1 и 4 в одном вызове
+    _old_xy = np.array([[0.0, 0.0], [10.0, 0.0], [0.0, 5.0]])
+    _old_t = np.array([1, 1, 4])
+    _new_xy = np.array([[0.2, 0.1], [9.8, 0.3], [0.1, 5.2]])
+    _new_t = np.array([1, 1, 4])
+    _matches_syn = trk.match_by_type(_old_xy, _old_t, _new_xy, _new_t)
+    check(all(_old_t[r["old_idx"]] == _new_t[r["new_idx"]]
+             for r in _matches_syn if r["dist_km"] is not None),
+          "сопоставление не смешивает типы (1 с 1, большие с большими)")
+    check(sum(1 for r in _matches_syn if r["dist_km"] is not None) == 3,
+          "все три датчика нашли пару своего типа", "%d записей" % len(_matches_syn))
+
+    # ПОЯВЛЕНИЕ/ИСЧЕЗНОВЕНИЕ (§8.9.4) — датчиков одного типа стало меньше
+    _old2 = np.array([[0.0, 0.0], [10.0, 0.0]]); _old2t = np.array([1, 1])
+    _new2 = np.array([[0.1, 0.1]]); _new2t = np.array([1])
+    _mm2 = trk.match_by_type(_old2, _old2t, _new2, _new2t)
+    _matched2 = [r for r in _mm2 if r["dist_km"] is not None]
+    _gone2 = [r for r in _mm2 if r["dist_km"] is None and r["old_idx"] is not None]
+    check(len(_matched2) == 1 and len(_gone2) == 1,
+          "меньше датчиков стало — лишний без пары, а не потерян")
+    check(_matched2[0]["old_idx"] == 0,
+          "пару получил БЛИЖНИЙ старый датчик, не первый по порядку",
+          "old_idx=%s (0.0,0.0) а не 1 (10.0,0.0)" % _matched2[0]["old_idx"])
+
+    # ПАНЕЛЬ РЕЖИМОВ — три чекбокса поверх карты, ЗАДЕЛ НА БУДУЩЕЕ (заказчик 06.09.2026:
+    # «панель оставь, просто её выбор пока не влияет ни на что») — только присутствие.
+    check(hasattr(v, "chk_mode_sim") and hasattr(v, "chk_mode_analysis")
+          and hasattr(v, "chk_mode_routes"),
+          "три чекбокса-заготовки на карте: моделирование/анализ/маршруты")
+
+    # РАБОЧИЙ ПЕРЕКЛЮЧАТЕЛЬ — обычная галочка в группе «датчики и подписи», рядом с
+    # «Датчики», «Кандидатные позиции» и т.п. (заказчик: «функция всегда есть в этой
+    # вкладке чекбоксов»)
+    check(hasattr(v, "chk_sensor_track"), "«Анализ размещения» — галочка в группе показа")
+    check(not v.chk_sensor_track.isChecked(), "по умолчанию выключена")
+
+    # СНИМОК ПЕРВОГО ПОСТРОЕНИЯ: снимается заново после «Сброса» (только что был выше)
+    check(m.initial_sensors is None,
+          "после «Сброса» снимок первого построения снят")
+    c._work_place()
+    check(m.initial_sensors is not None,
+          "первая расстановка после сброса снимает новый снимок",
+          "малых %d, больших %d" % (len(m.initial_sensors), len(m.initial_sensors_big)))
+    _init_small = np.array(m.initial_sensors, float, copy=True)
+    _init_type = np.array(m.initial_sensors_type, int, copy=True)
+    _init_big = np.array(m.initial_sensors_big, float, copy=True)
+
+    m.p.threat_iter_routes = 40
+    for _attempt in range(3):
+        m.iter_reset(); m.iter_batch()
+        if len(m.iter_routes) >= 5:
+            break
+    c._work_place()
+    check(m.sensor_source == "iter", "расстановка после итераций взята из своей выборки")
+
+    _matches = m.sensor_movement()
+    check(len(_matches) > 0, "«анализ размещения» нашёл пары", "%d записей" % len(_matches))
+    _hu = trk.total_movement(_matches)
+    # наивная нумерация «по порядку внутри типа» — то, от чего заказчик и просил уйти
+    _naive = 0.0
+    for _t in sorted(set(_init_type.tolist()) | {4}):
+        if _t == 4:
+            _o, _n = _init_big, m.sensors_big
+        else:
+            _o, _n = _init_small[_init_type == _t], m.sensors[m.sensors_type == _t]
+        _k = min(len(_o), len(_n))
+        if _k:
+            _naive += float(np.sum(np.hypot(_o[:_k, 0] - _n[:_k, 0], _o[:_k, 1] - _n[:_k, 1])))
+    check(_hu <= _naive + 1e-6,
+          "сопоставление не хуже наивной нумерации по порядку",
+          "венгерский %.1f км против наивных %.1f км" % (_hu, _naive))
+
+    _before_positions = np.array(m.sensors, float, copy=True)
+    c._render_sensor_track({"show_sensor_track": True})
+    check(np.allclose(m.sensors, _before_positions),
+          "включённый анализ НЕ меняет позиции датчиков (только рисует)")
+    check(len(v._track_items) > 0, "слой анализа что-то нарисовал",
+          "%d элементов" % len(v._track_items))
+    c._render_sensor_track({"show_sensor_track": False})
+    check(len(v._track_items) == 0, "выключение анализа снимает слой")
+
+    # ТА ЖЕ ГАЛОЧКА ЖИВЬЁМ — через обычный путь показа (chk → _layer_toggled → on_toggle
+    # → _render_all), а не вызовом внутреннего метода контроллера напрямую
+    v.chk_sensor_track.setChecked(True)
+    check(len(v._track_items) > 0,
+          "галочка «Анализ размещения» рисует слой по обычному пути показа",
+          "%d элементов" % len(v._track_items))
+    v.chk_sensor_track.setChecked(False)
+    check(len(v._track_items) == 0, "и снимает его тем же путём")
+
+    # СТРЕЛКА НУЛЕВОЙ ДЛИНЫ (§8.9.4) — не рисуется, только серая точка первого построения
+    import pyqtgraph as _pg
+    _zero_match = [dict(type_id=1, old_idx=0, new_idx=0, old_xy=(0.0, 0.0),
+                        new_xy=(0.0, 0.0), dist_km=0.0)]
+    v.render_sensor_track(_zero_match, {1: 2.0})
+    # ⚠️ НЕ `hasattr(it, "getData")` — он есть и у ScatterPlotItem (серая точка),
+    # только PlotDataItem — это ЛИНИЯ-СТРЕЛКА (проверяется isinstance)
+    _n_lines = sum(1 for it in v._track_items if isinstance(it, _pg.PlotDataItem))
+    check(_n_lines == 0, "нулевое перемещение — стрелка не рисуется")
+    v.render_sensor_track([], {})
+
+    # ⚠️ РЕГРЕССИЯ 06.09.2026 (заказчик): «Пуск» БЕЗ предварительной «Расставить
+    # датчики» — раньше снимок первого построения не брался НИКОГДА (условие захвата
+    # требовало len(iter_routes) < 5, а датчики впервые считаются уже при ==5, порог
+    # THREAT_SENSOR_REFRESH_EVERY). Заказчик увидел это как «датчики для анализа
+    # двигаются каждые 5 итераций» — на деле снимка не было вовсе весь сеанс.
+    # ⚠️ ЯВНЫЙ СБРОС iter_routes/iter_iteration/_sensors_at: `m`/`c` — общие на весь
+    # прогон, и «Пуск» через `on_iter_play()` мог бы тихо ПРОДОЛЖИТЬ с накопленного
+    # состояния прежних разделов (проверяет `iter_iteration == 0`, а он уже не 0) —
+    # тест управляет механизмом («iter_step» + «_maybe_refresh_sensors») напрямую,
+    # ровно как это делает анимация, но без зависимости от истории кнопки.
+    m._reset_sensors()
+    check(m.initial_sensors is None, "перед регрессией: снимка нет (условие теста)")
+    m.p.threat_iter_routes = 25
+    check(m.iter_reset(), "цель достижима — можно накапливать маршруты для регрессии")
+    c._sensors_at = 0
+    _snaps = []
+    for _ in range(8000):
+        m.iter_step()
+        c._maybe_refresh_sensors()
+        if m.initial_sensors is not None:
+            _snaps.append(np.array(m.initial_sensors, float, copy=True))
+        if len(m.iter_routes) >= 25:
+            break
+    check(len(_snaps) > 0,
+          "снимок взят, даже если «Пуск» нажат БЕЗ предварительной расстановки",
+          "маршрутов накоплено %d" % len(m.iter_routes))
+    check(_snaps and all(np.array_equal(s, _snaps[0]) for s in _snaps),
+          "снимок не «плывёт» при каждом периодическом пересчёте (каждые "
+          "THREAT_SENSOR_REFRESH_EVERY маршрутов)",
+          "проверено %d раз подряд" % len(_snaps))
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
         return 1
-    print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои, окно исходных данных и история "
-         "полётов — в норме.")
+    print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои, окно исходных данных, история "
+         "полётов и анализ размещения — в норме.")
     return 0
 
 
