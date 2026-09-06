@@ -75,12 +75,16 @@ class ThreatController:
         self._cur_j = 0                   # индекс точки анимации
         self._speed = 6                   # скорость анимации (точек за кадр)
         self._sensors_at = 0              # при скольких маршрутах датчики пересчитаны
+        # Снимок состояния ПЕРЕД моделированием — к нему возвращает кнопка «Очистить».
+        # None — моделирование ещё не запускали, возвращаться некуда.
+        self._pre_iter = None
         # цель/сектор заданы кликом, но маршруты ещё не пересчитаны: ждём «Применить»
         self._pending_recalc = False
         view.set_callbacks(
             on_build=self.on_build, on_relief=self.on_relief,
             on_place=self.on_place, on_apply=self.on_apply,
             on_reset=self.on_reset, on_reset_view=self.on_reset_view,
+            on_clear_iter=self.on_clear_iter,
             on_mode=self.on_mode, on_toggle=self.on_toggle,
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
@@ -95,6 +99,8 @@ class ThreatController:
             on_clear_area=self.on_clear_area,
             # датчики, заданные человеком (задача 8.7)
             on_manual_add=self.on_manual_add, on_manual_remove=self.on_manual_remove,
+            on_manual_edit=self.on_manual_edit, on_clear_sensors=self.on_clear_sensors,
+            on_sensor_delete=self.on_sensor_delete,
             on_manual_clear=self.on_manual_clear, on_manual_mode=self.on_manual_mode,
             on_sensor_rows=self._sensor_rows)
         # СТАРТ: район не задан — расчётные кнопки закрыты, синей рамки нет
@@ -222,6 +228,7 @@ class ThreatController:
         self.view.set_iter_checked(True)
         self.model.p.threat_iter_routes = self.view.get_iter_T()
         if self.model.iter_iteration == 0 or self._iter_finished():
+            self._snapshot_before_iter()                  # чтобы «Очистить» вернуло это
             if not self.model.iter_reset():
                 self.view.flash_title("Цель недостижима по коридорам (проверьте L_max/цель).")
                 return
@@ -304,6 +311,7 @@ class ThreatController:
         self.view.set_iter_checked(True)
         self.model.p.threat_iter_routes = self.view.get_iter_T()
         if self.model.iter_iteration == 0:
+            self._snapshot_before_iter()                  # чтобы «Очистить» вернуло это
             if not self.model.iter_reset():
                 self.view.flash_title("Цель недостижима по коридорам.")
                 return
@@ -325,7 +333,72 @@ class ThreatController:
         self.view.set_iter_checked(True)
         self.model.p.threat_iter_routes = self.view.get_iter_T()
         self._sensors_at = 0                             # iter_batch начинает выборку заново
+        self._snapshot_before_iter()
         self._run_async("iter", self.model.iter_batch)
+
+    # ---- «ОЧИСТИТЬ»: назад к состоянию ДО МОДЕЛИРОВАНИЯ (заказчик 05.09.2026) ----
+    def _snapshot_before_iter(self):
+        """Запомнить расстановку и заданные датчики ПЕРЕД запуском итераций.
+
+        ⚠️ Снимок делается сам, а не по кнопке: человек нажимает «Пуск» или «Пакетно», не
+        думая о том, что потом захочет вернуться. Момент — старт выборки, то есть когда
+        `iter_iteration == 0`: повторный запуск поверх уже накопленного снимок НЕ
+        обновляет, иначе «до моделирования» означало бы «до последней добавки».
+
+        Что запоминаем: расстановку со всеми её спутниками (тип, режим, кем поставлен),
+        заданные человеком датчики (их динамические позиции при итерациях меняются) и
+        показатели. Карту, рельеф и район — нет: моделирование их не трогает."""
+        import copy
+        m = self.model
+        if m.iter_iteration and self._pre_iter is not None:
+            return                                    # выборка уже идёт — снимок не трогаем
+        self._pre_iter = dict(
+            sensors=np.array(m.sensors, float, copy=True),
+            sensors_big=np.array(m.sensors_big, float, copy=True),
+            sensors_type=np.array(m.sensors_type, int, copy=True),
+            sensors_static=np.array(m.sensors_static, bool, copy=True),
+            sensors_big_static=np.array(m.sensors_big_static, bool, copy=True),
+            sensors_manual=np.array(m.sensors_manual, bool, copy=True),
+            sensors_big_manual=np.array(m.sensors_big_manual, bool, copy=True),
+            manual=copy.deepcopy(m.manual_sensors),
+            metrics=copy.deepcopy(m.metrics()),
+        )
+
+    def on_clear_iter(self):
+        """Кнопка «Очистить»: убрать итерации и вернуть состояние до моделирования.
+
+        Отличие от «Сброса»: тот обнуляет всё, оставляя район, весовую карту и рельеф.
+        Здесь карта, маршруты «все возможные» и заданные условия остаются — уходит
+        только то, что дало моделирование."""
+        import copy
+        m = self.model
+        self._anim_stop()
+        m.iter_routes = []
+        m.iter_iteration = 0
+        self._sensors_at = 0
+        snap = self._pre_iter
+        if snap is not None:
+            m.sensors = np.array(snap["sensors"], float, copy=True)
+            m.sensors_big = np.array(snap["sensors_big"], float, copy=True)
+            m.sensors_type = np.array(snap["sensors_type"], int, copy=True)
+            m.sensors_static = np.array(snap["sensors_static"], bool, copy=True)
+            m.sensors_big_static = np.array(snap["sensors_big_static"], bool, copy=True)
+            m.sensors_manual = np.array(snap["sensors_manual"], bool, copy=True)
+            m.sensors_big_manual = np.array(snap["sensors_big_manual"], bool, copy=True)
+            m.manual_sensors = copy.deepcopy(snap["manual"])
+            m._metrics = copy.deepcopy(snap["metrics"])
+        self.view.iter_show_accumulated([])
+        self.view.iter_clear_current()
+        self.view.set_iter_checked(False)
+        self.view.refresh_sensor_table(self._sensor_rows())
+        self.view.set_manual_count(len(m.manual_sensors))
+        self._render_all()
+        self._full_metrics()
+        self.view.set_title(
+            "Итерации убраны — вернулись к состоянию до моделирования."
+            if snap is not None else
+            "Итерации убраны. Снимка «до моделирования» не было — датчики остались "
+            "теми, что посчитаны сейчас.")
 
     # ---- окно «Исходные данные»: применить сразу (не блокирует программу) ----
     # ⚠️ ОДИН ОБРАБОТЧИК НА ВСЁ ОКНО (задача 8.7). Прежде их было два — «Датчики» и
@@ -433,25 +506,36 @@ class ThreatController:
             self.view.render_sensors(
                 _np.empty((0, 2), float), p.threat_R,
                 _np.empty((0, 2), float), p.threat_R_big,
-                pending=[(s.x_km, s.y_km, s.type_id) for s in m.manual_sensors])
+                pending=[(s.x_km, s.y_km, s.type_id, s.static)
+                         for s in m.manual_sensors])
             return
         radii = {s.type_id: s.r_km for s in sensor_types(p)}
         # ПОСТАВЛЕННЫЕ МЫШЬЮ, НО ЕЩЁ НЕ УЧТЁННЫЕ РАСЧЁТОМ — показываем сразу. Отбираем
         # тех, кого нет в текущей расстановке: после «Расставить датчики» они уже там, и
         # рисовать их вторично значило бы удваивать значки.
+        #
+        # ⚠️ ФЛАГ `placed` ЗДЕСЬ ГЛАВНЕЕ РАССТОЯНИЯ. Одной проверки «нет в расстановке»
+        # мало: ДИНАМИЧЕСКИЙ датчик в неё и не попадает — алгоритм ставит его в другом
+        # месте, — и точка клика оставалась на карте навсегда. Со стороны это выглядело
+        # так, будто динамические не двигаются вовсе (замечание заказчика 05.09.2026).
+        # Учтённые расстановкой заявки не рисуем: их место теперь показывает расчёт.
         placed = list(_np.asarray(m.sensors, float)) + list(_np.asarray(m.sensors_big, float))
         pending = []
         for mm in m.manual_sensors:
+            if getattr(mm, "placed", False):
+                continue
             near = any(abs(pt[0] - mm.x_km) < 1e-3 and abs(pt[1] - mm.y_km) < 1e-3
                        for pt in placed)
             if not near:
-                pending.append((mm.x_km, mm.y_km, mm.type_id))
+                pending.append((mm.x_km, mm.y_km, mm.type_id, mm.static))
         self.view.render_sensors(
             m.sensors, p.threat_R, getattr(m, "sensors_big", None),
             getattr(p, "threat_R_big", 0.0),
             types=getattr(m, "sensors_type", None),
             static=getattr(m, "sensors_static", None),
             big_static=getattr(m, "sensors_big_static", None),
+            manual=getattr(m, "sensors_manual", None),
+            big_manual=getattr(m, "sensors_big_manual", None),
             type_radii=radii, pending=pending)
 
     # ================= ДАТЧИКИ, ЗАДАННЫЕ ЧЕЛОВЕКОМ (задача 8.7) =================
@@ -483,9 +567,82 @@ class ThreatController:
         self.model.remove_manual_sensor(best)
         self._after_manual_change()
 
+    def on_manual_edit(self, index, type_id, static, lon, lat):
+        """Изменить датчик строкой таблицы: тип, режим и координаты — одним действием.
+
+        ⚠️ ЗАПИСЬ ПРАВИТСЯ НА МЕСТЕ, а не «удалить и добавить заново». Пара вызовов
+        ломалась о то, что в режиме расчёта таблица показывает РЕЗУЛЬТАТ расстановки:
+        удаление не находило ручной записи и отказывалось работать, а добавление создавало
+        лишний датчик — правка выглядела «не работает» (заказчик 05.09.2026). Заодно
+        сохраняется ПОРЯДОК записей: строка остаётся на своём месте в таблице.
+
+        Строку, которую поставила программа (её нет среди заданных), правка превращает в
+        заданную: человек указал для неё место — значит теперь место выбрал он."""
+        rows = self._sensor_rows()
+        if not (0 <= int(index) < len(rows)):
+            return
+        r = rows[int(index)]
+        rec = self._manual_at(r["x_km"], r["y_km"])
+        if rec is None:
+            rec = self.model.add_manual_lonlat(int(type_id), bool(static), lon, lat)
+        else:
+            self.model.update_manual_lonlat(rec, int(type_id), bool(static), lon, lat)
+        # ⚠️ ДВИГАЕМ И САМУ РАССТАНОВКУ, а не только заявку (заказчик 05.09.2026: «сразу
+        # отобразиться на карте, перерисовать данный датчик»). Без этого на карте
+        # оказывались бы двое: старый — из расчёта, новый — как «только что поставленный».
+        if self.model.move_placed_sensor((r["x_km"], r["y_km"]),
+                                         (rec.x_km, rec.y_km),
+                                         int(type_id), bool(static)):
+            rec.placed = True                 # заявка уже отражена в расстановке
+            self.model._metrics = self.model._evaluate_current()
+        self._after_manual_change()
+
+    def on_sensor_delete(self, lon, lat):
+        """Удалить датчик, выбранный на карте в режиме правки (клавиша Delete).
+
+        ⚠️ ПО КООРДИНАТЕ, А НЕ ПО НОМЕРУ СТРОКИ. Номер меняется при любой правке — после
+        переноса он указывает уже на другой датчик, и удалялся бы не тот. Убираются обе
+        стороны: и заявка человека, и точка в расстановке, — иначе датчик исчезал бы из
+        таблицы, но оставался на карте (или наоборот)."""
+        from model.geo_frame import lonlat_to_km
+        x, y = lonlat_to_km(float(lon), float(lat),
+                            self.model.lon0, self.model.lat0)
+        rec = self._manual_at(x, y, tol=0.05)
+        if rec is not None:
+            self.model.manual_sensors.remove(rec)
+        gone = self.model.remove_placed_sensor(x, y)
+        if gone:
+            self.model._metrics = self.model._evaluate_current()
+        if not gone and rec is None:
+            self.view.flash_title("Датчик не найден — щёлкните точнее по его центру.")
+            return
+        self._after_manual_change()
+
+    def _manual_at(self, x_km, y_km, tol=1e-3):
+        """Заданная человеком запись в этой точке — или None, если её поставил алгоритм."""
+        best, best_d = None, tol
+        for m in self.model.manual_sensors:
+            d = ((m.x_km - x_km) ** 2 + (m.y_km - y_km) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = m, d
+        return best
+
     def on_manual_clear(self):
         self.model.clear_manual_sensors()
         self._after_manual_change()
+
+    def on_clear_sensors(self):
+        """Кнопка «Очистить датчики»: убрать с карты ВСЕ — и подобранные, и заданные.
+
+        Отличие от «Сброса»: цель, сектор, запретные зоны, маршруты и итерации остаются
+        на месте. Убирается только расстановка, чтобы посчитать её заново — например с
+        другими параметрами типов (заказчик 05.09.2026)."""
+        self.model._reset_sensors()
+        self.model.clear_manual_sensors()
+        self.model._metrics = None
+        self._after_manual_change()
+        self.view.set_title("Датчики убраны с карты. Нажмите «Расставить датчики», "
+                            "чтобы расставить заново.")
 
     def on_manual_mode(self, manual):
         """Переключение «Рассчитать позиции» ⇄ «Задать позиции»."""
@@ -509,6 +666,22 @@ class ThreatController:
                              lon=lon, lat=lat, x_km=m.x_km, y_km=m.y_km))
         return rows
 
+    def _left_to_place(self):
+        """Сколько датчиков алгоритму осталось доставить к заданным человеком.
+
+        Считается ПО ТИПАМ и суммируется: заказ у каждого типа свой, и «20 всего» ничего
+        не сказало бы, если пять из них уже стоят типом 2. Отрицательное значение —
+        заданных больше, чем заказано: лишние в расстановку не попадут."""
+        from model.sensors import sensor_types
+        p = self.model.p
+        left = 0
+        for s in sensor_types(p):
+            if not s.active:
+                continue
+            have = sum(1 for m in self.model.manual_sensors if m.type_id == s.type_id)
+            left += int(s.n) - have
+        return left
+
     def _after_manual_change(self):
         """Список заданных датчиков изменился: обновить таблицу и карту.
 
@@ -521,14 +694,22 @@ class ThreatController:
         if manual and self.model.grid is not None:
             self.model.place_sensors()
         self.view.refresh_sensor_table(self._sensor_rows())
+        self.view.set_manual_count(len(self.model.manual_sensors))
         n = len(self.model.manual_sensors)
         n_fix = sum(1 for m in self.model.manual_sensors if m.static)
         out = self.model.manual_outside_area()
         msg = "Задано датчиков вручную: %d%s%s." % (
-            n, ", закреплённых: %d" % n_fix if n_fix else "",
+            n, ", статических: %d" % n_fix if n_fix else "",
             ", ВНЕ РАЙОНА: %d" % out if out else "")
-        if not manual and n_fix and self.model.grid is not None:
-            msg += " Нажмите «Расставить датчики», чтобы закрепить их в расчёте."
+        # ⚠️ СКОЛЬКО ОСТАЛОСЬ ДОСТАВИТЬ — считаем ДО нажатия кнопки (заказчик
+        # 05.09.2026). Заданные входят в заказанное число, и человек должен видеть,
+        # сколько датчиков алгоритм добавит к его собственным, а не узнавать это постфактум.
+        if not manual and n:
+            left = self._left_to_place()
+            msg += (" Останется доставить: %d." % left if left >= 0 else
+                    " Задано БОЛЬШЕ, чем заказано: лишние %d не поместятся." % -left)
+        if not manual and n and self.model.grid is not None:
+            msg += " Нажмите «Расставить датчики»."
         self.view.set_title(msg)
         self._render_all()
 
@@ -1087,9 +1268,16 @@ class ThreatController:
         if len(by) > 1:
             parts = " · ".join(f"тип {t}: {by[t]['n']}" for t in sorted(by))
             out.append(f"  по типам: {parts}")
-        n_fix = me.get("n_static", 0)
-        if n_fix:
-            out.append(f"  закреплено человеком: {n_fix}")
+        # ⚠️ ДВЕ РАЗНЫЕ СТРОКИ. «Задано человеком» — сколько позиций он назвал сам;
+        # «из них статических» — сколько из них не сдвинется и при итерациях. До
+        # итераций стоят все заданные, при итерациях динамические уезжают, и разница
+        # между строками показывает, что именно сейчас закреплено.
+        n_hand, n_fix = me.get("n_manual", 0), me.get("n_static", 0)
+        if n_hand:
+            out.append(f"  задано человеком: {n_hand}"
+                       + (f"  (из них статических: {n_fix})" if n_fix else ""))
+        elif n_fix:
+            out.append(f"  статических: {n_fix}")
         return out
 
     def _by_type_lines(self, me):

@@ -85,7 +85,7 @@ class CoverageCache:
       * covfrac[i, c]  — доля точек маршрута в зоне датчика (распределение).
     """
 
-    def __init__(self, candidates, R, L_seg, k):
+    def __init__(self, candidates, R, L_seg, k, placed=None):
         self.cand = np.asarray(candidates, float)
         self.C = len(self.cand)
         self.R = float(R)
@@ -94,12 +94,45 @@ class CoverageCache:
         self._hit, self._mask, self._cov = [], [], []
         self._wcov = None                                 # матрица покрытия клеток (вкладка 3)
         self._wpos = None                                 # веса клеток
+        # ⚠️ УЖЕ ПОСТАВЛЕННЫЕ ДАТЧИКИ ДРУГИХ ТИПОВ — `[(x, y, R), …]`. Кэш строится под
+        # ОДИН радиус, поэтому датчики с другим радиусом кандидатами быть не могут; но их
+        # ПОКРЫТИЕ обязано учитываться, иначе следующий тип не знает, что этот кусок
+        # маршрута уже засечён нужное число раз, и садится поверх (заказчик 05.09.2026:
+        # «кратность и распределение должны работать и между группами»).
+        self._placed = [(float(x), float(y), float(r)) for x, y, r in (placed or [])]
+        self._pre_n, self._pre_mask, self._pre_cov = [], [], []
 
     @property
     def n_traj(self):
         return len(self._hit)
 
+    def _add_placed_row(self, traj):
+        """Вклад УЖЕ ПОСТАВЛЕННЫХ датчиков (других типов) в покрытие этой траектории.
+
+        Считается по радиусу КАЖДОГО из них, а не по радиусу кэша: у типов радиусы
+        разные, и мерить чужой датчик своей меркой значило бы завышать или занижать его
+        зону. Результат — стартовое состояние для `greedy`: сколько раз маршрут уже
+        засечён, какие его участки закрыты и какая доля пройдена под наблюдением."""
+        n = 0
+        mask = np.uint32(0)
+        cov = 0.0
+        if self._placed:
+            idx = np.array_split(np.arange(len(traj)), self.L_seg)
+            for x, y, r in self._placed:
+                within = np.hypot(traj[:, 0] - x, traj[:, 1] - y) <= r
+                if not within.any():
+                    continue
+                n += 1
+                cov += float(within.mean())
+                for j, ix in enumerate(idx):
+                    if len(ix) and within[ix].any():
+                        mask |= np.uint32(1) << np.uint32(j)
+        self._pre_n.append(n)
+        self._pre_mask.append(mask)
+        self._pre_cov.append(min(cov, 1.0))
+
     def add_trajectory(self, traj):
+        self._add_placed_row(np.asarray(traj, float))
         if self.C == 0:
             self._hit.append(np.zeros(0, np.uint8))
             self._mask.append(np.zeros(0, np.uint32))
@@ -158,11 +191,20 @@ class CoverageCache:
         k, Lseg = self.k, self.L_seg
 
         covsum = H.sum(axis=0).astype(float)              # маршрутов на кандидата (третичный ключ)
-        n_vec = np.zeros(T, np.int64)
-        mask_vec = np.zeros(T, np.uint32)
-        cur_min = np.zeros(T)
-        cur_pop = np.zeros(T)
-        cur_cov = np.zeros(T)                              # накопл. доля покрытия [0..1]
+        # ⚠️ СТАРТУЕМ НЕ С НУЛЯ, ЕСЛИ ДАТЧИКИ ДРУГИХ ТИПОВ УЖЕ СТОЯТ. Их покрытие —
+        # часть решения, и жадный прирост обязан считаться поверх него: иначе тип 2
+        # «не видит» кратности, набранной типом 1, и ставит датчики в уже закрытые места.
+        pre_n = (np.asarray(self._pre_n, np.int64) if len(self._pre_n) == T
+                 else np.zeros(T, np.int64))
+        pre_mask = (np.asarray(self._pre_mask, np.uint32) if len(self._pre_mask) == T
+                    else np.zeros(T, np.uint32))
+        pre_cov = (np.asarray(self._pre_cov, float) if len(self._pre_cov) == T
+                   else np.zeros(T))
+        n_vec = pre_n.copy()
+        mask_vec = pre_mask.copy()
+        cur_min = np.minimum(n_vec, k).astype(float)
+        cur_pop = _popcount(mask_vec).astype(float)
+        cur_cov = np.minimum(pre_cov, 1.0)                 # накопл. доля покрытия [0..1]
         avail = np.ones(self.C, bool)
         chosen = []
 

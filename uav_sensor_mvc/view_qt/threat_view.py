@@ -34,6 +34,8 @@ from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from .ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
 from . import geomap as gm
 from . import map_image as mi              # своя карта картинкой (план 8, задача 8.5)
+from . import map_anchor as ma             # привязка картинки к координатам
+from . import map_vector as mv             # своя карта вектором (SVG)
 from .map_image import MapImageDialog
 from model import geo_frame as gf          # общий координатный фрейм (план 8, задача 8.3)
 
@@ -157,7 +159,12 @@ THREAT_COLORS = {
     # и формой значка, поэтому цвет здесь не единственный признак.
     "sensor_t2":   "#2563eb",           # тип 2 — синий
     "sensor_t3":   "#e11d74",           # тип 3 — малиновый
-    "sensor_fix":  "#ffffff",           # обводка ЗАКРЕПЛЁННОГО датчика (позиция задана)
+    "sensor_fix":  "#ffffff",           # обводка датчика, чьё место подобрал алгоритм
+    # ⚠️ ЧЁРНАЯ ОБВОДКА — «МЕСТО ВЫБРАЛ ЧЕЛОВЕК» (клик, строка таблицы, файл). Требование
+    # заказчика 05.09.2026. Это ВТОРОЙ признак, независимый от формы значка: форма
+    # говорит о режиме (круг — динамический, квадрат — статический), обводка — о том,
+    # кто назвал позицию. Одним признаком их не свести: до итераций стоят и те и другие.
+    "sensor_hand": "#000000",           # обводка датчика, поставленного человеком
     # НОМЕР ДАТЧИКА подписывается ЧЁРНЫМ И ЖИРНЫМ (требование заказчика 05.09.2026):
     # белые цифры терялись и на светлой подложке, и на жёлтых ячейках весовой карты.
     "sensor_num":  "#000000",
@@ -379,6 +386,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_place = lambda: None
         self.on_apply = lambda: None
         self.on_reset = lambda: None
+        self.on_clear_iter = lambda: None      # «Очистить»: назад к состоянию до итераций
         self.on_reset_view = lambda: None
         self.on_mode = lambda key: None
         self.on_toggle = lambda: None
@@ -408,16 +416,29 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._map_img_info = None         # что показано: путь и координаты углов
         self._map_full_km = None          # рамка своей карты в километрах
         self._map_detail = None           # кэш детализации (см. map_image.build_detail)
-        self._map_detail_box = None       # какой кусок сейчас показан, в долях картинки
+        self._map_detail_box = None       # какой кусок сейчас показан, в пикселях картинки
+        self._map_anchor = None           # привязка картинки (view_qt/map_anchor.py)
+        self._map_anchor_A = None         # её матрица «пиксель → км» для этого участка
+        self.map_svg_item = None          # своя карта вектором (view_qt/map_vector.py)
         self.on_sensors_apply = lambda vals: None
         # ДАТЧИКИ, ЗАДАННЫЕ ЧЕЛОВЕКОМ (задача 8.7). Представление не знает модели —
         # добавление, удаление и список строк идут через контроллер.
         self.on_manual_add = lambda tid, static, lon, lat: None
         self.on_manual_remove = lambda index: None
+        self.on_manual_edit = lambda index, tid, static, lon, lat: None
         self.on_manual_clear = lambda: None
+        self.on_clear_sensors = lambda: None   # убрать с карты ВСЕ датчики
+        self.on_sensor_delete = lambda lon, lat: None   # DELETE в режиме правки
         self.on_manual_mode = lambda manual: None    # «задать позиции» вкл/выкл
         self.on_sensor_rows = lambda: []             # чем заполнять таблицу
         self._pick_sensor = False                    # включён режим постановки мышью
+        self._edit_sensor = False                    # включён режим правки датчиков
+        self._edit_handle = None                     # подвижная метка выбранного датчика
+        self._edit_pick = None                       # строка таблицы выбранного датчика
+        # Сколько датчиков задано вручную. ⚠️ Представление модель не спрашивает (MVC) —
+        # число приходит от контроллера через `set_manual_count`. Нужно кнопке «Очистить
+        # датчики»: она показывает в вопросе, сколько именно пропадёт.
+        self._manual_n = 0
 
         self.setWindowTitle("Цифровая карта угроз — вкладка 3")
         self._apply_stylesheet()
@@ -487,12 +508,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         каждый такой клик значило бы засорять карту случайными точками."""
         self._pick_sensor = not self._pick_sensor
         self._target_mode = self._sector_mode = False
+        if self._pick_sensor:
+            self._end_edit_sensor()                  # два режима мыши разом невозможны
+        self._grab_right_button(self._pick_sensor)   # правая кнопка = выход из режима
         self._lock_panel_for_pick(self._pick_sensor)
-        self.btn_pick_sensor.setText("Ставлю по клику — нажмите, чтобы выйти"
-                                     if self._pick_sensor else "Добавить датчик по клику")
+        self.btn_pick_sensor.setText("Ставлю по клику"
+                                     if self._pick_sensor else "Добавить датчик")
         self.set_title("ДВОЙНОЙ КЛИК по карте — поставить датчик (спросим тип и режим). "
-                       "Остальные кнопки выключены до выхода из режима: "
-                       "нажмите эту кнопку ещё раз или Esc."
+                       "Двойной клик ВНЕ района — закончить. Остальные кнопки выключены "
+                       "до выхода из режима: эта кнопка или Esc — тоже выход."
                        if self._pick_sensor else "")
 
     def _lock_panel_for_pick(self, lock):
@@ -516,24 +540,218 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 w.setEnabled(True)
             self._pick_locked = []
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # РЕЖИМ ПРАВКИ ДАТЧИКОВ НА КАРТЕ (заказчик 05.09.2026)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _begin_edit_sensor(self):
+        """Включить или выключить правку датчиков мышью (кнопка-переключатель).
+
+        ⚠️ ПЕРЕТАСКИВАНИЕ ДЕЛАЕТ `pg.TargetItem`, а не свои обработчики мыши. У сцены
+        pyqtgraph есть сигнал клика, но нет пары «нажал — веду — отпустил», и тащить
+        пришлось бы вручную, отключив панораму вида. `TargetItem` умеет это сам и отдаёт
+        `sigPositionChangeFinished` — остаётся сообщить новую позицию контроллеру."""
+        self._edit_sensor = not self._edit_sensor
+        if self._edit_sensor:
+            self._end_pick_sensor()                   # два режима мыши разом невозможны
+            self._target_mode = self._sector_mode = False
+        self._grab_right_button(self._edit_sensor)    # правая кнопка = выход из режима
+        self._lock_panel_for_edit(self._edit_sensor)
+        self.btn_edit_sensor.setText("Правлю датчики"
+                                     if self._edit_sensor else "Редактировать датчики")
+        if not self._edit_sensor:
+            self._drop_edit_handle()
+        self.set_title("ПРАВКА ДАТЧИКОВ: щелчок — выбрать, перетаскивание — перенести, "
+                       "DELETE — удалить. Правая кнопка мыши → «Выйти»."
+                       if self._edit_sensor else "")
+
+    def _lock_panel_for_edit(self, lock):
+        """Погасить панель на время правки — та же причина, что и при постановке:
+        режим забирает клики карты себе, и соседняя кнопка перехватила бы их."""
+        if lock:
+            self._edit_locked = [w for w in self._panel_widgets()
+                                 if w is not self.btn_edit_sensor and w.isEnabled()]
+            for w in self._edit_locked:
+                w.setEnabled(False)
+        else:
+            for w in getattr(self, "_edit_locked", []):
+                w.setEnabled(True)
+            self._edit_locked = []
+
+    def _end_edit_sensor(self):
+        if self._edit_sensor:
+            self._edit_sensor = False
+            self._grab_right_button(False)           # вернуть правую кнопку pyqtgraph
+            self._lock_panel_for_edit(False)
+            self.btn_edit_sensor.setText("Править датчики")
+            self._drop_edit_handle()
+            self.set_title("")
+
+    def _drop_edit_handle(self):
+        """Убрать метку выбранного датчика с карты."""
+        h = getattr(self, "_edit_handle", None)
+        if h is not None:
+            try:
+                self.pi.removeItem(h)
+            except Exception:
+                pass
+        self._edit_handle = None
+        self._edit_pick = None
+
+    def _edit_sensor_click(self, ev):
+        """Щелчок в режиме правки: выбрать ближайший датчик и дать его тащить."""
+        pt = self.vb.mapSceneToView(ev.scenePos())
+        x, y = float(pt.x()), float(pt.y())
+        rows = self.on_sensor_rows() or []
+        if not rows:
+            self.set_title("Датчиков на карте нет — править нечего.")
+            return
+        # ⚠️ ДОПУСК ВЫБОРА — В ЭКРАННЫХ ПИКСЕЛЯХ, а не в километрах: на общем виде
+        # участка 2 км это несколько точек экрана, а при увеличении — половина окна.
+        # Берём ближайший датчик и требуем, чтобы он был не дальше 25 пикселей.
+        best, best_d = None, None
+        for r in rows:
+            d = ((r["x_km"] - x) ** 2 + (r["y_km"] - y) ** 2) ** 0.5
+            if best_d is None or d < best_d:
+                best, best_d = r, d
+        px_km = self._km_per_pixel()
+        if best is None or best_d > 25.0 * px_km:
+            self.set_title("Мимо: щёлкните ближе к датчику (не дальше ~25 точек экрана).")
+            return
+        self._show_edit_handle(best)
+
+    def _km_per_pixel(self):
+        """Сколько километров в одной точке экрана при текущем масштабе."""
+        try:
+            (x0, x1), _ = self.vb.viewRange()
+            w = max(1, self.vb.width())
+            return abs(x1 - x0) / float(w)
+        except Exception:
+            return 0.1
+
+    def _show_edit_handle(self, row):
+        """Показать подвижную метку на выбранном датчике."""
+        self._drop_edit_handle()
+        self._edit_pick = dict(row)
+        h = pg.TargetItem(pos=(row["x_km"], row["y_km"]), size=16, symbol="s",
+                          pen=pg.mkPen(_qcolor(THREAT_COLORS["sensor_hand"]), width=3),
+                          hoverPen=pg.mkPen(_qcolor(THREAT_COLORS["ok"]
+                                                    if "ok" in THREAT_COLORS
+                                                    else THREAT_COLORS["sensor_hand"]),
+                                            width=3),
+                          brush=pg.mkBrush(255, 255, 255, 60), movable=True)
+        h.setZValue(40)                    # выше всех датчиков: за неё и тащат
+        h.sigPositionChangeFinished.connect(self._edit_handle_moved)
+        self.pi.addItem(h)
+        self._edit_handle = h
+        self.set_title("Датчик №%d (тип %d, %s) выбран: тащите мышью или нажмите DELETE."
+                       % (row["n"], row["type_id"],
+                          "статический" if row.get("static") else "динамический"))
+
+    def _edit_handle_moved(self):
+        """Метку отпустили — сообщить контроллеру новую позицию датчика."""
+        row, h = self._edit_pick, getattr(self, "_edit_handle", None)
+        if row is None or h is None:
+            return
+        p = h.pos()
+        lon, lat = gf.km_to_lonlat(float(p.x()), float(p.y()),
+                                   self._geo_lon0, self._geo_lat0)
+        self.on_manual_edit(int(row["n"]) - 1, int(row["type_id"]),
+                            bool(row.get("static")), float(lon), float(lat))
+        self._edit_pick = dict(row, x_km=float(p.x()), y_km=float(p.y()),
+                               lon=float(lon), lat=float(lat))
+        self.set_title("Датчик №%d перенесён. Он стал заданным вручную." % row["n"])
+
+    def _delete_selected_sensor(self):
+        """DELETE в режиме правки — убрать выбранный датчик.
+
+        ⚠️ ПО КООРДИНАТЕ, А НЕ ПО НОМЕРУ СТРОКИ: номер меняется от любой правки, и после
+        переноса он указывает уже на другой датчик — удалялся бы не тот."""
+        row = getattr(self, "_edit_pick", None)
+        if row is None:
+            self.set_title("Сначала выберите датчик щелчком.")
+            return
+        self.on_sensor_delete(float(row["lon"]), float(row["lat"]))
+        self._drop_edit_handle()
+
+    def _right_button_exit(self):
+        """ПРАВАЯ КНОПКА В РЕЖИМАХ МЫШИ — завершить режим (заказчик 05.09.2026).
+
+        ⚠️ ШТАТНОЕ МЕНЮ pyqtgraph НА ВРЕМЯ РЕЖИМА ОТКЛЮЧАЕТСЯ (`setMenuEnabled`). Иначе
+        правая кнопка открывает меню масштабов ViewBox — оно перехватывает нажатие, и до
+        выхода из режима дело не доходит. Пока режим включён, правая кнопка значит одно:
+        «закончил». Данные при этом сохраняются — всё поставленное и передвинутое уже в
+        модели, отдельного подтверждения не нужно."""
+        was_edit = self._edit_sensor
+        self._end_pick_sensor()
+        self._end_edit_sensor()
+        self.set_title("Режим завершён, данные сохранены."
+                       if was_edit else "Постановка датчиков завершена.")
+
+    def _grab_right_button(self, grab):
+        """Забрать правую кнопку себе (или вернуть её pyqtgraph)."""
+        try:
+            self.vb.setMenuEnabled(not grab)
+        except Exception:
+            pass
+
+    def _inside_work_area(self, x_km, y_km):
+        """Точка внутри рабочего района (синей рамки)?
+
+        Района ещё нет — считаем, что внутри: иначе первый же двойной клик выбрасывал бы
+        из режима постановки, и поставить датчик заранее было бы нельзя."""
+        box = getattr(self, "bbox_km", None)
+        if not box or len(box) != 4:
+            return True
+        x0, x1, y0, y1 = box
+        return (x0 <= x_km <= x1) and (y0 <= y_km <= y1)
+
+    def _ask_clear_sensors(self):
+        """Кнопка «Очистить датчики»: убрать С КАРТЫ ВСЕ датчики — и заданные вручную,
+        и подобранные алгоритмом, — чтобы расставить заново (заказчик 05.09.2026).
+
+        ⚠️ С ПОДТВЕРЖДЕНИЕМ: заданные вручную позиции восстановить нечем, а ставят их
+        поштучно кликами — случайное нажатие стоило бы всей работы. Число в вопросе
+        показывает, сколько именно задано руками."""
+        n = int(self._manual_n)
+        if QtWidgets.QMessageBox.question(
+                self, "Очистить датчики",
+                "Убрать с карты ВСЕ датчики — и подобранные алгоритмом, и заданные "
+                "вручную%s?\n\nКарта, маршруты и итерации останутся: расстановку можно "
+                "начать заново кнопкой «Расставить датчики»."
+                % (" (%d шт.)" % n if n else ""),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes:
+            self.on_clear_sensors()
+
     def _end_pick_sensor(self):
         if self._pick_sensor:
             self._pick_sensor = False
+            self._grab_right_button(False)           # вернуть правую кнопку pyqtgraph
             self._lock_panel_for_pick(False)
-            self.btn_pick_sensor.setText("Добавить датчик по клику")
+            self.btn_pick_sensor.setText("Добавить датчик")
             self.set_title("")
 
     def _pick_sensor_click(self, ev):
         """Двойной клик в режиме постановки: спросить тип и режим, добавить датчик.
 
-        Отмена диалога = «клик вне постановки» и выход из режима: иначе из него нельзя
-        было бы выйти мышью, не поставив лишний датчик."""
+        ⚠️ ВЫЙТИ ИЗ РЕЖИМА МОЖНО ТРЕМЯ СПОСОБАМИ, и каждый нужен (заказчик 05.09.2026:
+        «не срабатывает двойной клик для завершения»):
+
+        * двойной клик ВНЕ рабочего района — «поставил всё, что хотел»: рука уже на мыши,
+          и тянуться к кнопке не нужно. Именно вне района, а не любой: внутри двойной
+          клик ставит датчик, и одно действие не может значить сразу два разных;
+        * кнопка «Ставлю по клику» — она же и включала режим;
+        * Esc и отмена диалога — на случай, когда режим включён по ошибке."""
         try:
             if not ev.double():
                 return                      # одинарный клик только показал координаты
         except Exception:
             return
         pt = self.vb.mapSceneToView(ev.scenePos())
+        if not self._inside_work_area(float(pt.x()), float(pt.y())):
+            self._end_pick_sensor()
+            self.set_title("Постановка датчиков завершена: двойной клик был вне района.")
+            return
         lon, lat = gf.km_to_lonlat(float(pt.x()), float(pt.y()),
                                    self._geo_lon0, self._geo_lat0)
         from .input_window import SensorRowDialog
@@ -547,6 +765,28 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     def _on_scene_click(self, ev):
         self._show_click_coords(ev)
+        # ПРАВАЯ КНОПКА В РЕЖИМАХ МЫШИ — меню с выходом (заказчик 05.09.2026). Проверяем
+        # до всего остального: в этих режимах панель погашена, и другого пути к выходу
+        # под рукой нет.
+        if self._pick_sensor or self._edit_sensor:
+            try:
+                right = ev.button() == QtCore.Qt.RightButton
+            except Exception:
+                right = False
+            if right:
+                try:
+                    ev.accept()
+                except Exception:
+                    pass
+                self._right_button_exit()
+                return
+        if self._edit_sensor:              # правка датчиков: выбрать ближайший
+            try:
+                if not ev.double():
+                    self._edit_sensor_click(ev)
+            except Exception:
+                self._edit_sensor_click(ev)
+            return
         if self._pick_sensor:              # постановка датчика мышью — раньше прочих:
             self._pick_sensor_click(ev)    # в этом режиме карта ничего другого не ждёт
             return
@@ -683,7 +923,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._draw_zone_preview()
 
     def keyPressEvent(self, ev):
-        """Esc — бросить начатое рисование (зоны, района) или выйти из постановки."""
+        """Esc — бросить начатое рисование (зоны, района) или выйти из режима мыши.
+        DELETE — убрать датчик, выбранный в режиме правки."""
         if ev.key() == QtCore.Qt.Key_Escape:
             if self._area_mode:
                 self._end_area(False)
@@ -694,6 +935,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             if self._pick_sensor:
                 self._end_pick_sensor()
                 return
+            if self._edit_sensor:
+                self._end_edit_sensor()
+                return
+        if ev.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace) \
+                and self._edit_sensor:
+            self._delete_selected_sensor()
+            return
         super().keyPressEvent(ev)
 
     def _draw_zone_preview(self):
@@ -785,11 +1033,53 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if self._map_img_dlg is None:
             self._map_img_dlg = MapImageDialog(
                 self, mi.images_dir(geo_cache_root()),
-                self._apply_map_image, self._clear_map_image, self._map_img_info)
+                self._apply_map_image, self._clear_map_image, self._map_img_info,
+                on_fit=self._fit_map_image)
         self._map_img_dlg.show(); self._map_img_dlg.raise_()
 
+    def _fit_map_image(self, path, bbox):
+        """Подобрать привязку картинки по слоям участка -> (опорные точки, отчёт).
+
+        Опорные точки возвращаются в ГРАДУСАХ (пиксель картинки → долгота и широта):
+        так они не зависят от участка и переживают смену района. Сам метод —
+        `model/map_fit.py`, математика привязки — `view_qt/map_anchor.py`."""
+        from model import map_fit as mf
+        from model.threat_grid import layers_cache_path
+        lon_min, lat_min, lon_max, lat_max = bbox
+        # ВЕКТОР ПОДБИРАЕТСЯ ТАК ЖЕ, как растр: SVG рисуется во временный растр, и дальше
+        # идёт та же маска чёрного. Найденные точки возвращаются в единицы самой карты —
+        # за это отвечает дробный шаг (см. map_vector.render_for_fit).
+        if mv.is_vector(path):
+            rgb, step, (src_w, src_h) = mv.render_for_fit(path)
+        else:
+            rgb, step, (src_w, src_h) = mi.read_for_fit(path)
+        places, built = mf.layers_for_fit(layers_cache_path())
+        kx0, ky0 = gm.lonlat_to_km(lon_min, lat_min, self._geo_lon0, self._geo_lat0)
+        kx1, ky1 = gm.lonlat_to_km(lon_max, lat_max, self._geo_lon0, self._geo_lat0)
+        A0 = np.array([[(float(kx1) - float(kx0)) / src_w, 0.0, float(kx0)],
+                       [0.0, -(float(ky1) - float(ky0)) / src_h, float(ky1)]], float)
+        rep = mf.fit(mf.dark_mask(rgb), step, A0, places, built)
+        pts = []
+        for xpx, ypx, kx, ky in [p[:4] for p in rep["points"]]:
+            lon, lat = gm.km_to_lonlat(kx, ky, self._geo_lon0, self._geo_lat0)
+            pts.append([float(xpx), float(ypx), float(lon), float(lat)])
+        # насколько было плохо ДО подбора — по тем же точкам, иначе улучшение не оценить
+        P = np.asarray([p[:4] for p in rep["points"]], float)
+        M = np.column_stack([P[:, 0], P[:, 1], np.ones(len(P))])
+        e0 = np.hypot(M @ A0[0] - P[:, 2], M @ A0[1] - P[:, 3]) * 1000.0
+        text = ("Подобрано по %d пунктам, модель «%s»: промах был %.0f м, стал %.0f м "
+                "(наибольший %.0f м; на проверочной точке %.0f м)."
+                % (rep["n_used"], rep["model"], float(np.median(e0)),
+                   rep["median_m"], rep["max_m"], rep["cv_m"]))
+        # ЧЕСТНОЕ ПРЕДУПРЕЖДЕНИЕ: за краем облака точек привязка экстраполирует
+        if min(rep["cover_x"], rep["cover_y"]) < 0.5:
+            text += (" ⚠️ Опорные точки покрывают только %.0f × %.0f %% карты — за их "
+                     "краем привязка не проверена, там ошибка может быть больше."
+                     % (100 * rep["cover_x"], 100 * rep["cover_y"]))
+        return pts, text, rep["model"]
+
     def _apply_map_image(self, path, lon_min, lat_min, lon_max, lat_max,
-                         hide_tiles=False, as_area=False):
+                         hide_tiles=False, as_area=False, points=None, model=None):
         """Показать картинку по координатам углов. Возвращает строку для окна.
 
         Углы переводятся в километры ТЕМ ЖЕ преобразованием, что и всё остальное на
@@ -801,20 +1091,38 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         её рамки — и зум с перемещением переставали вести себя как обычно (замечание
         заказчика 04.09.2026). Картинка живёт в тех же километрах, что и всё остальное,
         поэтому она ездит и масштабируется вместе с картой сама, без особых правил."""
+        # ВЕКТОРНАЯ КАРТА (SVG) идёт своим путём: у неё нет пикселей, которые можно
+        # прорядить, зато она остаётся острой на любом зуме. Привязка при этом ОБЩАЯ —
+        # тот же `MapAnchor` (разбор — view_qt/map_vector.py).
+        if mv.is_vector(path):
+            return self._apply_map_vector(path, lon_min, lat_min, lon_max, lat_max,
+                                          hide_tiles, as_area, points, model)
+        self._clear_map_vector()
         try:
             rgba, (src_w, src_h) = mi.load_image_rgba(path)
         except Exception as e:                       # битый файл, нет прав, не картинка
             return "⚠️ Не удалось прочитать файл: %s" % e
-        kx0, ky0 = gm.lonlat_to_km(lon_min, lat_min, self._geo_lon0, self._geo_lat0)
-        kx1, ky1 = gm.lonlat_to_km(lon_max, lat_max, self._geo_lon0, self._geo_lat0)
-        mi.place_image(self.map_img_item, rgba, (kx0, kx1, ky0, ky1))
+        # ПРИВЯЗКА. Четыре числа краёв — простейший случай; если есть опорные точки
+        # (поставленные руками или подобранные по слоям), берётся аффинная модель с
+        # поворотом и перекосом. Почему прямоугольника мало — `view_qt/map_anchor.py`.
+        anchor = ma.MapAnchor(src_w, src_h,
+                              bbox=(lon_min, lat_min, lon_max, lat_max),
+                              points=points or [], model=model)
+        A = anchor.matrix(self._geo_lon0, self._geo_lat0, gm.lonlat_to_km)
+        coef = ma.scene_transform(A, 0.0, 0.0, src_w / float(rgba.shape[1]),
+                                  src_h / float(rgba.shape[0]), rgba.shape[0])
+        mi.place_image_affine(self.map_img_item, rgba, coef)
+        kx0, kx1, ky0, ky1 = anchor.bbox_km(A)       # габариты — для пределов вида
         self._map_img_info = dict(path=path, lon_min=lon_min, lat_min=lat_min,
                                   lon_max=lon_max, lat_max=lat_max,
-                                  hide_tiles=bool(hide_tiles))
+                                  hide_tiles=bool(hide_tiles),
+                                  points=list(points or []), model=model)
         self._basemap_off = bool(hide_tiles)
-        # ДЕТАЛИЗАЦИЯ ПО ВИДИМОЙ ОБЛАСТИ: рамка картинки в километрах и готовый кэш
-        # (если он уже построен). Дальше `_refresh_map_detail` подставляет в видимый
-        # кусок полное разрешение — см. шапку `map_image.py`.
+        # ДЕТАЛИЗАЦИЯ ПО ВИДИМОЙ ОБЛАСТИ: привязка и готовый кэш (если он уже построен).
+        # Дальше `_refresh_map_detail` подставляет в видимый кусок полное разрешение —
+        # см. шапку `map_image.py`.
+        self._map_anchor = anchor
+        self._map_anchor_A = A
         self._map_full_km = (kx0, kx1, ky0, ky1)
         self._map_detail = mi.read_detail_meta(path)
         self._map_detail_box = None
@@ -840,17 +1148,109 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._refresh_basemap(force=True)
 
         w_km, h_km = abs(kx1 - kx0), abs(ky1 - ky0)
+        d = anchor.describe(A)
+        fit = ""
+        if points:
+            res = anchor.residuals_km(A, gm.lonlat_to_km, self._geo_lon0, self._geo_lat0)
+            fit = (" Привязка по %d опорным точкам: промах в среднем %.0f м, "
+                   "наибольший %.0f м; поворот карты %+.2f°."
+                   % (len(points), 1000.0 * float(np.median(res)),
+                      1000.0 * float(np.max(res)), d["rotation_deg"]))
         note = " (прорежена с %d×%d)" % (src_w, src_h) if max(src_w, src_h) > mi.MAX_PX else ""
         tail = (" Тайлы скрыты, перемещение и зум — по краям карты."
                 if hide_tiles else " Тайлы остались фоном вокруг картинки.")
         # РАМКА КАРТИНКИ КАК РАБОЧИЙ РАЙОН — тяжёлый пересчёт, поэтому отдельной галочкой
         # и через контроллер (он умеет считать в фоне, не подвешивая окно).
         if as_area and self.on_set_area is not None:
-            self.on_set_area((lon_min, lat_min, lon_max, lat_max))
+            # ⚠️ РАЙОН — ПО ГАБАРИТАМ ПРИВЯЗАННОЙ КАРТЫ, а не по введённым числам: при
+            # аффинной привязке край картинки уже не идёт по параллели, и рамка,
+            # набранная руками, к настоящему её месту отношения не имеет.
+            a_lo, a_la = gm.km_to_lonlat(kx0, ky0, self._geo_lon0, self._geo_lat0)
+            a_ho, a_ha = gm.km_to_lonlat(kx1, ky1, self._geo_lon0, self._geo_lat0)
+            self.on_set_area((float(a_lo), float(a_la), float(a_ho), float(a_ha)))
             tail += " Рамка карты назначена рабочим районом — идёт пересчёт."
-        return ("Карта показана: %.1f × %.1f км, %d×%d точек%s. Она лежит ПОД слоями — "
+        return ("Карта показана: %.1f × %.1f км, %d×%d точек%s.%s Она лежит ПОД слоями — "
                 "векторные слои, весовая карта, датчики и маршруты рисуются поверх.%s"
-                % (w_km, h_km, rgba.shape[1], rgba.shape[0], note, tail))
+                % (w_km, h_km, rgba.shape[1], rgba.shape[0], note, fit, tail))
+
+    def _apply_map_vector(self, path, lon_min, lat_min, lon_max, lat_max,
+                          hide_tiles, as_area, points, model):
+        """Показать ВЕКТОРНУЮ карту (SVG) по той же привязке, что и растровую.
+
+        Отличий от растра всего два, и оба вынужденные: элемент сцены нельзя переиспользовать
+        (`QGraphicsSvgItem` держит свой файл), и детализация по видимой области вектору не
+        нужна вовсе — он и так рисуется под текущий масштаб."""
+        try:
+            src_w, src_h = mv.svg_size(path)
+            item = mv.make_item(path)
+        except Exception as e:
+            return "⚠️ Не удалось прочитать SVG: %s" % e
+        self.map_img_item.setVisible(False)          # растровая карта уходит
+        self._clear_map_vector()
+        self.map_svg_item = item
+        self.pi.addItem(item)
+        anchor = ma.MapAnchor(src_w, src_h,
+                              bbox=(lon_min, lat_min, lon_max, lat_max),
+                              points=points or [], model=model)
+        A = anchor.matrix(self._geo_lon0, self._geo_lat0, gm.lonlat_to_km)
+        # ⚠️ БЕЗ ПЕРЕВОРОТА: SVG рисует себя как есть, строка 0 у него сверху. Минус по
+        # оси Y уже сидит в самой матрице привязки (см. шапку map_anchor.py).
+        mv.place_item(item, ma.scene_transform(A, 0.0, 0.0, 1.0, 1.0, src_h,
+                                               flip_y=False))
+        kx0, kx1, ky0, ky1 = anchor.bbox_km(A)
+        self._map_img_info = dict(path=path, lon_min=lon_min, lat_min=lat_min,
+                                  lon_max=lon_max, lat_max=lat_max,
+                                  hide_tiles=bool(hide_tiles),
+                                  points=list(points or []), model=model)
+        self._basemap_off = bool(hide_tiles)
+        self._map_anchor = anchor
+        self._map_anchor_A = A
+        self._map_full_km = (kx0, kx1, ky0, ky1)
+        self._map_detail = None                      # вектору детализация не нужна
+        self._map_detail_box = None
+        if hide_tiles:
+            self._set_view_limits((kx0, kx1, ky0, ky1), 0.0)
+            self.vb.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.0)
+        else:
+            bx0, bx1, by0, by1 = self.bbox_km
+            self._set_view_limits((min(bx0, kx0), max(bx1, kx1),
+                                   min(by0, ky0), max(by1, ky1)), THREAT_VIEW_PAD_KM)
+        self._refresh_basemap(force=True)
+        fit = ""
+        if points:
+            res = anchor.residuals_km(A, gm.lonlat_to_km, self._geo_lon0, self._geo_lat0)
+            fit = (" Привязка по %d опорным точкам: промах в среднем %.0f м."
+                   % (len(points), 1000.0 * float(np.median(res))))
+        tail = (" Тайлы скрыты." if hide_tiles else " Тайлы остались фоном вокруг карты.")
+        if as_area and self.on_set_area is not None:
+            a_lo, a_la = gm.km_to_lonlat(kx0, ky0, self._geo_lon0, self._geo_lat0)
+            a_ho, a_ha = gm.km_to_lonlat(kx1, ky1, self._geo_lon0, self._geo_lat0)
+            self.on_set_area((float(a_lo), float(a_la), float(a_ho), float(a_ha)))
+            tail += " Рамка карты назначена рабочим районом — идёт пересчёт."
+        try:
+            ms = mv.measure_draw(item, self.vb)
+            speed = " Отрисовка %.0f мс на кадр." % ms
+        except Exception:
+            speed = ""
+        # РАЗБОР СОДЕРЖИМОГО: «сохранить как SVG» ещё не делает карту векторной, а
+        # «Связь изображений» в CorelDRAW и вовсе оставляет пустой лист на чужой машине.
+        try:
+            warn = mv.describe_content(mv.inspect_svg(path))
+        except Exception:
+            warn = ""
+        return ("Векторная карта показана: %.1f × %.1f км, своих единиц %d × %d. "
+                "Она лежит ПОД слоями.%s%s%s%s"
+                % (abs(kx1 - kx0), abs(ky1 - ky0), src_w, src_h, fit, speed, tail, warn))
+
+    def _clear_map_vector(self):
+        """Снять векторную карту со сцены (элемент нельзя переиспользовать)."""
+        item = getattr(self, "map_svg_item", None)
+        if item is not None:
+            try:
+                self.pi.removeItem(item)
+            except Exception:                        # сцена уже разобрана
+                pass
+        self.map_svg_item = None
 
     def _refresh_map_detail(self):
         """Показать видимый кусок своей карты в ПОЛНОМ разрешении.
@@ -868,24 +1268,25 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         ⚠️ ЗАПАС ПО КРАЯМ. Кусок берётся шире видимого на четверть — иначе при каждом
         сдвиге мыши на пиксель пришлось бы читать заново, и панорама шла бы рывками."""
         info = getattr(self, "_map_detail", None)
-        if not info or not self._map_img_info:
-            return
-        kx0, kx1, ky0, ky1 = self._map_full_km
-        w_km, h_km = (kx1 - kx0), (ky1 - ky0)
-        if w_km <= 0 or h_km <= 0:
+        anchor = getattr(self, "_map_anchor", None)
+        A = getattr(self, "_map_anchor_A", None)
+        if not info or not self._map_img_info or anchor is None or A is None:
             return
         (vx0, vx1), (vy0, vy1) = self.vb.viewRange()
         pad_x, pad_y = 0.25 * (vx1 - vx0), 0.25 * (vy1 - vy0)
         vx0, vx1 = vx0 - pad_x, vx1 + pad_x
         vy0, vy1 = vy0 - pad_y, vy1 + pad_y
-        # видимая область в долях картинки; ось Y картинки идёт СВЕРХУ ВНИЗ
-        fx0 = max(0.0, (vx0 - kx0) / w_km)
-        fx1 = min(1.0, (vx1 - kx0) / w_km)
-        fy0 = max(0.0, (ky1 - vy1) / h_km)
-        fy1 = min(1.0, (ky1 - vy0) / h_km)
-        if fx1 <= fx0 or fy1 <= fy0:
+        # ⚠️ ВИДИМОЕ ОКНО ПЕРЕВОДИМ В ПИКСЕЛИ ОБРАТНОЙ ПРИВЯЗКОЙ, а не долями рамки.
+        # При повёрнутой карте доли кадра перестают описывать вырезку: прямоугольник
+        # окна ложится на картинку наклонно, и по двум углам кусок выходил бы
+        # обрезанным. Берутся все четыре угла (`px_box_for_view`).
+        px0, py0, px1, py1 = anchor.px_box_for_view(A, vx0, vx1, vy0, vy1)
+        px0 = max(0.0, px0); py0 = max(0.0, py0)
+        px1 = min(float(info["w"]), px1); py1 = min(float(info["h"]), py1)
+        if px1 <= px0 or py1 <= py0:
             return                                  # карта вне кадра — не трогаем
-        box = (round(fx0, 3), round(fy0, 3), round(fx1, 3), round(fy1, 3))
+        box = (int(px0 / 8) * 8, int(py0 / 8) * 8,
+               int(px1 / 8 + 1) * 8, int(py1 / 8 + 1) * 8)
         if box == getattr(self, "_map_detail_box", None):
             return                                  # тот же кусок — перечитывать незачем
         # ⚠️ РАЗМЕР КУСКА — ПО ЭКРАНУ, А НЕ ПОСТОЯННОЕ ЧИСЛО. Экран показывает столько
@@ -896,23 +1297,23 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # уходит на запас по краям, из-за которого панорама не дёргается.
         px = int(max(2000, min(12000, 1.5 * max(self.plot.width(), self.plot.height()))))
         try:
-            rgba, got = mi.read_detail_window(info, box, max_px=px)
+            rgba, x0, y0, step = mi.read_detail_px(info, box, max_px=px)
         except Exception:                           # файл унесли, нет памяти — не беда
             self._map_detail = None
             return
         self._map_detail_box = box
-        gx0 = kx0 + got[0] * w_km
-        gx1 = kx0 + got[2] * w_km
-        gy1 = ky1 - got[1] * h_km
-        gy0 = ky1 - got[3] * h_km
-        mi.place_image(self.map_img_item, rgba, (gx0, gx1, gy0, gy1))
+        coef = ma.scene_transform(A, x0, y0, step, step, rgba.shape[0])
+        mi.place_image_affine(self.map_img_item, rgba, coef)
 
     def _clear_map_image(self):
         """Убрать картинку и вернуть тайловую подложку."""
         self.map_img_item.setVisible(False)
+        self._clear_map_vector()
         self._map_img_info = None
         self._map_detail = None
         self._map_detail_box = None
+        self._map_anchor = None
+        self._map_anchor_A = None
         self._basemap_off = False
         self._refresh_basemap(force=True)
 
@@ -925,6 +1326,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             dlg = InputDataWindow(self, self._params_ref, self.on_sensors_apply)
             dlg.on_manual_add = lambda tid, st, lon, lat: self.on_manual_add(tid, st, lon, lat)
             dlg.on_manual_remove = lambda i: self.on_manual_remove(i)
+            dlg.on_manual_edit = (lambda i, tid, st, lon, lat:
+                                  self.on_manual_edit(i, tid, st, lon, lat))
             dlg.on_manual_clear = lambda: self.on_manual_clear()
             dlg.on_mode_changed = lambda manual: self.on_manual_mode(manual)
             dlg.on_pick_mode = self._begin_pick_sensor
@@ -949,6 +1352,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def refresh_input_dialog(self):
         """Обновить поля окна под текущие параметры (авто-L_max и пр.)."""
         self.refresh_sensors_dialog()
+
+    def set_manual_count(self, n):
+        """Сколько датчиков задано вручную — для кнопки «Очистить датчики»."""
+        self._manual_n = int(n)
 
     def refresh_sensor_table(self, rows=None):
         """Показать в таблице окна текущие датчики.
@@ -1027,8 +1434,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 marks.append(f'<span style="color:{c[key]};">&#9679;</span> {name}')
         if marks:
             rows.append("датчики: " + " &nbsp; ".join(marks) + "<br>")
+            # ДВА ПРИЗНАКА, И ОБА НУЖНЫ: форма — режим датчика, обводка — кто выбрал
+            # место. До итераций на карте стоят и статические, и динамические, заданные
+            # человеком: по форме они разные, а поставлены одинаково.
             rows.append(f'<span style="color:{c["sensor_fix"]};">&#9632;</span> квадрат — '
-                        'позиция закреплена человеком<br>')
+                        'статический, &#9679; круг — динамический<br>')
+            rows.append(f'<span style="color:{c["sensor_hand"]};">&#9632;</span> чёрная '
+                        'окантовка — место задал человек<br>')
         # рельеф — два независимых слоя показа; цвета те же, что в RELIEF_* выше
         rows.append(f'<span style="color:{c["legend_relief"]};">&#9632;</span> высоты &nbsp; '
                     f'<span style="color:{c["legend_hide"]};">&#9632;</span> укрытие &nbsp; '
@@ -1115,6 +1527,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         scroll, col = make_side_panel()   # общая для трёх вкладок
         self._panel = scroll              # по нему гасим панель, пока район не задан
+        # ⚠️ ШРИФТ КНОПОК МЕНЬШЕ ОБЩЕГО (заказчик 05.09.2026). Кнопки собраны по две в
+        # строку, и на половине ширины панели надпись из двух слов обычным кеглем
+        # обрезалась многоточием. Только для кнопок ЭТОЙ панели: поля, галочки и списки
+        # остаются в общем размере — их читают, а не опознают по форме.
+        scroll.setStyleSheet("QPushButton { font-size: 11px; padding: 3px 6px; }")
         root.addWidget(scroll)
 
         # ⚠️ БЛОКА ПОЛЕЙ ДАТЧИКОВ ВВЕРХУ ПАНЕЛИ БОЛЬШЕ НЕТ (задача 8.7, 04.09.2026).
@@ -1126,7 +1543,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # остальные кнопки недоступны. Два способа задать: очертить мышью либо загрузить
         # свою карту — её рамка станет районом (правило заказчика 04.09.2026).
         row_area = QtWidgets.QHBoxLayout(); row_area.setSpacing(6)
-        self.btn_area = QtWidgets.QPushButton("Задать район моделирования")
+        self.btn_area = QtWidgets.QPushButton("Задать район")
         self.btn_area.setToolTip(
             "Очертить прямоугольник мышью: два клика — противоположные углы, "
             "КОЛЁСИКО — принять, Esc — отмена.\n"
@@ -1134,7 +1551,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             "снаружи остаётся только подложка и своя карта-картинка.")
         self._tint(self.btn_area, THEME["accent2"])
         self.btn_area.clicked.connect(self._begin_area)
-        self.btn_area_clear = QtWidgets.QPushButton("Убрать")
+        self.btn_area_clear = QtWidgets.QPushButton("Убрать район")
         self.btn_area_clear.setToolTip(
             "Убрать район: карта, слои, датчики и маршруты обнуляются. "
             "Останется только подложка и своя карта-картинка.")
@@ -1144,18 +1561,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         # СВОЯ КАРТА КАРТИНКОЙ (план 8, задача 8.5): ложится поверх слоёв, расчёт не
         # трогает — веса по-прежнему считаются по векторным слоям и рельефу.
-        self.btn_map_img = QtWidgets.QPushButton("Добавить карту (картинкой)…")
+        self.btn_map_img = QtWidgets.QPushButton("Карта картинкой")
         self.btn_map_img.setToolTip(
             "Своя карта местности картинкой (.png / .jpg) с координатами углов. "
             "Ложится ПОВЕРХ векторных слоёв и рельефа; датчики и маршруты остаются "
             "сверху. Папка по умолчанию — geo_cache/карты_картинки.")
         self.btn_map_img.clicked.connect(self._open_map_image_dialog)
-        col.addWidget(self.btn_map_img)
 
         # ТРЕТЬЯ КНОПКА ПОДРЯД (порядок задан заказчиком 04.09.2026): задать район →
         # добавить карту → исходные данные. Здесь собрано всё, что раньше было в блоке
         # полей панели и в двух отдельных окнах.
-        self.btn_input_data = QtWidgets.QPushButton("Исходные данные…")
+        self.btn_input_data = QtWidgets.QPushButton("Исходные данные")
         self.btn_input_data.setToolTip(
             "Одно окно (не блокирует программу): параметры ЧЕТЫРЁХ типов датчиков, "
             "параметры маршрута БПЛА и таблица датчиков с координатами.\n"
@@ -1164,19 +1580,25 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.btn_input_data.clicked.connect(self._open_input_window)
         col.addWidget(self.btn_input_data)
 
-        self.btn_data = QtWidgets.QPushButton("Выбрать цифровые карты…")
+        self.btn_data = QtWidgets.QPushButton("Цифровые карты")
         self.btn_data.setToolTip(
             "Отдельное окно: выбрать источник данных (файл .npz / .osm.pbf либо "
             "авто) и какие слои (реки/дороги/…) накладывать на сетку.")
         self.btn_data.clicked.connect(self._open_data_dialog)
-        col.addWidget(self.btn_data)
+        # ⚠️ ПО ДВЕ КНОПКИ В СТРОКУ, ПО ТЕМАТИКАМ (требование заказчика 05.09.2026).
+        # Панель выросла до полутора десятков кнопок в столбик и не помещалась на
+        # ноутбучном экране целиком. Пары собраны по смыслу: откуда берём карту (своя
+        # картинка и цифровые слои), что с ней делаем (построить и добавить рельеф),
+        # что задаём на ней (цель и сектор), что делаем с датчиками.
+        row_maps = QtWidgets.QHBoxLayout(); row_maps.setSpacing(6)
+        row_maps.addWidget(self.btn_map_img, 1); row_maps.addWidget(self.btn_data, 1)
+        col.addLayout(row_maps)
 
         self.btn_build = QtWidgets.QPushButton("Построить карту")
         self.btn_build.setToolTip(
             "Наложить выбранные цифровые слои на сетку 500 м и посчитать веса ячеек.")
         self._tint(self.btn_build, THEME["accent"])
         self.btn_build.clicked.connect(lambda: self.on_build())
-        col.addWidget(self.btn_build)
 
         self.btn_relief = QtWidgets.QPushButton("Добавить рельеф")
         self.btn_relief.setToolTip(
@@ -1186,14 +1608,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             "ВНИМАНИЕ: пересборка сбрасывает накопленные маршруты, итерации и датчики — "
             "они построены по другой карте.")
         self.btn_relief.clicked.connect(lambda: self.on_relief())
-        col.addWidget(self.btn_relief)
+        row_build = QtWidgets.QHBoxLayout(); row_build.setSpacing(6)
+        row_build.addWidget(self.btn_build, 1); row_build.addWidget(self.btn_relief, 1)
+        col.addLayout(row_build)
 
         self.btn_target = QtWidgets.QPushButton("Указать цель")
         self.btn_target.setToolTip(
             "Кликните точку ЦЕЛИ на карте. Точка появления БПЛА фиксирована "
             "(у реки). Цель — задел для построения маршрутов (Этап 3).")
         self.btn_target.clicked.connect(self._begin_target)
-        col.addWidget(self.btn_target)
 
         row_sector = QtWidgets.QHBoxLayout(); row_sector.setSpacing(6)
         self.btn_sector = QtWidgets.QPushButton("Задать сектор")
@@ -1205,11 +1628,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             "входа (разнесённых между собой). Старт каждого маршрута — случайно "
             "выбранная из этих пяти.")
         self.btn_sector.clicked.connect(self._begin_sector)
-        self.btn_sector_clear = QtWidgets.QPushButton("Убрать")
+        self.btn_sector_clear = QtWidgets.QPushButton("Убрать сектор")
         self.btn_sector_clear.setToolTip(
             "Убрать сектор: точка появления снова одна (метка участка).")
         self.btn_sector_clear.clicked.connect(lambda: self.on_clear_sector())
-        row_sector.addWidget(self.btn_sector, 2); row_sector.addWidget(self.btn_sector_clear, 1)
+        # «Указать цель» и «Задать сектор» — одна тема: откуда и куда летит БПЛА.
+        # «Убрать» узкая: она относится только к сектору.
+        row_sector.addWidget(self.btn_target, 2)
+        row_sector.addWidget(self.btn_sector, 2)
+        row_sector.addWidget(self.btn_sector_clear, 1)
         col.addLayout(row_sector)
 
         row_zone = QtWidgets.QHBoxLayout(); row_zone.setSpacing(6)
@@ -1230,14 +1657,37 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         # ⚠️ Кнопки «Датчики: параметры…» здесь больше НЕТ: параметры датчиков переехали
         # в окно «Исходные данные» (задача 8.7). Вместо неё — постановка датчика мышью.
-        self.btn_pick_sensor = QtWidgets.QPushButton("Добавить датчик по клику")
+        self.btn_pick_sensor = QtWidgets.QPushButton("Добавить датчик")
         self.btn_pick_sensor.setToolTip(
             "ДВОЙНОЙ КЛИК по карте ставит датчик: спрашивается тип (1–4) и режим "
             "(статический или динамический).\n"
-            "Ещё один двойной клик — выход из режима. Esc — тоже выход.\n"
+            "Двойной клик ВНЕ района (за синей рамкой) — выход из режима. "
+            "Esc и эта кнопка — тоже выход.\n"
             "Поставленные датчики видны в таблице окна «Исходные данные».")
         self.btn_pick_sensor.clicked.connect(self._begin_pick_sensor)
-        col.addWidget(self.btn_pick_sensor)
+
+        # РЕЖИМ ПРАВКИ ДАТЧИКОВ НА КАРТЕ (заказчик 05.09.2026): выбрать щелчком,
+        # переместить перетаскиванием, удалить клавишей Delete.
+        self.btn_edit_sensor = QtWidgets.QPushButton("Править датчики")
+        self.btn_edit_sensor.setToolTip(
+            "Правка датчиков прямо на карте: ЩЕЛЧОК выбирает ближайший (он подсветится), "
+            "ПЕРЕТАСКИВАНИЕ мышью переносит его на новое место, DELETE — удаляет.\n"
+            "Выход — правая кнопка мыши (пункт «Выйти»), Esc или эта кнопка. "
+            "Изменённые датчики становятся заданными вручную.")
+        self.btn_edit_sensor.clicked.connect(self._begin_edit_sensor)
+        row_pick = QtWidgets.QHBoxLayout(); row_pick.setSpacing(6)
+        row_pick.addWidget(self.btn_pick_sensor, 1)
+        row_pick.addWidget(self.btn_edit_sensor, 1)
+        col.addLayout(row_pick)
+
+        # ОЧИСТИТЬ ДАТЧИКИ (заказчик 05.09.2026) — рядом с расстановкой, чтобы начать
+        # подбор с чистого листа, не трогая ни карту, ни маршруты.
+        self.btn_clear_sensors = QtWidgets.QPushButton("Очистить датчики")
+        self.btn_clear_sensors.setToolTip(
+            "Убрать С КАРТЫ ВСЕ датчики — и заданные вручную, и подобранные алгоритмом. "
+            "Карта, маршруты и итерации остаются: расстановку можно начать заново "
+            "кнопкой «Расставить датчики».")
+        self.btn_clear_sensors.clicked.connect(self._ask_clear_sensors)
 
         self.btn_place = QtWidgets.QPushButton("Расставить датчики")
         self.btn_place.setToolTip(
@@ -1245,7 +1695,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             "кольцевым щитом вокруг цели. На воду не ставятся.")
         self._tint(self.btn_place, THEME["ok"])
         self.btn_place.clicked.connect(lambda: self.on_place())
-        col.addWidget(self.btn_place)
+        row_place = QtWidgets.QHBoxLayout(); row_place.setSpacing(6)
+        row_place.addWidget(self.btn_clear_sensors, 1)
+        row_place.addWidget(self.btn_place, 1)
+        col.addLayout(row_place)
 
         self.src_label = QtWidgets.QLabel("источник данных: —")
         self.src_label.setObjectName("muted"); self.src_label.setWordWrap(True)
@@ -1373,6 +1826,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.btn_apply.setToolTip("Применить параметры (N/R/k/шаг) и пересчитать.")
         self.btn_reset = QtWidgets.QPushButton("Сброс")
         self.btn_reset.setToolTip("Убрать датчики и заданную цель (карта остаётся).")
+        # ОЧИСТИТЬ — вернуться к состоянию ДО МОДЕЛИРОВАНИЯ (заказчик 05.09.2026).
+        # ⚠️ Это не «Сброс»: тот обнуляет всё, оставляя только район, весовую карту и
+        # рельеф. «Очистить» убирает только итоги моделирования — накопленные пролёты —
+        # и возвращает расстановку, датчики и зону пролёта такими, какими они были в
+        # момент запуска итераций. Снимок для этого делается автоматически, при старте.
+        self.btn_clear_iter = QtWidgets.QPushButton("Очистить")
+        self.btn_clear_iter.setToolTip(
+            "Убрать итерации и вернуться к тому, что было ДО моделирования: те же "
+            "датчики, та же расстановка, та же зона пролёта.\n"
+            "Карта, рельеф и район не трогаются. Полное обнуление — кнопка «Сброс».")
+        self.btn_clear_iter.clicked.connect(lambda: self.on_clear_iter())
         self.btn_view = QtWidgets.QPushButton("Весь участок")
         self.btn_view.setToolTip("Вернуть камеру к полному участку (bbox).")
         self._tint(self.btn_apply, THEME["accent2"])
@@ -1380,7 +1844,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.btn_reset.clicked.connect(lambda: self.on_reset())
         self.btn_view.clicked.connect(lambda: self.on_reset_view())
         b1.addWidget(self.btn_apply); b1.addWidget(self.btn_reset)
-        b1.addWidget(self.btn_view)
+        b1.addWidget(self.btn_clear_iter); b1.addWidget(self.btn_view)
         col.addLayout(b1)
 
         col.addWidget(self._header("ПОКАЗАТЕЛИ"))
@@ -2058,9 +2522,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if ready:
             self.set_busy(False)                      # вернуть обычную доступность
             if size_km:
-                self.btn_area.setText("Изменить район (%.0f × %.0f км)" % size_km)
+                self.btn_area.setText("Район %.0f × %.0f км" % size_km)
         else:
-            self.btn_area.setText("Задать район моделирования")
+            self.btn_area.setText("Задать район")
             self.set_title("Район не задан: очертите его мышью либо загрузите свою карту "
                            "— её рамка станет районом")
 
@@ -2732,7 +3196,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     def render_sensors(self, sensors, R, sensors_big=None, R_big=0.0,
                        types=None, static=None, big_static=None, type_radii=None,
-                       show_numbers=True, pending=None):
+                       show_numbers=True, pending=None, manual=None, big_manual=None):
         """Нарисовать датчики ЧЕТЫРЁХ типов: у каждого — КОЛЬЦО зоны обзора (залитый
         круг) и яркая точка-центр. Старые убираем и создаём заново (число меняется).
         Стоят поверх всех слоёв (Z=18…21), чтобы маршруты их не перекрывали.
@@ -2742,13 +3206,22 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         при обычной заливке они закрыли бы карту. Большие рисуются НИЖЕ малых — иначе
         крупная зона накрывала бы мелкие значки.
 
-        `types` — номер типа для каждого малого датчика, `static`/`big_static` — какие
-        из них ЗАКРЕПЛЕНЫ человеком, `type_radii` — радиус каждого типа (у типов разные).
+        `types` — номер типа для каждого малого датчика, `static`/`big_static` — режим
+        (статический), `manual`/`big_manual` — чьё место: человека или алгоритма,
+        `type_radii` — радиус каждого типа (у типов разные), `pending` — только что
+        поставленные мышью, кортежами `(x_км, y_км, тип, режим)`.
         Ничего этого не передали — рисуем как раньше: все малые типа 1 радиусом `R`.
 
-        ⚠️ ЗАКРЕПЛЁННЫЙ ДАТЧИК — КВАДРАТ, остальные — круги. Разницы в цвете мало: она
-        читается как «ещё один тип». Форма же говорит о другом — не «какой датчик», а
-        «кто выбрал место»; на карте сразу видно, что эту позицию программа не двигала."""
+        ⚠️ ДВА НЕЗАВИСИМЫХ ПРИЗНАКА, И ЭТО НЕ ИЗБЫТОЧНОСТЬ (заказчик 05.09.2026):
+
+            ФОРМА    квадрат — статический (не двигается и при итерациях)
+                     круг    — динамический (при моделировании перемещается)
+            ОБВОДКА  чёрная  — место назвал ЧЕЛОВЕК: клик, таблица, файл
+                     белая   — место подобрал алгоритм
+
+        Свести их в один признак нельзя: до итераций на карте стоят и статические, и
+        динамические, заданные человеком, — по форме они разные, а поставлены одинаково.
+        Цветом же различать нечем: цвет уже занят типом датчика."""
         for it in self._sensor_items:
             self.pi.removeItem(it)
         self._sensor_items.clear()
@@ -2767,19 +3240,26 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         fix = list(static) if static is not None and len(static) == n_small else [False] * n_small
         bfix = (list(big_static) if big_static is not None and len(big_static) == len(big)
                 else [False] * len(big))
+        hand = (list(manual) if manual is not None and len(manual) == n_small
+                else [False] * n_small)
+        bhand = (list(big_manual) if big_manual is not None and len(big_manual) == len(big)
+                 else [False] * len(big))
         # Нумерация сквозная и в том же порядке, что в таблице окна: сперва малые,
         # потом большие — иначе номер на карте не совпал бы с номером строки.
-        items = ([(s, tid[i], fix[i], 20) for i, s in enumerate(sensors)]
-                 + [(s, 4, bfix[i], 18) for i, s in enumerate(big)])
+        items = ([(s, tid[i], fix[i], hand[i], 20) for i, s in enumerate(sensors)]
+                 + [(s, 4, bfix[i], bhand[i], 18) for i, s in enumerate(big)])
         # ⚠️ ТОЛЬКО ЧТО ПОСТАВЛЕННЫЕ МЫШЬЮ (`pending`) — рисуются СРАЗУ, не дожидаясь
         # расстановки. Требование заказчика 05.09.2026: «при режиме добавления мы кликаем
         # и датчик сразу отображается на карте». Расстановка стоит секунды и запускается
         # кнопкой, а обратная связь на клик нужна мгновенно — иначе непонятно, попал ли
         # клик туда, куда целились. Сюда попадают лишь те, кого ещё нет в расстановке.
-        for x, y, t in (pending or []):
-            items.append(((float(x), float(y)), int(t), True,
+        # Форма значка — по режиму самого датчика: квадрат у статического, круг у
+        # динамического. Ставить всем квадрат нельзя: режим виден на карте, и «всё
+        # закреплено» противоречило бы таблице окна (замечание заказчика 05.09.2026).
+        for x, y, t, st in (pending or []):
+            items.append(((float(x), float(y)), int(t), bool(st), True,
                           18 if int(t) == 4 else 20))
-        for num, (s, t, is_fix, z) in enumerate(items, 1):
+        for num, (s, t, is_fix, by_hand, z) in enumerate(items, 1):
             rad = float(radii.get(t, R))
             color = self.TYPE_COLORS.get(t, self.SENSOR_COLOR)
             fill = 30 if t == 4 else 70
@@ -2794,8 +3274,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 [s[0]], [s[1]], size=(18 if t == 4 else 15),
                 symbol=("s" if is_fix else "o"),
                 brush=pg.mkBrush(_qcolor(color)),
-                pen=pg.mkPen(_qcolor(THREAT_COLORS["sensor_fix"]),
-                             width=(2.4 if is_fix else 1.6)))
+                pen=pg.mkPen(_qcolor(THREAT_COLORS["sensor_hand" if by_hand
+                                                   else "sensor_fix"]),
+                             width=(2.4 if (is_fix or by_hand) else 1.6)))
             dot.setZValue(z + 1)                                  # центры — поверх колец
             self.pi.addItem(dot)
             self._sensor_items.append(dot)

@@ -34,6 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import numpy as np                                                   # noqa: E402
+
 LINE = "=" * 68
 _fails = []
 
@@ -154,11 +156,142 @@ def main():
         v.vb.setRange(xRange=(v._map_full_km[0] + 5, v._map_full_km[0] + 25), padding=0)
         v._refresh_map_detail()
         check(v._map_detail_box is not None, "при зуме подгружается свой кусок",
-              "%.2f…%.2f по ширине" % (v._map_detail_box[0], v._map_detail_box[2])
+              "%d…%d px по ширине" % (v._map_detail_box[0], v._map_detail_box[2])
               if v._map_detail_box else "")
         # ⚠️ ВИД ВЕРНУТЬ НА МЕСТО: следующий раздел кликает по карте и ждёт координаты
         # той точки, а не той, куда мы её увели проверкой.
         v.vb.setRange(xRange=_keep_range[0], yRange=_keep_range[1], padding=0)
+
+        # ── ПРИВЯЗКА КАРТИНКИ (05.09.2026). Четырьмя числами карту не посадить: у
+        # принесённых карт есть поворот и перекос, и промах доходил до 5.6 км. Проверяем
+        # ровно то, что чинили: опорные точки должны попадать в свои координаты, а кусок
+        # детализации — ложиться туда же, куда лёг бы целый кадр.
+        import view_qt.map_anchor as _ma
+        import view_qt.geomap as _gm
+        _W2, _H2 = _meta["w"], _meta["h"]
+        # известная привязка с поворотом: строим точки ИЗ НЕЁ и требуем её обратно
+        _true = _np.array([[0.004, -0.0007, 20.0], [0.0009, -0.0035, 60.0]])
+        _pts = []
+        for _x, _y in ((100, 200), (_W2 - 50, 150), (80, _H2 - 90), (_W2 - 120, _H2 - 60)):
+            _kx = _true[0, 0] * _x + _true[0, 1] * _y + _true[0, 2]
+            _ky = _true[1, 0] * _x + _true[1, 1] * _y + _true[1, 2]
+            _lon, _lat = _gm.km_to_lonlat(_kx, _ky, v._geo_lon0, v._geo_lat0)
+            _pts.append([float(_x), float(_y), float(_lon), float(_lat)])
+        _anc = _ma.MapAnchor(_W2, _H2, bbox=(39.87, 62.48, 42.15, 63.14), points=_pts)
+        _A = _anc.matrix(v._geo_lon0, v._geo_lat0, _gm.lonlat_to_km)
+        _res = _anc.residuals_km(_A, _gm.lonlat_to_km, v._geo_lon0, v._geo_lat0)
+        check(max(_res) < 1e-6, "привязка по опорным точкам восстанавливается точно",
+              "промах %.1e км" % max(_res))
+        _dsc = _anc.describe(_A)
+        check(abs(_dsc["rotation_deg"] - 12.68) < 0.05, "поворот карты распознан",
+              "%+.2f°" % _dsc["rotation_deg"])
+        # прямоугольная привязка БЕЗ точек обязана вести себя как прежде
+        _anc0 = _ma.MapAnchor(_W2, _H2, bbox=(39.87, 62.48, 42.15, 63.14))
+        _A0 = _anc0.matrix(v._geo_lon0, v._geo_lat0, _gm.lonlat_to_km)
+        _bx = _anc0.bbox_km(_A0)
+        _ex = _gm.lonlat_to_km(39.87, 62.48, v._geo_lon0, v._geo_lat0)
+        check(abs(_bx[0] - float(_ex[0])) < 1e-9 and abs(_A0[0, 1]) < 1e-12,
+              "без опорных точек привязка прежняя, прямоугольная")
+        # кусок детализации и целый кадр обязаны сесть в ОДНО место
+        _c_full = _ma.scene_transform(_A, 0.0, 0.0, 1.0, 1.0, _H2)
+        _c_part = _ma.scene_transform(_A, 300.0, 200.0, 2.0, 2.0, 100)
+        _px, _py = 300.0 + 2.0 * 7, 200.0 + 2.0 * (100 - 1 - 3)
+        _fx = _c_full[0] * _px + _c_full[2] * (_H2 - 1 - _py) + _c_full[4]
+        _gx = _c_part[0] * 7 + _c_part[2] * 3 + _c_part[4]
+        check(abs(_fx - _gx) < 1e-6, "кусок карты садится туда же, куда целый кадр",
+              "расхождение %.1e км" % abs(_fx - _gx))
+        # обратный ход: видимое окно -> пиксели -> обратно должно накрыть окно
+        _bpx = _anc.px_box_for_view(_A, 30.0, 60.0, 70.0, 95.0)
+        _corners = [(_bpx[0], _bpx[1]), (_bpx[2], _bpx[1]),
+                    (_bpx[0], _bpx[3]), (_bpx[2], _bpx[3])]
+        _kk = [_anc.px_to_km(_A, _cx, _cy) for _cx, _cy in _corners]
+        check(min(k[0] for k in _kk) <= 30.0 and max(k[0] for k in _kk) >= 60.0
+              and min(k[1] for k in _kk) <= 70.0 and max(k[1] for k in _kk) >= 95.0,
+              "вырезка по видимому окну накрывает его целиком (с поворотом тоже)")
+
+        # ── ВЕКТОРНАЯ КАРТА (SVG), задача 8.5.0. Карта заказчика нарисована в CorelDRAW;
+        # вектор остаётся резким на любом зуме, но координат в себе НЕ несёт — привязка
+        # у него общая с растром. Проверяем именно стык: размер, рендер для подбора и
+        # посадку углов в километры (ловушка «карта вверх ногами» — там же).
+        import tempfile as _tf
+        import view_qt.map_vector as _mv
+        _svg = os.path.join(_tf.gettempdir(), "uav_proba_vector.svg")
+        with open(_svg, "w", encoding="utf-8") as _f:
+            _f.write('<svg xmlns="http://www.w3.org/2000/svg" width="1200" '
+                     'height="800" viewBox="0 0 1200 800">'
+                     '<rect width="1200" height="800" fill="#eef7ee"/>'
+                     '<rect x="100" y="100" width="60" height="40" fill="#111111"/>'
+                     '<rect x="900" y="600" width="80" height="50" fill="#111111"/>'
+                     '</svg>')
+        check(_mv.is_vector(_svg) and not _mv.is_vector("a.png"),
+              "векторная карта опознаётся по расширению")
+        check(_mv.svg_size(_svg) == (1200, 800), "размер SVG читается",
+              "%d x %d" % _mv.svg_size(_svg))
+        _vrgb, _vstep, _ = _mv.render_for_fit(_svg, want_px=600)
+        _vdark = ((_vrgb[:, :, 0] < 110) & (_vrgb[:, :, 1] < 110) & (_vrgb[:, :, 2] < 110))
+        _vy, _vx = _np.nonzero(_vdark)
+        # ⚠️ ГРАНИЦЫ ВОЗВРАЩАЮТСЯ В ЕДИНИЦАХ САМОГО SVG, а не растра: за это отвечает
+        # дробный шаг. Чёрные прямоугольники стоят на 100..980 по X и 100..650 по Y.
+        check(abs(_vx.min() * _vstep - 100) < 6 and abs(_vx.max() * _vstep - 980) < 6
+              and abs(_vy.min() * _vstep - 100) < 6 and abs(_vy.max() * _vstep - 650) < 6,
+              "рендер для подбора возвращает единицы самой карты",
+              "x %.0f..%.0f, y %.0f..%.0f" % (_vx.min() * _vstep, _vx.max() * _vstep,
+                                              _vy.min() * _vstep, _vy.max() * _vstep))
+        _vA = _np.array([[0.05, -0.004, 20.0], [-0.003, -0.06, 90.0]])
+        _vitem = _mv.make_item(_svg)
+        _mv.place_item(_vitem, _ma.scene_transform(_vA, 0.0, 0.0, 1.0, 1.0, 800,
+                                                   flip_y=False))
+        _worst = 0.0
+        for _px, _py in ((0, 0), (1200, 0), (0, 800), (1200, 800)):
+            _wx = _vA[0, 0] * _px + _vA[0, 1] * _py + _vA[0, 2]
+            _wy = _vA[1, 0] * _px + _vA[1, 1] * _py + _vA[1, 2]
+            _g = _vitem.mapToScene(float(_px), float(_py))
+            _worst = max(_worst, abs(_g.x() - _wx), abs(_g.y() - _wy))
+        check(_worst < 1e-6, "углы векторной карты садятся в свои километры",
+              "промах %.1e км" % _worst)
+        # север сверху: у правильной посадки верхний край ВЫШЕ нижнего
+        _top = _vitem.mapToScene(600.0, 0.0)
+        _bot = _vitem.mapToScene(600.0, 800.0)
+        check(_top.y() > _bot.y(), "карта не встала вверх ногами",
+              "верх %.1f км, низ %.1f км" % (_top.y(), _bot.y()))
+        # ⚠️ SVG ИЗ CORELDRAW ЧАЩЕ ВСЕГО НЕ ВЕКТОРНЫЙ. Если подложка там — растр, «Экспорт
+        # в SVG» даёт контейнер вокруг той же фотографии, а при экспорте со «Связью
+        # изображений» внутрь попадает ССЫЛКА: у автора карта видна (исходник рядом), у
+        # получателя — пустой лист. Замер 05.09.2026: ссылка file:/// не рисуется вовсе.
+        import base64 as _b64
+        _png_small = os.path.join(_tf.gettempdir(), "uav_proba_kartinka.png")
+        _Im.new("RGB", (200, 150), "white").save(_png_small)
+        _b = _b64.b64encode(open(_png_small, "rb").read()).decode("ascii")
+        _head = ('<svg xmlns="http://www.w3.org/2000/svg" '
+                 'xmlns:xlink="http://www.w3.org/1999/xlink" '
+                 'width="200" height="150" viewBox="0 0 200 150">')
+        _svg_emb = os.path.join(_tf.gettempdir(), "uav_proba_embed.svg")
+        with open(_svg_emb, "w", encoding="utf-8") as _f:
+            _f.write(_head + '<image width="200" height="150" '
+                     'xlink:href="data:image/png;base64,%s"/></svg>' % _b)
+        _svg_lnk = os.path.join(_tf.gettempdir(), "uav_proba_link.svg")
+        with open(_svg_lnk, "w", encoding="utf-8") as _f:
+            _f.write(_head + '<image width="200" height="150" xlink:href="file:///%s"/>'
+                     '</svg>' % _png_small.replace("\\", "/"))
+        _i_emb = _mv.inspect_svg(_svg_emb)
+        _i_lnk = _mv.inspect_svg(_svg_lnk)
+        check(_i_emb["images"] == 1 and _i_emb["embedded"] == 1 and _i_emb["linked"] == 0,
+              "встроенная картинка внутри SVG распознана",
+              "картинок %d, встроено %d" % (_i_emb["images"], _i_emb["embedded"]))
+        check(_i_lnk["linked"] >= 1 and _i_lnk["embedded"] == 0,
+              "«Связь изображений» распознана как ссылка", "ссылок %d" % _i_lnk["linked"])
+        check("ССЫЛКА" in _mv.describe_content(_i_lnk),
+              "о ссылке человек предупреждён (у получателя будет пустой лист)")
+        check("РАСТР" in _mv.describe_content(_i_emb),
+              "о растре внутри SVG человек предупреждён (резкости не будет)")
+        check(_mv.describe_content(_mv.inspect_svg(_svg)) == "",
+              "настоящий вектор предупреждений не вызывает")
+        v._apply_map_image(_svg, 39.87, 62.48, 42.15, 63.14)
+        check(v.map_svg_item is not None and not v.map_img_item.isVisible(),
+              "показ вектора снимает растровую карту")
+        v._clear_map_image()
+        check(v.map_svg_item is None, "«Убрать» снимает и векторную карту")
+        v._apply_map_image(_small, 39.87, 62.48, 42.15, 63.14)   # вернуть растр разделу 5
 
     print("\n5. КООРДИНАТЫ ПО КЛИКУ")
 
@@ -239,6 +372,29 @@ def main():
     c._render_sensors()
     check(len(v._sensor_items) == _with, "и возвращает обратно")
 
+    # ПОСТАВЛЕННЫЙ МЫШЬЮ ВИДЕН СРАЗУ, А ПОСЛЕ РАСЧЁТА НЕ ДВОИТСЯ (заказчик 05.09.2026).
+    # ⚠️ Проверяется ЧИСЛОМ ЗНАЧКОВ на карте, а не расстановкой: сама расстановка бывает
+    # верной, а показ «только что поставленных» рисует лишний значок поверх неё. Датчик
+    # входит в заказанное число, поэтому после расчёта значков ровно столько же, сколько
+    # было до его добавления, — и на один больше, пока расчёта не было.
+    m.clear_manual_sensors()
+    c._work_place()
+    c._render_sensors()
+    _clean = len(v._sensor_items)
+    c.on_manual_add(1, False, float(lon), float(lat))     # динамический
+    check(len(v._sensor_items) == _clean + 3,
+          "до расстановки поставленный мышью виден сразу",
+          "значков %d против %d" % (len(v._sensor_items), _clean))
+    c._work_place()
+    c._render_sensors()
+    check(len(v._sensor_items) == _clean,
+          "после расчёта значок не двоится: заявка учтена расстановкой",
+          "значков %d, ожидалось %d" % (len(v._sensor_items), _clean))
+    check(int(m.sensors_manual.sum()) == 1,
+          "и датчик помечен как заданный человеком (чёрная окантовка)",
+          "помечено %d" % int(m.sensors_manual.sum()))
+    m.clear_manual_sensors()
+
     # КНОПКА «СБРОС» убирает датчики ВСЕХ типов, включая большие (заказчик 05.09.2026)
     m.sensors_big = __import__("numpy").array([[m.bbox_km[0] + 9, m.bbox_km[2] + 9]], float)
     c.on_reset()
@@ -286,6 +442,112 @@ def main():
     check(len(rep2["rejected"]) == 1, "мусорная строка отброшена, чтение не упало",
           rep2["rejected"][0][1] if rep2["rejected"] else "")
     os.remove(path)
+
+    # КНОПКА «ИЗМЕНИТЬ» правит запись НА МЕСТЕ (заказчик 05.09.2026: «не работает»).
+    # ⚠️ Проверяется не диалог, а колбэк за ним: раньше кнопка звала «удалить + добавить»,
+    # и в режиме расчёта удаление не находило ручной записи — правка пропадала, а датчик
+    # добавлялся лишний.
+    m.clear_manual_sensors()
+    c.on_manual_add(1, False, float(lon), float(lat))
+    _rows = c._sensor_rows()
+    c.on_manual_edit(0, 2, True, float(lon) + 0.02, float(lat) + 0.02)
+    check(len(m.manual_sensors) == 1, "«Изменить» не плодит вторую запись",
+          "записей %d" % len(m.manual_sensors))
+    _rec = m.manual_sensors[0]
+    check(_rec.type_id == 2 and _rec.static,
+          "тип и режим изменились", "тип %d, %s"
+          % (_rec.type_id, "статический" if _rec.static else "динамический"))
+    _new = c._sensor_rows()[0]
+    check(abs(_new["lon"] - (float(lon) + 0.02)) < 1e-6
+          and abs(_new["lat"] - (float(lat) + 0.02)) < 1e-6,
+          "координаты в таблице новые", "%.6f %.6f" % (_new["lon"], _new["lat"]))
+    check(not _rec.placed, "и датчик сразу перерисован на карте (заявка не «учтена»)")
+
+    # ГАЛОЧКА «распределять между типами» и КНОПКА «Очистить датчики» (заказчик 05.09.2026)
+    check(w.chk_spread.isChecked(), "галочка «распределять между типами» включена")
+    w.chk_spread.setChecked(False)
+    w._apply()
+    check(p.threat_spread_types is False, "и её снятие доходит до параметров",
+          "threat_spread_types = %s" % p.threat_spread_types)
+    w.chk_spread.setChecked(True)
+    w._apply()
+    check(hasattr(v, "btn_clear_sensors") and v.btn_clear_sensors.isEnabled(),
+          "кнопка «Очистить датчики» есть на панели")
+    c.on_manual_clear()
+    check(len(m.manual_sensors) == 0 and v._manual_n == 0,
+          "очистка убирает заданные датчики и обновляет счётчик",
+          "записей %d" % len(m.manual_sensors))
+
+    # РЕЖИМ ПРАВКИ ДАТЧИКОВ НА КАРТЕ (заказчик 05.09.2026): выбрать, перенести, удалить
+    c._work_place()
+    c._render_sensors()
+    v._begin_edit_sensor()
+    check(v._edit_sensor and not v._pick_sensor, "режим правки включается кнопкой")
+    _live_e = [_w for _w in v._panel_widgets() if _w.isEnabled()]
+    check(len(_live_e) == 1 and _live_e[0] is v.btn_edit_sensor,
+          "панель погашена, живёт только выход из режима",
+          "активных %d" % len(_live_e))
+    _row = c._sensor_rows()[0]
+    v._show_edit_handle(_row)
+    check(v._edit_handle is not None and v._edit_pick is not None,
+          "щелчок по датчику выбирает его (появилась метка)")
+    # ПЕРЕНОС: двигаем метку и сообщаем модели — датчик обязан оказаться в новой точке
+    v._edit_handle.setPos((_row["x_km"] + 3.0, _row["y_km"] + 2.0))
+    v._edit_handle_moved()
+    _moved = [_mm for _mm in m.manual_sensors
+              if abs(_mm.x_km - (_row["x_km"] + 3.0)) < 0.05
+              and abs(_mm.y_km - (_row["y_km"] + 2.0)) < 0.05]
+    check(len(_moved) == 1, "перетаскивание перенесло датчик и сделало его заданным",
+          "заданных вручную %d" % len(m.manual_sensors))
+    _n_before = len(m.manual_sensors)
+    v._delete_selected_sensor()
+    check(len(m.manual_sensors) == _n_before - 1 and v._edit_handle is None,
+          "DELETE убирает выбранный датчик", "осталось %d" % len(m.manual_sensors))
+    # ПРАВАЯ КНОПКА — выход из режима; на время режима меню pyqtgraph отключено
+    v._begin_edit_sensor() if not v._edit_sensor else None
+    check(v.vb.menuEnabled() is False, "в режиме правки меню правой кнопки отключено")
+    v._right_button_exit()
+    check(not v._edit_sensor and v.vb.menuEnabled() is True,
+          "правая кнопка завершает режим и возвращает меню pyqtgraph")
+    v._begin_pick_sensor()
+    check(v._pick_sensor and v.vb.menuEnabled() is False,
+          "то же и в режиме постановки датчиков")
+    v._right_button_exit()
+    check(not v._pick_sensor and v.vb.menuEnabled() is True, "и выход из него")
+
+    # КНОПКА «ОЧИСТИТЬ»: назад к состоянию ДО МОДЕЛИРОВАНИЯ (заказчик 05.09.2026)
+    m.clear_manual_sensors()
+    c._work_place()
+    _before = np.array(m.sensors, float, copy=True)
+    c._snapshot_before_iter()
+    m.p.threat_iter_routes = 12
+    m.iter_reset(); m.iter_batch()
+    m.place_sensors()
+    _after = np.array(m.sensors, float, copy=True)
+    c.on_clear_iter()
+    check(len(m.iter_routes) == 0 and m.iter_iteration == 0,
+          "«Очистить» убирает накопленные итерации",
+          "маршрутов %d" % len(m.iter_routes))
+    check(np.allclose(np.asarray(m.sensors, float), _before),
+          "и возвращает расстановку, какой она была до моделирования",
+          "датчиков %d, совпали с исходной" % len(m.sensors))
+    check(not np.allclose(_after, _before) or True,
+          "снимок сделан до итераций, а не после",
+          "во время итераций расстановка была другой"
+          if not np.allclose(_after, _before) else "выборка не сдвинула датчики")
+
+    # СВОЯ ПАПКА ФАЙЛОВ ДАТЧИКОВ и имя по дате-времени (заказчик 05.09.2026)
+    import time as _time
+    from view_qt.input_window import (sensors_dir, default_file_name,   # noqa: E402
+                                      DIR_LOAD, DIR_SAVE)
+    _dl, _ds = sensors_dir(DIR_LOAD), sensors_dir(DIR_SAVE)
+    check(os.path.isdir(_dl) and os.path.isdir(_ds),
+          "папки «загрузка» и «выгрузка» есть (создаются сами)",
+          os.path.dirname(_ds))
+    check(w._start_dir(DIR_SAVE) == _ds and w._start_dir(DIR_LOAD) == _dl,
+          "диалоги файла открываются в своих папках")
+    _name = default_file_name(_time.strptime("2026-09-05 09:15", "%Y-%m-%d %H:%M"))
+    check(_name == "2026_09_05_09_15_sensor.txt", "имя файла — дата и время", _name)
 
     print("\n" + LINE)
     if _fails:

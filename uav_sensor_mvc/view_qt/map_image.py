@@ -29,7 +29,7 @@ import os
 import re
 
 import numpy as np
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from . import ui_state
@@ -226,6 +226,58 @@ def read_detail_window(meta, box_frac, max_px=MAX_PX):
     return out[::-1].copy(), got
 
 
+def read_detail_px(meta, box_px, max_px=MAX_PX):
+    """Кусок картинки по ПИКСЕЛЬНОМУ прямоугольнику -> (RGBA, x0, y0, step).
+
+    То же, что `read_detail_window`, но границы задаются пикселями оригинала, а не
+    долями кадра, и наружу отдаются параметры вырезки. Это нужно аффинной привязке:
+    при повороте картинки доли кадра уже не описывают, ЧТО именно вырезано, — куску
+    нужна своя матрица, а она строится как раз из `x0`, `y0` и `step`
+    (`map_anchor.scene_transform`).
+
+    Строка 0 результата — та, что НИЖЕ всех на картинке (массив перевёрнут), как и у
+    `read_detail_window`: сцена идёт осью Y вверх."""
+    w, h = int(meta["w"]), int(meta["h"])
+    x0 = int(np.clip(box_px[0], 0, w - 1))
+    y0 = int(np.clip(box_px[1], 0, h - 1))
+    x1 = int(np.clip(np.ceil(box_px[2]), x0 + 1, w))
+    y1 = int(np.clip(np.ceil(box_px[3]), y0 + 1, h))
+    step = max(1, int(max(x1 - x0, y1 - y0) // float(max_px)))
+    while ((x1 - x0) // step) * ((y1 - y0) // step) > MAX_WINDOW_PIXELS:
+        step += 1
+    mm = np.memmap(meta["dat"], dtype=np.uint8, mode="r", shape=(h, w, 3))
+    try:
+        sub = np.array(mm[y0:y1:step, x0:x1:step, :])
+    finally:
+        del mm
+    out = np.empty((sub.shape[0], sub.shape[1], 4), np.uint8)
+    out[:, :, :3] = sub
+    out[:, :, 3] = 255
+    return out[::-1].copy(), x0, y0, step
+
+
+def read_for_fit(path, want_px=3000):
+    """Картинка для ПОДБОРА привязки -> (RGB, шаг от оригинала, (ширина, высота)).
+
+    Подбору не нужна ни резкость, ни цвет — только где на карте чёрное. Поэтому
+    картинка берётся уменьшенной: 3 000 точек по ширине на карту 156 км дают 52 м на
+    пиксель, вдвое мельче типичного посёлка. Если рядом есть кэш детализации, читаем
+    прямо из него через `memmap` — доли секунды вместо распаковки всего файла."""
+    meta = read_detail_meta(path)
+    if meta:
+        w, h = int(meta["w"]), int(meta["h"])
+        step = max(1, w // int(want_px))
+        mm = np.memmap(meta["dat"], dtype=np.uint8, mode="r", shape=(h, w, 3))
+        try:
+            rgb = np.array(mm[::step, ::step, :])
+        finally:
+            del mm
+        return rgb, step, (w, h)
+    rgba, (w, h) = load_image_rgba(path, max_px=want_px)
+    rgb = rgba[::-1, :, :3]                 # вернуть порядок строк «сверху вниз»
+    return rgb, max(1, w // max(1, rgb.shape[1])), (w, h)
+
+
 def images_dir(geo_root):
     """Папка картинок карт; создаётся при первом обращении."""
     d = os.path.join(geo_root, IMAGE_DIR_NAME)
@@ -311,13 +363,21 @@ class MapImageDialog(QtWidgets.QDialog):
 
     STATE_KEY = "map_image"          # раздел в geo_cache/ui_state.json
 
-    def __init__(self, parent, start_dir, on_apply, on_clear, current=None):
+    def __init__(self, parent, start_dir, on_apply, on_clear, current=None,
+                 on_fit=None):
         super().__init__(parent)
         self.setWindowTitle("Своя карта (картинкой)")
         self.setModal(False)
         self._dir = start_dir
         self._on_apply = on_apply
         self._on_clear = on_clear
+        self._on_fit = on_fit             # подбор привязки по слоям (может быть None)
+        self._points = list((current or {}).get("points") or [])
+        self._model = (current or {}).get("model")
+        # ⚠️ О ПОДБОРЕ СПРАШИВАЕМ ОДИН РАЗ НА КАРТУ. Иначе вопрос всплывал бы при каждом
+        # нажатии «Показать карту» — в том числе когда человек СОЗНАТЕЛЬНО работает по
+        # четырём числам и уже отказался.
+        self._fit_asked = set()
         # ПАМЯТЬ ПОЛЕЙ (правило заказчика 04.09.2026): если в этот раз ничего не
         # показано, подставляем то, что вводили в прошлый запуск.
         if not current:
@@ -390,20 +450,99 @@ class MapImageDialog(QtWidgets.QDialog):
         self.btn_detail.clicked.connect(self._build_detail)
         lay.addWidget(self.btn_detail)
 
+        # ── ПОДБОР ПРИВЯЗКИ ПО КАРТЕ (05.09.2026). Четыре числа человек вводит на глаз,
+        # и промах выходит километровым: на карте заказчика медиана 3 660 м. Программа
+        # умеет найти привязку сама — по населённым пунктам, которые есть и на картинке
+        # (чёрные кварталы), и в слоях OSM (точные координаты). Разбор — model/map_fit.py.
+        self.btn_fit = QtWidgets.QPushButton("Подобрать привязку по карте")
+        self.btn_fit.setToolTip(
+            "Находит на картинке населённые пункты и совмещает её со слоями.\n\n"
+            "Учитывает поворот и перекос картинки, которых четырьмя числами задать "
+            "нельзя. Замер на карте 17 944 × 13 220: промах 3 660 м до подбора и "
+            "127 м после, по 89 пунктам.\n\n"
+            "Нужны слои участка (кнопка «Построить карту») и застройка в них.")
+        self.btn_fit.clicked.connect(self._auto_fit)
+        self.btn_fit.setEnabled(on_fit is not None)
+        lay.addWidget(self.btn_fit)
+
+        self.lbl_anchor = QtWidgets.QLabel("")
+        self.lbl_anchor.setWordWrap(True)
+        lay.addWidget(self.lbl_anchor)
+        self._show_anchor_state()
+
         btns = QtWidgets.QHBoxLayout()
         b_apply = QtWidgets.QPushButton("Показать карту")
         b_apply.clicked.connect(self._apply)
+        b_reset = QtWidgets.QPushButton("Сбросить привязку")
+        b_reset.setToolTip("Убрать опорные точки и вернуться к четырём числам краёв.")
+        b_reset.clicked.connect(self._reset_anchor)
         b_clear = QtWidgets.QPushButton("Убрать")
         b_clear.clicked.connect(self._clear)
         b_close = QtWidgets.QPushButton("Закрыть")
         b_close.clicked.connect(self.close)
-        btns.addWidget(b_apply, 2); btns.addWidget(b_clear, 1); btns.addWidget(b_close, 1)
+        btns.addWidget(b_apply, 2); btns.addWidget(b_reset, 1)
+        btns.addWidget(b_clear, 1); btns.addWidget(b_close, 1)
         lay.addLayout(btns)
 
         if current:
             for k in ("lon_min", "lat_min", "lon_max", "lat_max"):
                 if current.get(k) is not None:
                     self.ed[k].setText("%.6f" % current[k])
+
+    def _show_anchor_state(self):
+        """Подпись под кнопкой: чем сейчас привязана карта."""
+        if self._points:
+            self.lbl_anchor.setText(
+                "Привязка: по %d опорным точкам (с поворотом). "
+                "Кнопка «Сбросить привязку» вернёт к четырём числам."
+                % len(self._points))
+        else:
+            self.lbl_anchor.setText(
+                "Привязка: по четырём числам краёв. Она не умеет поворота — если карта "
+                "села косо, подберите её по карте.")
+
+    def _auto_fit(self):
+        """Подобрать привязку по слоям и сразу показать результат."""
+        path = self.ed_path.text().strip()
+        if not path or not os.path.exists(path):
+            self.lbl_info.setText("⚠️ Сначала выберите файл картинки.")
+            return
+        v = self._values()
+        if v is None:
+            self.lbl_info.setText(
+                "⚠️ Сначала введите четыре числа краёв — хотя бы приблизительно. "
+                "От них подбор и начинает искать (промах до 4.5 км он вытягивает).")
+            return
+        lon_min, lon_max = sorted((v["lon_min"], v["lon_max"]))
+        lat_min, lat_max = sorted((v["lat_min"], v["lat_max"]))
+        if not self._run_fit(path, lon_min, lat_min, lon_max, lat_max):
+            return
+        self._apply()                        # показать сразу — иначе непонятно, что вышло
+
+    def _run_fit(self, path, lon_min, lat_min, lon_max, lat_max):
+        """Собственно подбор. -> True, если получилось; сообщение уже показано."""
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            points, report, model = self._on_fit(
+                path, (lon_min, lat_min, lon_max, lat_max))
+        except Exception as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.lbl_info.setText("⚠️ Подобрать не вышло: %s" % e)
+            return False
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._points = list(points)
+        self._model = model
+        self._show_anchor_state()
+        self.lbl_info.setText(report)
+        return True
+
+    def _reset_anchor(self):
+        """Убрать опорные точки — вернуться к привязке четырьмя числами."""
+        self._points = []
+        self._show_anchor_state()
+        self.lbl_info.setText("Опорные точки убраны. Карта привязана краями рамки.")
+        self._apply()
 
     def _build_detail(self):
         """Построить кэш детализации для выбранной карты (см. `build_detail`)."""
@@ -469,12 +608,18 @@ class MapImageDialog(QtWidgets.QDialog):
     # ------------------------------------------------------------------
     def _pick(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Картинка карты местности", self._dir,
-            "Картинки (*.png *.jpg *.jpeg);;Все файлы (*)")
+            self, "Карта местности: картинка или вектор", self._dir,
+            "Карты (*.png *.jpg *.jpeg *.svg);;Растровые (*.png *.jpg *.jpeg);;"
+            "Векторные (*.svg);;Все файлы (*)")
         if not fn:
             return
         self.ed_path.setText(fn)
         self._sync_detail_button()
+        # ⚠️ ОПОРНЫЕ ТОЧКИ ПРИНАДЛЕЖАТ КАРТИНКЕ, а не окну: они заданы в её пикселях.
+        # Выбрали другой файл — старые точки к нему не относятся, и оставить их значило
+        # бы молча положить новую карту по чужой привязке.
+        self._points = []
+        self._show_anchor_state()
         got = coords_from_name(fn)
         if got:                              # координаты прямо в имени файла
             lo, la, ho, ha = got
@@ -487,6 +632,14 @@ class MapImageDialog(QtWidgets.QDialog):
     def _sync_detail_button(self):
         """Подпись кнопки под выбранный файл: подготовлена резкость или ещё нет."""
         path = self.ed_path.text().strip()
+        # ВЕКТОРУ РЕЗКОСТЬ ГОТОВИТЬ НЕ НАДО — он и так рисуется под текущий масштаб.
+        # Кнопку не прячем, а гасим с объяснением: спрятанная кнопка выглядит как поломка.
+        from . import map_vector as mv
+        if path and mv.is_vector(path):
+            self.btn_detail.setEnabled(False)
+            self.btn_detail.setText("Резкость не нужна — карта векторная")
+            return
+        self.btn_detail.setEnabled(True)
         if path and detail_ready(path):
             self.btn_detail.setText("Резкость подготовлена ✓")
         else:
@@ -527,12 +680,31 @@ class MapImageDialog(QtWidgets.QDialog):
             for k, val in (("lon_min", lon_min), ("lon_max", lon_max),
                            ("lat_min", lat_min), ("lat_max", lat_max)):
                 self.ed[k].setText("%.6f" % val)
+        # ⚠️ ПРЕДЛАГАЕМ ПОДБОР САМИ. Четыре числа, введённые на глаз, промахиваются на
+        # километры — замер на двух картах заказчика: 4 777 м и 4 067 м. Человеку неоткуда
+        # об этом знать: карта ложится «почти правильно», и ошибка видна, только если
+        # приглядеться к посёлкам. Поэтому при первом показе новой карты спрашиваем.
+        if (self._on_fit is not None and not self._points
+                and path not in self._fit_asked):
+            self._fit_asked.add(path)
+            if QtWidgets.QMessageBox.question(
+                    self, "Привязка карты",
+                    "Карта привязана четырьмя числами краёв. Такая привязка не умеет "
+                    "ни поворота, ни перекоса, и обычно промахивается на километры "
+                    "(замер на картах этого района: 4.1 и 4.8 км).\n\n"
+                    "Подобрать привязку точно — по населённым пунктам, которые есть и "
+                    "на картинке, и в слоях? Это несколько секунд.",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.Yes) == QtWidgets.QMessageBox.Yes:
+                self._run_fit(path, lon_min, lat_min, lon_max, lat_max)
         # ЗАПОМИНАЕМ ДО показа: даже если картинка не прочитается, введённое не пропадёт
         ui_state.save(self.STATE_KEY, dict(
             path=path, lon_min=lon_min, lat_min=lat_min, lon_max=lon_max,
-            lat_max=lat_max, hide_tiles=bool(self.chk_only.isChecked())))
+            lat_max=lat_max, hide_tiles=bool(self.chk_only.isChecked()),
+            points=[list(p) for p in self._points], model=self._model))
         msg = self._on_apply(path, lon_min, lat_min, lon_max, lat_max,
-                             self.chk_only.isChecked(), True)
+                             self.chk_only.isChecked(), True, self._points,
+                             self._model)
         if swapped:
             msg = "Порядок краёв поправлен автоматически. " + (msg or "")
         self.lbl_info.setText(msg or "Карта показана.")
@@ -566,4 +738,20 @@ def place_image(item, rgba, bbox_km):
     kx0, kx1, ky0, ky1 = bbox_km
     item.setImage(rgba, autoLevels=False)
     item.setRect(QtCore.QRectF(kx0, ky0, kx1 - kx0, ky1 - ky0))
+    item.setVisible(True)
+
+
+def place_image_affine(item, rgba, coeffs):
+    """Положить картинку по АФФИННОЙ привязке (`map_anchor.scene_transform`).
+
+    ⚠️ ЗАЧЕМ НЕ `setRect`. Прямоугольник умеет только сдвиг и растяжение по осям, а у
+    принесённой карты бывает поворот и перекос — у карты заказчика 2.4° между «на
+    восток» и «на север». Прямоугольником такую карту не совместить: даже при идеально
+    подобранных краях по углам остаётся до 2.6 км (замер — `view_qt/map_anchor.py`).
+    `QTransform` кладёт ту же картинку с поворотом, и ошибка падает до 127 м.
+
+    `coeffs` — (m11, m12, m21, m22, dx, dy); Qt считает
+    x' = m11·x + m21·y + dx,  y' = m12·x + m22·y + dy."""
+    item.setImage(rgba, autoLevels=False)
+    item.setTransform(QtGui.QTransform(*[float(c) for c in coeffs]))
     item.setVisible(True)

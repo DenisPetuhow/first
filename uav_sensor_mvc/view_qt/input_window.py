@@ -45,6 +45,12 @@ STATE_FILE = "sensor_file"        # последняя папка файла д�
 FILE_MARK = "UAV-SENSORS"         # опознавательная строка в шапке файла
 FILE_VERSION = "v1"
 
+# ── СВОЯ ПАПКА ФАЙЛОВ ДАТЧИКОВ (требование заказчика 05.09.2026) ──────────────────────
+# Две подпапки: что читаем — в одной, что пишем — в другой. Раньше файл предлагался в
+# корне программы, рядом с исходниками, и выгрузки терялись среди них.
+SENSORS_DIR = "датчики"
+DIR_LOAD, DIR_SAVE = "загрузка", "выгрузка"
+
 # Слова, которыми в файле и в таблице записывается режим датчика. По-русски — человеку,
 # по-английски (s/d) — на случай чужой кодировки: файл правят руками в блокноте.
 _STATIC_WORDS = ("статический", "стат", "static", "s", "с")   # ⚠️ последняя — РУССКАЯ «с»
@@ -55,6 +61,33 @@ _DYNAMIC_WORDS = ("динамический", "дин", "dynamic", "d", "д")
 # ФАЙЛ ДАТЧИКОВ (формат — план 8, §8.7.7). Один и тот же на чтение и на запись:
 # файл, выгруженный программой, обязан читаться ею же без правки руками.
 # ══════════════════════════════════════════════════════════════════════════════
+def sensors_dir(kind):
+    """Папка файлов датчиков: `датчики/загрузка` или `датчики/выгрузка`.
+
+    Создаётся при первом обращении — обеих подпапок в репозитории нет, это рабочие
+    данные. Считается от КОРНЯ ПРОГРАММЫ, а не от `os.getcwd()`: рабочая директория
+    зависит от того, откуда программу запустили, и файлы разбредались бы по диску.
+    Не удалось создать (нет прав, диск только на чтение) — отдаём корень программы:
+    диалог всё равно откроется, просто не в своей папке."""
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        SENSORS_DIR, kind)
+    try:
+        if not os.path.isdir(root):
+            os.makedirs(root)
+    except OSError:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return root
+
+
+def default_file_name(when=None):
+    """Имя файла выгрузки по дате и времени: `2026_09_05_09_15_sensor.txt`.
+
+    ⚠️ ГОД ПЕРВЫМ, разделитель — подчёркивание (заказчик 05.09.2026). Имена в таком
+    виде сортируются по алфавиту так же, как по времени, и в папке выгрузки видно
+    порядок работ. Двоеточие времени в имени файла Windows не допускает."""
+    return time.strftime("%Y_%m_%d_%H_%M_sensor.txt", when or time.localtime())
+
+
 def mode_word(static):
     return "статический" if static else "динамический"
 
@@ -200,7 +233,11 @@ class SensorRowDialog(QtWidgets.QDialog):
             "Статический датчик остаётся ровно там, куда поставлен: алгоритм принимает "
             "его позицию как данность и достраивает остальные вокруг. Оптимальность "
             "расстановки при этом снижается — это осознанная плата за возможность "
-            "поставить датчик там, где он нужен.")
+            "поставить датчик там, где он нужен.\n\n"
+            "Динамический в режиме «Рассчитать позиции» место не закрепляет: по кнопке "
+            "«Расставить датчики» алгоритм подберёт его сам, и датчик может встать в "
+            "другой точке. В режиме «Задать позиции» подбора нет вовсе — там оба режима "
+            "стоят там, где заданы.")
         note.setWordWrap(True)
         note.setStyleSheet("color:%s;" % THEME["muted"])
         note.setMaximumWidth(380)
@@ -327,6 +364,7 @@ class InputDataWindow(QtWidgets.QDialog):
         # колбэки — их ставит threat_view (представление ничего не знает о модели)
         self.on_manual_add = lambda tid, static, lon, lat: None
         self.on_manual_remove = lambda index: None
+        self.on_manual_edit = lambda index, tid, static, lon, lat: None
         self.on_manual_clear = lambda: None
         self.on_mode_changed = lambda manual: None
         self.on_pick_mode = lambda: None           # «ставить датчики кликом по карте»
@@ -415,6 +453,21 @@ class InputDataWindow(QtWidgets.QDialog):
         grid.addWidget(QtWidgets.QLabel("Кратность засечки:"), 1, 0)
         grid.addWidget(self.rb_k_same, 1, 1)
         grid.addWidget(self.rb_k_own, 1, 2)
+
+        # РАСПРЕДЕЛЕНИЕ МЕЖДУ ТИПАМИ (заказчик 05.09.2026). Правило «не ближе 1.6·R»
+        # внутри типа работало всегда, а между типами разнос был вдвое слабее — и группы
+        # слипались. Галочка включает его и между типами; кратность засечки учитывается
+        # между ними в любом случае, это не «распределение», а правильный счёт покрытия.
+        self.chk_spread = QtWidgets.QCheckBox("распределять между типами")
+        self.chk_spread.setToolTip(
+            "ВКЛ (по умолчанию): датчики РАЗНЫХ типов не ставятся ближе, чем датчики "
+            "одного типа между собой, — то же правило 1.6·R, взятое по паре радиусов. "
+            "ВЫКЛ: разнос действует только внутри своего типа, и типы могут стоять "
+            "рядом.\n\nБольших датчиков (тип 4) не касается: у них своё правило кольца "
+            "вокруг цели. Кратность засечки между типами учитывается всегда.")
+        self.chk_spread.setChecked(True)
+        grid.addWidget(QtWidgets.QLabel("Разнос датчиков:"), 2, 0)
+        grid.addWidget(self.chk_spread, 2, 1, 1, 2)
         grid.setColumnStretch(3, 1)
         return box
 
@@ -603,6 +656,7 @@ class InputDataWindow(QtWidgets.QDialog):
         self.chk_step_auto.blockSignals(False)
         same = bool(getattr(p, "threat_k_same", True))
         (self.rb_k_same if same else self.rb_k_own).setChecked(True)
+        self.chk_spread.setChecked(bool(getattr(p, "threat_spread_types", True)))
         manual = bool(getattr(p, "threat_manual_mode", False))
         (self.rb_manual if manual else self.rb_calc).setChecked(True)
         self._auto_changed()
@@ -709,6 +763,7 @@ class InputDataWindow(QtWidgets.QDialog):
             except ValueError:
                 vals[name] = getattr(self._params, name, 0)
         vals["threat_k_same"] = self.rb_k_same.isChecked()
+        vals["threat_spread_types"] = self.chk_spread.isChecked()
         if vals["threat_k_same"]:                  # общая кратность — одно число на всех
             vals["threat_k2"] = vals["threat_k3"] = vals["threat_k"]
         lmax_auto = self.chk_lmax_auto.isChecked()
@@ -769,8 +824,12 @@ class InputDataWindow(QtWidgets.QDialog):
         dlg._select(dlg.cb_mode, bool(r.get("static")))
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             tid, static, lon, lat = dlg.values()
-            self.on_manual_remove(i)
-            self.on_manual_add(tid, static, lon, lat)
+            # ⚠️ ОДНИМ ДЕЙСТВИЕМ, а не «удалить и добавить» (замечание заказчика
+            # 05.09.2026: «кнопка изменить не работает»). Пара вызовов ломалась о то, что
+            # в режиме расчёта таблица показывает РЕЗУЛЬТАТ расстановки: удаление не
+            # находило ручной записи, отказывалось работать — и правка молча пропадала,
+            # а на её месте появлялся лишний датчик.
+            self.on_manual_edit(i, tid, static, lon, lat)
 
     def _del_row(self):
         i = self._selected()
@@ -792,18 +851,35 @@ class InputDataWindow(QtWidgets.QDialog):
         self.on_pick_mode()
 
     # ---------- файл ----------
-    def _start_dir(self):
-        """Папка последнего файла датчиков (память полей) либо папка программы."""
-        last = ui_state.get(STATE_FILE).get("dir", "")
+    def _start_dir(self, kind):
+        """Откуда начинать выбор файла: СВОЯ папка (`датчики/загрузка`, `датчики/выгрузка`).
+
+        ⚠️ ПАМЯТЬ ПОСЛЕДНЕЙ ПАПКИ ЗДЕСЬ НЕ ГОДИТСЯ (правило заказчика 05.09.2026):
+        «изначально при нажатии кнопки — запись туда». Один поход в чужую папку иначе
+        уводил бы туда все следующие выгрузки, и файлы снова расползались бы. Запомнить
+        стоит лишь то, куда человек ушёл САМ, — на случай, если своей папки нет вовсе."""
+        own = sensors_dir(kind)
+        if os.path.isdir(own):
+            return own
+        last = ui_state.get(STATE_FILE).get(kind, "")
         return last if last and os.path.isdir(last) else os.getcwd()
+
+    @staticmethod
+    def _remember_dir(kind, path):
+        """Запомнить, куда человек ушёл сам. ⚠️ Раздел памяти пишется ЦЕЛИКОМ
+        (`ui_state.save`), поэтому старые ключи переносим — иначе выбор папки для чтения
+        стирал бы запомненную папку записи."""
+        d = dict(ui_state.get(STATE_FILE))
+        d[kind] = os.path.dirname(path)
+        ui_state.save(STATE_FILE, d)
 
     def _load_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Датчики из файла", self._start_dir(),
+            self, "Датчики из файла", self._start_dir(DIR_LOAD),
             "Текстовые файлы (*.txt);;Все файлы (*)")
         if not path:
             return
-        ui_state.save(STATE_FILE, dict(dir=os.path.dirname(path)))
+        self._remember_dir(DIR_LOAD, path)
         try:
             records, rep = read_sensors_file(path)
         except Exception as ex:                    # нет прав, битая кодировка, каталог
@@ -829,11 +905,12 @@ class InputDataWindow(QtWidgets.QDialog):
             self._warn("Таблица пуста — записывать нечего.")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Датчики в файл", os.path.join(self._start_dir(), "sensors.txt"),
+            self, "Датчики в файл",
+            os.path.join(self._start_dir(DIR_SAVE), default_file_name()),
             "Текстовые файлы (*.txt);;Все файлы (*)")
         if not path:
             return
-        ui_state.save(STATE_FILE, dict(dir=os.path.dirname(path)))
+        self._remember_dir(DIR_SAVE, path)
         try:
             n = write_sensors_file(path, self._rows, self._params)
         except Exception as ex:
