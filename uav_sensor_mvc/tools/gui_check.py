@@ -549,11 +549,194 @@ def main():
     _name = default_file_name(_time.strptime("2026-09-05 09:15", "%Y-%m-%d %H:%M"))
     check(_name == "2026_09_05_09_15_sensor.txt", "имя файла — дата и время", _name)
 
+    # ================================================================
+    # 7. ИСТОРИЯ ПОЛЁТОВ: выгрузка и загрузка (задача 8.6)
+    # ================================================================
+    print("\n7. ИСТОРИЯ ПОЛЁТОВ (задача 8.6)")
+    from model import flight_log as fl
+    import tempfile as _tf2
+
+    _flights_path = os.path.join(_tf2.gettempdir(), "uav_flights_check.txt")
+    if os.path.exists(_flights_path):
+        os.remove(_flights_path)
+
+    # НЕЗАВЕРШЁННЫЙ пакет -> «Выгрузить» ничего не пишет (заказчик: «предупреждение,
+    # что нет данных»), а не половину выборки молча.
+    m.iter_routes = []
+    m.p.threat_iter_routes = 50
+    c.on_flights_save(_flights_path)
+    check(not os.path.exists(_flights_path),
+          "незавершённый пакет — файл не создаётся", "накоплено 0 из 50")
+
+    # пакет пройден целиком -> выгрузка проходит. ⚠️ iter_batch — СТОХАСТИКА (журнал
+    # п. 202): на маленьком T изредка не хватает одной-двух попыток до заказанного —
+    # три независимых попытки почти всегда дают ровно T, не выдавая ложную тревогу.
+    m.p.threat_iter_routes = 12
+    for _attempt in range(3):
+        m.iter_reset(); m.iter_batch()
+        if m.iterations_complete():
+            break
+    check(m.iterations_complete(), "пакет пройден целиком — можно выгружать",
+          "%d из %d" % (len(m.iter_routes), m.p.threat_iter_routes))
+    _before_routes = [np.asarray(r, float).copy() for r in m.iter_routes]
+    c.on_flights_save(_flights_path)
+    check(os.path.exists(_flights_path), "«Выгрузить историю полётов» создала файл")
+
+    _routes_deg, _rep = fl.load_flights(_flights_path)
+    check(_rep["recognized"] and not _rep["rejected"],
+          "файл опознан как UAV-ROUTES, мусора нет", "маршрутов %d" % _rep["n_routes"])
+    check(_rep["n_routes"] == len(_before_routes),
+          "маршрутов выгружено ровно столько, сколько накоплено",
+          "%d" % _rep["n_routes"])
+
+    # ФОРМАТ КОМПАКТНЫЙ (заказчик 06.09.2026: построчно на точку — «очень длинно»):
+    # одна строка на МАРШРУТ, а не на точку, точки внутри строки — через «|»
+    with open(_flights_path, encoding="utf-8") as _f:
+        _raw_lines = [ln for ln in _f.read().splitlines() if ln.strip()]
+    _point_lines = [ln for ln in _raw_lines if not ln.startswith("#")]
+    check(len(_point_lines) == len(_before_routes),
+          "одна строка на маршрут, а не на точку",
+          "%d строк на %d маршрутов, %d точек всего"
+          % (len(_point_lines), len(_before_routes), _rep["n_points"]))
+    check(all(" | " in ln or len(r) <= 1
+              for ln, r in zip(_point_lines, _before_routes)),
+          "точки внутри строки маршрута разделены «|»")
+
+    # ЗАГРУЗКА КНОПКОЙ — В ОТДЕЛЬНОЕ ПОЛЕ, не в iter_routes (план 8 §8.6.4)
+    m.iter_routes = []; m.iter_iteration = 0     # имитируем «новый сеанс»
+    c.on_flights_load(_flights_path)
+    check(len(m.loaded_routes) == len(_before_routes),
+          "загружено в ОТДЕЛЬНОЕ поле loaded_routes", "%d маршрутов" % len(m.loaded_routes))
+    check(m.iter_routes == [], "iter_routes не тронут загрузкой (выборки не смешаны)")
+    check(v.chk_loaded_routes.isChecked(), "чекбокс «загруженная выборка» включился сам")
+
+    def _route_close(a, b, tol_km=0.001):
+        a = np.asarray(a, float); b = np.asarray(b, float)
+        return a.shape == b.shape and float(np.max(np.abs(a - b))) < tol_km
+
+    _same = all(_route_close(a, b) for a, b in zip(_before_routes, m.loaded_routes))
+    check(_same, "координаты после выгрузки-загрузки совпали", "с точностью формата, < 1 м")
+
+    # ДО ИТЕРАЦИЙ, при включённой галке, расстановка берёт ЗАГРУЖЕННУЮ выборку…
+    check(m._sample_for_sensors() is m.loaded_routes,
+          "до итераций и с галкой — источник для расстановки: загруженная выборка")
+    c._work_place()
+    check(m.sensor_source == "loaded",
+          "модель помечает источник расстановки «loaded» (заказчик: показать в заголовке)")
+    # …а с накоплением ≥5 своих итераций — снова СВОЮ (заказчик: «с пуском не работает»)
+    m.p.threat_iter_routes = 6
+    for _attempt in range(3):                    # та же стохастика, что и выше (журнал п. 202)
+        m.iter_reset(); m.iter_batch()
+        if len(m.iter_routes) >= 5:
+            break
+    check(len(m.iter_routes) >= 5, "свои итерации снова накоплены",
+          "%d" % len(m.iter_routes))
+    check(m._sample_for_sensors() is m.iter_routes,
+          "с пуском итераций загруженная выборка перестаёт работать")
+
+    # ОКНО «ПОСМОТРЕТЬ МАРШРУТЫ» (задача 8.6, довесок 06.09.2026) — на этом шаге и свои
+    # маршруты (iter_routes), и загруженная история (loaded_routes) непустые
+    check(hasattr(w, "btn_view_routes"),
+          "кнопка «Посмотреть маршруты» есть в окне «Исходные данные»")
+    w.on_view_routes()
+    rv = v._route_viewer_dlg
+    check(rv is not None, "окно «Посмотреть маршруты» открылось")
+    check(len(rv._own_routes) == len(m.iter_routes)
+          and len(rv._loaded_routes) == len(m.loaded_routes),
+          "окно получило актуальные списки", "свои %d, загруженные %d"
+          % (len(rv._own_routes), len(rv._loaded_routes)))
+    check(rv.btn_loaded.isEnabled(), "переключатель «Загруженная история» доступен")
+    check(rv.table.rowCount() == len(rv._own_routes[0]),
+          "таблица сразу показала точки первого своего маршрута",
+          "%d точек" % rv.table.rowCount())
+    rv._show_on_map()
+    check(v.route_preview_item.isVisible(), "«Показать на карте» включило подсветку")
+    rv._reset_preview()
+    check(not v.route_preview_item.isVisible(), "«Сбросить» снимает подсветку")
+    rv.btn_loaded.setChecked(True)
+    check(rv.table.rowCount() == len(rv._loaded_routes[0]),
+          "переключение на «Загруженная история» показывает ЕЁ точки")
+    rv._show_on_map()
+    check(v.route_preview_item.isVisible(), "подсветка работает и для загруженного маршрута")
+    rv._reset_preview()
+
+    # ДИНАМИЧЕСКОЕ ОБНОВЛЕНИЕ (заказчик 06.09.2026): «в таблице чтобы сразу записывались
+    # маршруты после прохода» — без повторного открытия окна кнопкой. ⚠️ on_iter_step —
+    # та же стохастика (журнал п. 202): изредка не даёт маршрут за одну попытку, поэтому
+    # добиваемся хоть одного успеха несколькими попытками — тест смотрит на ОБНОВЛЕНИЕ
+    # окна, а не на надёжность генерации (её проверяет flow_check.py).
+    rv.btn_own.setChecked(True)                        # вернулись к «своим»
+    _n_before = rv.list.count()
+    rv.list.setCurrentRow(0)                            # смотрим НЕ последний маршрут
+    for _attempt in range(5):
+        c.on_iter_step()                                # плюс один маршрут к своим
+        if rv.list.count() > _n_before:
+            break
+    check(rv.list.count() == _n_before + 1,
+          "новый пройденный маршрут появился в списке сам, без переоткрытия окна",
+          "%d -> %d" % (_n_before, rv.list.count()))
+    check(rv.list.currentRow() == 0,
+          "выбор НЕ последнего маршрута не сбивается новым маршрутом")
+    rv.list.setCurrentRow(rv.list.count() - 1)          # теперь смотрим ПОСЛЕДНИЙ
+    _n_before2 = rv.list.count()
+    for _attempt in range(5):
+        c.on_iter_step()                                # ещё один маршрут
+        if rv.list.count() > _n_before2:
+            break
+    check(rv.list.currentRow() == rv.list.count() - 1,
+          "выбор ПОСЛЕДНЕГО маршрута следует за новым последним")
+    rv.close()
+
+    # УДАЛИТЬ ВЫБОРКУ (заказчик 06.09.2026) — убирает ТОЛЬКО загруженное, датчики,
+    # цель и зоны не трогает; в отличие от «Сброса»
+    _n_own_before_clear = len(m.iter_routes)
+    c.on_flights_clear()
+    check(m.loaded_routes == [] and not v.chk_loaded_routes.isChecked(),
+          "«Удалить выборку» очищает loaded_routes и гасит галку")
+    check(len(m.iter_routes) == _n_own_before_clear and m.sensors is not None,
+          "«Удалить выборку» не трогает свои итерации и датчики")
+    c.on_flights_clear()      # повторный клик на пустом месте — не должен падать
+    check(True, "повторное «Удалить выборку» на уже пустом не падает")
+
+    # ФАЙЛ НЕ В НАШЕМ ФОРМАТЕ — понятная причина, а не сбой чтения
+    _bad_path = os.path.join(_tf2.gettempdir(), "uav_flights_check_bad.txt")
+    with open(_bad_path, "w", encoding="utf-8") as f:
+        f.write("просто текст, не маршруты\n1 2 3\n")
+    _bad_routes, _bad_rep = fl.load_flights(_bad_path)
+    _reason = fl.check_compatible(_bad_routes, _bad_rep)
+    check(_reason is not None, "файл не в формате UAV-ROUTES отклонён с причиной",
+          _reason or "")
+    os.remove(_bad_path)
+
+    check(hasattr(v, "btn_flights_save") and hasattr(v, "btn_flights_load")
+          and hasattr(v, "btn_flights_clear"),
+          "кнопки «Выгрузить/Загрузить/Удалить» историю полётов на панели")
+
+    _rl, _rs = fl.routes_dir(fl.DIR_LOAD), fl.routes_dir(fl.DIR_SAVE)
+    check(os.path.isdir(_rl) and os.path.isdir(_rs),
+          "папки «маршруты/загрузка» и «маршруты/выгрузка» создаются сами",
+          os.path.dirname(_rs))
+    _rname = fl.default_file_name(_time.strptime("2026-09-05 10:20", "%Y-%m-%d %H:%M"))
+    check(_rname == "2026_09_05_10_20_routes.txt", "имя файла — дата и время", _rname)
+
+    # «Сброс» убирает и загруженную историю полётов — она такие же входные данные,
+    # как заданные вручную датчики (см. правку c.on_reset выше по файлу). Выборка была
+    # снята кнопкой «Удалить выборку» чуть выше — загружаем её снова для этой проверки.
+    c.on_flights_load(_flights_path)
+    check(len(m.loaded_routes) > 0, "перед сбросом загруженная выборка на месте",
+          "%d маршрутов" % len(m.loaded_routes))
+    c.on_reset()
+    check(m.loaded_routes == [] and not v.chk_loaded_routes.isChecked(),
+          "«Сброс» убирает загруженную историю полётов и гасит галку")
+
+    os.remove(_flights_path)
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
         return 1
-    print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои и окно исходных данных — в норме.")
+    print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои, окно исходных данных и история "
+         "полётов — в норме.")
     return 0
 
 

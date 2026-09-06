@@ -2000,6 +2000,13 @@ class ThreatModel:
         self.routes = []               # примеры коридоров-центров (список (M,2) км)
         self.iter_routes = []          # итерационные (стохастические) маршруты — накопление
         self.iter_iteration = 0        # номер текущей итерации (как t во вкладке 2)
+        # ЗАГРУЖЕННАЯ ИЗ ФАЙЛА ВЫБОРКА ПРОЛЁТОВ (задача 8.6). ⚠️ НЕ путать с iter_routes —
+        # отдельное поле, иначе счётчик итераций и вся статистика соврут (журнал, план 8
+        # §8.6.4). Как и manual_sensors, это ВХОДНЫЕ ДАННЫЕ: не сбрасывается пересборкой
+        # карты, сменой цели или входа — только новой загрузкой либо явной очисткой.
+        self.loaded_routes = []        # список (M,2) км — то же представление, что iter_routes
+        self.show_loaded_routes = False  # чекбокс «показать загруженную выборку»
+        self.sensor_source = None      # чем объяснена последняя расстановка: iter/loaded/zone/weight/manual
         self._iter_ctx = None          # контекст выборки (проходимость/поле расстояний/вес)
         self._ctx_built_key = None     # при каком (разрыв, цель) собран контекст — см. _ensure_ctx
         self._iter_rng = None          # ГПСЧ выборки
@@ -2159,6 +2166,40 @@ class ThreatModel:
         """Маршруты в градусах: список массивов (M,2). По умолчанию — накопленные."""
         src = self.iter_routes if routes is None else routes
         return [self.km_to_lonlat_arr(r) for r in src]
+
+    # ---- ЗАГРУЖЕННАЯ ИЗ ФАЙЛА ВЫБОРКА ПРОЛЁТОВ (задача 8.6, model/flight_log.py) ----
+    def load_routes_lonlat(self, routes_lonlat):
+        """Загрузить маршруты В ГРАДУСАХ (из файла) → сохранить в километрах ТЕКУЩЕГО
+        фрейма. Координаты самодостаточны (как и у `add_manual_lonlat`): маршрут из
+        другого района просто ляжет в другое место сцены, без ошибки."""
+        out = []
+        for r in routes_lonlat:
+            a = np.asarray(r, float).reshape(-1, 2)
+            if len(a) < 2:
+                continue
+            x, y = lonlat_to_km(a[:, 0], a[:, 1], self.lon0, self.lat0)
+            out.append(np.column_stack([np.asarray(x, float), np.asarray(y, float)]))
+        self.loaded_routes = out
+        return len(out)
+
+    def clear_loaded_routes(self):
+        """Убрать загруженную выборку и погасить чекбокс показа. Возвращает, сколько
+        маршрутов было."""
+        n = len(self.loaded_routes)
+        self.loaded_routes = []
+        self.show_loaded_routes = False
+        return n
+
+    def loaded_routes_lonlat(self):
+        """Загруженные маршруты в градусах — для окна «Посмотреть маршруты» (задача 8.6,
+        довесок 06.09.2026): показ ведётся в тех же градусах, что и в файле."""
+        return [self.km_to_lonlat_arr(r) for r in self.loaded_routes]
+
+    def iterations_complete(self):
+        """Все ли T итераций прошли — условие, при котором осмысленно выгружать историю
+        полётов (иначе выборка неполная и разная от запуска к запуску, план 8 §8.6.1)."""
+        T = int(getattr(self.p, "threat_iter_routes", 0))
+        return T > 0 and len(self.iter_routes) >= T
 
     def cells_lonlat(self):
         """ЦЕНТРЫ ячеек сетки в градусах, (M,2) — вместе с `flat_cells` дают
@@ -3014,6 +3055,7 @@ class ThreatModel:
         # оттого, что маршрутов ещё нет. Поэтому выборка при необходимости строится —
         # ровно как в обычном режиме.
         if bool(getattr(self.p, "threat_manual_mode", False)):
+            self.sensor_source = "manual"
             if len(self.iter_routes) < 5 and len(self.routes) < 5:
                 self.plan_routes()
             # ⚠️ НО ПРИ МОДЕЛИРОВАНИИ И ЗДЕСЬ РАБОТАЕТ АЛГОРИТМ (заказчик 05.09.2026):
@@ -3028,9 +3070,14 @@ class ThreatModel:
         if len(self.iter_routes) < 5 and len(self.routes) < 5:
             self.plan_routes()                         # до итераций — по всем возможным путям
         sample = self._sample_for_sensors()
+        # ОТКУДА ВЗЯТА ВЫБОРКА (задача 8.6, заказчик 06.09.2026) — контроллер показывает
+        # это в заголовке («расстановка по загруженной истории»), не только для отладки.
+        self.sensor_source = ("iter" if sample is self.iter_routes else
+                              "loaded" if sample is self.loaded_routes else "zone")
         if sample and len(sample) >= 5:
             self.sensors = self._place_by_routes(self.candidates, sample)
         else:
+            self.sensor_source = "weight"    # выборки мало — расстановка по сырому весу
             self.sensors = self._place_by_weight(self.candidates)
         # БОЛЬШИЕ датчики — отдельным правилом (круговой щит у цели), по той же выборке
         self.sensors_big = self._place_big(sample)
@@ -3442,9 +3489,16 @@ class ThreatModel:
 
     def _sample_for_sensors(self):
         """Выборка маршрутов, по которой считаются датчики и 2-я тепловая карта (§4.6):
-        идут ИТЕРАЦИИ → их выборка; иначе → ВСЕ возможные пути (наиболее вероятные)."""
+        идут ИТЕРАЦИИ → их выборка; иначе, если включён чекбокс и файл загружен → ЗАГРУ-
+        ЖЕННАЯ выборка (задача 8.6); иначе → ВСЕ возможные пути (наиболее вероятные).
+
+        ⚠️ ИТЕРАЦИИ ВСЕГДА В ПРИОРИТЕТЕ. Как только накопится ≥5 своих маршрутов, чекбокс
+        «показать загруженную выборку» перестаёт влиять на расстановку — это и есть
+        «с пуском итераций он уже не работает» (заказчик, план 8 §8.6.1)."""
         if len(self.iter_routes) >= 5:
             return self.iter_routes
+        if self.show_loaded_routes and len(self.loaded_routes) >= 5:
+            return self.loaded_routes
         return self.routes
 
     def generalized_sample(self, frac=0.10):

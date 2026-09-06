@@ -13,6 +13,8 @@ CONTROLLER (Qt) · Вкладка 3 «Цифровая карта угроз».
 
 Карта кода — теория/карта_кода/README.md (генерируется codemap.py).
 """
+import os
+
 import numpy as np
 from pyqtgraph.Qt import QtCore
 
@@ -102,7 +104,14 @@ class ThreatController:
             on_manual_edit=self.on_manual_edit, on_clear_sensors=self.on_clear_sensors,
             on_sensor_delete=self.on_sensor_delete,
             on_manual_clear=self.on_manual_clear, on_manual_mode=self.on_manual_mode,
-            on_sensor_rows=self._sensor_rows)
+            on_sensor_rows=self._sensor_rows,
+            # история полётов: выгрузка/загрузка (задача 8.6)
+            on_flights_save=self.on_flights_save, on_flights_load=self.on_flights_load,
+            on_flights_clear=self.on_flights_clear,
+            # окно «Посмотреть маршруты» (задача 8.6, довесок 06.09.2026)
+            on_routes_data=self._routes_data_for_viewer,
+            on_route_preview=self.on_route_preview,
+            on_route_preview_reset=self.on_route_preview_reset)
         # СТАРТ: район не задан — расчётные кнопки закрыты, синей рамки нет
         view.set_area_ready(model.area_ready,
                             model.area_size_km() if model.area_ready else None,
@@ -285,6 +294,7 @@ class ThreatController:
             self._anim_fails = 0
             self._cur_route = route
             self._cur_j = 0
+            self.view.refresh_route_viewer()   # маршрут долетел — виден в списке сразу
             # «итерационные маршруты» выкл -> на карте только ТЕКУЩИЙ пролёт (не весь веер)
             show_acc = self.view.get_toggles().get("show_iter")
             self.view.iter_show_accumulated(self.model.iter_routes if show_acc else [])
@@ -320,6 +330,7 @@ class ThreatController:
         self.view.iter_show_accumulated(self.model.iter_routes)
         if route is not None:
             self.view.iter_update_flight(route, len(route) - 1)   # весь маршрут + БПЛА в цели
+            self.view.refresh_route_viewer()       # маршрут добавлен — виден в списке сразу
         self._maybe_refresh_sensors()                            # датчики по накопленной выборке
         self._refresh_generalized()                              # 10 % «на этот момент»
         self.view.set_title(self._iter_title())
@@ -394,11 +405,89 @@ class ThreatController:
         self.view.set_manual_count(len(m.manual_sensors))
         self._render_all()
         self._full_metrics()
+        self.view.refresh_route_viewer()   # список «своих маршрутов» опустел — обновить
         self.view.set_title(
             "Итерации убраны — вернулись к состоянию до моделирования."
             if snap is not None else
             "Итерации убраны. Снимка «до моделирования» не было — датчики остались "
             "теми, что посчитаны сейчас.")
+
+    # ================= ИСТОРИЯ ПОЛЁТОВ: выгрузка/загрузка (задача 8.6) =================
+    def on_flights_save(self, path):
+        """Кнопка «Выгрузить историю полётов». Путь уже выбран диалогом во View —
+        здесь только проверка готовности (заказчик: «если пакетное моделирование не
+        завершилось — предупреждение, что нет данных») и сама запись."""
+        from model import flight_log
+        if not self.model.iterations_complete():
+            self.view.flash_title(
+                "Нет данных: пакет итераций не завершён (%d/%d) — дойдите «Пуск»/"
+                "«Пакетно» до конца."
+                % (len(self.model.iter_routes), int(self.model.p.threat_iter_routes)))
+            return
+        try:
+            n_routes, n_points = flight_log.save_flights(path, self.model)
+        except OSError as ex:
+            self.view.flash_title("Файл не записан: %s" % ex)
+            return
+        msg = "Записано в файл: маршрутов %d, точек %d." % (n_routes, n_points)
+        size_mb = os.path.getsize(path) / (1024.0 * 1024.0)
+        if size_mb > 8.0:                      # план 8 §8.6.4: предупредить про размер
+            msg += "  ⚠ файл %.1f МБ" % size_mb
+        self.view.flash_title(msg)
+
+    def on_flights_load(self, path):
+        """Кнопка «Загрузить историю полёта». Маршруты идут В ОТДЕЛЬНОЕ поле
+        `model.loaded_routes` — НЕ в `iter_routes` (план 8 §8.6.4: иначе счётчик
+        итераций и вся статистика соврут). Участок и якорь НЕ проверяются — координаты
+        в градусах самодостаточны, как и у заданных вручную датчиков."""
+        from model import flight_log
+        try:
+            routes_deg, report = flight_log.load_flights(path)
+        except OSError as ex:
+            self.view.flash_title("Файл не прочитан: %s" % ex)
+            return
+        reason = flight_log.check_compatible(routes_deg, report)
+        if reason:
+            self.view.flash_title("Файл не подходит: %s" % reason)
+            return
+        n = self.model.load_routes_lonlat(routes_deg)
+        self.model.show_loaded_routes = True
+        self.view.set_loaded_routes_checked(True)
+        msg = "Загружено маршрутов: %d, точек: %d." % (n, report["n_points"])
+        if report["rejected"]:
+            msg += "  Отброшено строк: %d." % len(report["rejected"])
+        self.view.flash_title(msg)
+        self._render_all()
+        self.view.refresh_route_viewer()   # «Загруженная история» появилась/сменилась
+
+    def on_flights_clear(self):
+        """Кнопка «Удалить выборку» — убирает ТОЛЬКО загруженную историю (заказчик
+        06.09.2026): после этого «Расставить датчики» снова считает по зоне пролёта
+        (или по своим итерациям, если они уже накоплены), как было бы без загрузки.
+        В отличие от «Сброса» — датчики, цель и зоны не трогает."""
+        n = self.model.clear_loaded_routes()
+        self.view.set_loaded_routes_checked(False)
+        self.view.flash_title(
+            "Загруженная история убрана (%d маршрутов)." % n if n else
+            "Загруженной истории и не было.")
+        self._render_all()
+        self.view.refresh_route_viewer()   # «Загруженная история» опустела — обновить
+
+    # ---- окно «Посмотреть маршруты» (задача 8.6, довесок 06.09.2026) ----
+    def _routes_data_for_viewer(self):
+        """Данные для окна просмотра: свои пройденные маршруты и загруженная история,
+        оба в градусах — то же представление, что в файле."""
+        return self.model.routes_lonlat(), self.model.loaded_routes_lonlat()
+
+    def on_route_preview(self, is_loaded, index):
+        """Подсветить на карте ОДИН выбранный маршрут (км — тот же фрейм, что у карты).
+        Индекс — по тому же списку, что вернул `_routes_data_for_viewer`."""
+        src = self.model.loaded_routes if is_loaded else self.model.iter_routes
+        if 0 <= index < len(src):
+            self.view.render_route_preview(src[index])
+
+    def on_route_preview_reset(self):
+        self.view.render_route_preview(None)
 
     # ---- окно «Исходные данные»: применить сразу (не блокирует программу) ----
     # ⚠️ ОДИН ОБРАБОТЧИК НА ВСЁ ОКНО (задача 8.7). Прежде их было два — «Датчики» и
@@ -791,8 +880,16 @@ class ThreatController:
             # заданной расстановки. Об этом и пишем, иначе слово «расставлено» вводило бы
             # в заблуждение: позиции задал человек, программа их не выбирала.
             manual = bool(getattr(self.model.p, "threat_manual_mode", False))
-            head = ("Задано датчиков %d (позиции ваши, расчёт по ним)" % me["n_sensors"]
-                    if manual else "Датчиков %d" % me["n_sensors"])
+            # ОТКУДА ВЗЯТА ВЫБОРКА (задача 8.6, заказчик 06.09.2026): если позиции считал
+            # алгоритм по ЗАГРУЖЕННОЙ истории полёта — сказать об этом прямо, а не молчать,
+            # будто расстановка обычная (по своей выборке или зоне пролёта).
+            if manual:
+                head = "Задано датчиков %d (позиции ваши, расчёт по ним)" % me["n_sensors"]
+            elif getattr(self.model, "sensor_source", None) == "loaded":
+                head = ("Датчиков %d (расстановка по ЗАГРУЖЕННОЙ истории маршрутов)"
+                        % me["n_sensors"])
+            else:
+                head = "Датчиков %d" % me["n_sensors"]
             self.view.set_title(
                 f"{head} · засечено пролётов "
                 f"{me.get('detect_k_frac', 0)*100:.0f}% (кратность ≥{self.model.p.threat_k}) · "
@@ -823,6 +920,7 @@ class ThreatController:
             self._maybe_refresh_sensors(force=True)      # датчики по выборке пролётов
             self._render_all()
             self._full_metrics()
+            self.view.refresh_route_viewer()   # пакет добавил маршруты все разом — обновить
             self.view.set_title(self._iter_title() + " (пакетно). Датчики по выборке пролётов.")
 
     # ---- построение карты (в фоне) ----
@@ -959,6 +1057,9 @@ class ThreatController:
         # их обратно как якоря, и сброс выглядел бы неполным.
         self.model._reset_sensors()
         self.model.clear_manual_sensors()
+        self.model.clear_loaded_routes()   # загруженная история полётов — тоже входные данные
+        self.view.set_loaded_routes_checked(False)
+        self.view.render_route_preview(None)   # подсветка маршрута могла указывать в никуда
         self.model.target_km = None
         self.model.clear_sector()          # сектор отсчитывается от цели — уходит вместе с ней
         self._pending_recalc = False       # считать после сброса нечего
@@ -971,8 +1072,10 @@ class ThreatController:
         self._cur_route = None
         self._render_all()
         self.view.refresh_sensor_table([])          # таблица в окне тоже пустеет
+        self.view.refresh_route_viewer()            # оба списка маршрутов опустели
         self.view.set_title("Сброшено: датчики (малые, большие и заданные вручную), "
-                            "цель и зоны убраны. Карта сохранена.")
+                            "цель, зоны и загруженная история полётов убраны. "
+                            "Карта сохранена.")
         if self.model.grid is None:
             self._idle_metrics()
         else:
@@ -1026,6 +1129,9 @@ class ThreatController:
 
     def on_toggle(self):
         t = self.view.get_toggles()
+        # чекбокс «показать загруженную выборку» — модель узнаёт о нём здесь: она сама
+        # решает (в `_sample_for_sensors`), можно ли по нему ставить датчики (задача 8.6)
+        self.model.show_loaded_routes = bool(t.get("show_loaded_routes"))
         # итерации (веер ИЛИ обобщённая выборка) включили, а их ещё нет -> сгенерировать
         # в фоне (стохастика, ~1 с). Обобщённая выборка тоже строится из этих маршрутов.
         if ((t.get("show_iter") or t.get("show_iter_gen")) and self.model.grid is not None
@@ -1085,6 +1191,7 @@ class ThreatController:
             self.view.render_routes([], None, None, t)
             self.view.render_iter_routes([], t)
             self.view.render_generalized([], t)
+            self.view.render_loaded_routes([], t)
             self.view.render_iter_heat(None, None, t)
             self.view.render_crossings(None, t)
             self._render_sensors(empty=True)
@@ -1122,6 +1229,7 @@ class ThreatController:
         self.view.render_candidates(self.model.candidates, t)
         self.view.render_routes(self.model.routes, self.model.route_area, extent, t)
         self.view.render_iter_routes(self.model.iter_routes, t)
+        self.view.render_loaded_routes(self.model.loaded_routes, t)
         self._refresh_generalized(t)
         self.view.render_iter_heat(
             self.model.route_density_field() if t.get("show_iter_heat") else None, extent, t)

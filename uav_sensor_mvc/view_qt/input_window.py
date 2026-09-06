@@ -368,6 +368,7 @@ class InputDataWindow(QtWidgets.QDialog):
         self.on_manual_clear = lambda: None
         self.on_mode_changed = lambda manual: None
         self.on_pick_mode = lambda: None           # «ставить датчики кликом по карте»
+        self.on_view_routes = lambda: None         # «Посмотреть маршруты» (задача 8.6)
 
         self._build_ui()
         self.refresh(params)
@@ -468,7 +469,17 @@ class InputDataWindow(QtWidgets.QDialog):
         self.chk_spread.setChecked(True)
         grid.addWidget(QtWidgets.QLabel("Разнос датчиков:"), 2, 0)
         grid.addWidget(self.chk_spread, 2, 1, 1, 2)
-        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(3, 1)                # растяжка — кнопка ниже прижмётся вправо
+
+        # «ПОСМОТРЕТЬ МАРШРУТЫ» (задача 8.6, довесок 06.09.2026, заказчик): сверху
+        # справа — список пройденных маршрутов и загруженной истории с таблицей точек.
+        self.btn_view_routes = QtWidgets.QPushButton("Посмотреть маршруты")
+        self.btn_view_routes.setToolTip(
+            "Список маршрутов, пройденных к этому моменту, и отдельно — загруженная "
+            "история полёта (если есть). Выбор показывает все точки маршрута в таблице "
+            "и умеет подсветить его на карте.")
+        self.btn_view_routes.clicked.connect(lambda: self.on_view_routes())
+        grid.addWidget(self.btn_view_routes, 0, 4, 3, 1)
         return box
 
     def _build_types(self):

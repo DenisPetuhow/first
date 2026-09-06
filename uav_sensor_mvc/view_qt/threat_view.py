@@ -19,6 +19,7 @@ VIEW (Qt) · Вкладка 3 «Цифровая карта угроз».
 Карта кода — теория/карта_кода/README.md (генерируется codemap.py).
 """
 import math
+import os
 
 import numpy as np
 import pyqtgraph as pg
@@ -38,6 +39,7 @@ from . import map_anchor as ma             # привязка картинки �
 from . import map_vector as mv             # своя карта вектором (SVG)
 from .map_image import MapImageDialog
 from model import geo_frame as gf          # общий координатный фрейм (план 8, задача 8.3)
+from model import flight_log as fl         # история полётов: папки/имя файла (задача 8.6)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЦВЕТА ВКЛАДКИ 3 — ПРАВИТЬ ЗДЕСЬ (одно место на всю вкладку)
@@ -128,6 +130,10 @@ THREAT_COLORS = {
     "route_all":   "#00e5ff",           # все возможные маршруты (полупрозр.), self.route_item
     "route_iter":  "#ff5a5a",           # накопленные итерационные («выборка»), self.route_iter_item
     "route_gen":   "#ff2d2d",           # обобщённая выборка 10 %, self.route_gen_item
+    # ЗАГРУЖЕННАЯ ИЗ ФАЙЛА выборка (задача 8.6) — золотисто-жёлтый, свободная ниша между
+    # перекрёстками (#ffd166, ромбы-точки) и палитрой turbo; штрих пунктиром — ВТОРОЙ,
+    # независимый от цвета признак (та же дисциплина, что у sensor_hand/обводки).
+    "route_loaded": "#ffd400",          # своя выборка из файла, self.route_loaded_item
     "route_main":  "#0a0a0a",           # ОСНОВНОЙ (текущий) маршрут итерации — чёрный, self.route_cur_item
     "uav":         "#ff4dff",           # маркер летящего БПЛА, self.uav_marker
     # — ОГИБАЮЩАЯ И ДАТЧИКИ —
@@ -412,6 +418,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_iter_gen_frac = lambda v: None
         self._params_ref = params         # для префилла окна исходных данных
         self._input_dlg = None            # окно «Исходные данные» (задача 8.7)
+        self._route_viewer_dlg = None     # окно «Посмотреть маршруты» (задача 8.6, довесок)
         self._map_img_dlg = None          # окно «Своя карта» (картинкой)
         self._map_img_info = None         # что показано: путь и координаты углов
         self._map_full_km = None          # рамка своей карты в километрах
@@ -428,6 +435,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_manual_edit = lambda index, tid, static, lon, lat: None
         self.on_manual_clear = lambda: None
         self.on_clear_sensors = lambda: None   # убрать с карты ВСЕ датчики
+        # ИСТОРИЯ ПОЛЁТОВ: выгрузка/загрузка (задача 8.6). Путь уже выбран диалогом —
+        # чтение/запись файла и работу с моделью делает контроллер.
+        self.on_flights_save = lambda path: None
+        self.on_flights_load = lambda path: None
+        self.on_flights_clear = lambda: None
+        # ОКНО «ПОСМОТРЕТЬ МАРШРУТЫ» (задача 8.6, довесок 06.09.2026)
+        self.on_routes_data = lambda: ([], [])
+        self.on_route_preview = lambda is_loaded, index: None
+        self.on_route_preview_reset = lambda: None
         self.on_sensor_delete = lambda lon, lat: None   # DELETE в режиме правки
         self.on_manual_mode = lambda manual: None    # «задать позиции» вкл/выкл
         self.on_sensor_rows = lambda: []             # чем заполнять таблицу
@@ -722,6 +738,56 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes:
             self.on_clear_sensors()
+
+    # ---- ИСТОРИЯ ПОЛЁТОВ: выгрузка/загрузка (задача 8.6) ----
+    # Диалог выбора файла — дело представления (та же папка/имя, что у датчиков,
+    # `view_qt/input_window.py`); что делать с путём (проверить готовность, прочитать,
+    # положить в модель) знает только контроллер — ему путь и передаётся колбэком.
+    def _save_flights(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "История полётов в файл",
+            os.path.join(fl.routes_dir(fl.DIR_SAVE), fl.default_file_name()),
+            "Текстовые файлы (*.txt);;Все файлы (*)")
+        if not path:
+            return
+        self.on_flights_save(path)
+
+    def _load_flights(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "История полёта из файла", fl.routes_dir(fl.DIR_LOAD),
+            "Текстовые файлы (*.txt);;Все файлы (*)")
+        if not path:
+            return
+        self.on_flights_load(path)
+
+    def _clear_flights(self):
+        self.on_flights_clear()
+
+    # ---- окно «Посмотреть маршруты» (задача 8.6, довесок 06.09.2026) ----
+    def _open_route_viewer(self):
+        """Открыть окно списком/таблицей маршрутов. Создаётся один раз, дальше только
+        `set_data` со свежими списками — так же, как окно «Исходные данные»."""
+        if self._route_viewer_dlg is None:
+            from .route_viewer import RouteViewerDialog
+            self._route_viewer_dlg = RouteViewerDialog(
+                self,
+                on_preview=lambda is_loaded, i: self.on_route_preview(is_loaded, i),
+                on_reset=lambda: self.on_route_preview_reset())
+        own, loaded = self.on_routes_data()
+        self._route_viewer_dlg.set_data(own, loaded)
+        self._route_viewer_dlg.show()
+        self._route_viewer_dlg.raise_()
+        self._route_viewer_dlg.activateWindow()
+
+    def refresh_route_viewer(self):
+        """Подтянуть в открытое окно «Посмотреть маршруты» свежие данные — вызывается
+        контроллером после КАЖДОГО завершённого маршрута (задача 8.6, заказчик
+        06.09.2026: список должен расти сам по ходу прохода, а не только при следующем
+        открытии). Если окно не открыто — ничего не делает, лишней работы нет."""
+        if self._route_viewer_dlg is None or not self._route_viewer_dlg.isVisible():
+            return
+        own, loaded = self.on_routes_data()
+        self._route_viewer_dlg.set_data(own, loaded)
 
     def _end_pick_sensor(self):
         if self._pick_sensor:
@@ -1331,6 +1397,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             dlg.on_manual_clear = lambda: self.on_manual_clear()
             dlg.on_mode_changed = lambda manual: self.on_manual_mode(manual)
             dlg.on_pick_mode = self._begin_pick_sensor
+            dlg.on_view_routes = self._open_route_viewer
             self._input_dlg = dlg
         self._input_dlg.refresh(self._params_ref)
         self.refresh_sensor_table()
@@ -1374,6 +1441,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_iter.blockSignals(True)
         self.chk_iter.setChecked(bool(on))
         self.chk_iter.blockSignals(False)
+
+    def set_loaded_routes_checked(self, on):
+        """Включить/выключить чекбокс «загруженная выборка» (задача 8.6) без повторного
+        срабатывания `_layer_toggled` — перерисовку контроллер делает сам следом."""
+        self.chk_loaded_routes.blockSignals(True)
+        self.chk_loaded_routes.setChecked(bool(on))
+        self.chk_loaded_routes.blockSignals(False)
 
     # ---- опорные точки-ориентиры для схемы/подписей ----
     def _orient_points(self):
@@ -1421,6 +1495,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         rows.append(f'<span style="color:{c["legend_main"]};font-size:{sq:.1f}pt;">&#9644;&#9644;</span> '
                     f'основной &nbsp; <span style="color:{c["route_gen"]};font-size:{sq:.1f}pt;">'
                     '&#9644;&#9644;</span> выборка<br>')
+        rows.append(f'<span style="color:{c["route_loaded"]};font-size:{sq:.1f}pt;">'
+                    '&#9644;&#9644;</span> загруженная выборка (файл)<br>')
         # ДАТЧИКИ: цвет — тип, ФОРМА — кто выбрал место. Показываем только те типы,
         # которые реально работают: строка «тип 3» при нуле датчиков этого типа лишь
         # засоряет легенду и заставляет искать на карте то, чего там нет.
@@ -1847,6 +1923,34 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         b1.addWidget(self.btn_clear_iter); b1.addWidget(self.btn_view)
         col.addLayout(b1)
 
+        # ИСТОРИЯ ПОЛЁТОВ: выгрузка/загрузка (задача 8.6, заказчик 03.09.2026).
+        self.btn_flights_save = QtWidgets.QPushButton("Выгрузить историю полётов")
+        self.btn_flights_save.setToolTip(
+            "Записать НАКОПЛЕННЫЕ маршруты (все T итераций) в текстовый файл: координаты "
+            "в градусах, по блоку на маршрут. Осмысленно только когда пакет пройден "
+            "целиком — иначе выборка неполная и меняется от запуска к запуску.")
+        self.btn_flights_save.clicked.connect(self._save_flights)
+        self.btn_flights_load = QtWidgets.QPushButton("Загрузить историю полёта")
+        self.btn_flights_load.setToolTip(
+            "Прочитать файл того же формата и показать эти маршруты «Загруженной "
+            "выборкой» (галочка в блоке «ПОКАЗ» → «пролёт БПЛА»): по ним можно "
+            "расставить датчики ДО начала своих итераций.")
+        self.btn_flights_load.clicked.connect(self._load_flights)
+        # УДАЛИТЬ ВЫБОРКУ (заказчик 06.09.2026): без неё единственный способ вернуться
+        # к расчёту «по зоне пролёта» после загрузки — общий «Сброс», а он заодно снимает
+        # датчики, цель и зоны. Отдельная кнопка убирает только загруженную историю.
+        self.btn_flights_clear = QtWidgets.QPushButton("Удалить выборку")
+        self.btn_flights_clear.setToolTip(
+            "Убрать ЗАГРУЖЕННУЮ историю полёта. После этого «Расставить датчики» снова "
+            "считает по зоне пролёта (или по своим итерациям, если они уже идут) — как "
+            "было бы без загрузки.")
+        self.btn_flights_clear.clicked.connect(self._clear_flights)
+        row_flights = QtWidgets.QHBoxLayout(); row_flights.setSpacing(6)
+        row_flights.addWidget(self.btn_flights_save, 1)
+        row_flights.addWidget(self.btn_flights_load, 1)
+        row_flights.addWidget(self.btn_flights_clear, 1)
+        col.addLayout(row_flights)
+
         col.addWidget(self._header("ПОКАЗАТЕЛИ"))
         self.metrics = QtWidgets.QPlainTextEdit(); self.metrics.setReadOnly(True)
         self.metrics.setMinimumHeight(200)
@@ -1895,6 +1999,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             ("chk_iter_gen", "Выборка", False,
              "Не весь веер, а ~10 % пройденных маршрутов: самые частые (по тепловой карте), "
              "но распределённо по карте, не кучкой. Прошло 150 → покажет 15."),
+            ("chk_loaded_routes", "Загруженная выборка", False,
+             "Маршруты из файла (кнопка «Загрузить историю полёта») — жёлтым пунктиром. "
+             "Пока не начаты свои итерации, по ним можно расставить датчики; с пуском "
+             "«Пуск»/«Пакетно» программа переключается на свою выборку, эта гаснет."),
         )),
         ("датчики и подписи", (
             # ⚠️ САМИ ДАТЧИКИ — отдельная галочка (заказчик 05.09.2026). Их зоны обзора
@@ -1999,6 +2107,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         "chk_iter":      ("route_iter_item", "route_cur_item"),
         "chk_iter_heat": ("iter_heat_img",),
         "chk_iter_gen":  ("route_gen_item",),
+        "chk_loaded_routes": ("route_loaded_item",),
         "chk_cand":      ("cand_scatter",),
     }
 
@@ -2309,6 +2418,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_gen_item = self.pi.plot([], [], antialias=True, connect="finite",
                                            pen=pg.mkPen(_qcolor(THREAT_COLORS["route_gen"], 160), width=2.2))
         self.route_gen_item.setZValue(4); self.route_gen_item.setVisible(False)
+        # ЗАГРУЖЕННАЯ ИЗ ФАЙЛА выборка (задача 8.6) — жёлтый пунктир, чтобы не путать со
+        # своими маршрутами (те красные/циан/чёрный).
+        self.route_loaded_item = self.pi.plot(
+            [], [], antialias=True, connect="finite",
+            pen=pg.mkPen(_qcolor(THREAT_COLORS["route_loaded"], 200), width=1.8,
+                         style=QtCore.Qt.DashLine))
+        self.route_loaded_item.setZValue(3); self.route_loaded_item.setVisible(False)
+        # ПОДСВЕТКА ОДНОГО МАРШРУТА из окна «Посмотреть маршруты» (задача 8.6, довесок
+        # 06.09.2026) — толстая белая линия ПОВЕРХ всего остального (Z выше датчиков
+        # незачем, но выше всех маршрутов), чтобы конкретный путь было видно однозначно.
+        self.route_preview_item = self.pi.plot(
+            [], [], antialias=True, connect="finite",
+            pen=pg.mkPen(_qcolor("#ffffff", 235), width=3.6))
+        self.route_preview_item.setZValue(6); self.route_preview_item.setVisible(False)
         # ОСНОВНОЙ (текущий) маршрут итерации — ЧЁРНЫЙ, чётко виден на светлой карте
         self.route_cur_item = self.pi.plot([], [], antialias=True, connect="finite",
                                            pen=pg.mkPen(_qcolor(THREAT_COLORS["route_main"], 255), width=3.2))
@@ -2417,6 +2540,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_iter=self.chk_iter.isChecked(),
                     show_iter_heat=self.chk_iter_heat.isChecked(),
                     show_iter_gen=self.chk_iter_gen.isChecked(),
+                    show_loaded_routes=self.chk_loaded_routes.isChecked(),
                     show_relief=self.chk_relief.isChecked(),
                     show_relief_k=self.chk_relief_k.isChecked(),
                     show_zones=self.chk_zones.isChecked(),
@@ -3110,6 +3234,34 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             ys.append(r[:, 1]); ys.append(nan)
         self.route_gen_item.setData(np.concatenate(xs), np.concatenate(ys), connect="finite")
         self.route_gen_item.setVisible(True)
+
+    def render_route_preview(self, route_km):
+        """Подсветить ОДИН маршрут (км, как у `iter_show_accumulated`) или снять подсветку
+        (`route_km=None`) — колбэк окна «Посмотреть маршруты» (задача 8.6, довесок
+        06.09.2026). Не зависит от галочек «ПОКАЗ»: подсветка — временный просмотр,
+        а не постоянный слой."""
+        if route_km is None or len(route_km) == 0:
+            self.route_preview_item.setData([], []); self.route_preview_item.setVisible(False)
+            return
+        r = np.asarray(route_km, float)
+        self.route_preview_item.setData(r[:, 0], r[:, 1], connect="finite")
+        self.route_preview_item.setVisible(True)
+
+    def render_loaded_routes(self, routes, toggles):
+        """ЗАГРУЖЕННАЯ ИЗ ФАЙЛА выборка пролётов (задача 8.6) — жёлтым пунктиром, своим
+        слоем, чтобы не путать со своими маршрутами. `routes` — километры, как и у
+        `iter_show_accumulated` (тот же локальный фрейм сцены)."""
+        show = bool(toggles.get("show_loaded_routes")) and bool(routes)
+        if not show:
+            self.route_loaded_item.setData([], []); self.route_loaded_item.setVisible(False)
+            return
+        nan = np.array([np.nan]); xs, ys = [], []
+        for r in routes:
+            r = np.asarray(r, float)
+            xs.append(r[:, 0]); xs.append(nan)
+            ys.append(r[:, 1]); ys.append(nan)
+        self.route_loaded_item.setData(np.concatenate(xs), np.concatenate(ys), connect="finite")
+        self.route_loaded_item.setVisible(True)
 
     def render_iter_heat(self, density, extent, toggles):
         """2-я тепловая карта — частота пролёта БПЛА (плотность маршрутов), LUT magma."""
