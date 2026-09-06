@@ -30,7 +30,7 @@ from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS,
                     THREAT_SPEND_LABELS, THREAT_VIEW_PAD_KM, THREAT_AREA_DIR,
-                    THREAT_CELL_M)
+                    THREAT_CELL_M, THREAT_COMPASS_LINE_KM)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from .ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
 from . import geomap as gm
@@ -197,6 +197,12 @@ THREAT_COLORS = {
     # цветом линии построения связывает их с ней.
     "zone_pt":     "#8e0e6b",
     "zone_pt_edge": "#00e0a4",
+    # ЛИНЕЙКА «Расстояние» (план 8, задача 8.9, довесок 06.09.2026) — служебный
+    # инструмент представления, не тематический слой, поэтому цвет взят подальше от
+    # всего перечисленного выше: неоновый салатовый не встречается больше нигде на карте.
+    "measure_line": "#39ff14",
+    "measure_pt":   "#39ff14",
+    "measure_pt_edge": "#101418",
     # СЕКТОР ПОЯВЛЕНИЯ БПЛА. Цвет выбран не «красивый», а РАЗЛИЧИМЫЙ: разметка лежит
     # поверх весовой карты в палитре turbo (синий → циан → зелёный → жёлтый → красный),
     # то есть поверх почти всего спектра. Белого в turbo нет вовсе — поэтому белый значок
@@ -206,6 +212,12 @@ THREAT_COLORS = {
     "sector_edge": "#101418",           # тёмная подложка под пунктиром (контраст на светлом)
     "entry_pt":    "#ffffff",           # точки входа: белая заливка
     "entry_pt_edge": "#101418",         # и тёмная обводка
+    # КОМПАСНЫЕ СЕКТОРА «АНАЛИЗА МОДЕЛИРОВАНИЯ» (довесок 06.09.2026) — та же логика
+    # различимости, что у сектора появления: белый читается на любом фоне turbo.
+    # Красный — направление, не набравшее заданную кратность (по всем типам разом).
+    "compass_ok":   "#ffffff",
+    "compass_bad":  "#ff2222",
+    "compass_edge": "#101418",
     # НАЗВАНИЯ НАСЕЛЁННЫХ ПУНКТОВ — свой текст поверх подложки. Тёмная буква на светлой
     # плашке: подложка OSM светлая, весовая карта под ней — палитра turbo (тёмно-синий →
     # красный), и цветной текст без плашки читался бы через раз. Плашка полупрозрачная,
@@ -369,6 +381,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._layer_casing = {}            # обводка слоя (широкая светлая линия под ним)
         self._sensor_items = []
         self._track_items = []            # анализ размещения (задача 8.9) — свои элементы
+        self._compass_items = []          # сектора по направлениям (довесок 06.09.2026)
         self._framed = False
         # ВИДИМОСТЬ КАЖДОГО ВЕКТОРНОГО СЛОЯ по отдельности (окно «Векторные слои…»).
         # Живёт здесь, а не в диалоге: окно можно закрыть и открыть, набор остаётся.
@@ -428,6 +441,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._params_ref = params         # для префилла окна исходных данных
         self._input_dlg = None            # окно «Исходные данные» (задача 8.7)
         self._route_viewer_dlg = None     # окно «Посмотреть маршруты» (задача 8.6, довесок)
+        self._analysis_dlg = None         # окно «Анализ моделирования» (довесок 06.09.2026)
         self._map_img_dlg = None          # окно «Своя карта» (картинкой)
         self._map_img_info = None         # что показано: путь и координаты углов
         self._map_full_km = None          # рамка своей карты в километрах
@@ -451,15 +465,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_flights_clear = lambda: None
         # ОКНО «ПОСМОТРЕТЬ МАРШРУТЫ» (задача 8.6, довесок 06.09.2026)
         self.on_routes_data = lambda: ([], [])
+        self.on_analysis_data = lambda: ""    # HTML отчёта «Анализ моделирования»
         self.on_route_preview = lambda is_loaded, index: None
         self.on_route_preview_reset = lambda: None
         self.on_sensor_delete = lambda lon, lat: None   # DELETE в режиме правки
         self.on_manual_mode = lambda manual: None    # «задать позиции» вкл/выкл
         self.on_sensor_rows = lambda: []             # чем заполнять таблицу
+        self.on_mode_analysis = lambda checked: None  # «режим анализа» плашки (задача 8.9)
         self._pick_sensor = False                    # включён режим постановки мышью
         self._edit_sensor = False                    # включён режим правки датчиков
         self._edit_handle = None                     # подвижная метка выбранного датчика
         self._edit_pick = None                       # строка таблицы выбранного датчика
+        self._measure_mode = False                    # включена линейка «Расстояние»
+        self._measure_pts = []                        # точки линейки, км
+        self._measure_labels = []                     # подписи отрезков (пересобираются)
         # Сколько датчиков задано вручную. ⚠️ Представление модель не спрашивает (MVC) —
         # число приходит от контроллера через `set_manual_count`. Нужно кнопке «Очистить
         # датчики»: она показывает в вопросе, сколько именно пропадёт.
@@ -497,12 +516,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     # ---- режим «указать цель» (клик по карте) ----
     def _begin_target(self):
+        self._end_measure()               # режимы мыши взаимно исключают друг друга
         self._target_mode = True
         self._sector_mode = False
         self.set_title("Кликните точку ЦЕЛИ на карте")
 
     # ---- режим «задать сектор появления» (клик по краю карты) ----
     def _begin_sector(self):
+        self._end_measure()               # режимы мыши взаимно исключают друг друга
         self._sector_mode = True
         self._target_mode = False
         self.set_title("Кликните точку на КРАЮ карты — ось сектора пойдёт от цели к ней "
@@ -535,6 +556,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._target_mode = self._sector_mode = False
         if self._pick_sensor:
             self._end_edit_sensor()                  # два режима мыши разом невозможны
+            self._end_measure()
         self._grab_right_button(self._pick_sensor)   # правая кнопка = выход из режима
         self._lock_panel_for_pick(self._pick_sensor)
         self.btn_pick_sensor.setText("Ставлю по клику"
@@ -578,6 +600,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._edit_sensor = not self._edit_sensor
         if self._edit_sensor:
             self._end_pick_sensor()                   # два режима мыши разом невозможны
+            self._end_measure()
             self._target_mode = self._sector_mode = False
         self._grab_right_button(self._edit_sensor)    # правая кнопка = выход из режима
         self._lock_panel_for_edit(self._edit_sensor)
@@ -707,10 +730,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         «закончил». Данные при этом сохраняются — всё поставленное и передвинутое уже в
         модели, отдельного подтверждения не нужно."""
         was_edit = self._edit_sensor
+        was_measure = self._measure_mode
         self._end_pick_sensor()
         self._end_edit_sensor()
-        self.set_title("Режим завершён, данные сохранены."
-                       if was_edit else "Постановка датчиков завершена.")
+        self._end_measure()
+        self.set_title("Измерение завершено." if was_measure else
+                       "Режим завершён, данные сохранены." if was_edit else
+                       "Постановка датчиков завершена.")
 
     def _grab_right_button(self, grab):
         """Забрать правую кнопку себе (или вернуть её pyqtgraph)."""
@@ -788,6 +814,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._route_viewer_dlg.raise_()
         self._route_viewer_dlg.activateWindow()
 
+    # ---- окно «Анализ моделирования» (план 8, задача 8.9, довесок 06.09.2026) ----
+    def _open_analysis_window(self):
+        """Открыть/обновить окно полной статистики — снимок на момент нажатия кнопки."""
+        if self._analysis_dlg is None:
+            from .analysis_window import AnalysisDialog
+            self._analysis_dlg = AnalysisDialog(self)
+        self._analysis_dlg.set_html(self.on_analysis_data())
+        self._analysis_dlg.show()
+        self._analysis_dlg.raise_()
+        self._analysis_dlg.activateWindow()
+
     def refresh_route_viewer(self):
         """Подтянуть в открытое окно «Посмотреть маршруты» свежие данные — вызывается
         контроллером после КАЖДОГО завершённого маршрута (задача 8.6, заказчик
@@ -843,7 +880,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # ПРАВАЯ КНОПКА В РЕЖИМАХ МЫШИ — меню с выходом (заказчик 05.09.2026). Проверяем
         # до всего остального: в этих режимах панель погашена, и другого пути к выходу
         # под рукой нет.
-        if self._pick_sensor or self._edit_sensor:
+        if self._pick_sensor or self._edit_sensor or self._measure_mode:
             try:
                 right = ev.button() == QtCore.Qt.RightButton
             except Exception:
@@ -864,6 +901,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             return
         if self._pick_sensor:              # постановка датчика мышью — раньше прочих:
             self._pick_sensor_click(ev)    # в этом режиме карта ничего другого не ждёт
+            return
+        if self._measure_mode:             # линейка «Расстояние» — тоже раньше прочих
+            self._measure_click(ev)
             return
         if self._area_mode:               # режимы взаимно исключают друг друга:
             self._area_click(ev)          # иначе один клик колёсиком замкнул бы и
@@ -893,6 +933,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # строится прямоугольник: сетка 500 м прямоугольная, и никакой другой формы район
     # принимать не может.
     def _begin_area(self):
+        self._end_measure()               # режимы мыши взаимно исключают друг друга
         self._area_mode = True
         self._area_pts = []
         self._draw_area_preview()
@@ -963,6 +1004,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # ---- режим рисования ЗАПРЕТНОЙ ЗОНЫ ----
     def _begin_zone(self):
         """Включить рисование: клики ставят вершины, нажатие колёсика замыкает зону."""
+        self._end_measure()               # режимы мыши взаимно исключают друг друга
         self._zone_mode = True
         self._zone_pts = []
         self._draw_zone_preview()
@@ -1013,6 +1055,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             if self._edit_sensor:
                 self._end_edit_sensor()
                 return
+            if self._measure_mode:
+                self._end_measure()
+                return
         if ev.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace) \
                 and self._edit_sensor:
             self._delete_selected_sensor()
@@ -1030,16 +1075,40 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._mode_bar = QtWidgets.QWidget(self.plot)
         self._mode_bar.setStyleSheet(
             "QWidget { background: rgba(11,17,28,195); border-radius: 4px; } "
-            "QCheckBox { font-size: 10px; color: %s; padding: 1px 3px; }" % THEME["text"])
+            "QCheckBox { font-size: 10px; color: %s; padding: 1px 3px; } "
+            "QPushButton { font-size: 10px; color: %s; padding: 1px 6px; "
+            "background: rgba(255,255,255,20); border: 1px solid rgba(255,255,255,70); "
+            "border-radius: 3px; } "
+            "QPushButton:checked { background: rgba(255,255,255,80); }"
+            % (THEME["text"], THEME["text"]))
         mb = QtWidgets.QHBoxLayout(self._mode_bar)
         mb.setContentsMargins(6, 2, 6, 2); mb.setSpacing(8)
         self.chk_mode_sim = QtWidgets.QCheckBox("режим моделирования")
         self.chk_mode_sim.setChecked(True)
+        self.chk_mode_sim.setToolTip(
+            "Задел на будущее — пока не реализовано, выбор ни на что не влияет.")
+        # «РЕЖИМ АНАЛИЗА» — РАБОЧИЙ переключатель (довесок 06.09.2026, а не задел):
+        # во время моделирования расстановка (свои датчики и большие) не пересчитывается
+        # вовсе, как только что-то уже поставлено — см. `threat_analysis_static`.
         self.chk_mode_analysis = QtWidgets.QCheckBox("режим анализа")
-        self.chk_mode_routes = QtWidgets.QCheckBox("построение маршрутов")
-        for chk in (self.chk_mode_sim, self.chk_mode_analysis, self.chk_mode_routes):
-            chk.setToolTip("Задел на будущее — пока не реализовано, выбор ни на что не влияет.")
-            mb.addWidget(chk)
+        self.chk_mode_analysis.setToolTip(
+            "Во время моделирования расстановка НЕ пересчитывается: ни свои датчики, "
+            "ни большие — все ведут себя как статические. Первое построение (кнопка "
+            "«Расставить датчики» или начало «Пуска») отрабатывает как обычно; "
+            "включайте до старта итераций, чтобы «анализ размещения» ниже сравнивал "
+            "именно позиции, названные человеком, а не обычный дрейф расстановки.")
+        self.chk_mode_analysis.stateChanged.connect(
+            lambda st: self.on_mode_analysis(bool(st)))
+        # «ПОСТРОЕНИЕ МАРШРУТОВ» (задел) заменён рабочим инструментом-линейкой —
+        # заказчик 06.09.2026: «убери, сделай кнопку расстояние».
+        self.btn_measure = QtWidgets.QPushButton("Расстояние")
+        self.btn_measure.setCheckable(True)
+        self.btn_measure.setToolTip(
+            "Линейка по карте: левый клик — точка, между соседними точками — отрезок "
+            "с расстоянием в км. Правая кнопка мыши, Esc или повторное нажатие — выход.")
+        self.btn_measure.clicked.connect(self._toggle_measure)
+        for w in (self.chk_mode_sim, self.chk_mode_analysis, self.btn_measure):
+            mb.addWidget(w)
         self._mode_bar.adjustSize()
         self.plot.installEventFilter(self)      # переносить плашку при изменении размера
 
@@ -1053,6 +1122,106 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         w, h = self._mode_bar.width(), self._mode_bar.height()
         self._mode_bar.move(max(0, self.plot.width() - w - 8), 6)
         self._mode_bar.raise_()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ЛИНЕЙКА «РАССТОЯНИЕ» (план 8, задача 8.9, довесок 06.09.2026)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Кнопка-переключатель в плашке режимов: левый клик по карте ставит точку, между
+    # СОСЕДНИМИ точками рисуется отрезок с расстоянием в км (цепочкой, как в обычных
+    # картографических линейках — QGIS, Google Maps), правая кнопка/Esc/повторное
+    # нажатие кнопки — выход. Ничего не пишет в модель: чистый инструмент представления.
+    def _toggle_measure(self):
+        if self._measure_mode:
+            self._end_measure()
+        else:
+            self._begin_measure()
+
+    def _begin_measure(self):
+        # режимы мыши взаимно исключают друг друга (тот же принцип, что у правки
+        # и постановки датчиков) — выходим из всего, что могло быть включено раньше
+        self._end_pick_sensor()
+        self._end_edit_sensor()
+        if self._zone_mode:
+            self._end_zone(False)
+        if self._area_mode:
+            self._end_area(False)
+        self._target_mode = self._sector_mode = False
+        self._measure_mode = True
+        self._measure_pts = []
+        self._draw_measure()
+        self._grab_right_button(True)       # правая кнопка = выход из режима
+        self.btn_measure.setChecked(True)
+        self.set_title("ЛИНЕЙКА: левый клик — точка, между соседними — расстояние. "
+                       "Правая кнопка мыши, Esc или кнопка «Расстояние» — выход.")
+
+    def _end_measure(self):
+        if not self._measure_mode:
+            return
+        self._measure_mode = False
+        self._measure_pts = []
+        self._draw_measure()
+        self._grab_right_button(False)      # вернуть правую кнопку pyqtgraph
+        self.btn_measure.setChecked(False)
+        self.set_title("")
+
+    def _measure_click(self, ev):
+        try:
+            btn = ev.button()
+        except Exception:
+            btn = QtCore.Qt.LeftButton
+        if btn != QtCore.Qt.LeftButton:
+            return
+        try:
+            ev.accept()
+        except Exception:
+            pass
+        pt = self.vb.mapSceneToView(ev.scenePos())
+        self._measure_pts.append((float(pt.x()), float(pt.y())))
+        self._draw_measure()
+        if len(self._measure_pts) >= 2:
+            (ax, ay), (bx, by) = self._measure_pts[-2], self._measure_pts[-1]
+            seg = float(np.hypot(bx - ax, by - ay))
+            total = float(sum(np.hypot(p1[0] - p0[0], p1[1] - p0[1])
+                              for p0, p1 in zip(self._measure_pts, self._measure_pts[1:])))
+            self.set_title("ЛИНЕЙКА: точка %d — отрезок %.2f км, всего %.2f км. "
+                           "Правая кнопка мыши/Esc — выход."
+                           % (len(self._measure_pts), seg, total))
+
+    def _draw_measure(self):
+        """Перерисовать линейку целиком: ломаную, точки и подпись на каждом отрезке."""
+        for lbl in self._measure_labels:
+            self.pi.removeItem(lbl)
+        self._measure_labels = []
+        pts = self._measure_pts
+        if not pts:
+            self.measure_line_item.setData([], [])
+            self.measure_pts_item.setData([], [])
+            return
+        a = np.asarray(pts, float)
+        self.measure_line_item.setData(a[:, 0], a[:, 1])
+        self.measure_pts_item.setData(a[:, 0], a[:, 1])
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            seg = float(np.hypot(bx - ax, by - ay))
+            lbl = pg.TextItem("%.2f км" % seg,
+                              color=_qcolor(THREAT_COLORS["track_label"]),
+                              fill=pg.mkBrush(_qcolor(THREAT_COLORS["track_label_bg"])),
+                              anchor=(0.5, 0.5))
+            lbl.setPos((ax + bx) / 2.0, (ay + by) / 2.0)
+            lbl.setZValue(30)
+            self.pi.addItem(lbl, ignoreBounds=True)
+            self._measure_labels.append(lbl)
+        if len(pts) >= 2:                  # сумма ВСЕХ отрезков — у последней точки
+            total = float(sum(np.hypot(p1[0] - p0[0], p1[1] - p0[1])
+                              for p0, p1 in zip(pts, pts[1:])))
+            lx, ly = pts[-1]
+            tot_lbl = pg.TextItem("всего: %.2f км" % total,
+                                  color=_qcolor(THREAT_COLORS["track_label"]),
+                                  fill=pg.mkBrush(_qcolor(THREAT_COLORS["track_label_bg"])),
+                                  anchor=(0.5, 1.6))
+            tot_lbl.setPos(lx, ly)
+            tot_lbl.setZValue(30)
+            self.pi.addItem(tot_lbl, ignoreBounds=True)
+            self._measure_labels.append(tot_lbl)
 
     def _draw_zone_preview(self):
         """Показать зону, которую пользователь рисует прямо сейчас."""
@@ -1822,6 +1991,18 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         row_place.addWidget(self.btn_place, 1)
         col.addLayout(row_place)
 
+        # «АНАЛИЗ МОДЕЛИРОВАНИЯ» (план 8, задача 8.9, довесок 06.09.2026) — отдельное
+        # окно с полной статистикой засечки: сумма, разбивка по типам датчиков и по
+        # 12 направлениям компаса (те же сектора, что рисует галка «Сектора» в группе
+        # «пролёт БПЛА»).
+        self.btn_analysis = QtWidgets.QPushButton("Анализ моделирования")
+        self.btn_analysis.setToolTip(
+            "Полная статистика засечки: сумма, по каждому типу датчиков и по 12 "
+            "направлениям компаса вокруг цели (шаг 30°) — с какой стороны кратности "
+            "не хватает. Снимок на МОМЕНТ нажатия, окно не обновляется само.")
+        self.btn_analysis.clicked.connect(self._open_analysis_window)
+        col.addWidget(self.btn_analysis)
+
         self.src_label = QtWidgets.QLabel("источник данных: —")
         self.src_label.setObjectName("muted"); self.src_label.setWordWrap(True)
         col.addWidget(self.src_label)
@@ -2050,6 +2231,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
              "Маршруты из файла (кнопка «Загрузить историю полёта») — жёлтым пунктиром. "
              "Пока не начаты свои итерации, по ним можно расставить датчики; с пуском "
              "«Пуск»/«Пакетно» программа переключается на свою выборку, эта гаснет."),
+            ("chk_sector_stats", "Сектора (анализ по направлениям)", False,
+             "12 лучей от цели, как у компаса, с шагом 30°: рядом с каждым — сколько "
+             "маршрутов пришло именно с этой стороны. Красным — направления, где хотя "
+             "бы один такой маршрут не набрал заданную кратность k (полный разбор — "
+             "кнопка «Анализ моделирования»)."),
         )),
         ("датчики и подписи", (
             # ⚠️ САМИ ДАТЧИКИ — отдельная галочка (заказчик 05.09.2026). Их зоны обзора
@@ -2457,6 +2643,18 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                                                         width=2.5, dash=[10, 5]))
         self.area_draw_item.setZValue(7)
         self.pi.addItem(self.zone_draw_pts)
+        # ЛИНЕЙКА «Расстояние» (задача 8.9, довесок 06.09.2026) — поверх всего (Z = 8):
+        # служебный инструмент, должен быть виден на фоне любых слоёв и зон.
+        self.measure_line_item = self.pi.plot(
+            [], [], antialias=True, connect="all",
+            pen=pg.mkPen(_qcolor(THREAT_COLORS["measure_line"], 235), width=2.6,
+                         dash=[6, 3]))
+        self.measure_line_item.setZValue(8)
+        self.measure_pts_item = pg.ScatterPlotItem(
+            size=9, symbol="o", brush=pg.mkBrush(_qcolor(THREAT_COLORS["measure_pt"])),
+            pen=pg.mkPen(_qcolor(THREAT_COLORS["measure_pt_edge"]), width=1.6))
+        self.measure_pts_item.setZValue(8.1)
+        self.pi.addItem(self.measure_pts_item)
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
         self.iter_heat_img.setZValue(-7); self.iter_heat_img.setOpacity(0.62)
@@ -2596,6 +2794,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_iter_gen=self.chk_iter_gen.isChecked(),
                     show_loaded_routes=self.chk_loaded_routes.isChecked(),
                     show_sensor_track=self.chk_sensor_track.isChecked(),
+                    show_sector_stats=self.chk_sector_stats.isChecked(),
                     show_relief=self.chk_relief.isChecked(),
                     show_relief_k=self.chk_relief_k.isChecked(),
                     show_zones=self.chk_zones.isChecked(),
@@ -2625,7 +2824,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         return (self.btn_data, self.btn_build, self.btn_target, self.btn_place,
                 self.btn_apply, self.btn_reset, self.btn_pick_sensor,
                 self.btn_sector, self.btn_sector_clear, self.btn_zone,
-                self.btn_zone_undo, self.btn_input_data)
+                self.btn_zone_undo, self.btn_input_data, self.btn_analysis)
 
     def _panel_widgets(self):
         """ВСЕ управляющие элементы правой панели: кнопки, галочки, поля, списки.
@@ -3597,6 +3796,39 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             QtCore.QPointF(back_x - W * px, back_y - W * py),
         ])
         return QtWidgets.QGraphicsPolygonItem(poly)
+
+    def render_sector_compass(self, stats, target_xy):
+        """Сектора «анализа моделирования» по направлениям (довесок 06.09.2026):
+        12 лучей от цели, как у компаса (0° = север, по часовой стрелке), длиной
+        `THREAT_COMPASS_LINE_KM`. Красным — направления, не набравшие кратность
+        (`stats[i]["ok"] is False`); рядом с каждым — сумма пришедших с него маршрутов.
+
+        `stats` — список из `ThreatModel.sector_stats()`, `target_xy` — цель в км
+        (`None`, если район/цель не заданы — тогда просто нечего рисовать)."""
+        for it in self._compass_items:
+            self.pi.removeItem(it)
+        self._compass_items = []
+        if not stats or target_xy is None:
+            return
+        tx, ty = float(target_xy[0]), float(target_xy[1])
+        L = float(THREAT_COMPASS_LINE_KM)
+        for e in stats:
+            rad = np.radians(float(e["deg"]))
+            ex, ey = tx + L * np.sin(rad), ty + L * np.cos(rad)   # 0°=север(+y), по часовой
+            bad = bool(e["n_routes"]) and not e["ok"]
+            color = THREAT_COLORS["compass_bad"] if bad else THREAT_COLORS["compass_ok"]
+            line = self.pi.plot([tx, ex], [ty, ey], antialias=True,
+                                pen=pg.mkPen(_qcolor(color, 235), width=2.2))
+            line.setZValue(9)
+            self._compass_items.append(line)
+            lbl = pg.TextItem(str(e["n_routes"]),
+                              color=_qcolor(color),
+                              fill=pg.mkBrush(_qcolor(THREAT_COLORS["compass_edge"], 210)),
+                              anchor=(0.5, 0.5))
+            lbl.setPos(ex, ey)
+            lbl.setZValue(9.1)
+            self.pi.addItem(lbl, ignoreBounds=True)
+            self._compass_items.append(lbl)
 
     def render_entry_target(self, entry, target):
         self.entry_scatter.setData([entry[0]], [entry[1]])

@@ -105,13 +105,17 @@ class ThreatController:
             on_sensor_delete=self.on_sensor_delete,
             on_manual_clear=self.on_manual_clear, on_manual_mode=self.on_manual_mode,
             on_sensor_rows=self._sensor_rows,
+            # «режим анализа» плашки над картой (план 8, задача 8.9, довесок 06.09.2026)
+            on_mode_analysis=self.on_mode_analysis,
             # история полётов: выгрузка/загрузка (задача 8.6)
             on_flights_save=self.on_flights_save, on_flights_load=self.on_flights_load,
             on_flights_clear=self.on_flights_clear,
             # окно «Посмотреть маршруты» (задача 8.6, довесок 06.09.2026)
             on_routes_data=self._routes_data_for_viewer,
             on_route_preview=self.on_route_preview,
-            on_route_preview_reset=self.on_route_preview_reset)
+            on_route_preview_reset=self.on_route_preview_reset,
+            # окно «Анализ моделирования» (план 8, задача 8.9, довесок 06.09.2026)
+            on_analysis_data=self._analysis_html)
         # СТАРТ: район не задан — расчётные кнопки закрыты, синей рамки нет
         view.set_area_ready(model.area_ready,
                             model.area_size_km() if model.area_ready else None,
@@ -738,6 +742,12 @@ class ThreatController:
         self.model.p.threat_manual_mode = bool(manual)
         self._after_manual_change()
 
+    def on_mode_analysis(self, checked):
+        """Галочка «режим анализа» плашки над картой (план 8, задача 8.9, довесок
+        06.09.2026): во время моделирования расстановка перестаёт пересчитываться —
+        см. `threat_grid.place_sensors` и `config.Params.threat_analysis_static`."""
+        self.model.p.threat_analysis_static = bool(checked)
+
     def _sensor_rows(self):
         """Чем заполнять таблицу окна.
 
@@ -1196,6 +1206,7 @@ class ThreatController:
             self.view.render_crossings(None, t)
             self._render_sensors(empty=True)
             self.view.render_sensor_track([], {})
+            self.view.render_sector_compass([], None)
             return
         extent = g.extent_km()
         # рельеф: карта высот берётся в РОДНОМ разрешении (сетка 500 м для показа груба),
@@ -1240,6 +1251,16 @@ class ThreatController:
             self.view.render_crossings(None, t)
         self._render_sensors()
         self._render_sensor_track(t)
+        self._render_sector_compass(t)
+
+    def _render_sector_compass(self, toggles):
+        """Сектора «анализа моделирования» по направлениям (довесок 06.09.2026): галка
+        в группе «пролёт БПЛА» — считает модель (`sector_stats`), рисует представление."""
+        if not toggles.get("show_sector_stats"):
+            self.view.render_sector_compass([], None)
+            return
+        self.view.render_sector_compass(self.model.sector_stats(),
+                                        self.model.target_only_km())
 
     def _render_sensor_track(self, toggles):
         """«Анализ размещения» (задача 8.9) — сравнение ПЕРВОГО построения с ТЕКУЩИМ.
@@ -1418,10 +1439,69 @@ class ThreatController:
             out.append(f"  тип {t}: {d['n']} шт. · R={d['r_km']:g} км · k={d.get('k', 0)}")
             out.append(f"     ловит ≥1: {d['detect_frac']*100:.0f}% · "
                        f"≥k: {d.get('detect_k_frac', 0)*100:.0f}% · "
-                       f"кратность {d['mean_hits']:.1f}")
+                       f"кратность {d['mean_hits']:.1f} · "
+                       f"покрытие {d.get('covered_frac', 0)*100:.0f}%")
             if d.get("idle"):
                 out.append(f"     ⚠ простаивает: {d['idle']} (не видят ни одного пролёта)")
         return out
+
+    # ---- окно «Анализ моделирования» (план 8, задача 8.9, довесок 06.09.2026) ----
+    def _analysis_html(self):
+        """HTML-текст окна: сумма засечки, разбивка по типам датчиков (те же числа,
+        что и в боковой панели, `_placement_lines`/`_by_type_lines`) и — НОВОЕ —
+        разбивка по 12 направлениям компаса (`ThreatModel.sector_stats`). Направления,
+        не набравшие заданную кратность k, выделяются красным (заказчик: «те, которые
+        не удовлетворили кратности, помечаются красным»)."""
+        me = self.model.metrics() or {}
+        lines = ["<h3>ЗАСЕЧКА ПРОЛЁТОВ</h3>"]
+        if not me:
+            lines.append("<p>Показателей ещё нет — сначала расставьте датчики.</p>")
+            return "".join(lines)
+        # ⚠️ ВЕЗДЕ «КОЛИЧЕСТВО (ПРОЦЕНТ)», А НЕ ГОЛЫЙ ПРОЦЕНТ (заказчик, довесок
+        # 06.09.2026: «пиши количество (процент)») — так же, как уже сделано в разделе
+        # «ПО НАПРАВЛЕНИЯМ» ниже. `_evaluate` хранит только долю (`detect_frac`), не
+        # само число маршрутов — считаем его обратно, округляя долю × общее число.
+        n_ev = int(me.get("n_routes_eval", 0))
+        lines.append(
+            "<p>по %d маршрутам: засечено &ge;1 — %d (%.0f%%), засечено &ge;k(%d) — "
+            "%d (%.0f%%), средняя кратность %.1f, доля покрытия веса %.0f%%</p>"
+            % (n_ev, round(me.get("detect_frac", 0) * n_ev), me.get("detect_frac", 0) * 100,
+               int(self.model.p.threat_k), round(me.get("detect_k_frac", 0) * n_ev),
+               me.get("detect_k_frac", 0) * 100,
+               me.get("mean_hits", 0), me.get("covered_frac", 0) * 100))
+        by = me.get("by_type") or {}
+        if by:
+            lines.append("<h3>ПО ТИПАМ ДАТЧИКОВ</h3><ul>")
+            for t in sorted(by):
+                d = by[t]
+                lines.append(
+                    "<li>тип %d: %d шт., R=%.3g км, k=%d — ловит &ge;1: %d (%.0f%%), "
+                    "&ge;k: %d (%.0f%%), средняя кратность %.1f, покрытие веса %.0f%%%s</li>"
+                    % (t, d["n"], d["r_km"], d.get("k", 0),
+                       round(d["detect_frac"] * n_ev), d["detect_frac"] * 100,
+                       round(d.get("detect_k_frac", 0) * n_ev), d.get("detect_k_frac", 0) * 100,
+                       d["mean_hits"], d.get("covered_frac", 0) * 100,
+                       (" · простаивает: %d" % d["idle"]) if d.get("idle") else ""))
+            lines.append("</ul>")
+        stats = self.model.sector_stats()
+        cardinal = {0: " (север)", 90: " (восток)", 180: " (юг)", 270: " (запад)"}
+        lines.append("<h3>ПО НАПРАВЛЕНИЯМ (компас от цели, шаг 30°, по заходу маршрута, "
+                     "не по старту)</h3><ul>")
+        for e in stats:
+            deg = e["deg"]
+            n = e["n_routes"]
+            pct = (lambda x: (100.0 * x / n) if n else 0.0)
+            row = ("%d&deg;%s: маршрутов %d — не засечено (0 раз) %d (%.0f%%), "
+                  "засечено &ge;1 — %d (%.0f%%), засечено &ge;k(%d) — %d (%.0f%%)"
+                  % (deg, cardinal.get(deg, ""), n, e["n_zero"], pct(e["n_zero"]),
+                     e["n_ge1"], pct(e["n_ge1"]), e["k"], e["n_ge_k"], pct(e["n_ge_k"])))
+            if e["n_routes"] and not e["ok"]:
+                lines.append('<li style="color:#ff5555"><b>%s — кратности не хватает'
+                            '</b></li>' % row)
+            else:
+                lines.append("<li>%s</li>" % row)
+        lines.append("</ul>")
+        return "".join(lines)
 
     def run(self):
         self.view.show()

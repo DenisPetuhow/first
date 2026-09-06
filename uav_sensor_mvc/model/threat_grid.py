@@ -64,7 +64,8 @@ from config import (THREAT_BBOX_LONLAT, THREAT_WORK_LONLAT, THREAT_CELL_M, THREA
                     THREAT_SECTOR_HALF_DEG, THREAT_SECTOR_ENTRIES,
                     THREAT_SECTOR_EDGE_KM, THREAT_SECTOR_WIN_ALONG,
                     THREAT_SECTOR_WIN_ACROSS, THREAT_SECTOR_MIN_SEP_KM,
-                    THREAT_SECTOR_MIN_ANGLE_FRAC, THREAT_LAYER_MARGIN_KM)
+                    THREAT_SECTOR_MIN_ANGLE_FRAC, THREAT_LAYER_MARGIN_KM,
+                    THREAT_COMPASS_STEP_DEG, THREAT_COMPASS_APPROACH_KM)
 # кольцо и угловой разнос БОЛЬШИХ датчиков — поля Params (правятся в окне «Датчики»),
 # поэтому берутся оттуда; здесь только умолчания на случай старого Params
 from config import Params as _P
@@ -3053,6 +3054,16 @@ class ThreatModel:
         а не по сырому весу — поэтому минус-города датчикам не мешают. Выборка: идут ИТЕРАЦИИ
         → их пролёты; иначе → ВСЕ возможные пути (строятся, если их нет). Правила A/B и разнос."""
         g = self.ensure_built()
+        # «РЕЖИМ АНАЛИЗА» (план 8, задача 8.9, довесок 06.09.2026): во время
+        # моделирования расстановка (свои датчики и большие) не пересчитывается —
+        # см. докстринг `threat_analysis_static` в config.py. Флаг проверяется В ДВУХ
+        # МЕСТАХ, а не одним общим `return` в начале функции: у ручного режима свой
+        # путь, где «пересчёт» — это просто чтение таблицы `manual_sensors», а не
+        # прогон жадного алгоритма (см. ниже), и его замораживать не нужно — иначе
+        # свежедобавленная вручную точка не появлялась бы на карте вовсе.
+        analysis_freeze = (self.in_iterations()
+                           and bool(getattr(self.p, "threat_analysis_static", False))
+                           and (len(self.sensors) or len(self.sensors_big)))
         # РЕЖИМ «ЗАДАТЬ ПОЗИЦИИ» (задача 8.7): позиции не подбираются — датчики стоят
         # ровно там, где их задал человек, и кнопка «Расставить датчики» их НЕ ДВИГАЕТ.
         # ⚠️ Но ПОКАЗАТЕЛИ считаются: засечку и кратность заданной расстановки не по чему
@@ -3068,9 +3079,14 @@ class ThreatModel:
             # он перемещается, если статический — стоит на месте». Число датчиков берётся
             # из ТАБЛИЦЫ (сколько задано, столько и будет), а не из полей N: в этом режиме
             # поля N только для чтения и сами показывают счёт по таблице.
-            if self.in_iterations() and self._manual_dynamic_count():
+            # ⚠️ `analysis_freeze` гасит именно ЭТОТ прогон (жадный по `manual_locked`),
+            # а не сам путь целиком: без него динамический вручную заданный датчик
+            # переезжал бы во время моделирования, что и запрещает режим анализа.
+            if self.in_iterations() and self._manual_dynamic_count() and not analysis_freeze:
                 return self._place_manual_iter()
             return self._place_manual()
+        if analysis_freeze:
+            return
         self.candidates = self.candidate_positions()
         if len(self.iter_routes) < 5 and len(self.routes) < 5:
             self.plan_routes()                         # до итераций — по всем возможным путям
@@ -3636,9 +3652,13 @@ class ThreatModel:
         total = float(np.sum(np.clip(g.weight, 0, None)))
         covered = 0.0
         rad = self._sensor_radii()
-        if len(self.sensors) and len(cells_xy):
-            pos = cells_w > 0
-            xy, w = cells_xy[pos], cells_w[pos]
+        # ⚠️ `xy`/`w` ВЫНЕСЕНЫ ИЗ `if` (были внутри него до довеска 06.09.2026): нужны
+        # ЕЩЁ РАЗ ниже, для доли покрытия КАЖДОГО ТИПА в отдельности (заказчик: «и для
+        # типов тоже определяй долю покрытия») — второй раз их не пересчитывать.
+        pos = cells_w > 0 if len(cells_w) else np.zeros(0, bool)
+        xy = cells_xy[pos] if len(cells_xy) else np.empty((0, 2), float)
+        w = cells_w[pos] if len(cells_w) else np.empty(0, float)
+        if len(self.sensors) and len(xy):
             d = np.linalg.norm(xy[:, None, :] - self.sensors[None, :, :], axis=2)
             seen = (d <= rad[None, :]).any(axis=1)
             covered = float(np.sum(w[seen]))
@@ -3666,12 +3686,22 @@ class ThreatModel:
                 # одна общая строка «засечено ≥ k» в этом случае отвечала бы на вопрос,
                 # которого никто не задавал. Здесь — выполнение СОБСТВЕННОГО k типа.
                 k_t = max(1, int(k_of.get(t, self.p.threat_k)))
+                # ДОЛЯ ПОКРЫТИЯ ЭТОГО ТИПА (довесок 06.09.2026) — тот же приём, что у
+                # общего `covered_frac` выше, но по сенсорам ОДНОГО типа: сколько веса
+                # карты видит именно он, а не расстановка целиком.
+                sens_t, rad_t = self.sensors[col], rad[col]
+                if len(sens_t) and len(xy):
+                    dT = np.linalg.norm(xy[:, None, :] - sens_t[None, :, :], axis=2)
+                    covered_t = float(np.sum(w[(dT <= rad_t[None, :]).any(axis=1)]))
+                else:
+                    covered_t = 0.0
                 by_type[t] = dict(n=int(col.sum()),
                                   r_km=float(rad[col][0]) if col.any() else 0.0,
                                   k=k_t,
                                   detect_frac=float((h_t >= 1).mean()),
                                   detect_k_frac=float((h_t >= k_t).mean()),
                                   mean_hits=float(h_t.mean()),
+                                  covered_frac=(covered_t / total if total > 0 else 0.0),
                                   idle=int((seen_by[:, col].sum(axis=0) == 0).sum()))
         return dict(total_weight=total, covered_weight=covered,
                     covered_frac=(covered / total if total > 0 else 0.0),
@@ -3704,6 +3734,73 @@ class ThreatModel:
 
     def metrics(self):
         return self._metrics
+
+    @staticmethod
+    def _approach_bearing(route, target_xy):
+        """Азимут ОТ ЦЕЛИ на КОНЕЧНУЮ часть маршрута — направление ЗАХОДА, а не старта
+        (см. `sector_stats`). Идёт по точкам маршрута С КОНЦА и берёт первую, что дальше
+        `THREAT_COMPASS_APPROACH_KM` от цели; `None` — весь маршрут ближе этого порога
+        (вырожденный случай, короче одной клетки сетки)."""
+        B = np.asarray(target_xy, float)
+        for p in route[::-1]:
+            d = np.asarray(p, float) - B
+            if np.hypot(d[0], d[1]) >= THREAT_COMPASS_APPROACH_KM:
+                return float(np.degrees(np.arctan2(d[0], d[1])) % 360.0)
+        return None
+
+    def sector_stats(self):
+        """Статистика прихода БПЛА по 12 направлениям КОМПАСА, шаг
+        `THREAT_COMPASS_STEP_DEG` = 30° (план 8, задача 8.9, довесок 06.09.2026,
+        кнопка «Анализ моделирования»).
+
+        Направление маршрута — азимут ОТ ЦЕЛИ на его КОНЕЧНУЮ часть, направление ЗАХОДА
+        (не старта!): 0° = север (+y), по часовой стрелке (90° = восток, +x) — обычный
+        компас. Сектор k покрывает [k·шаг − шаг/2, k·шаг + шаг/2) и подписан своим
+        центральным углом (0, 30, 60, … 330).
+
+        ⚠️ ИМЕННО ЗАХОД, А НЕ СТАРТ (исправлено 06.09.2026, заказчик: «смотреть...
+        конечную точку захода на цель, это данные каждого маршрута»). Точка ВХОДА общая
+        у всех маршрутов сразу (их THREAT_SECTOR_ENTRIES = 5 на весь сектор появления),
+        и азимут от старта почти всегда стягивался в 3–5 секторов из 12: маршруты
+        огибают рельеф и запретные зоны, и БПЛА визуально заходит на цель со всех
+        сторон, а разбивка по старту этого не показывала. `_approach_bearing` ищет
+        направление С КОНЦА маршрута, пока не отойдёт от цели хотя бы на
+        `THREAT_COMPASS_APPROACH_KM` — сама последняя точка лежит В цели.
+
+        Кратность — ОБЩАЯ, по ВСЕМ типам датчиков разом (то же `hits`, что у верхней
+        строки отчёта «Засечено ≥ k» в `_evaluate`, а не разбивка `by_type`, — заказчик
+        явно просил «по всем типам датчиков», не по каждому отдельно).
+
+        Возвращает список из 12 словарей `dict(deg, n_routes, n_zero, n_ge1, n_ge_k, k,
+        ok)`. `ok=False` — сектор НЕ ПУСТОЙ, и хотя бы один его маршрут не набрал
+        заданную кратность `k` (`Params.threat_k`): направление помечается красным на
+        карте и в тексте отчёта."""
+        step = float(THREAT_COMPASS_STEP_DEG)
+        n_sec = max(1, int(round(360.0 / step)))
+        out = [dict(deg=int(round(i * step)), n_routes=0, n_zero=0, n_ge1=0, n_ge_k=0,
+                    k=int(self.p.threat_k), ok=True) for i in range(n_sec)]
+        sample = self._sample_for_sensors()
+        if not sample or not len(self.sensors):
+            return out
+        B = np.asarray(self.target_only_km(), float)
+        rad = self._sensor_radii()
+        k = max(1, int(self.p.threat_k))
+        for r in sample:
+            bearing = self._approach_bearing(r, B)
+            if bearing is None:
+                continue                  # маршрут целиком лежит в цели — без направления
+            idx = int(round(bearing / step)) % n_sec
+            seen = (np.linalg.norm(r[:, None, :] - self.sensors[None, :, :],
+                                   axis=2).min(axis=0) <= rad)
+            hits = int(seen.sum())
+            e = out[idx]
+            e["n_routes"] += 1
+            e["n_zero"] += int(hits == 0)
+            e["n_ge1"] += int(hits >= 1)
+            e["n_ge_k"] += int(hits >= k)
+        for e in out:
+            e["ok"] = (e["n_routes"] == 0) or (e["n_ge_k"] == e["n_routes"])
+        return out
 
     def reachable_stats(self):
         """Корректная мера «всех возможных мест пролёта» — размер огибающей (граф-обход):

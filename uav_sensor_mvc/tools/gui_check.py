@@ -795,11 +795,24 @@ def main():
           "пару получил БЛИЖНИЙ старый датчик, не первый по порядку",
           "old_idx=%s (0.0,0.0) а не 1 (10.0,0.0)" % _matched2[0]["old_idx"])
 
-    # ПАНЕЛЬ РЕЖИМОВ — три чекбокса поверх карты, ЗАДЕЛ НА БУДУЩЕЕ (заказчик 06.09.2026:
-    # «панель оставь, просто её выбор пока не влияет ни на что») — только присутствие.
+    # ПАНЕЛЬ РЕЖИМОВ поверх карты (заказчик 06.09.2026, довесок того же дня):
+    # «режим моделирования» остался задел-заготовкой, «режим анализа» стал РАБОЧИМ
+    # переключателем, «построение маршрутов» заменено кнопкой-линейкой «Расстояние».
     check(hasattr(v, "chk_mode_sim") and hasattr(v, "chk_mode_analysis")
-          and hasattr(v, "chk_mode_routes"),
-          "три чекбокса-заготовки на карте: моделирование/анализ/маршруты")
+          and hasattr(v, "btn_measure"),
+          "плашка режимов: заготовка/анализ/линейка")
+    check(not hasattr(v, "chk_mode_routes"),
+          "чекбокс «построение маршрутов» заменён кнопкой, а не сосуществует с ней")
+
+    # «РЕЖИМ АНАЛИЗА» — РАБОЧИЙ, а не задел (довесок 06.09.2026): галочка плашки
+    # управляет `Params.threat_analysis_static` через тот же путь колбэков, что и
+    # остальные переключатели контроллера.
+    check(m.p.threat_analysis_static is False, "по умолчанию выключен")
+    v.chk_mode_analysis.setChecked(True)
+    check(m.p.threat_analysis_static is True,
+          "галочка «режим анализа» включает заморозку расстановки в модели")
+    v.chk_mode_analysis.setChecked(False)
+    check(m.p.threat_analysis_static is False, "и выключает её обратно")
 
     # РАБОЧИЙ ПЕРЕКЛЮЧАТЕЛЬ — обычная галочка в группе «датчики и подписи», рядом с
     # «Датчики», «Кандидатные позиции» и т.п. (заказчик: «функция всегда есть в этой
@@ -825,6 +838,23 @@ def main():
             break
     c._work_place()
     check(m.sensor_source == "iter", "расстановка после итераций взята из своей выборки")
+
+    # «РЕЖИМ АНАЛИЗА» ЗАМОРАЖИВАЕТ РАССТАНОВКУ (довесок 06.09.2026): во время
+    # моделирования, если что-то уже стоит, `place_sensors` обязан выйти РАНЬШЕ, чем
+    # тронет `sensor_source` — это и отличает «пересчёт дал тот же ответ» от «пересчёта
+    # не было вовсе» (сам жадный алгоритм детерминирован и на тех же данных мог бы
+    # случайно совпасть).
+    check(m.in_iterations() and (len(m.sensors) or len(m.sensors_big)),
+          "условие теста: идут итерации, расстановка уже есть")
+    m.p.threat_analysis_static = True
+    m.sensor_source = "__sentinel__"
+    m.place_sensors()
+    check(m.sensor_source == "__sentinel__",
+          "режим анализа: во время моделирования расстановка не пересчитывается вовсе")
+    m.p.threat_analysis_static = False
+    m.place_sensors()
+    check(m.sensor_source != "__sentinel__",
+          "без режима анализа расстановка пересчитывается как обычно")
 
     _matches = m.sensor_movement()
     check(len(_matches) > 0, "«анализ размещения» нашёл пары", "%d записей" % len(_matches))
@@ -903,12 +933,141 @@ def main():
           "THREAT_SENSOR_REFRESH_EVERY маршрутов)",
           "проверено %d раз подряд" % len(_snaps))
 
+    print("\n9. ЛИНЕЙКА «РАССТОЯНИЕ» (план 8, задача 8.9, довесок 06.09.2026)")
+
+    class _MeasureEv:                         # имитация клика по карте, как в разделе 5
+        def __init__(self, x_km, y_km, button=Qt.LeftButton):
+            self._pos = v.vb.mapViewToScene(QPointF(x_km, y_km))
+            self._btn = button
+
+        def scenePos(self):
+            return self._pos
+
+        def button(self):
+            return self._btn
+
+        def accept(self):
+            pass
+
+    check(hasattr(v, "btn_measure"), "кнопка «Расстояние» есть в плашке режимов")
+    check(not v._measure_mode, "линейка по умолчанию выключена")
+    v._toggle_measure()
+    check(v._measure_mode, "нажатие кнопки включает режим измерения")
+    check(v.btn_measure.isChecked(), "кнопка показывает нажатое состояние")
+
+    x0, y0 = m.bbox_km[0] + 5, m.bbox_km[2] + 5
+    v._on_scene_click(_MeasureEv(x0, y0))
+    v._on_scene_click(_MeasureEv(x0 + 3.0, y0 + 4.0))
+    check(len(v._measure_pts) == 2, "два клика — две точки линейки")
+    # ⚠️ ПОДПИСЕЙ НА ОДНУ БОЛЬШЕ ОТРЕЗКОВ: кроме подписи самого отрезка, у ПОСЛЕДНЕЙ
+    # точки есть ещё подпись «всего: N.NN км» — сумма всей цепочки (заказчик: «у
+    # последней точки сумма расстояний всего»).
+    check(len(v._measure_labels) == 2,
+          "между двумя точками: подпись отрезка + подпись суммы у последней точки")
+    check(abs(np.hypot(3.0, 4.0) - 5.0) < 1e-9,
+          "условие теста: отрезок 3-4-5 даёт ровно 5.0 км")
+
+    v._on_scene_click(_MeasureEv(x0 + 3.0, y0 - 2.0))
+    check(len(v._measure_pts) == 3 and len(v._measure_labels) == 3,
+          "третий клик продолжает ЦЕПОЧКУ (2 отрезка + 1 сумма), а не тянется к первой",
+          "точек %d, подписей %d" % (len(v._measure_pts), len(v._measure_labels)))
+
+    # правая кнопка — выход, с очисткой нарисованного (заказчик: «клик правой кнопки выйти»)
+    v._on_scene_click(_MeasureEv(x0, y0, button=Qt.RightButton))
+    check(not v._measure_mode, "правая кнопка выходит из режима измерения")
+    check(not v.btn_measure.isChecked(), "кнопка отжимается при выходе")
+    check(len(v._measure_pts) == 0 and len(v._measure_labels) == 0,
+          "выход очищает линейку с карты")
+
+    # режимы мыши взаимно исключают друг друга — тот же принцип, что у правки датчиков
+    v._toggle_measure()
+    check(v._measure_mode, "снова включили — для проверки взаимного исключения режимов")
+    v._begin_edit_sensor()
+    check(v._edit_sensor and not v._measure_mode,
+          "включение другого режима мыши гасит линейку")
+    v._end_edit_sensor()
+
+    print("\n10. АНАЛИЗ МОДЕЛИРОВАНИЯ: кнопка, окно, сектора по направлениям "
+         "(план 8, задача 8.9, довесок 06.09.2026)")
+
+    check(hasattr(v, "btn_analysis"), "кнопка «Анализ моделирования» есть на панели")
+    check(hasattr(v, "chk_sector_stats"), "галочка «Сектора» есть в группе «пролёт БПЛА»")
+    check(not v.chk_sector_stats.isChecked(), "по умолчанию выключена")
+
+    _stats = m.sector_stats()
+    check(len(_stats) == 12, "12 направлений компаса, шаг 30°", "%d штук" % len(_stats))
+    check([e["deg"] for e in _stats] == list(range(0, 360, 30)),
+          "углы по порядку 0..330 с шагом 30")
+    _sample = m._sample_for_sensors()
+    check(sum(e["n_routes"] for e in _stats) == len(_sample),
+          "каждый маршрут выборки попал ровно в один сектор компаса",
+          "%d маршрутов, сумма по секторам %d"
+          % (len(_sample), sum(e["n_routes"] for e in _stats)))
+
+    # РЕГРЕССИЯ 06.09.2026 (заказчик, по скриншоту): направление раньше бралось от
+    # СТАРТА маршрута, а старт общий на весь сектор появления (THREAT_SECTOR_ENTRIES =
+    # 5) — почти все маршруты стягивались в 3-5 секторов из 12, хотя огибают рельеф и
+    # запретные зоны и заходят на цель со всех сторон. Сравниваем со СТАРЫМ способом
+    # (азимут от `r[0]`) на ТОЙ ЖЕ выборке — новый обязан занимать секторов не меньше.
+    _B = np.asarray(m.target_only_km(), float)
+    _old_sectors = set()
+    for _r in _sample:
+        _d = np.asarray(_r[0], float) - _B
+        if abs(_d[0]) > 1e-9 or abs(_d[1]) > 1e-9:
+            _brg = float(np.degrees(np.arctan2(_d[0], _d[1])) % 360.0)
+            _old_sectors.add(int(round(_brg / 30.0)) % 12)
+    _new_sectors = {i for i, e in enumerate(_stats) if e["n_routes"] > 0}
+    check(len(_new_sectors) >= len(_old_sectors),
+          "направление по ЗАХОДУ занимает секторов не меньше, чем старое — по СТАРТУ",
+          "по заходу %d секторов, по старту было бы %d"
+          % (len(_new_sectors), len(_old_sectors)))
+
+    c._render_sector_compass({"show_sector_stats": True})
+    check(len(v._compass_items) == 24, "12 линий + 12 подписей нарисованы",
+          "%d элементов" % len(v._compass_items))
+    c._render_sector_compass({"show_sector_stats": False})
+    check(len(v._compass_items) == 0, "выключение галки убирает сектора с карты")
+
+    v.chk_sector_stats.setChecked(True)
+    check(len(v._compass_items) == 24,
+          "галочка «Сектора» рисует их обычным путём показа (chk -> on_toggle -> _render_all)")
+    v.chk_sector_stats.setChecked(False)
+    check(len(v._compass_items) == 0, "и убирает их тем же путём")
+
+    _html = c._analysis_html()
+    check(all(s in _html for s in ("ЗАСЕЧКА ПРОЛЁТОВ", "ПО ТИПАМ", "ПО НАПРАВЛЕНИЯМ")),
+          "окно «Анализ моделирования» содержит все три раздела")
+    check(str(int(m.p.threat_k)) in _html, "заданная кратность k упомянута в тексте")
+    check(_html.count("%)") >= 12 * 3,
+          "у каждого из 12 направлений — по три числа с процентом рядом (заказчик: "
+          "«пиши количество (процент)»)", "найдено %d" % _html.count("%)"))
+    # ТА ЖЕ ПАРА «количество (процент)» — и в верхней сумме «ЗАСЕЧКА ПРОЛЁТОВ», и в
+    # разбивке «ПО ТИПАМ» (довесок 06.09.2026, повторная проверка по просьбе заказчика).
+    check(_html.count("%)") >= 12 * 3 + 2 + 2 * len(m.metrics().get("by_type", {})),
+          "количество (процент) есть и в сумме, и по каждому типу — не только по секторам",
+          "найдено %d" % _html.count("%)"))
+    check(_html.count("покрыти") >= 2,
+          "доля покрытия названа и в сумме, и у каждого типа отдельно",
+          "упоминаний: %d" % _html.count("покрыти"))
+
+    # ДОЛЯ ПОКРЫТИЯ У КАЖДОГО ТИПА — заказчик: «и для типов тоже определяй долю
+    # покрытия». Раньше `covered_frac` считался только один раз, на всю расстановку.
+    _me = m.metrics() or {}
+    _by = _me.get("by_type") or {}
+    check(len(_by) > 0 and all("covered_frac" in d for d in _by.values()),
+          "у каждого типа в отчёте есть своя доля покрытия веса")
+    check(all(0.0 <= d["covered_frac"] <= 1.0 for d in _by.values()),
+          "доля покрытия каждого типа — корректная доля [0..1]",
+          " · ".join("тип %d: %.0f%%" % (t, d["covered_frac"] * 100)
+                     for t, d in sorted(_by.items())))
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
         return 1
     print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои, окно исходных данных, история "
-         "полётов и анализ размещения — в норме.")
+         "полётов, анализ размещения, линейка «Расстояние» и анализ моделирования "
+         "по направлениям — в норме.")
     return 0
 
 
