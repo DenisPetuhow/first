@@ -81,19 +81,43 @@ def _tile_xy(lon, lat, z):
 
 
 _lo, _la, _ho, _ha = THREAT_BBOX_LONLAT
+# ⚠️ ДВА МЕСТА ПОИСКА, КАК У ПОКАЗА. С 03.09.2026 у каждого участка свой
+# tile_cache/<участок>/, но старая общая раскладка tile_cache/<слой>/ НЕ ПЕРЕЛОЖЕНА
+# (ОГРАНИЧЕНИЯ 5.1д: правило действует на то, что качается заново). Поэтому
+# `geomap.find_cached_tile` перебирает ОБА места — сперва папку участка, затем корень
+# кэша, — и сборка обязана делать то же самое, иначе половина подложки не доедет.
+#
+# Замер по участку `arh` 08.09.2026 (слой osm, рабочая рамка Плесецка 117 × 73 км):
+#   только корень кэша  — 2 759 тайлов, зумы 7…10 полные, но z13 лишь 69 %;
+#   только папка участка — 1 200 тайлов, z13 30 %, а зумы 7…10 ПУСТЫ (0 из 53).
+# Оба перекоса ломают показ по-своему: без папки участка теряется детализация, без
+# корня кэша программа открывается на обзорном зуме БЕЗ ПОДЛОЖКИ ВООБЩЕ.
+# Берём объединение: приоритет у папки участка (она свежее), корень добирает остальное.
+_tile_roots = []                                   # (корень источника, папка назначения)
+if _area_dir:
+    _tile_roots.append((os.path.join(ROOT, "tile_cache", _area_dir),
+                        os.path.join("tile_cache", _area_dir)))
+_tile_roots.append((os.path.join(ROOT, "tile_cache"), "tile_cache"))
+
+_seen_tiles = set()                                # (слой, z, x, y) — чтобы не дублировать
 for _layer in ("osm", "osm_hot"):
     for _z in range(7, 16):                        # тот же диапазон, что у программы
         _x0, _y0 = _tile_xy(_lo, _ha, _z)
         _x1, _y1 = _tile_xy(_ho, _la, _z)
-        for _x in range(_x0, _x1 + 1):
-            _src_dir = os.path.join(ROOT, "tile_cache", _layer, str(_z), str(_x))
-            if not os.path.isdir(_src_dir):
-                continue
-            for _y in range(_y0, _y1 + 1):
-                _f = os.path.join(_src_dir, "%d.png" % _y)
-                if os.path.exists(_f):
-                    datas.append((_f, os.path.join("tile_cache", _layer,
-                                                   str(_z), str(_x))))
+        for _src_root, _dst_root in _tile_roots:
+            for _x in range(_x0, _x1 + 1):
+                _src_dir = os.path.join(_src_root, _layer, str(_z), str(_x))
+                if not os.path.isdir(_src_dir):
+                    continue
+                for _y in range(_y0, _y1 + 1):
+                    _key = (_layer, _z, _x, _y)
+                    if _key in _seen_tiles:        # уже взят из папки участка
+                        continue
+                    _f = os.path.join(_src_dir, "%d.png" % _y)
+                    if os.path.exists(_f):
+                        _seen_tiles.add(_key)
+                        datas.append((_f, os.path.join(_dst_root, _layer,
+                                                       str(_z), str(_x))))
 
 datas = [(src, dst) for src, dst in datas if os.path.exists(src)]
 datas += rasterio_datas                     # файлы данных GDAL (см. выше)
