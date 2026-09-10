@@ -64,6 +64,11 @@ EXTERNAL = {
     # PyInstaller: поля рецепта сборки и папки результата (СБОРКА_EXE.md)
     "hiddenimports", "datas", "excludes", "collect_submodules", "collect_data_files",
     "_internal", "venv", "work", "diag", "test", "spec", "onefile", "noconsole",
+    # ⚠️ `_tile_roots` ЖИВЁТ В КОДЕ, но в `build_demo.spec`: разбираются только файлы
+    # `.py`, а рецепт сборки имеет расширение `.spec`. Имя настоящее (список источников
+    # тайлов, журнал п. 243) — не выдумка документации. `pyinstaller` — имя пакета pip,
+    # `cp314` — часть имени файла колеса (`numpy-2.5.1-cp314-…win_amd64.whl`).
+    "_tile_roots", "pyinstaller", "cp314",
     # библиотеки, УПОМЯНУТЫЕ как варианты, но в проект не взятые
     "folium", "mercantile", "osmium", "pyqtlet2", "QtLocation", "QtWebEngine",
     "Leaflet", "MapLibre", "geopandas", "Pillow",
