@@ -2558,7 +2558,11 @@ class ThreatModel:
 
     def count_routes(self):
         """ТОЧНОЕ число возможных маршрутов вход→цель внутри области залёта (без перебора).
-        Их порядка 1e107 — отсюда и невозможность «показать все» иначе как областью."""
+
+        Замеры 11.09.2026: участок `arh` — **7.24e+162**, `plesetsk_wide` — **8.24e+104**.
+        Отсюда и невозможность «показать все» иначе как областью: атомов во Вселенной
+        ~1e80. ⚠️ Прежняя запись «~1e107» относилась к Плесецку — см. разбор в
+        `threat_routes.count_possible_routes`."""
         from .threat_routes import count_possible_routes
         if self.grid is None or self.route_area is None or self._iter_ctx is None:
             return 0.0

@@ -3443,7 +3443,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def render_routes(self, routes, route_area, extent, toggles):
         """ВСЕ возможные места пролёта: розовый ФОН = огибающая (route_area) — КОРРЕКТНО
         посчитанная ГРАФОМ достижимость A→ячейка→цель ≤ L_max (все места, куда может дойти
-        БПЛА по коридорам, включая юг). Поверх — розовые ЛИНИИ-примеры маршрутов."""
+        БПЛА по коридорам, включая юг). Поверх — ЛИНИИ-примеры маршрутов.
+
+        ⚠️ Линии рисуются цветом `route_all` = #00e5ff, то есть ГОЛУБЫЕ. Прежняя редакция
+        докстринга называла их розовыми — розовая здесь только заливка (`envelope`);
+        поправлено 11.09.2026."""
         show = toggles["show_routes"]
         if show and route_area is not None and np.asarray(route_area).any():
             ra = np.asarray(route_area)

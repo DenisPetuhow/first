@@ -72,6 +72,9 @@ EXTERNAL = {
     # библиотеки, УПОМЯНУТЫЕ как варианты, но в проект не взятые
     "folium", "mercantile", "osmium", "pyqtlet2", "QtLocation", "QtWebEngine",
     "Leaflet", "MapLibre", "geopandas", "Pillow",
+    # `dateutil` — назван в разборе `check_dates.py` (теория/код/) ради ОТКАЗА: даты
+    # сравниваются кортежами строк, чтобы не тащить библиотеку ради одной строки
+    "dateutil",
     # QtSvg — модуль PyQt5 для вектора; в проекте пока не используется, описан
     # как задел (план 8, §8.5.0)
     "QtSvg", "QGraphicsSvgItem",
