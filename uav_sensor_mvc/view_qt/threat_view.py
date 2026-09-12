@@ -342,6 +342,15 @@ def _iter_heat_cmap():
         return pg.colormap.ColorMap(stops, _iter_heat_lut())
 
 
+def _pad_box(box, km=0.0, frac=0.0):
+    # Расширяет рамку полем с четырёх сторон. Принимает: (x0,x1,y0,y1) км, поле в км
+    # и долю собственного размера. Отдаёт: новую рамку той же формы.
+    x0, x1, y0, y1 = box
+    dx = km + (x1 - x0) * frac                   # поле по X, км
+    dy = km + (y1 - y0) * frac                   # поле по Y, км
+    return (x0 - dx, x1 + dx, y0 - dy, y1 + dy)
+
+
 class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # Подложка гасится: поверх неё лежат НАШИ дороги, реки и лесополосы, а OSM рисует
     # свои — без гашения это две карты одного смысла друг на друге. Но и перебарщивать
@@ -494,7 +503,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                            lambda: self._map_offline,
                            scheme_points=self._orient_points(),
                            tile_area=THREAT_AREA_DIR)
-        self._set_view_limits(self.bbox_km, THREAT_VIEW_PAD_KM)
+        self._apply_view_limits()                 # предел вида: область + район + поля
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
         # смена масштаба/панорама -> перерисовать слои под новый кадр (прореживание по
         # видимой области + переключение застройки растр/контуры). С задержкой, чтобы
@@ -1417,13 +1426,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # участке 95.9 км ОБРЕЗАЛАСЬ краем вида — края нельзя было посмотреть
         # (снимок заказчика 04.09.2026). Район РАСЧЁТА ни в одном из режимов не меняется:
         # он задаётся отдельно (задача 8.2).
-        if hide_tiles:
-            self._set_view_limits((kx0, kx1, ky0, ky1), 0.0)
+        if hide_tiles:                                  # работаем только по этой карте
+            self._apply_view_limits((kx0, kx1, ky0, ky1), only_extra=True)
             self.vb.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.0)
-        else:
-            bx0, bx1, by0, by1 = self.bbox_km
-            self._set_view_limits((min(bx0, kx0), max(bx1, kx1),
-                                   min(by0, ky0), max(by1, ky1)), THREAT_VIEW_PAD_KM)
+        else:                                           # карта лежит внутри области
+            self._apply_view_limits((kx0, kx1, ky0, ky1))
         self._refresh_basemap(force=True)
 
         w_km, h_km = abs(kx1 - kx0), abs(ky1 - ky0)
@@ -1487,13 +1494,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._map_full_km = (kx0, kx1, ky0, ky1)
         self._map_detail = None                      # вектору детализация не нужна
         self._map_detail_box = None
-        if hide_tiles:
-            self._set_view_limits((kx0, kx1, ky0, ky1), 0.0)
+        if hide_tiles:                                  # работаем только по этой карте
+            self._apply_view_limits((kx0, kx1, ky0, ky1), only_extra=True)
             self.vb.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.0)
-        else:
-            bx0, bx1, by0, by1 = self.bbox_km
-            self._set_view_limits((min(bx0, kx0), max(bx1, kx1),
-                                   min(by0, ky0), max(by1, ky1)), THREAT_VIEW_PAD_KM)
+        else:                                           # карта лежит внутри области
+            self._apply_view_limits((kx0, kx1, ky0, ky1))
         self._refresh_basemap(force=True)
         fit = ""
         if points:
@@ -2869,6 +2874,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         kx0, kx1, ky0, ky1 = bbox_km
         self.bbox_km = tuple(bbox_km)
         self.bbox_item.setData([kx0, kx1, kx1, kx0, kx0], [ky0, ky0, ky1, ky1, ky0])
+        self._apply_view_limits()             # район сменился — предел вида считается от него
         # ГАЛОЧКА ВКЛЮЧАЕТСЯ САМА: район задан — значит отсчёт от него и нужен (правило
         # заказчика 04.09.2026). Снять её можно вручную, тогда ноль вернётся в угол области.
         chk = getattr(self, "chk_axes_area", None)
@@ -2918,6 +2924,65 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def set_title(self, text):
         self.pi.setTitle(text, color=THEME["text"], size="10pt")
 
+    # ОТСТУП ПРИ ВПИСЫВАНИИ И ПОЛЕ У ПРЕДЕЛА — про одно и то же поле у края окна, но
+    # считаются в разных местах. ⚠️ Держать их порознь уже ДВАЖДЫ давало «рамка липнет
+    # к краю»: вписывание просит долю кадра, а предел вида столько не даёт и сдвигает
+    # кадр внутрь. Поэтому предел считается от этой же доли, с запасом.
+    VIEW_FIT_PAD = 0.03        # frame_bbox: доля кадра под отступ при вписывании
+    VIEW_LIMIT_PAD = 0.04      # поле у ПРЕДЕЛА вида: та же доля плюс запас
+
+    def _view_aspect(self):
+        # Соотношение сторон ОБЛАСТИ РИСОВАНИЯ (ширина/высота), без осей и подписей.
+        # Отдаёт: float; 1.0, пока размер неизвестен (виджет ещё не показан).
+        try:
+            r = self.vb.boundingRect()
+            if r.width() > 1.0 and r.height() > 1.0:
+                return float(r.width()) / float(r.height())
+        except Exception:                            # виджета ещё нет — вызов из __init__
+            pass
+        return 1.0
+
+    def _fit_frame(self, box, aspect):
+        # Кадр, в который вписывается рамка при заблокированном масштабе осей.
+        # Принимает: рамку (x0,x1,y0,y1) км и соотношение сторон окна. Отдаёт: рамку кадра.
+        x0, x1, y0, y1 = box
+        k = 1.0 + 2.0 * self.VIEW_LIMIT_PAD          # рамка плюс поле с двух сторон
+        fw, fh = (x1 - x0) * k, (y1 - y0) * k        # кадр без учёта формы окна, км
+        if fh <= 0 or fw <= 0:
+            return box
+        if fw / fh < aspect:                         # окно шире рамки — кадр растёт по X
+            fw = fh * aspect
+        else:                                        # окно уже рамки — кадр растёт по Y
+            fh = fw / aspect
+        cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5    # центр рамки: кадр строим вокруг него
+        return (cx - fw * 0.5, cx + fw * 0.5, cy - fh * 0.5, cy + fh * 0.5)
+
+    def _apply_view_limits(self, extra_km=None, only_extra=False):
+        # Ставит пределы перемещения камеры — ОБЪЕДИНЕНИЕ рамок, у каждой своё поле.
+        # Принимает: extra_km (x0,x1,y0,y1) — рамка своей карты-картинки; None — взять
+        # ту, что уже показана. only_extra — режим «только своя карта». Отдаёт: ничего.
+        if extra_km is None:                         # вызов не из загрузки карты
+            extra_km = getattr(self, "_map_full_km", None)   # карта могла быть загружена раньше
+        if only_extra and extra_km:                  # своя карта сама себе граница
+            self._set_view_limits(extra_km, 0.0)     # поля не надо: её край и есть предел
+            return
+        # ⚠️ ПРЕДЕЛ СЧИТАЕТСЯ ПО КАДРУ, А НЕ ПО ДАННЫМ — и область входит в него ВСЕГДА.
+        # Две ошибки разом, обе про чёрную рамку (по ней нарисована граница области):
+        #   1) предел по одному РАЙОНУ режет рамку с той стороны, куда район смещён
+        #      внутри области: на `arh` слева оставалось 101.24 км при поле 100;
+        #   2) при `setAspectLocked` кадр на широком окне ШИРЕ области, и предел по
+        #      данным душит его, обрезая область сверху и снизу (замер: окно 1560×960,
+        #      область 249.6 км показывалась как 197).
+        # Поэтому берём кадр, в который область вписывается при нынешней форме окна.
+        asp = self._view_aspect()
+        parts = [self._fit_frame(self.area_max_km, asp),                 # кадр под область
+                 _pad_box(self.bbox_km, km=THREAT_VIEW_PAD_KM)]          # район + простор
+        if extra_km:                                 # своя карта может торчать за область
+            parts.append(self._fit_frame(extra_km, asp))
+        self._set_view_limits((min(p[0] for p in parts), max(p[1] for p in parts),
+                               min(p[2] for p in parts), max(p[3] for p in parts)),
+                              0.0, min_ref=self.area_max_km)   # приближение — от области
+
     def frame_bbox(self, whole_area=False):
         """Вписать в окно район (по умолчанию) или ВСЮ область показа.
 
@@ -2926,9 +2991,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         83 % ширины: вид отъезжал почти втрое, а на небольшом экране карта превращалась
         в марку посреди пустого поля (заказчик 04.09.2026). Три процента одинаково
         уместны и на 13", и на большом мониторе — доля не зависит ни от размера окна,
-        ни от размера района."""
+        ни от размера района. ⚠️ Отступ виден, только если его пропускает ПРЕДЕЛ вида —
+        см. `_apply_view_limits`."""
         kx0, kx1, ky0, ky1 = self.area_max_km if whole_area else self.bbox_km
-        self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=0.03)
+        self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=self.VIEW_FIT_PAD)
 
     def process_pending(self):
         QtWidgets.QApplication.processEvents()
@@ -3872,9 +3938,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             # ПРИ ЗАПУСКЕ ПОКАЗЫВАЕМ ВСЮ ОБЛАСТЬ — чтобы чёрная рамка (предел расчётов)
             # была видна целиком с первой секунды и на любом экране. Район внутри неё
             # найдётся по синей рамке; кнопка «Весь участок» вписывает именно район.
+            # ⚠️ ПРЕДЕЛ — ПЕРЕД ВПИСЫВАНИЕМ: в `__init__` форма окна ещё не известна,
+            # и предел был посчитан по квадрату; вписывать в него — значит обрезать.
+            self._apply_view_limits()
             self.frame_bbox(whole_area=True)
             self._framed = True
         self._refresh_basemap(force=True)
+
+    def resizeEvent(self, e):
+        # Окно сменило форму -> предел вида пересчитывается: он зависит от соотношения
+        # сторон (см. `_apply_view_limits`). Без этого рамка области обрезается после
+        # разворота окна, хотя при запуске была видна целиком.
+        QtWidgets.QWidget.resizeEvent(self, e)
+        if getattr(self, "_framed", False):           # до первого показа пределов ещё нет
+            self._apply_view_limits()
 
 
 class VectorLayersDialog(QtWidgets.QDialog):
