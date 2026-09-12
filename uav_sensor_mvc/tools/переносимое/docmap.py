@@ -83,7 +83,7 @@ SKIP_DIRS = {".git", ".claude", "tile_cache", "geo_cache", "offline_packages",
 # docmap добавит блок, codemap затрёт его при пересборке, и `--check` обоих будет вечно
 # ругаться. Проверено на деле — оглавление успело попасть в КАРТА_КОДА.md (журнал п. 213).
 SKIP_GENERATED = "теория/карта_кода/"
-SKIP = {"CLAUDE.md", "README.md", "теория/РАЗБОР_DOCMAP.md",
+SKIP = {"CLAUDE.md", "README.md", "теория/код/РАЗБОР_DOCMAP.md",
         "теория/README.md", "теория/журнал/README.md",
         "теория/планы/README.md", "теория/архив/README.md",
         "теория/вкладка_3/README.md", "теория/карты/README.md",
