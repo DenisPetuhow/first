@@ -48,8 +48,8 @@ LONG_OK = {
         "связный разбор механики; 137 ссылок на её §-разделы",
     "теория/планы/8_ПЛАН_КАРТА_И_ИНТЕРФЕЙС.md":
         "закрытый план — хроника, не список дел; 60 ссылок",
-    "теория/журнал/ЖУРНАЛ_5.md":
-        "закрытая часть журнала, переезжает в архив целиком (план 9, задача 9.2)",
+    "теория/архив/журнал/ЖУРНАЛ_5.md":
+        "закрытая часть журнала в архиве — хроника, делить нечего (план 9, задача 9.2)",
 }
 # скрипт лежит в tools/переносимое/, корень проекта — на два уровня выше
 def _find_root(markers=("CLAUDE.md", "config.py")):
@@ -222,6 +222,54 @@ def check_links(docs):
     return bad
 
 
+# ── §-РАЗДЕЛЫ В ССЫЛКАХ ─────────────────────────────────────────────────────────
+# ⚠️ ЦЕЛЫЙ КЛАСС ОШИБОК, КОТОРЫЙ НЕ ЛОВИЛСЯ НИЧЕМ. Ссылка вида
+# `[МЕТОДИЧКА §14.1](путь/МЕТОДИЧКА.md)` ведёт на СУЩЕСТВУЮЩИЙ файл, поэтому битой не
+# считается, — а раздела §14.1 в нём может уже не быть. Такие ссылки уводят молча, и
+# «битых ссылок 0» ничего о них не говорит. Замер 11.09.2026: только на одну методичку
+# ведут 137 ссылок, почти все с номером раздела.
+#
+# Номер раздела в этом проекте живёт в ДВУХ видах, и оба законны:
+#   * заголовком —      `## 14. Маршруты…`, `### 8.1.1. Что требуется`;
+#   * строкой таблицы — `| 5.1 | Участок берётся из реестра | …` (так устроены
+#     ОГРАНИЧЕНИЯ: там разделы — это пронумерованные правила, а не заголовки).
+# Поэтому ищем номер в обоих положениях: иначе половина ссылок на ОГРАНИЧЕНИЯ окажется
+# «битой» на ровном месте.
+SEC_RE = re.compile(r"§\s*(\d+(?:\.\d+)*[а-яё]?)")
+
+
+def _has_section(text, num):
+    """Есть ли в документе раздел с таким номером — заголовком либо строкой таблицы."""
+    n = re.escape(num)
+    if re.search(r"(?m)^#{1,6}[^\n]*?(?<![\d.])" + n + r"(?![\d])", text):
+        return True
+    return bool(re.search(r"(?m)^\|\s*\**\s*" + n + r"\s*\**\s*\|", text))
+
+
+def check_sections(docs):
+    """Ссылки с §-номером, ведущие на файл, где такого раздела нет."""
+    bad, cache = [], {}
+    for rel in docs:
+        base = os.path.dirname(os.path.join(ROOT, rel))
+        text = io.open(os.path.join(ROOT, rel), encoding="utf-8").read()
+        for m in re.finditer(r"\[([^\]]*)\]\(([^)\s]+)\)", text):
+            label, target = m.group(1), m.group(2).split("#")[0].strip()
+            nums = SEC_RE.findall(label)
+            if not nums or not target.endswith(".md"):
+                continue
+            if target.startswith(("http", "mailto:")) or "," in target:
+                continue
+            path = os.path.normpath(os.path.join(base, target.replace("%20", " ")))
+            if not os.path.exists(path):
+                continue                       # это уже поймает check_links
+            if path not in cache:
+                cache[path] = io.open(path, encoding="utf-8").read()
+            for num in nums:
+                if not _has_section(cache[path], num):
+                    bad.append((rel, target, num))
+    return bad
+
+
 # ── СТРУКТУРА ───────────────────────────────────────────────────────────────────
 def check_structure(docs):
     """Папка с документами обязана иметь README, файл — укладываться в MAX_LINES."""
@@ -281,15 +329,24 @@ def main():
         print("  БИТАЯ  %-46s -> %s" % (f, t))
     print("  проверено файлов: %d, битых ссылок: %d" % (len(docs), len(bad)))
 
+    print("\n── §-РАЗДЕЛЫ В ССЫЛКАХ ──")
+    secs = check_sections(docs)
+    for f, t, num in secs[:25]:
+        print("  НЕТ §%-8s %-42s -> %s" % (num, f[:42], t))
+    if len(secs) > 25:
+        print("  … и ещё %d" % (len(secs) - 25))
+    print("  ссылок с номером раздела не найдено: %d" % len(secs))
+
     print("\n── СТРУКТУРА ──")
     problems = check_structure(docs)
     for p in problems:
         print("  " + p)
     print("  папок и файлов в порядке" if not problems else "  замечаний: %d" % len(problems))
 
-    if stale or bad or problems or wrong:
+    if stale or bad or problems or wrong or secs:
         print("\nтребуется вмешательство: оглавлений %d, неверных номеров строк %d, "
-              "битых ссылок %d, замечаний %d" % (stale, len(wrong), len(bad), len(problems)))
+              "битых ссылок %d, §-разделов %d, замечаний %d"
+              % (stale, len(wrong), len(bad), len(secs), len(problems)))
         return 1
     return 0
 

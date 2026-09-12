@@ -16,9 +16,9 @@
 
 | | |
 |---|---|
-| файлов кода | 59 |
-| строк кода | 26044 ≈ 338 тыс. токенов |
-| строк карты | 1035 ≈ 9 тыс. токенов |
+| файлов кода | 60 |
+| строк кода | 26346 ≈ 342 тыс. токенов |
+| строк карты | 1056 ≈ 9 тыс. токенов |
 | частей | 1 (порог деления — 1500 строк) |
 
 ## Модули: где искать
@@ -43,9 +43,10 @@
 | `model/area_start.py` | 396 | 5148 | 1 | 28 | [КАРТА_1.md](КАРТА_1.md) стр. **911** |
 | `tools/reference_cases.py` | 390 | 5070 | 0 | 6 | [КАРТА_1.md](КАРТА_1.md) стр. **953** |
 | `tools/flow_check.py` | 357 | 4641 | 0 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **967** |
-| `main_qt.py` | 354 | 4602 | 0 | 5 | [КАРТА_1.md](КАРТА_1.md) стр. **976** |
-| `model/optimization.py` | 337 | 4381 | 1 | 11 | [КАРТА_1.md](КАРТА_1.md) стр. **987** |
-| `view_qt/area_view.py` | 306 | 3978 | 1 | 18 | [КАРТА_1.md](КАРТА_1.md) стр. **1007** |
+| `tools/переносимое/docmap.py` | 355 | 4615 | 0 | 11 | [КАРТА_1.md](КАРТА_1.md) стр. **976** |
+| `main_qt.py` | 354 | 4602 | 0 | 5 | [КАРТА_1.md](КАРТА_1.md) стр. **997** |
+| `model/optimization.py` | 337 | 4381 | 1 | 11 | [КАРТА_1.md](КАРТА_1.md) стр. **1008** |
+| `view_qt/area_view.py` | 306 | 3978 | 1 | 18 | [КАРТА_1.md](КАРТА_1.md) стр. **1028** |
 
 ## Мелкие модули — читаются целиком
 
@@ -53,12 +54,12 @@
 
 | Модуль | Строк | Что внутри |
 |---|---|---|
-| `tools/переносимое/docmap.py` | 298 | `_find_root`, `norm`, `walk_md`, `build_toc`, `apply_toc`, `verify_toc`, `check_links`, `check_structure`, `main` |
 | `controller/controller.py` | 285 | `SimulationController`, `__init__`, `_make_timer`, `_toggles`, `_layers`, `on_apply`, `on_mode`, `on_traj`, `on_profile`, `on_law`, `on_speed`, `on_toggle`, … (27 всего) |
 | `view_qt/map_anchor.py` | 275 | `MapAnchor`, `__init__`, `choose_model`, `matrix`, `_from_bbox`, `_from_points`, `px_to_km`, `invert`, `km_to_px`, `px_box_for_view`, `corners_km`, `bbox_km`, … (17 всего) |
-| `tools/переносимое/check_names.py` | 252 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
+| `tools/переносимое/check_names.py` | 255 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
 | `view_qt/basemap_mixin.py` | 249 | `_BasemapSignals`, `_BasemapTask`, `__init__`, `run`, `BasemapMixin`, `_init_basemap`, `_set_view_limits`, `_refresh_basemap`, `_on_basemap_ready`, `_fade_basemap`, `_set_scheme_visible`, `_draw_scheme`, … (15 всего) |
 | `tools/reference_run.py` | 243 | `_fmt`, `main` |
+| `tools/переносимое/check_dates.py` | 242 | `_find_root`, `git_date`, `_key`, `docs`, `git_rows`, `write_folder_logs`, `main` |
 | `tools/переносимое/check_claims.py` | 240 | `_find_root`, `docs`, `paragraphs`, `selftest`, `main` |
 | `view_qt/map_vector.py` | 220 | `is_vector`, `svg_size`, `inspect_svg`, `describe_content`, `make_item`, `place_item`, `render_for_fit`, `measure_draw` |
 | `model/simulation.py` | 217 | `SimulationModel`, `__init__`, `reset`, `_compute_view_bbox`, `set_traj_model`, `corridor_bbox`, `corridor_outline`, `view_bbox`, `sample_trajectory`, `_anchor_idx`, `frequent_paths`, `fan_paths`, … (15 всего) |
