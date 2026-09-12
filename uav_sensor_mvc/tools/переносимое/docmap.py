@@ -222,6 +222,39 @@ def check_links(docs):
     return bad
 
 
+# ── ТЕКСТ ССЫЛКИ ПРОТИВ ЕЁ ПУТИ ─────────────────────────────────────────────────
+# ⚠️ ЕЩЁ ОДИН МОЛЧАЛИВЫЙ КЛАСС ОШИБОК. Ссылка вида `[пособие/5_ТЕОРИЯ_В_КОДЕ.md](
+# ../код/5_ТЕОРИЯ_В_КОДЕ.md)` рабочая: путь верен, файл существует, проверка ссылок
+# довольна. Но ТЕКСТ называет папку, в которой файла давно нет, — и читатель идёт искать
+# руками не туда. Появляется это само собой при переносе файлов: пути правит скрипт,
+# подписи остаются прежними. Поймано 12.09.2026 на себе: после разбора корня теории
+# так соврали пять ссылок.
+LABEL_PATH = re.compile(r"([\wА-Яа-яЁё_-]+)/([\wА-Яа-яЁё_.-]+\.md)")
+
+
+def check_labels(docs):
+    """Ссылки, где текст называет папку, отличную от настоящей. Возвращает (файл, текст, путь)."""
+    bad = []
+    for rel in docs:
+        base = os.path.dirname(rel)
+        text = io.open(os.path.join(ROOT, rel), encoding="utf-8").read()
+        for m in re.finditer(r"\[([^\]]*)\]\(([^)\s]+)\)", text):
+            label, target = m.group(1), m.group(2).split("#")[0].strip()
+            if not target.endswith(".md") or target.startswith(("http", "mailto:")):
+                continue
+            lm = LABEL_PATH.search(label)
+            if not lm:
+                continue                      # в тексте папка не названа — сверять нечего
+            # настоящий путь цели ОТ КОРНЯ проекта
+            real = norm(os.path.normpath(os.path.join(base, target.replace("%20", " "))))
+            said = "%s/%s" % (lm.group(1), lm.group(2))
+            # ⚠️ «журнал/README.md» и «теория/журнал/README.md» — одно и то же: в тексте
+            # часто пишут хвост пути, а не полный. Поэтому сравнение по СУФФИКСУ.
+            if not real.endswith(said):
+                bad.append((rel, said, real))
+    return bad
+
+
 # ── §-РАЗДЕЛЫ В ССЫЛКАХ ─────────────────────────────────────────────────────────
 # ⚠️ ЦЕЛЫЙ КЛАСС ОШИБОК, КОТОРЫЙ НЕ ЛОВИЛСЯ НИЧЕМ. Ссылка вида
 # `[МЕТОДИЧКА §14.1](путь/МЕТОДИЧКА.md)` ведёт на СУЩЕСТВУЮЩИЙ файл, поэтому битой не
@@ -329,6 +362,12 @@ def main():
         print("  БИТАЯ  %-46s -> %s" % (f, t))
     print("  проверено файлов: %d, битых ссылок: %d" % (len(docs), len(bad)))
 
+    print("\n── ТЕКСТ ССЫЛКИ ПРОТИВ ПУТИ ──")
+    labels = check_labels(docs)
+    for f, said, real in labels[:20]:
+        print("  ВРЁТ   %-38s текст «%s» -> %s" % (f[:38], said, real))
+    print("  подписей, называющих не ту папку: %d" % len(labels))
+
     print("\n── §-РАЗДЕЛЫ В ССЫЛКАХ ──")
     secs = check_sections(docs)
     for f, t, num in secs[:25]:
@@ -343,10 +382,10 @@ def main():
         print("  " + p)
     print("  папок и файлов в порядке" if not problems else "  замечаний: %d" % len(problems))
 
-    if stale or bad or problems or wrong or secs:
+    if stale or bad or problems or wrong or secs or labels:
         print("\nтребуется вмешательство: оглавлений %d, неверных номеров строк %d, "
-              "битых ссылок %d, §-разделов %d, замечаний %d"
-              % (stale, len(wrong), len(bad), len(secs), len(problems)))
+              "битых ссылок %d, врущих подписей %d, §-разделов %d, замечаний %d"
+              % (stale, len(wrong), len(bad), len(labels), len(secs), len(problems)))
         return 1
     return 0
 
