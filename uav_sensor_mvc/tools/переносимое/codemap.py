@@ -139,16 +139,41 @@ def public_names(root, files):
     return used
 
 
-def git_counts(root, path, since_rev=None):
-    """Сколько коммитов трогали путь (весь, либо после ревизии)."""
+def git_counts(root, path, since_rev=None, since_date=None):
+    """Сколько коммитов трогали путь (весь, после ревизии либо после ДАТЫ).
+
+    ⚠️ `since_date` появился 12.09.2026 и чинит ПОРЧУ МЕРЫ ИЗМЕРЕНИЕМ. Отсчёт от
+    последнего коммита документа врёт, если документ правили НЕ ПО СУЩЕСТВУ: в тот день
+    во все документы разом проставили отметку «Правился», и `--stale` мгновенно
+    «очистился» — одиннадцать отставших документов стали выглядеть свежими, хотя их
+    содержание никто не сверял. Дата берётся из самой отметки (см. `verified_since`).
+    """
     cmd = ["git", "-C", root, "rev-list", "--count", "HEAD"]
-    if since_rev:
+    if since_date:
+        cmd = ["git", "-C", root, "rev-list", "--count",
+               "--since=%s" % since_date, "HEAD"]
+    elif since_rev:
         cmd = ["git", "-C", root, "rev-list", "--count", "%s..HEAD" % since_rev]
     cmd += ["--", path]
     try:
         return int(subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip())
     except Exception:
         return -1
+
+
+_VERIFIED_RE = re.compile(r"не сверял[оа]сь с (\d{2})\.(\d{2})\.(\d{4})")
+
+
+def verified_since(text):
+    """Дата в формате git (ГГГГ-ММ-ДД) из отметки «содержание не сверялось с …», либо None.
+
+    ⚠️ ЗАЧЕМ. Документ может быть свежим по git и при этом непроверенным по существу:
+    правка шапки, переименование, перенос в другую папку — всё это обновляет дату коммита,
+    но ничего не говорит о содержании. Отметка «не сверялось с» — единственное место, где
+    записано, когда содержание сверяли НА САМОМ ДЕЛЕ. Ставит её `check_dates.py`.
+    """
+    m = _VERIFIED_RE.search(text[:2000])       # отметка живёт в шапке, не глубже
+    return "%s-%s-%s" % (m.group(3), m.group(2), m.group(1)) if m else None
 
 
 def last_commit(root, path):
@@ -369,15 +394,21 @@ def stale_report(root, docs_dir="теория"):
         rev, date = last_commit(root, rel)
         if not rev:
             continue
+        # ⚠️ ЕСЛИ ДОКУМЕНТ САМ ПРИЗНАЁТСЯ, что содержание не сверялось с такой-то даты, —
+        # верить ему, а не git. Правка шапки не делает содержание проверенным.
+        since = verified_since(text)
         hits = []
         for base in named:
             for path in by_name[base]:
-                k = git_counts(root, path, since_rev=rev)
+                k = (git_counts(root, path, since_date=since) if since
+                     else git_counts(root, path, since_rev=rev))
                 if k > 0:
                     hits.append((k, base))
         if hits:
             hits.sort(reverse=True)
-            rows.append((sum(k for k, _b in hits), rel, date, hits[:4]))
+            # показываем ту дату, ОТ КОТОРОЙ реально считали: либо «сверялось с», либо git
+            shown = ("%s (сверялось)" % since) if since else date
+            rows.append((sum(k for k, _b in hits), rel, shown, hits[:4]))
     return sorted(rows, reverse=True)
 
 
@@ -393,8 +424,11 @@ def main(argv=None):
         rows = stale_report(root)
         dirty = uncommitted(root)
         print("СРОК ГОДНОСТИ ДОКУМЕНТАЦИИ")
-        print("Сколько раз правили КОД, который документ сам упоминает, ПОСЛЕ последней")
-        print("правки этого документа.\n")
+        print("Сколько раз правили КОД, который документ сам упоминает, ПОСЛЕ того как")
+        print("содержание документа последний раз СВЕРЯЛИ.")
+        print("Отсчёт: от отметки «содержание не сверялось с …», если она есть, иначе от")
+        print("последнего коммита документа. ⚠️ Правка шапки или перенос файла обновляют")
+        print("git, но содержание проверенным не делают — отсюда и первый вариант.\n")
         if not rows:
             print("Документов, отставших от упоминаемого кода, нет.")
             return 0
