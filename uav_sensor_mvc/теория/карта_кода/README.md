@@ -17,7 +17,7 @@
 | | |
 |---|---|
 | файлов кода | 60 |
-| строк кода | 26440 ≈ 343 тыс. токенов |
+| строк кода | 26444 ≈ 343 тыс. токенов |
 | строк карты | 1059 ≈ 9 тыс. токенов |
 | частей | 1 (порог деления — 1500 строк) |
 
@@ -57,7 +57,7 @@
 | `controller/controller.py` | 285 | `SimulationController`, `__init__`, `_make_timer`, `_toggles`, `_layers`, `on_apply`, `on_mode`, `on_traj`, `on_profile`, `on_law`, `on_speed`, `on_toggle`, … (27 всего) |
 | `view_qt/map_anchor.py` | 275 | `MapAnchor`, `__init__`, `choose_model`, `matrix`, `_from_bbox`, `_from_points`, `px_to_km`, `invert`, `km_to_px`, `px_box_for_view`, `corners_km`, `bbox_km`, … (17 всего) |
 | `tools/reference_run.py` | 264 | `_fmt`, `main` |
-| `tools/переносимое/check_names.py` | 255 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
+| `tools/переносимое/check_names.py` | 259 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
 | `view_qt/basemap_mixin.py` | 249 | `_BasemapSignals`, `_BasemapTask`, `__init__`, `run`, `BasemapMixin`, `_init_basemap`, `_set_view_limits`, `_refresh_basemap`, `_on_basemap_ready`, `_fade_basemap`, `_set_scheme_visible`, `_draw_scheme`, … (15 всего) |
 | `tools/переносимое/check_dates.py` | 242 | `_find_root`, `git_date`, `_key`, `docs`, `git_rows`, `write_folder_logs`, `main` |
 | `tools/переносимое/check_claims.py` | 240 | `_find_root`, `docs`, `paragraphs`, `selftest`, `main` |
