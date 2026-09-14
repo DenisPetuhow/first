@@ -313,7 +313,10 @@ def check_structure(docs):
     for d, files in sorted(dirs.items()):
         if not d:
             continue
-        if not any(os.path.basename(f) == "README.md" for f in files):
+        # ⚠️ README может идти с номером (`01.README.md`) — заказчик нумерует файлы
+        # папки ради порядка в проводнике (13.09.2026, `теория/код/`)
+        if not any(re.match(r"^(?:\d+[._])?README\.md$", os.path.basename(f))
+                   for f in files):
             problems.append("папка без README: %s (%d файлов)" % (d, len(files)))
     allowed = []
     for rel in docs:

@@ -100,6 +100,25 @@ def save_flights(path, model):
     return len(routes_deg), n_points
 
 
+def split_repeats(route, atol=1e-9):
+    # Запись из нескольких ОДИНАКОВЫХ проходов подряд -> отдельные проходы.
+    # Вход: массив (M,2) в градусах, допуск совпадения, градусы. Отдаёт: список массивов (M/k,2);
+    # без повторов — [route].
+    a = np.asarray(route, float)             # точки записи, градусы
+    m = len(a)                               # точек в записи
+    # ⚠️ Файл из KML (14.09.2026) пишет маршрут 16 проходами подряд — 29 точек × 16 = 464, и
+    # это ЗАДУМАНО (заказчик). Одной ломаной запись рисовалась с возвратом из конца прохода в
+    # начало — 15 прямых через всю область. Поэтому проходы ДЕЛЯТСЯ, все точки сохраняются;
+    # свести к одному проходу на запись — галочка «обобщать» (ThreatModel.set_generalize_loaded).
+    # Ищется САМЫЙ КОРОТКИЙ проход, при котором каждый следующий точно повторяет предыдущий.
+    for p in range(2, m // 2 + 1):          # p — длина прохода: не короче 2 точек, проходов ≥ 2
+        if m % p:                            # проходы не укладываются в запись целиком
+            continue                         # — такая длина прохода невозможна
+        if np.allclose(a[p:], a[:-p], rtol=0.0, atol=atol):   # каждый проход повторяет предыдущий
+            return [a[i:i + p].copy() for i in range(0, m, p)]   # все проходы, каждый целиком
+    return [a]                               # повторов нет — запись как есть
+
+
 def load_flights(path):
     """Прочитать файл истории полётов → `(маршруты, отчёт)`.
 
@@ -144,9 +163,21 @@ def load_flights(path):
             cur.append((lon, lat))
     if cur:
         routes.append(np.asarray(cur, float))
-    n_points = sum(len(r) for r in routes)
+    # одинаковые проходы подряд -> отдельные маршруты (см. split_repeats): иначе возвраты через карту
+    in_file = len(routes)                        # записей R в файле
+    split, groups, with_repeats = [], [], 0      # проходы; номер записи у каждого; записей из проходов
+    for g, r in enumerate(routes):
+        parts = split_repeats(r)                 # проходы записи; без повторов — она одна
+        with_repeats += len(parts) > 1           # запись состояла из одинаковых проходов
+        split.extend(parts)
+        groups.extend([g] * len(parts))          # каждому проходу — номер его записи (для обобщения)
+    routes = split
+    n_points = sum(len(r) for r in routes)       # точек во всех проходах
     return routes, dict(recognized=recognized, n_routes=len(routes),
-                        n_points=n_points, rejected=rejected)
+                        n_points=n_points, rejected=rejected,
+                        routes_in_file=in_file,              # записей R в файле
+                        routes_with_repeats=with_repeats,    # из них поделено на проходы
+                        groups=groups)                       # номер записи у каждого маршрута
 
 
 def check_compatible(routes, report):

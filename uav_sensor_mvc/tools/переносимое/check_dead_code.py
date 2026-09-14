@@ -145,6 +145,12 @@ def unused_functions(files, defs):
     for name, places in sorted(defs.items()):
         if name.startswith("__") or name in ENTRY_POINTS:
             continue
+        # ⚠️ ОБРАБОТЧИК СОБЫТИЯ Qt (`wheelEvent`, `mousePressEvent`…) вызывает сам Qt, из
+        # кода к нему никто не обращается. Прочие переопределения проходили случайно — их
+        # где-то зовут по имени (`QWidget.showEvent(self, e)`), а `wheelEvent` в
+        # `SteppedViewBox` так не зовут, и 13.09.2026 он всплыл ложной находкой.
+        if re.match(r"^[a-z][A-Za-z]*Event$", name):   # имя по соглашению Qt
+            continue                                   # вызывается фреймворком
         if uses.get(name, 0) > 0:
             continue
         # имя нигде не вызывается; но если оно встречается в ТЕКСТЕ — это либо вызов

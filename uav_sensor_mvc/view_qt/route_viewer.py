@@ -22,12 +22,13 @@ from PyQt5 import QtWidgets
 class RouteViewerDialog(QtWidgets.QDialog):
     """Окно немодальное — не мешает работать с картой, пока открыто."""
 
-    def __init__(self, parent, on_preview, on_reset):
+    def __init__(self, parent, on_preview, on_reset, on_generalize=None):
         super().__init__(parent)
         self.setWindowTitle("Посмотреть маршруты")
         self.resize(620, 520)
         self._on_preview = on_preview      # callback(is_loaded: bool, index: int)
         self._on_reset = on_reset          # callback() -> убрать подсветку на карте
+        self._on_generalize = on_generalize or (lambda on: None)   # callback(on: bool) — галочка обобщения
         self._own_routes = []              # свои пройденные: список массивов (lon, lat)
         self._loaded_routes = []           # загруженная история: то же самое
 
@@ -36,6 +37,18 @@ class RouteViewerDialog(QtWidgets.QDialog):
         self.lbl_status = QtWidgets.QLabel("—")
         self.lbl_status.setWordWrap(True)
         col.addWidget(self.lbl_status)
+
+        # ОБОБЩЕНИЕ ОДИНАКОВЫХ ПРОХОДОВ (заказчик 14.09.2026). Файл из KML пишет маршрут 16
+        # проходами подряд: без галочки каждый проход — свой маршрут (64), с галочкой — по
+        # одному на запись файла (4). По умолчанию ВЫКЛЮЧЕНА. Считает модель, окно только просит.
+        self.chk_generalize = QtWidgets.QCheckBox("Обобщать одинаковые проходы загруженной истории")
+        self.chk_generalize.setToolTip(
+            "Выключено — каждый проход из файла отдельным маршрутом, все точки на месте.\n"
+            "Включено — по одному проходу на запись файла: одинаковые проходы подряд "
+            "считаются одним маршрутом. Недоступно, если повторов в файле нет.")
+        self.chk_generalize.setEnabled(False)
+        self.chk_generalize.toggled.connect(lambda on: self._on_generalize(bool(on)))
+        col.addWidget(self.chk_generalize)
 
         row_src = QtWidgets.QHBoxLayout()
         self.btn_own = QtWidgets.QPushButton("Свои маршруты")
@@ -82,6 +95,19 @@ class RouteViewerDialog(QtWidgets.QDialog):
         col.addWidget(close)
 
     # ---------- данные ----------
+    def set_generalize_state(self, available, on, records, passes):
+        # Показать состояние галочки обобщения, не вызывая колбэк.
+        # Вход: есть что обобщать (bool), включена (bool), записей в файле, проходов всего (int).
+        # Отдаёт: ничего.
+        self.chk_generalize.blockSignals(True)       # это отражение модели, а не нажатие человека
+        self.chk_generalize.setChecked(bool(on))
+        self.chk_generalize.blockSignals(False)
+        self.chk_generalize.setEnabled(bool(available))
+        self.chk_generalize.setText(
+            "Обобщать одинаковые проходы загруженной истории (%d записей, %d проходов)"
+            % (records, passes) if available else
+            "Обобщать одинаковые проходы загруженной истории — повторов нет")
+
     def set_data(self, own_routes_lonlat, loaded_routes_lonlat):
         """Обновить оба списка — вызывается и при открытии окна, и ДИНАМИЧЕСКИ по ходу
         прохода (заказчик 06.09.2026: «в таблице чтобы сразу записывались маршруты после

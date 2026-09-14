@@ -27,7 +27,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import THREAT_AREA, THREAT_BBOX_LONLAT, THREAT_AREA_DIR   # noqa: E402
+from config import THREAT_AREA, THREAT_BBOX_LONLAT, THREAT_TILE_AREA  # noqa: E402
 from view_qt import geomap as gm                                       # noqa: E402
 
 
@@ -73,7 +73,7 @@ def main(argv=None):
     root = gm.cache_root()
     # папка участка в кэше; со своей рамкой (--bbox) участок неизвестен — считаем обе
     # раскладки, но «в папке участка» показываем по активному
-    area = THREAT_AREA_DIR or ""
+    area = THREAT_TILE_AREA or ""
     z0, z1 = a.zoom
 
     line = "=" * 66

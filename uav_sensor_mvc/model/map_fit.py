@@ -266,11 +266,12 @@ def layers_for_fit(npz_path):
     Отдельной функцией, потому что нужна двоим: окну «Своя карта» и утилите
     `tools/map_fit.py`. Бросает `ValueError` с понятным текстом, если подбирать не по
     чему, — на карте без застройки метод не работает, и человеку надо это сказать."""
-    z = np.load(npz_path, allow_pickle=True)
-    places = [np.asarray(z[k], float) for k in z.files
-              if k.split("__")[0] == "place_pts"]
-    built = [np.asarray(z[k], float) for k in z.files
-             if k.split("__")[0] == "built_up"]
+    # слои — общим загрузчиком модели: он читает и прежний, и упакованный формат (14.09.2026);
+    # свой разбор по префиксу ключей упакованный файл не увидел бы вовсе
+    from model.threat_grid import _load_layers_npz
+    z = _load_layers_npz(npz_path)
+    places = [np.asarray(a, float) for a in z.get("place_pts", [])]
+    built = [np.asarray(a, float) for a in z.get("built_up", [])]
     built = [b for b in built if b.ndim == 2 and b.shape[1] >= 2]
     if not places or not built:
         raise ValueError(

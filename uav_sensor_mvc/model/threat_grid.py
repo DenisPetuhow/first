@@ -1327,12 +1327,29 @@ def layers_cache_path():
 OSM_LAYER_FILTERS = {
     "river":      {"waterway": ["river", "canal"]},
     "stream":     {"waterway": ["stream"]},
+    "ditch":      {"waterway": ["ditch", "drain"]},     # мелиоративные канавы
     "road_major": {"highway": ["motorway", "trunk", "primary", "secondary"]},
-    "road_local": {"highway": ["tertiary", "unclassified", "residential"]},
-    "railway":    {"railway": ["rail"]},
-    "power":      {"power": ["line"]},
+    # `road` — дорога, класс которой при разметке не указали (120 шт., 212 км): по сути
+    # обычная местная дорога, в фильтр не попадала только из-за названия
+    "road_local": {"highway": ["tertiary", "unclassified", "residential", "road"]},
+    "railway":    {"railway": ["rail", "narrow_gauge"]},  # узкоколейка — лесовозная
+    "railway_old": {"railway": ["abandoned", "disused"]},
+    # `minor_line` — ЛЭП низкого напряжения (113 шт., 580 км): в лесу под ней такая же
+    # вырубка, а брали только `line`
+    "power":      {"power": ["line", "minor_line"]},
     "pipeline":   {"man_made": ["pipeline"]},
     "tree_row":   {"natural": ["tree_row"]},
+    # ⚠️ ПРОСЕКА — один вид, без разновидностей: все 756 объектов участка `arh` помечены
+    # только `man_made=cutline`, уточняющего тега `cutline=*` (квартальная, противопожарная,
+    # под ЛЭП) в данных нет. Поэтому слой один, делить не на что (проверено 13.09.2026).
+    "cutline":    {"man_made": ["cutline"]},
+    # ⚠️ ЛЕСНАЯ ДОРОГА — берём ВСЕ `highway=track`, без отбора по качеству: уточняющих
+    # тегов почти нет (`tracktype` у 157 из 8 739), отбор выбросил бы почти всё.
+    # Сюда же (заказчик 13.09.2026): `service` — подъезды к карьерам и базам (3 105 шт.,
+    # 789 км) и ЗАБРОШЕННЫЕ лесные дороги под приставкой `abandoned:highway` (302 шт.,
+    # 519 км) — от фильтра их прятало только название. Тропы (`path`) НЕ берём: под
+    # пологом леса сверху их не видно.
+    "track":      {"highway": ["track", "service"], "abandoned:highway": ["track"]},
     "bridge":     {"bridge": ["yes", "viaduct"]},
     "built_up":   {"landuse": ["residential", "industrial"]},
 }
@@ -1385,13 +1402,17 @@ PLACE_BUILT_MIN_KM2 = 2.0
 OSM_CLIP_MARGIN_KM = 3.0
 
 
-def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
+def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None, only_layers=None, with_places=True):
     """Прочитать локальный .osm.pbf и вернуть слои в км-фрейме (lon0,lat0).
 
     Требует pyrosm/geopandas (устанавливаются отдельно, см. requirements). Читает
     только выбранный bbox (по THREAT_BBOX_LONLAT, если не задан), фильтрует объекты
     по OSM_LAYER_FILTERS. Это единая логика чтения OSM — общая для CLI-скрипта и
-    окна «Выбрать цифровые карты» в интерфейсе (без дублирования)."""
+    окна «Выбрать цифровые карты» в интерфейсе (без дублирования).
+
+    only_layers — набор имён слоёв (None — все), with_places — собирать ли пункты.
+    ⚠️ Нужны для РАЗБОРА ПО ЯДРАМ (`tools/pack_area.py --jobs`, план 10.13): каждый процесс
+    берёт свою группу слоёв тем же кодом, и итог совпадает с последовательным побайтово."""
     try:
         from pyrosm import OSM
     except Exception as e:
@@ -1408,6 +1429,8 @@ def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
     clip = _clip_box_km(lon0, lat0, (lo, la, ho, ha), OSM_CLIP_MARGIN_KM)
     out = {}
     for layer, flt in OSM_LAYER_FILTERS.items():
+        if only_layers is not None and layer not in only_layers:   # слой достался другому процессу
+            continue                                               # — его здесь не собираем
         try:
             gdf = osm.get_data_by_custom_criteria(
                 custom_filter=flt, filter_type="keep",
@@ -1424,6 +1447,8 @@ def layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat=None):
         parts = _clip_parts(parts, clip)
         if parts:
             out[layer] = parts
+    if not with_places:                          # пункты собирает другой процесс
+        return out
     place_pts, place_poly, place_names = _places_from_osm(osm, lon0, lat0, clip)
     if len(place_pts):
         out[PLACE_LAYER] = [place_pts]
@@ -1569,30 +1594,54 @@ def _sample_geotiff(path, lon, lat, cell_deg=None):
     было лотереей. Замер расхождения с усреднением: медиана 1.4 м, 95-й процентиль 6.4 м,
     максимум 42.5 м на обрывах. Вдобавок SRTM — модель ПОВЕРХНОСТИ, и одиночный пиксель
     мог попасть на крону дерева. Считается через интегральное изображение: одна свёртка
-    на весь растр независимо от числа ячеек."""
+    на окно растра под точками (не на весь растр) независимо от числа ячеек."""
     try:
         import rasterio
     except Exception:
         return None
     with rasterio.open(path) as ds:
-        band = np.asarray(ds.read(1), dtype=np.float64)
-        bad = ~np.isfinite(band)
-        if ds.nodata is not None:
+        inv = ~ds.transform                         # градусы -> пиксели растра
+        cols, rows = inv * (lon.ravel(), lat.ravel())
+        c_all = np.asarray(cols).reshape(lon.shape)   # столбец каждой точки во всём растре, пиксели
+        r_all = np.asarray(rows).reshape(lon.shape)   # строка каждой точки во всём растре, пиксели
+        if cell_deg is None:                        # ближайший пиксель — окно усреднения нулевое
+            hx = hy = 0.0
+        else:                                       # среднее по ячейке
+            hx = 0.5 * abs(float(cell_deg[0]) / ds.transform.a)   # полуячейка по X, пиксели
+            hy = 0.5 * abs(float(cell_deg[1]) / ds.transform.e)   # полуячейка по Y, пиксели
+        if not np.isfinite(r_all).any():            # ни одной настоящей точки
+            return np.full(lon.shape, np.nan)       # — высот нет
+        # ⚠️ ЧИТАЕТСЯ ОКНО ТОЧЕК, А НЕ ВЕСЬ РАСТР (14.09.2026). Прежде `ds.read(1)` брал растр
+        # целиком: сшитый рельеф области Marshut — 33 528 × 43 300 пикселей, ~10.8 ГБ в float64
+        # плюс две интегральные картинки того же размера, и построение карты на районе
+        # 56 × 50 км шло 86 с. Окно покрывает все точки с полуячейкой и 2 пикселями запаса и
+        # обрезано по краям растра — окна усреднения точек целиком внутри, те же пиксели.
+        # Ближайший пиксель совпадает до бита; среднее по ячейке — до 1.3e-7 м: интегральная
+        # сумма копится от угла окна, а не растра, и округление больших сумм ложится иначе.
+        # Замер: arh 5.55 -> 0.73 с, разошлось 178 ячеек из 35 186 (макс 1.2e-8 м);
+        # Marshut 67.91 -> 0.26 с, 759 из 11 300 (макс 1.26e-7 м); маршруты и датчики те же.
+        pad = 2                                     # запас окна, пиксели
+        r_lo = int(np.clip(np.floor(np.nanmin(r_all) - hy) - pad, 0, ds.height))   # верх окна
+        r_hi = int(np.clip(np.ceil(np.nanmax(r_all) + hy) + pad, 0, ds.height))    # низ окна (не вкл.)
+        c_lo = int(np.clip(np.floor(np.nanmin(c_all) - hx) - pad, 0, ds.width))    # левый край окна
+        c_hi = int(np.clip(np.ceil(np.nanmax(c_all) + hx) + pad, 0, ds.width))     # правый край (не вкл.)
+        if r_hi <= r_lo or c_hi <= c_lo:            # точки целиком вне растра
+            return np.full(lon.shape, np.nan)       # — высот нет
+        band = np.asarray(ds.read(1, window=((r_lo, r_hi), (c_lo, c_hi))), dtype=np.float64)   # окно, м
+        bad = ~np.isfinite(band)                    # пиксели без высоты
+        if ds.nodata is not None:                   # у растра объявлено «пустое» значение
             bad |= (band == float(ds.nodata))
         bad |= (band < -1000.0)                     # типовые «пустые» значения SRTM
-        inv = ~ds.transform
-        cols, rows = inv * (lon.ravel(), lat.ravel())
-        c = np.asarray(cols).reshape(lon.shape)
-        r = np.asarray(rows).reshape(lon.shape)
+        r = r_all - r_lo                            # строки точек в окне, пиксели
+        c = c_all - c_lo                            # столбцы точек в окне, пиксели
         if cell_deg is None:                        # ближайший пиксель
+            h, w = band.shape                       # размер окна, пиксели
             ci = np.rint(c).astype(int); ri = np.rint(r).astype(int)
-            ok = ((ci >= 0) & (ci < ds.width) & (ri >= 0) & (ri < ds.height))
+            ok = ((ci >= 0) & (ci < w) & (ri >= 0) & (ri < h))   # точка внутри окна (= внутри растра)
             vals = np.full(lon.shape, np.nan)
-            take = ok & ~bad[np.clip(ri, 0, ds.height - 1), np.clip(ci, 0, ds.width - 1)]
+            take = ok & ~bad[np.clip(ri, 0, h - 1), np.clip(ci, 0, w - 1)]
             vals[take] = band[ri[take], ci[take]]
             return vals
-        hx = 0.5 * abs(float(cell_deg[0]) / ds.transform.a)   # полуячейка в пикселях
-        hy = 0.5 * abs(float(cell_deg[1]) / ds.transform.e)
         return _block_mean_at(band, bad, r, c, hy, hx)
 
 
@@ -1803,16 +1852,49 @@ def _geom_to_kms(geom, lon0, lat0):
     return out
 
 
+# ⚠️ УПАКОВАННЫЙ ФОРМАТ СЛОЁВ (14.09.2026). Прежний формат — массив на КАЖДУЮ линию
+# (`<слой>__<i>`): на области Marshut это 2.6 млн массивов в 741 МБ, и модель читала файл
+# десятки минут — программа при открытии области просто стояла. Упакованный — на слой ДВА
+# массива: все точки подряд (`<слой>@xy`) и границы линий (`<слой>@off`, длина N+1). Линии
+# нарезаются при чтении видами на общий буфер — копий нет. Прежний формат читается как был.
+PACK_SEP = "@"
+
+
+def packed_npz_arrays(layers):
+    # Слои -> массивы для `np.savez_compressed` в упакованном формате (два массива на слой).
+    # Вход: dict имя -> список массивов (N,2|3), км. Отдаёт: dict имя ключа -> массив.
+    out = {}                                                        # массивы будущего файла
+    for name, parts in layers.items():
+        arrs = [np.asarray(a) for a in parts]                       # линии слоя
+        same = (arrs and all(a.dtype.kind not in "US" and a.ndim == 2 for a in arrs)
+                and len({a.shape[1] for a in arrs}) == 1)          # числа и одна ширина строки
+        if same:                                                    # слой упаковывается целиком
+            lens = np.fromiter((len(a) for a in arrs), np.int64, len(arrs))   # точек в каждой линии
+            out[name + PACK_SEP + "xy"] = np.concatenate(arrs).astype(np.float32)   # все точки подряд
+            out[name + PACK_SEP + "off"] = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64)   # границы линий
+        else:                                                       # имена пунктов — строки
+            for i, a in enumerate(arrs):                            # — по-старому, массив на объект
+                out["%s__%d" % (name, i)] = a if a.dtype.kind in "US" else a.astype(np.float32)
+    return out
+
+
 def _load_layers_npz(path):
-    """Слои из .npz, подготовленного офлайн-скриптом. Формат: ключи '<layer>__<i>'
-    -> массив (N,2) в км; наличие ключа задаёт слой."""
+    # Слои из .npz — оба формата: прежний (`<слой>__<i>`) и упакованный (`@xy` + `@off`).
+    # Вход: путь к файлу. Отдаёт: dict имя слоя -> список массивов (N,2|3), км.
     d = np.load(path, allow_pickle=True)
-    out = {}
+    out, packed = {}, {}                                     # слои; упакованные: имя -> {часть: ключ}
     for key in d.files:
-        if "__" not in key:
+        if PACK_SEP in key:                                  # ключ упакованного слоя
+            name, part = key.rsplit(PACK_SEP, 1)             # — запоминаем, соберём ниже
+            packed.setdefault(name, {})[part] = key
             continue
-        name, _idx = key.rsplit("__", 1)
+        if "__" not in key:                                  # служебный ключ без номера
+            continue                                         # — не слой
+        name, _idx = key.rsplit("__", 1)                     # rsplit: в имени слоя тоже бывает «_»
         out.setdefault(name, []).append(d[key])
+    for name, keys in packed.items():
+        xy, off = d[keys["xy"]], d[keys["off"]]              # все точки слоя; границы линий
+        out.setdefault(name, []).extend(np.split(xy, off[1:-1]))   # линии — виды на один буфер, без копий
     return out
 
 
@@ -2006,6 +2088,12 @@ class ThreatModel:
         # §8.6.4). Как и manual_sensors, это ВХОДНЫЕ ДАННЫЕ: не сбрасывается пересборкой
         # карты, сменой цели или входа — только новой загрузкой либо явной очисткой.
         self.loaded_routes = []        # список (M,2) км — то же представление, что iter_routes
+        # ОБОБЩЕНИЕ ОДИНАКОВЫХ ПРОХОДОВ (заказчик 14.09.2026): файл из KML пишет маршрут 16
+        # проходами подряд. `loaded_routes` — то, с чем работают показ и расстановка: либо
+        # ВСЕ проходы (по умолчанию), либо по первому проходу на запись файла (галочка).
+        self.loaded_routes_all = []    # все загруженные проходы, (M,2) км
+        self.loaded_groups = []        # номер записи файла у каждого прохода, int
+        self.generalize_loaded = False  # галочка «обобщать одинаковые проходы»; по умолчанию выкл
         self.show_loaded_routes = False  # чекбокс «показать загруженную выборку»
         self.sensor_source = None      # чем объяснена последняя расстановка: iter/loaded/zone/weight/manual
         self._iter_ctx = None          # контекст выборки (проходимость/поле расстояний/вес)
@@ -2169,25 +2257,56 @@ class ThreatModel:
         return [self.km_to_lonlat_arr(r) for r in src]
 
     # ---- ЗАГРУЖЕННАЯ ИЗ ФАЙЛА ВЫБОРКА ПРОЛЁТОВ (задача 8.6, model/flight_log.py) ----
-    def load_routes_lonlat(self, routes_lonlat):
+    def load_routes_lonlat(self, routes_lonlat, groups=None):
         """Загрузить маршруты В ГРАДУСАХ (из файла) → сохранить в километрах ТЕКУЩЕГО
         фрейма. Координаты самодостаточны (как и у `add_manual_lonlat`): маршрут из
         другого района просто ляжет в другое место сцены, без ошибки."""
-        out = []
-        for r in routes_lonlat:
-            a = np.asarray(r, float).reshape(-1, 2)
-            if len(a) < 2:
-                continue
+        # Вход: маршруты (M,2) в градусах; groups — номер записи файла у каждого (None — у
+        # каждого свой). Отдаёт: сколько маршрутов в выборке с учётом галочки «обобщать».
+        if groups is None:                           # номеров записей нет
+            groups = list(range(len(routes_lonlat)))  # — каждый маршрут сам себе запись
+        out, kept = [], []                           # маршруты в км и номера их записей
+        for r, g in zip(routes_lonlat, groups):
+            a = np.asarray(r, float).reshape(-1, 2)  # точки маршрута, градусы
+            if len(a) < 2:                           # из одной точки маршрута нет
+                continue                             # — пропускаем
             x, y = lonlat_to_km(a[:, 0], a[:, 1], self.lon0, self.lat0)
             out.append(np.column_stack([np.asarray(x, float), np.asarray(y, float)]))
-        self.loaded_routes = out
-        return len(out)
+            kept.append(int(g))
+        self.loaded_routes_all, self.loaded_groups = out, kept
+        return self._apply_generalization()
+
+    def _apply_generalization(self):
+        # Собрать `loaded_routes` по галочке «обобщать одинаковые проходы».
+        # Вход: ничего (loaded_routes_all, loaded_groups, generalize_loaded). Отдаёт: маршрутов, int.
+        if not self.generalize_loaded:               # обобщение выключено (по умолчанию)
+            self.loaded_routes = list(self.loaded_routes_all)   # — все проходы, как загружены
+        else:                                        # включено — по ОДНОМУ проходу на запись файла
+            seen, out = set(), []                    # записи, чей проход уже взят; итог
+            for r, g in zip(self.loaded_routes_all, self.loaded_groups):
+                if g in seen:                        # у этой записи проход уже есть
+                    continue                         # — остальные одинаковые пропускаем
+                seen.add(g)
+                out.append(r)
+            self.loaded_routes = out
+        return len(self.loaded_routes)
+
+    def set_generalize_loaded(self, on):
+        # Галочка «обобщать одинаковые проходы». Вход: on — bool.
+        # Отдаёт: сколько маршрутов стало в загруженной выборке, int.
+        self.generalize_loaded = bool(on)
+        return self._apply_generalization()
+
+    def loaded_repeat_info(self):
+        # Сведения для галочки. Вход: ничего. Отдаёт: (записей файла, проходов всего),
+        # оба int; записей меньше проходов — значит, обобщать есть что.
+        return len(set(self.loaded_groups)), len(self.loaded_routes_all)
 
     def clear_loaded_routes(self):
         """Убрать загруженную выборку и погасить чекбокс показа. Возвращает, сколько
         маршрутов было."""
-        n = len(self.loaded_routes)
-        self.loaded_routes = []
+        n = len(self.loaded_routes)                  # сколько было в выборке
+        self.loaded_routes, self.loaded_routes_all, self.loaded_groups = [], [], []
         self.show_loaded_routes = False
         return n
 

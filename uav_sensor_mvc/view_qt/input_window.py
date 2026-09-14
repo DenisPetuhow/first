@@ -372,6 +372,8 @@ class InputDataWindow(QtWidgets.QDialog):
         self.on_mode_changed = lambda manual: None
         self.on_pick_mode = lambda: None           # «ставить датчики кликом по карте»
         self.on_view_routes = lambda: None         # «Посмотреть маршруты» (задача 8.6)
+        self.on_pick_area = lambda: None           # «Область…» — папка с область.txt (10.5)
+        self.on_pick_tiles = lambda reset: None    # «Папка тайлов…», reset — по умолчанию
 
         self._build_ui()
         self.refresh(params)
@@ -393,6 +395,7 @@ class InputDataWindow(QtWidgets.QDialog):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
 
+        lay.addWidget(self._build_area())          # область и папка тайлов — самое первое
         lay.addWidget(self._build_top())           # режим работы + кратность
         mid = QtWidgets.QHBoxLayout(); mid.setSpacing(10)
         mid.addWidget(self._build_types(), 1)      # слева — датчики
@@ -416,6 +419,37 @@ class InputDataWindow(QtWidgets.QDialog):
         scr = QtWidgets.QApplication.primaryScreen()
         avail = scr.availableGeometry() if scr is not None else QtCore.QRect(0, 0, 1200, 800)
         self.resize(min(980, avail.width() - 60), min(760, avail.height() - 60))
+
+    def _build_area(self):
+        # Блок «Область и папка тайлов» — самый первый: от него зависит всё окно (план 10 §10.5).
+        # Вход: ничего. Отдаёт: QGroupBox с подписью и тремя кнопками; нажатия — в колбэки.
+        box = QtWidgets.QGroupBox("Область и папка тайлов")   # рамка блока
+        v = QtWidgets.QVBoxLayout(box)                          # подпись сверху, кнопки строкой
+        self.lbl_area = QtWidgets.QLabel("")
+        self.lbl_area.setWordWrap(True)
+        self.lbl_area.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        v.addWidget(self.lbl_area)
+        row = QtWidgets.QHBoxLayout()
+        b_area = QtWidgets.QPushButton("Область…")
+        b_area.setToolTip(
+            "Папка области с файлом «область.txt»: координаты области и начального района, "
+            "векторные слои и рельеф. Программа перезапустится на выбранной области.")
+        b_area.clicked.connect(lambda: self.on_pick_area())
+        b_tiles = QtWidgets.QPushButton("Папка тайлов…")
+        b_tiles.setToolTip("Папка, ОТКУДА показывается подложка и КУДА докачиваются тайлы. "
+                           "Меняется сразу, без перезапуска.")
+        b_tiles.clicked.connect(lambda: self.on_pick_tiles(False))
+        b_tiles0 = QtWidgets.QPushButton("Тайлы по умолчанию")
+        b_tiles0.setToolTip("Вернуть папку tile_cache/ рядом с программой.")
+        b_tiles0.clicked.connect(lambda: self.on_pick_tiles(True))
+        row.addWidget(b_area); row.addWidget(b_tiles); row.addWidget(b_tiles0); row.addStretch(1)
+        v.addLayout(row)
+        return box
+
+    def set_area_info(self, html):
+        # Подпись блока области: что открыто и где тайлы; текст готовит карта (`_area_info_text`).
+        # Вход: HTML-строка. Отдаёт: ничего.
+        self.lbl_area.setText(html)
 
     def _build_top(self):
         """Режим работы и кратность — вверху: они меняют смысл полей ниже."""

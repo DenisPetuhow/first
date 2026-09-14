@@ -49,6 +49,22 @@ import sys
 
 MARK_RE = re.compile(r">\s*\*\*Правился:\*\*\s*(\d{2}\.\d{2}\.\d{4})")
 FOLDER_LOG = "ЖУРНАЛ_ПАПКИ.md"
+# ⚠️ ИМЯ МОЖЕТ БЫТЬ С НОМЕРОМ ВПЕРЕДИ (`0.ЖУРНАЛ_ПАПКИ.md`): заказчик нумерует файлы, чтобы
+# задать порядок в проводнике (13.09.2026, папка `код/`). Без этого генератор создал бы
+# второй журнал под старым именем, а нумерованный счёл бы документом без отметки.
+FOLDER_LOG_RE = re.compile(r"^(?:\d+[._])?ЖУРНАЛ_ПАПКИ\.md$")
+
+
+def folder_log_name(folder):
+    # Имя мини-журнала в папке: уже лежащий (в том числе с номером) либо стандартное.
+    # Принимает: папку относительно корня. Отдаёт: имя файла.
+    try:
+        for f in os.listdir(os.path.join(ROOT, folder)):
+            if FOLDER_LOG_RE.match(f):                 # журнал уже есть, возможно с номером
+                return f                               # пишем в него же
+    except OSError:                                    # папки нет
+        pass
+    return FOLDER_LOG
 
 # папки, где отметка не нужна (см. шапку)
 SKIP_DIRS = {"карта_кода", "журнал", "архив"}
@@ -93,7 +109,7 @@ def docs():
     for dp, dn, fn in os.walk(os.path.join(ROOT, "теория")):
         dn[:] = [d for d in dn if d not in SKIP_DIRS]
         for f in fn:
-            if f.endswith(".md") and f != FOLDER_LOG:
+            if f.endswith(".md") and not FOLDER_LOG_RE.match(f):
                 out.append(os.path.relpath(os.path.join(dp, f), ROOT).replace("\\", "/"))
     return sorted(out)
 
@@ -114,7 +130,7 @@ def git_rows(folder, limit=14):
             date, subj = line.split("\t", 1)
         elif line.strip().endswith(".md"):
             name = os.path.basename(line.strip())
-            if name == FOLDER_LOG or (date, name) in seen:
+            if FOLDER_LOG_RE.match(name) or (date, name) in seen:
                 continue
             seen.add((date, name))
             rows.append((date, name, subj))
@@ -168,7 +184,7 @@ def write_folder_logs():
         else:
             body.append("| — | — | правок в истории нет (папка новая) |")
         body.append("")
-        io.open(os.path.join(ROOT, folder, FOLDER_LOG), "w",
+        io.open(os.path.join(ROOT, folder, folder_log_name(folder)), "w",
                 encoding="utf-8").write("\n".join(body))
         made += 1
     print("пересобрано мини-журналов папок: %d" % made)
@@ -200,7 +216,7 @@ def main():
         if os.path.basename(folder) in NO_FOLDER_LOG:
             continue
         if folder not in folder_logs:
-            lp = os.path.join(ROOT, folder, FOLDER_LOG)
+            lp = os.path.join(ROOT, folder, folder_log_name(folder))
             folder_logs[folder] = (io.open(lp, encoding="utf-8").read()
                                    if os.path.exists(lp) else None)
         log = folder_logs[folder]

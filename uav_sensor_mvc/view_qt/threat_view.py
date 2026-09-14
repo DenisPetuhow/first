@@ -29,15 +29,18 @@ import matplotlib.cm as cm
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS,
-                    THREAT_SPEND_LABELS, THREAT_VIEW_PAD_KM, THREAT_AREA_DIR,
-                    THREAT_CELL_M, THREAT_COMPASS_LINE_KM)
+                    THREAT_SPEND_LABELS, THREAT_TILE_AREA,
+                    THREAT_CELL_M, THREAT_COMPASS_LINE_KM, THREAT_AREA_LABEL,
+                    THREAT_AREA_SOURCE, THREAT_AREA_ERROR)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from .ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
 from . import geomap as gm
 from . import map_image as mi              # своя карта картинкой (план 8, задача 8.5)
+from . import area_choice                  # выбор области и папки тайлов (план 10, 10.5)
 from . import map_anchor as ma             # привязка картинки к координатам
 from . import map_vector as mv             # своя карта вектором (SVG)
 from .map_image import MapImageDialog
+from .tile_layer import SteppedViewBox   # колесо по уровням тайлов (задача 10.10)
 from model import geo_frame as gf          # общий координатный фрейм (план 8, задача 8.3)
 from model import flight_log as fl         # история полётов: папки/имя файла (задача 8.6)
 
@@ -92,19 +95,38 @@ LAYER_STYLE = {
                        casing="#eaf2f7", casing_w=4.0, alpha=245),
     "stream":     dict(color="#35576e", width=1.6, dash=None, z=-5.7,
                        casing=None, alpha=230),
+    # КАНАВА: тёмная бирюза — вода, но не синяя, чтобы не спутать с рекой и ручьём;
+    # контраст с фонами 5.08. Самая тонкая из водных (1.3) — значит самая яркая (255).
+    # Короткий пунктир [4,2]: канав 1 722 км, сплошной линией они легли бы сеткой.
+    "ditch":      dict(color="#105550", width=1.3, dash=[4, 2], z=-5.72,
+                       casing=None, alpha=255),
     # дороги: белый кант — они читаются поверх любой мешанины
+    # ⚠️ ЯРКОСТЬ ОБРАТНА ТОЛЩИНЕ (правило заказчика 13.09.2026). Толстую линию видно и
+    # приглушённой, а тонкая при той же прозрачности теряется. Поэтому крупная дорога
+    # (3.0 px) идёт самой блёклой, местная (2.1 px) ярче, а лесная — самая тонкая и
+    # потому самая яркая. Так линии не спорят друг с другом, но все читаются.
     "road_major": dict(color="#9e4825", width=3.0, dash=None, z=-5.1,
-                       casing="#ffffff", casing_w=5.0, alpha=250),
-    "road_local": dict(color="#8a5725", width=1.6, dash=None, z=-5.2,
-                       casing="#ffffff", casing_w=3.2, alpha=235),
+                       casing="#ffffff", casing_w=5.0, alpha=195),
+    "road_local": dict(color="#8a5725", width=2.1, dash=None, z=-5.2,
+                       casing="#ffffff", casing_w=3.6, alpha=245),
     # Ж/Д, ЛЭП, ЛЕСОПОЛОСА — на общем виде их «не было видно вовсе»: линия шириной 1.2 px
     # с редким пунктиром ([1,5] — точка через пять пустых) вырождается в еле заметную
     # пыль, и различать там уже нечего, какой ни возьми цвет. Поэтому они СТАЛИ ТОЛЩЕ, а
     # штрих ПЛОТНЕЕ: сначала линия должна читаться как линия, и только потом её тон
     # что-то значит. Штрихи при этом разные — тем и разводятся: шпалы / точки / длинный
     # пунктир / короткие штрихи.
-    "railway":    dict(color="#636363", width=2.2, dash=[7, 4], z=-5.5,
-                       casing="#ffffff", casing_w=4.0, alpha=255),
+    # ⚠️ Ж/Д ТОЛЩЕ (2.2 -> 2.8, заказчик 13.09.2026) и потому БЛЕДНЕЕ (255 -> 215):
+    # правило «яркость обратна толщине», см. дороги выше.
+    "railway":    dict(color="#636363", width=2.8, dash=[7, 4], z=-5.5,
+                       casing="#ffffff", casing_w=4.8, alpha=215),
+    # БРОШЕННАЯ Ж/Д: толще прежнего (1.6 → 2.2) и с БЕЛЫМ КАНТОМ, как основная (заказчик
+    # 13.09.2026) — так она читается как «железная дорога», а не как ещё один пунктир.
+    # Тоньше основной (2.2 против 2.8) — значит ярче (240 против 215). Темнее основной:
+    # контраст с фонами 5.23. Штрих «двойной пунктир» [4,2,4,6] — ни у кого такого нет.
+    # ⚠️ z −5.57, а не −5.52: кант рисуется на z − 0.04, и при шаге 0.02 кант основной ж/д
+    # ложился бы между линией и кантом брошенной (шаг держать не меньше 0.04).
+    "railway_old": dict(color="#4a4a4a", width=2.2, dash=[4, 2, 4, 6], z=-5.57,
+                        casing="#ffffff", casing_w=3.8, alpha=240),
     # Труба уведена из коричневого в ОЛИВКОВЫЙ: после затемнения до нормы она совпадала
     # с местной дорогой (17 единиц RGB — на карте это один цвет). Застройка по той же
     # причине уведена из бежевого в тёплый серый.
@@ -113,8 +135,25 @@ LAYER_STYLE = {
                        casing=None, alpha=240),
     "pipeline":   dict(color="#57571b", width=1.9, dash=[9, 5], z=-5.4,
                        casing=None, alpha=240),
-    "tree_row":   dict(color="#3b5c32", width=1.7, dash=[3, 4], z=-5.8,
-                       casing=None, alpha=225),
+    # ЛЕСОПОЛОСА толще (1.7 → 2.4, заказчик 13.09.2026) и по правилу «яркость обратна
+    # толщине» чуть бледнее (225 → 215): тонкая зелёная терялась на зелёной подложке леса.
+    "tree_row":   dict(color="#3b5c32", width=2.4, dash=[3, 4], z=-5.8,
+                       casing=None, alpha=215),
+    # ПРОСЕКА: штрих «линия-точка» (заказчик 13.09.2026) — такого рисунка ни у кого нет,
+    # остальные разведены шпалами [7,4], точками [2,3], длинным пунктиром [9,5] и
+    # короткими штрихами [3,4]. Цвет ТЁМНО-МАЛИНОВЫЙ: подобран перебором по контрасту с
+    # фонами подложки (лес #add19e, поля, луг, вода) — 5.45 при норме 4.5, и дальше всех
+    # отстоит от уже занятых цветов слоёв. Зелёный брать нельзя (лесополоса), красно-
+    # коричневый тоже (дороги).
+    "cutline":    dict(color="#7a2c45", width=1.9, dash=[8, 3, 1, 3], z=-5.65,
+                       casing=None, alpha=240),
+    # ЛЕСНАЯ ДОРОГА: грунтовый тёмно-коричневый, контраст с фонами 4.68 при норме 4.5.
+    # ⚠️ САМАЯ ТОНКАЯ — И ПОТОМУ САМАЯ ЯРКАЯ (alpha 255): их 18 623 км, вдвое больше всех
+    # обычных дорог, и толстой линией они забили бы карту сплошной сеткой. Лежит НИЖЕ
+    # прочих (z −5.75), чтобы не перекрывать реки и дороги. Штрих [5,2] — длинный штрих с
+    # коротким пробелом, такого рисунка нет ни у кого.
+    "track":      dict(color="#6b4a2f", width=1.6, dash=[5, 2], z=-5.75,
+                       casing=None, alpha=255),
     # мост — не отдельный кричащий цвет, а та же дорога с тёмным кантом
     "bridge":     dict(color="#9e4825", width=3.4, dash=None, z=-5.0,
                        casing="#333333", casing_w=5.4, alpha=255),
@@ -342,15 +381,6 @@ def _iter_heat_cmap():
         return pg.colormap.ColorMap(stops, _iter_heat_lut())
 
 
-def _pad_box(box, km=0.0, frac=0.0):
-    # Расширяет рамку полем с четырёх сторон. Принимает: (x0,x1,y0,y1) км, поле в км
-    # и долю собственного размера. Отдаёт: новую рамку той же формы.
-    x0, x1, y0, y1 = box
-    dx = km + (x1 - x0) * frac                   # поле по X, км
-    dy = km + (y1 - y0) * frac                   # поле по Y, км
-    return (x0 - dx, x1 + dx, y0 - dy, y1 + dy)
-
-
 class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # Подложка гасится: поверх неё лежат НАШИ дороги, реки и лесополосы, а OSM рисует
     # свои — без гашения это две карты одного смысла друг на друге. Но и перебарщивать
@@ -397,6 +427,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # Общий чекбокс «Векторные слои» гасит их все разом, не трогая этот выбор.
         self._vec_visible = {name: True for name in LAYER_STYLE}
         self._vec_dialog = None
+        self._data_dialog = None           # окно «Цифровые карты» (одно на вкладку)
         self._last_layers = {}             # последние данные слоёв — чтобы перерисовать
         self._last_built = None            # выбранный набор БЕЗ пересчёта модели
         self._last_extent = None
@@ -477,6 +508,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_analysis_data = lambda: ""    # HTML отчёта «Анализ моделирования»
         self.on_route_preview = lambda is_loaded, index: None
         self.on_route_preview_reset = lambda: None
+        self.on_generalize_loaded = lambda on: None             # галочка «обобщать проходы»
+        self.on_generalize_state = lambda: (False, False, 0, 0)  # (есть что, вкл, записей, проходов)
         self.on_sensor_delete = lambda lon, lat: None   # DELETE в режиме правки
         self.on_manual_mode = lambda manual: None    # «задать позиции» вкл/выкл
         self.on_sensor_rows = lambda: []             # чем заполнять таблицу
@@ -499,10 +532,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._build_scene_items()
         # tile_area: тайлы этого участка ложатся в свою папку кэша (ОГРАНИЧЕНИЯ 5.1д).
         # Уже скачанное остаётся в старой общей раскладке и продолжает находиться.
+        # ⚠️ ИМЯ папки, а не путь: участок из файла может лежать вне geo_cache/, и тогда
+        # `THREAT_AREA_DIR` — полный путь, а тайлы ищутся в <кэш тайлов>/<имя> (§10.5).
         self._init_basemap(lon0, lat0, lambda: self._map_layer,
                            lambda: self._map_offline,
                            scheme_points=self._orient_points(),
-                           tile_area=THREAT_AREA_DIR)
+                           tile_area=THREAT_TILE_AREA)
         self._apply_view_limits()                 # предел вида: область + район + поля
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
         # смена масштаба/панорама -> перерисовать слои под новый кадр (прореживание по
@@ -816,8 +851,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self._route_viewer_dlg = RouteViewerDialog(
                 self,
                 on_preview=lambda is_loaded, i: self.on_route_preview(is_loaded, i),
-                on_reset=lambda: self.on_route_preview_reset())
+                on_reset=lambda: self.on_route_preview_reset(),
+                on_generalize=lambda on: self.on_generalize_loaded(on))
         own, loaded = self.on_routes_data()
+        self._route_viewer_dlg.set_generalize_state(*self.on_generalize_state())
         self._route_viewer_dlg.set_data(own, loaded)
         self._route_viewer_dlg.show()
         self._route_viewer_dlg.raise_()
@@ -842,6 +879,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if self._route_viewer_dlg is None or not self._route_viewer_dlg.isVisible():
             return
         own, loaded = self.on_routes_data()
+        self._route_viewer_dlg.set_generalize_state(*self.on_generalize_state())
         self._route_viewer_dlg.set_data(own, loaded)
 
     def _end_pick_sensor(self):
@@ -1309,10 +1347,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
     # ---- окно выбора цифровых карт (источник + слои) ----
     def _open_data_dialog(self):
-        dlg = DigitalMapsDialog(self, self._data_path, self._enabled_layers)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            self._data_path, self._enabled_layers = dlg.result_choices()
-            self.on_choose_data(self._data_path, self._enabled_layers)
+        # Окно «Цифровые карты»: немодальное и одно на вкладку — с ним работают, глядя на
+        # карту (галочка сразу скрывает слой). Второй раз открывается то же окно.
+        if self._data_dialog is None:                    # первое открытие
+            self._data_dialog = DigitalMapsDialog(self)  # создаём один раз
+        self._data_dialog.sync()
+        self._data_dialog.show()
+        self._data_dialog.raise_()
+        self._data_dialog.activateWindow()
+
+    def apply_digital_maps(self, path, enabled):
+        # «Применить к расчёту»: запомнить источник и набор слоёв и отдать контроллеру.
+        # Принимает: путь к файлу либо None (авто), набор имён слоёв либо None (все).
+        self._data_path, self._enabled_layers = path, enabled
+        self.on_choose_data(path, enabled)
 
     # ---- своя карта картинкой (план 8, задача 8.5) ----
     def _open_map_image_dialog(self):
@@ -1617,11 +1665,32 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             dlg.on_mode_changed = lambda manual: self.on_manual_mode(manual)
             dlg.on_pick_mode = self._begin_pick_sensor
             dlg.on_view_routes = self._open_route_viewer
+            # ОБЛАСТЬ И ТАЙЛЫ (план 10 §10.5): область — перезапуск, тайлы — сразу
+            dlg.on_pick_area = lambda: area_choice.choose_area(dlg)
+            dlg.on_pick_tiles = lambda reset: self._pick_tile_root(dlg, reset)
             self._input_dlg = dlg
+        self._input_dlg.set_area_info(self._area_info_text())
         self._input_dlg.refresh(self._params_ref)
         self.refresh_sensor_table()
         self._input_dlg.show(); self._input_dlg.raise_()
         self._input_dlg.activateWindow()
+
+    def _area_info_text(self):
+        # Подпись блока «Область и папка тайлов»: что открыто, откуда взято, где тайлы.
+        # Отдаёт: HTML-строку; ошибка выбранной папки — красным, чтобы её не пропустить.
+        lines = ["Область: <b>%s</b>" % THREAT_AREA_LABEL,
+                 "<span style='color:%s'>файл: %s</span>" % (THEME["muted"], THREAT_AREA_SOURCE),
+                 "<span style='color:%s'>тайлы: %s</span>" % (THEME["muted"], gm.cache_root())]
+        if THREAT_AREA_ERROR:                            # выбранная папка не открылась
+            lines.append("<span style='color:#e05050'>⚠️ выбранная область не открыта: %s. "
+                         "Открыта область по умолчанию.</span>" % THREAT_AREA_ERROR)
+        return "<br>".join(lines)
+
+    def _pick_tile_root(self, dlg, reset):
+        # «Папка тайлов…» / «Тайлы по умолчанию» из окна «Исходные данные».
+        # Принимает: окно-родитель диалога и reset (True — вернуть tile_cache/ проекта).
+        if area_choice.choose_tile_root(dlg, self, reset=reset) is not None:   # сменили
+            dlg.set_area_info(self._area_info_text())
 
     def refresh_sensors_dialog(self):
         """Обновить поля окна «Исходные данные» (шаг сетки мог пересчитаться под радиус).
@@ -1796,7 +1865,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # (чекбокс «отсчёт от угла района» в блоке ПОКАЗ).
         self._axis_x = ShiftedAxis("bottom")
         self._axis_y = ShiftedAxis("left")
-        self.plot = pg.PlotWidget(axisItems={"bottom": self._axis_x, "left": self._axis_y})
+        # ⚠️ КОЛЕСО ХОДИТ ПО УРОВНЯМ ТАЙЛОВ, а не плавно — иначе тайл почти всегда
+        # приходится масштабировать, и подписи на карте рассыпаются (разбор —
+        # view_qt/tile_layer.py :: SteppedViewBox).
+        self.plot = pg.PlotWidget(axisItems={"bottom": self._axis_x, "left": self._axis_y},
+                                  viewBox=SteppedViewBox())
         self.pi = self.plot.getPlotItem()
         self.pi.setAspectLocked(True)
         self.pi.showGrid(x=True, y=True, alpha=0.12)
@@ -1878,8 +1951,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         self.btn_data = QtWidgets.QPushButton("Цифровые карты")
         self.btn_data.setToolTip(
-            "Отдельное окно: выбрать источник данных (файл .npz / .osm.pbf либо "
-            "авто) и какие слои (реки/дороги/…) накладывать на сетку.")
+            "Источник данных и набор слоёв. Галочка сразу скрывает слой на карте, но в "
+            "расчёте он остаётся; «Применить к расчёту» — и следующий «Построить карту» "
+            "учтёт снятые слои.")
         self.btn_data.clicked.connect(self._open_data_dialog)
         # ⚠️ ПО ДВЕ КНОПКИ В СТРОКУ, ПО ТЕМАТИКАМ (требование заказчика 05.09.2026).
         # Панель выросла до полутора десятков кнопок в столбик и не помещалась на
@@ -2849,6 +2923,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         ready = getattr(self, "_area_ready", True)
         for b in self._work_buttons():
             b.setEnabled((not busy) and ready)
+        # «Исходные данные» — и без района: там выбирается область (план 10 §10.5)
+        self.btn_input_data.setEnabled(not busy)
         # кнопка рельефа отдельно: без файла высот она остаётся недоступной и после расчёта
         self.btn_relief.setEnabled((not busy) and ready
                                    and getattr(self, "_relief_enabled", False))
@@ -2889,12 +2965,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def set_area_ready(self, ready, size_km=None, bbox_km=None):
         """Район задан или нет: от этого зависит вся остальная панель.
 
-        Пока район не задан, активны РОВНО ДВЕ кнопки — «Задать район» и «Добавить карту»
-        (правило заказчика 04.09.2026): работать не с чем, и любое другое действие либо
-        бессмысленно, либо обещает расчёт, которого не будет. Рамка на карте тоже не
-        рисуется — она обозначала бы район, которого нет."""
+        Пока район не задан, активны РОВНО ТРИ кнопки — «Задать район», «Добавить карту»
+        (правило заказчика 04.09.2026) и «Исходные данные»: в них выбирается ОБЛАСТЬ (план
+        10 §10.5, 13.09.2026). Остальное либо бессмысленно, либо обещает расчёт, которого
+        не будет. Рамка на карте тоже не рисуется — она обозначала бы район, которого нет."""
         self._area_ready = bool(ready)
-        keep = {self.btn_area, self.btn_map_img}      # ровно две кнопки-входа
+        # две кнопки-входа плюс «Исходные данные»: там выбираются ОБЛАСТЬ и папка тайлов
+        # (план 10 §10.5), и у области без района иначе не на что было бы её сменить
+        keep = {self.btn_area, self.btn_map_img, self.btn_input_data}
         for w in self._panel_widgets():
             if w not in keep:
                 w.setEnabled(bool(ready))
@@ -2974,9 +3052,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         #      данным душит его, обрезая область сверху и снизу (замер: окно 1560×960,
         #      область 249.6 км показывалась как 197).
         # Поэтому берём кадр, в который область вписывается при нынешней форме окна.
+        # ⚠️ РАЙОН — ТЕМ ЖЕ КАДРОМ С ПОЛЕМ 4 %, А НЕ «РАЙОН + 100 КМ» (план 10 §10.5.5,
+        # 13.09.2026). Добавка в 100 км жила со времён, когда своя карта не имела своего
+        # предела (теперь его даёт `extra_km`). На области 302 км её не видно, а на области
+        # Донецка 95 × 75 км без района камера уходила на 100 км в пустоту с каждой стороны.
         asp = self._view_aspect()
         parts = [self._fit_frame(self.area_max_km, asp),                 # кадр под область
-                 _pad_box(self.bbox_km, km=THREAT_VIEW_PAD_KM)]          # район + простор
+                 self._fit_frame(self.bbox_km, asp)]                     # кадр под район
         if extra_km:                                 # своя карта может торчать за область
             parts.append(self._fit_frame(extra_km, asp))
         self._set_view_limits((min(p[0] for p in parts), max(p[1] for p in parts),
@@ -2995,13 +3077,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         см. `_apply_view_limits`."""
         kx0, kx1, ky0, ky1 = self.area_max_km if whole_area else self.bbox_km
         self.pi.setRange(xRange=(kx0, kx1), yRange=(ky0, ky1), padding=self.VIEW_FIT_PAD)
+        self.snap_view_to_zoom()          # масштаб — на уровень тайлов, иначе подложка мылит
 
     def process_pending(self):
         QtWidgets.QApplication.processEvents()
 
     # ---- отрисовка данных карты ----
     MAX_LAYER_PTS = 48000     # предел точек на слой при отрисовке (прореживание)
-    MAX_LAYER_POLYS = 10000   # предел числа линий на слой (берём самые длинные)
+    # Предел числа линий на слой (берём самые длинные). ⚠️ 10 000 → 16 000 (13.09.2026): с
+    # лесными дорогами слой `track` на районе во всю область — 12 163 линии, и 2 163 коротких
+    # не рисовались. Замер (район = вся область `arh`): подготовка 98 → 71 мс — БЫСТРЕЕ, т.к.
+    # сортировка по длине нужна лишь сверх предела; кадр 158 → 169 мс, в пределах шума.
+    # Скорость держит не он, а MAX_LAYER_PTS: точек на слой не больше 48 000 при любом пределе.
+    MAX_LAYER_POLYS = 16000
     MAX_BRIDGES = 600         # маркеры ПЕРЕПРАВ (мост над водой); их ~400, влезают все
     BUILTUP_RASTER_FRAC = 0.35  # кадр уже этой доли участка -> застройка контурами
 
@@ -3276,6 +3364,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         """Переключить один слой (вызывается из окна) и сразу перерисовать."""
         self._vec_visible[str(name)] = bool(on)
         self.apply_vector_visibility()
+        # ⚠️ ДВА ОКНА ПОКАЗЫВАЮТ ОДНУ ГАЛОЧКУ: «Векторные слои» и «Цифровые карты». Снял в
+        # одном — во втором должно быть снято тоже, иначе окна начнут спорить.
+        for dlg in (self._vec_dialog, getattr(self, "_data_dialog", None)):
+            if dlg is not None and dlg.isVisible():      # окно открыто
+                dlg.sync()                               # подтянуть галки из представления
 
     def vector_visible(self):
         return dict(self._vec_visible)
@@ -4049,21 +4142,28 @@ class VectorLayersDialog(QtWidgets.QDialog):
 
 
 class DigitalMapsDialog(QtWidgets.QDialog):
-    """Отдельное окно: выбор ИСТОЧНИКА цифровых карт и набора накладываемых СЛОЁВ.
+    """Окно «Цифровые карты»: источник данных и набор слоёв — для ПОКАЗА и для РАСЧЁТА.
 
-    Источник: файл .npz (готовые слои) / .osm.pbf (сырой OSM-экстракт) либо «авто»
-    (кэш geo_cache/ → иначе демо-схема). Слои: чекбоксы по THREAT_LAYERS с их весами.
-    Возвращает выбор через result_choices(); саму загрузку делает контроллер."""
+    ⚠️ ДВА ДЕЙСТВИЯ, И ПУТАТЬ ИХ НЕЛЬЗЯ (схема заказчика 13.09.2026):
+      * ГАЛОЧКА — сразу, без пересчёта: слой скрывается на карте, но в расчёте ОСТАЁТСЯ.
+        Можно посмотреть карту без слоя и решить, нужен ли он;
+      * «ПРИМЕНИТЬ К РАСЧЁТУ» — снятые слои исключаются из весовой карты, и следующий
+        «Построить карту» их не накладывает.
+    Прежде окно было модальным: галочки ничего не показывали, пока не нажмёшь OK, а
+    скрытие жило в отдельном окне «Векторные слои». Оно осталось и делит с этим окном
+    одну и ту же галочку (`view._vec_visible`)."""
 
-    def __init__(self, parent, data_path, enabled_layers):
-        super().__init__(parent)
-        self.setWindowTitle("Выбор цифровых карт (слоёв) для наложения")
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+        self._data_path = view._data_path          # источник, выбранный в окне (до «Применить»)
+        self.setWindowTitle("Цифровые карты — источник и слои")
         self.setMinimumWidth(440)
-        self._data_path = data_path
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Tool)
         lay = QtWidgets.QVBoxLayout(self)
 
         lay.addWidget(QtWidgets.QLabel("<b>1. Источник данных</b>"))
-        self.src_lbl = QtWidgets.QLabel(self._src_text())
+        self.src_lbl = QtWidgets.QLabel()
         self.src_lbl.setWordWrap(True)
         self.src_lbl.setStyleSheet(f"color: {THEME['muted']};")
         lay.addWidget(self.src_lbl)
@@ -4075,49 +4175,126 @@ class DigitalMapsDialog(QtWidgets.QDialog):
         row.addWidget(btn_file); row.addWidget(btn_auto)
         lay.addLayout(row)
         hint = QtWidgets.QLabel(
-            "Где взять .osm.pbf — см. теория/МЕТОДИЧКА_ЗАГРУЗКА_КАРТ.md "
+            "Где взять .osm.pbf — см. теория/карты/МЕТОДИЧКА_ЗАГРУЗКА_КАРТ.md "
             "(BBBike/Geofabrik). .npz готовит tools/build_threat_grid.py.")
         hint.setWordWrap(True); hint.setStyleSheet(f"color: {THEME['muted']};")
         lay.addWidget(hint)
 
-        lay.addWidget(QtWidgets.QLabel("<b>2. Слои для наложения</b> (вес ячейки)"))
+        lay.addWidget(QtWidgets.QLabel("<b>2. Слои</b> (вес ячейки)"))
+        note = QtWidgets.QLabel("Галочка сразу скрывает слой на карте — в расчёте он остаётся. "
+                                "Исключить из расчёта: «Применить к расчёту», затем "
+                                "«Построить карту».")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {THEME['muted']}; font-size: 10px;")
+        lay.addWidget(note)
         self._checks = {}
         for name in THREAT_LAYER_ORDER:
             spec = THREAT_LAYERS.get(name)
-            if not spec:
-                continue
+            if not spec:                                 # слой без описания в config
+                continue                                 # показывать нечего
+            row = QtWidgets.QHBoxLayout(); row.setSpacing(8)
+            swatch = QtWidgets.QLabel()                  # образец цвета — как на карте
+            swatch.setFixedSize(18, 4)
+            color = LAYER_STYLE.get(name, {}).get("color", THEME["muted"])
+            swatch.setStyleSheet(f"background: {color}; border-radius: 2px;")
             role = "репеллер" if not spec.get("attractor", True) else "аттрактор"
             chk = QtWidgets.QCheckBox(f"{spec['label']}  ·  вес {spec['weight']:+g}  ·  {role}")
-            chk.setChecked(enabled_layers is None or name in enabled_layers)
+            chk.toggled.connect(lambda on, n=name: self._toggled(n, on))
             self._checks[name] = chk
-            lay.addWidget(chk)
+            row.addWidget(swatch); row.addWidget(chk, 1)
+            lay.addLayout(row)
 
-        bb = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
+        b_all = QtWidgets.QPushButton("Отметить все")
+        b_all.clicked.connect(lambda: self._set_all(True))
+        lay.addWidget(b_all)
+
+        # что уйдёт в расчёт и не расходится ли это с уже применённым
+        self.state_lbl = QtWidgets.QLabel()
+        self.state_lbl.setWordWrap(True)
+        lay.addWidget(self.state_lbl)
+
+        act = QtWidgets.QHBoxLayout()
+        self.btn_apply = QtWidgets.QPushButton("Применить к расчёту")
+        self.btn_apply.setToolTip("Снятые слои не войдут в весовую карту при следующем "
+                                  "«Построить карту».")
+        self.btn_apply.clicked.connect(self._apply)
+        close = QtWidgets.QPushButton("Закрыть")
+        close.setToolTip("Галочки сохраняются — окно можно открыть снова.")
+        close.clicked.connect(self.close)
+        act.addWidget(self.btn_apply, 1); act.addWidget(close)
+        lay.addLayout(act)
+        self.sync()
+
+    # ------------------------------------------------------------------
+    def sync(self):
+        """Подтянуть галки из представления: они же — видимость слоёв на карте."""
+        vis = self.view.vector_visible()
+        for name, chk in self._checks.items():
+            chk.blockSignals(True)
+            chk.setChecked(bool(vis.get(name, True)))
+            chk.blockSignals(False)
+        self.src_lbl.setText(self._src_text())
+        self._update_state()
+
+    def result_choices(self):
+        """(data_path|None, enabled_layers|None). Все отмечены -> None, то есть «все слои»."""
+        enabled = {n for n, c in self._checks.items() if c.isChecked()}
+        if len(enabled) == len(self._checks):            # ничего не снято
+            return self._data_path, None                 # «все» — как при запуске
+        return self._data_path, enabled
+
+    def _toggled(self, name, on):
+        # Галочка: только ПОКАЗ — перерисовать карту, расчёт не трогать.
+        self.view.set_vector_visible(name, on)
+        self._update_state()
+
+    def _set_all(self, on):
+        for name, chk in self._checks.items():
+            chk.blockSignals(True)
+            chk.setChecked(on)
+            chk.blockSignals(False)
+            self.view._vec_visible[name] = bool(on)
+        self.view.apply_vector_visibility()              # одна перерисовка на все слои
+        self._update_state()
+
+    def _apply(self):
+        # «Применить к расчёту»: снятые галки уходят из весовой карты.
+        path, enabled = self.result_choices()
+        self.view.apply_digital_maps(path, enabled)
+        self._update_state()
+
+    def _update_state(self):
+        """Строка состояния: сколько слоёв в расчёте и не расходится ли с применённым."""
+        path, want = self.result_choices()
+        total = len(self._checks)
+        n_want = total if want is None else len(want)
+        same = (want == self.view._enabled_layers) and (path == self.view._data_path)
+        if same:                                         # галки совпадают с применённым
+            self.state_lbl.setText("В расчёте: %d из %d слоёв." % (n_want, total))
+            self.state_lbl.setStyleSheet(f"color: {THEME['muted']};")
+        else:                                            # есть не применённые изменения
+            self.state_lbl.setText("⚠️ Галочки отличаются от расчёта: на карте скрыто, но "
+                                   "считается прежний набор. Нажмите «Применить к расчёту».")
+            self.state_lbl.setStyleSheet("color: #e0a030;")
+        self.btn_apply.setEnabled(not same)
 
     def _src_text(self):
         return (f"файл: {self._data_path}" if self._data_path
-                else "авто: geo_cache/threat_layers.npz → иначе демо-схема")
+                else "авто: кэш участка в geo_cache/ → иначе демо-схема")
 
     def _pick_file(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Файл цифровых карт", "",
             "Гео-данные (*.npz *.pbf *.osm);;Все файлы (*)")
-        if fn:
-            self._data_path = fn
+        if fn:                                           # файл выбран
+            self._data_path = fn                         # применится по кнопке
             self.src_lbl.setText(self._src_text())
+            self._update_state()
 
     def _use_auto(self):
         self._data_path = None
         self.src_lbl.setText(self._src_text())
-
-    def result_choices(self):
-        """(data_path|None, enabled_layers_set). Все галочки сняты -> пустой набор
-        (карта без слоёв); чтобы «все слои» — просто отметить все."""
-        enabled = {n for n, c in self._checks.items() if c.isChecked()}
-        return self._data_path, enabled
+        self._update_state()
 
 
 # ⚠️ КЛАССЫ `InputDataDialog` И `SensorsDialog` УДАЛЕНЫ 04.09.2026 (задача 8.7).

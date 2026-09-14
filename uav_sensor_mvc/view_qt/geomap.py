@@ -293,6 +293,15 @@ _TILE_MEM_MAX = 512
 _TILE_MEM_LOCK = threading.Lock()
 
 
+def clear_tile_memory():
+    # Забыть декодированные тайлы — при смене корня кэша (план 10 §10.5).
+    # Вход: ничего. Отдаёт: ничего.
+    # ⚠️ ключ памяти — (область, слой, z, x, y) БЕЗ корня: без сброса тот же тайл отдался бы
+    # из памяти старой картинкой, хотя папка уже другая
+    with _TILE_MEM_LOCK:                             # память общая с потоками загрузки тайлов
+        _TILE_MEM.clear()
+
+
 def _decoded_tile_u8(layer, z, x, y, allow_net, area=None):
     """Тайл как uint8 RGBA (256,256,4) из памяти/диска/сети, либо None."""
     # участок — ЧАСТЬ КЛЮЧА: у двух участков могут совпасть (z, x, y) на общих зумах,
@@ -318,6 +327,51 @@ def _decoded_tile_u8(layer, z, x, y, allow_net, area=None):
         if len(_TILE_MEM) > _TILE_MEM_MAX:
             _TILE_MEM.popitem(last=False)
     return u8
+
+
+def tile_rgba(layer, z, x, y, allow_net=True, area=None):
+    # Один тайл как uint8 RGBA (256,256,4) либо None, если его нет нигде.
+    # Принимает: слой, зум и тайловые координаты, разрешение на сеть, папку участка.
+    # Публичная обёртка над `_decoded_tile_u8` — ею пользуется `tile_layer.py`,
+    # который кладёт тайлы поштучно (план 10, задача 10.10).
+    return _decoded_tile_u8(layer, z, x, y, allow_net, area=area)
+
+
+def tile_bounds_km(z, x, y, lon0=KURSK_LON, lat0=KURSK_LAT):
+    # Границы тайла в километрах км-фрейма. Принимает: зум, тайловые координаты, якорь.
+    # Отдаёт: (x0, x1, y0, y1) км по возрастанию.
+    # ⚠️ Углы КАЖДОГО тайла считаются отдельно — в этом весь смысл поштучной укладки:
+    # нелинейность Меркатора остаётся внутри одного тайла (на зуме 9 это 48.5 м), тогда
+    # как у общей мозаики она копилась на всю её высоту (2.4 км).
+    tl_lon, tl_lat = num2deg(x, y, z)                     # верх-лево (С-З)
+    br_lon, br_lat = num2deg(x + 1, y + 1, z)             # низ-право (Ю-В)
+    ex0, ey1 = lonlat_to_km(tl_lon, tl_lat, lon0, lat0)   # лево, верх
+    ex1, ey0 = lonlat_to_km(br_lon, br_lat, lon0, lat0)   # право, низ
+    return float(ex0), float(ex1), float(ey0), float(ey1)
+
+
+def tiles_for_box(kx0, kx1, ky0, ky1, z, lon0=KURSK_LON, lat0=KURSK_LAT):
+    # Какие тайлы накрывают км-окно. Принимает: окно в км, зум, якорь.
+    # Отдаёт: (x0, x1, y0, y1) — диапазоны тайловых номеров включительно.
+    lon_min, lat_min = km_to_lonlat(kx0, ky0, lon0, lat0)
+    lon_max, lat_max = km_to_lonlat(kx1, ky1, lon0, lat0)
+    lon_min, lon_max = float(min(lon_min, lon_max)), float(max(lon_min, lon_max))
+    lat_min, lat_max = float(min(lat_min, lat_max)), float(max(lat_min, lat_max))
+    x0 = int(math.floor(deg2num(lon_min, lat_max, z)[0]))
+    x1 = int(math.floor(deg2num(lon_max, lat_min, z)[0]))
+    y0 = int(math.floor(deg2num(lon_min, lat_max, z)[1]))   # верх (макс. широта)
+    y1 = int(math.floor(deg2num(lon_max, lat_min, z)[1]))   # низ  (мин. широта)
+    n = int(2 ** z) - 1                                     # предел номера на этом зуме
+    return (max(0, x0), min(n, x1), max(0, y0), min(n, y1))
+
+
+def pick_zoom_for_box(kx0, kx1, ky0, ky1, target_px, lon0=KURSK_LON, lat0=KURSK_LAT):
+    # Зум для км-окна: обёртка над `_pick_zoom`, чтобы вызывающему не переводить в градусы.
+    # Принимает: окно в км, ширину виджета в px, якорь. Отдаёт: номер зума.
+    lon_min, _ = km_to_lonlat(kx0, ky0, lon0, lat0)
+    lon_max, _ = km_to_lonlat(kx1, ky1, lon0, lat0)
+    return _pick_zoom(float(min(lon_min, lon_max)), float(max(lon_min, lon_max)),
+                      target_px=target_px)
 
 
 def _pick_zoom(lon_min, lon_max, zmin=ZOOM_MIN, zmax=ZOOM_MAX,

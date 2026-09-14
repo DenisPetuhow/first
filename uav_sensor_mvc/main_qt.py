@@ -15,7 +15,12 @@
 import os
 import sys
 
-from config import Params, THEME
+# ⚠️ ДО `import config`: область и папка тайлов, выбранные в прошлый раз (план 10 §10.5).
+# config читает область при импорте, поэтому переменные окружения нужны раньше него.
+import area_file
+area_file.apply_saved_choice()
+
+from config import Params, THEME   # noqa: E402 — после выбора области, см. выше
 
 
 def _ensure_qt_plugin_path():

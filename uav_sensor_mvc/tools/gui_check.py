@@ -89,9 +89,18 @@ def main():
     print("\n3. БЛОКИРОВКА ПАНЕЛИ, пока район не задан")
     v.set_area_ready(False)
     locked = [w for w in v._panel_widgets() if not w.isEnabled()]
-    free = [b.text() for b in (v.btn_area, v.btn_map_img) if b.isEnabled()]
+    free = [b.text() for b in (v.btn_area, v.btn_map_img, v.btn_input_data) if b.isEnabled()]
     check(len(locked) > 10, "панель погашена", "%d элементов" % len(locked))
-    check(len(free) == 2, "активны ровно две кнопки", " · ".join(free))
+    # три входа: район, своя карта и «Исходные данные» — там выбирается ОБЛАСТЬ (план 10
+    # §10.5), и у области без района иначе не на что было бы её сменить
+    check(len(free) == 3, "активны ровно три кнопки-входа", " · ".join(free))
+    v.set_busy(True); v.set_busy(False)            # фоновый расчёт прошёл без района
+    check(v.btn_input_data.isEnabled(), "«Исходные данные» не гаснут после фонового расчёта")
+    v._open_input_window()
+    lbl = v._input_dlg.lbl_area.text()
+    check("Область:" in lbl and "тайлы:" in lbl, "в окне есть блок области и папки тайлов",
+          lbl.split("<br>")[0][:60])
+    v._input_dlg.hide()
     check(not v.bbox_item.isVisible(), "синяя рамка убрана вместе с районом")
     v.set_area_ready(True, m.area_size_km(), m.bbox_km)
     check(len([w for w in v._panel_widgets() if not w.isEnabled()]) < 5,
@@ -721,6 +730,23 @@ def main():
           _reason or "")
     os.remove(_bad_path)
 
+    # ⚠️ МАРШРУТ, ЗАПИСАННЫЙ ОДИНАКОВЫМИ ПРОХОДАМИ ПОДРЯД (файл из KML, 14.09.2026): одной
+    # ломаной линия возвращалась из конца прохода в начало — прямые через всю область.
+    # Проходы ЗАДУМАНЫ (заказчик) — делятся на отдельные маршруты, все точки сохраняются.
+    _rep_path = os.path.join(_tf2.gettempdir(), "uav_flights_check_repeat.txt")
+    _one = ["  40.10 62.50", "  40.20 62.60", "  40.35 62.62", "  40.50 62.70"]
+    with open(_rep_path, "w", encoding="utf-8") as f:
+        f.write("# UAV-ROUTES v1\n# R 1\n" + "\n".join(_one * 3) + "\n# R 2\n" + "\n".join(_one) + "\n")
+    _rr, _rrep = fl.load_flights(_rep_path)
+    check(len(_rr) == 4 and all(len(r) == 4 for r in _rr) and _rrep.get("routes_in_file") == 2,
+          "три одинаковых прохода — три маршрута, по 4 точки каждый",
+          "маршрутов %d (в файле %s), точек %d" % (len(_rr), _rrep.get("routes_in_file"),
+                                                 _rrep.get("n_points", 0)))
+    check(_rrep.get("n_points") == 16, "все точки сохранены", "16 из 16")
+    _jump = max(float(np.hypot(*np.diff(r, axis=0).T).max()) for r in _rr)
+    check(_jump < 0.2, "возвратов из конца в начало нет", "длиннейший шаг %.2f°" % _jump)
+    os.remove(_rep_path)
+
     check(hasattr(v, "btn_flights_save") and hasattr(v, "btn_flights_load")
           and hasattr(v, "btn_flights_clear"),
           "кнопки «Выгрузить/Загрузить/Удалить» историю полётов на панели")
@@ -743,6 +769,30 @@ def main():
           "«Сброс» убирает загруженную историю полётов и гасит галку")
 
     os.remove(_flights_path)
+
+    # ГАЛОЧКА «ОБОБЩАТЬ ОДИНАКОВЫЕ ПРОХОДЫ» (заказчик 14.09.2026): по умолчанию выключена —
+    # все проходы отдельными маршрутами; включена — по одному проходу на запись файла
+    _gen_path = os.path.join(_tf2.gettempdir(), "uav_flights_check_generalize.txt")   # тестовый файл
+    with open(_gen_path, "w", encoding="utf-8") as f:
+        f.write("# UAV-ROUTES v1\n# R 1\n" + "\n".join(_one * 3) + "\n# R 2\n" + "\n".join(_one) + "\n")
+    c.on_flights_load(_gen_path)
+    check(len(m.loaded_routes) == 4 and not m.generalize_loaded,
+          "по умолчанию обобщение выключено — все проходы отдельными маршрутами",
+          "%d маршрутов" % len(m.loaded_routes))
+    v._open_route_viewer()
+    _dlg = v._route_viewer_dlg                       # окно «Посмотреть маршруты»
+    check(_dlg.chk_generalize.isEnabled() and not _dlg.chk_generalize.isChecked(),
+          "галочка в окне доступна (повторы есть) и снята", _dlg.chk_generalize.text())
+    _dlg.chk_generalize.setChecked(True)             # человек ставит галочку
+    check(m.generalize_loaded and len(m.loaded_routes) == 2 and len(m.loaded_routes_all) == 4,
+          "галочка обобщает: по проходу на запись, все проходы сохранены в модели",
+          "в выборке %d, всего проходов %d" % (len(m.loaded_routes), len(m.loaded_routes_all)))
+    _dlg.chk_generalize.setChecked(False)            # и снимает
+    check(not m.generalize_loaded and len(m.loaded_routes) == 4,
+          "снятая галочка возвращает все проходы", "%d маршрутов" % len(m.loaded_routes))
+    _dlg.hide()
+    c.on_flights_clear()
+    os.remove(_gen_path)
 
     # ================================================================
     # 8. АНАЛИЗ РАЗМЕЩЕНИЯ: стрелки, устойчивые номера (задача 8.9)
@@ -1061,13 +1111,72 @@ def main():
           " · ".join("тип %d: %.0f%%" % (t, d["covered_frac"] * 100)
                      for t, d in sorted(_by.items())))
 
+    print("\n11. СЛОЙ ЗАВЕДЁН ЦЕЛИКОМ, А НЕ НАПОЛОВИНУ")
+    # ⚠️ НОВЫЙ СЛОЙ ЖИВЁТ В ЧЕТЫРЁХ МЕСТАХ СРАЗУ, и забыть любое — тихая поломка:
+    # без фильтра тегов слой не соберётся из OSM (веса не будет), без стиля не нарисуется,
+    # без порядка не попадёт в легенду и в окно «Векторные слои». Проверка заведена
+    # 13.09.2026 при добавлении слоя ПРОСЕК: всё это пришлось сверять руками.
+    from config import THREAT_LAYERS, THREAT_LAYER_ORDER
+    from model.threat_grid import OSM_LAYER_FILTERS
+    from view_qt.threat_view import LAYER_STYLE
+    for where, names in (("фильтр тегов OSM", OSM_LAYER_FILTERS),
+                         ("стиль линии", LAYER_STYLE),
+                         ("порядок слоёв", THREAT_LAYER_ORDER)):
+        miss = [k for k in THREAT_LAYERS if k not in names]
+        check(not miss, "у каждого слоя есть %s" % where,
+              "нет у: %s" % ", ".join(miss) if miss else "слоёв %d" % len(THREAT_LAYERS))
+    extra = [k for k in THREAT_LAYER_ORDER if k not in THREAT_LAYERS]
+    check(not extra, "в порядке слоёв нет лишних имён",
+          "лишние: %s" % ", ".join(extra) if extra else "")
+    # стиль без слоя — тоже ошибка: он нарисуется, но веса у него не будет
+    orphan = [k for k in LAYER_STYLE if k not in THREAT_LAYERS]
+    check(not orphan, "нет стилей для несуществующих слоёв",
+          "лишние: %s" % ", ".join(orphan) if orphan else "")
+    # ⚠️ СРАВНИВАЕМ ТОЛЬКО ЛИНЕЙНЫЕ СЛОИ. У площадного слоя штрих — это рисунок контура,
+    # и совпасть с линией он может без вреда: их всё равно не спутать (застройка — пятно).
+    # Первый же прогон проверки нашёл такую пару — `power` и `built_up` с [2, 3].
+    dashes = {}
+    for name, st in LAYER_STYLE.items():
+        if THREAT_LAYERS.get(name, {}).get("geom") != "line":
+            continue
+        d = tuple(st.get("dash") or ())
+        if d:                                     # сплошных линий несколько — это норма
+            dashes.setdefault(d, []).append(name)
+    same = [v for v in dashes.values() if len(v) > 1]
+    check(not same, "штрих у каждой линии свой — слои различимы",
+          ("совпадают: %s" % "; ".join(", ".join(v) for v in same)) if same else
+          "разных штрихов %d" % len(dashes))
+
+    print("\n12. ЦИФРОВЫЕ КАРТЫ: галочка скрывает, «Применить» + «Построить» исключают")
+    # ⚠️ ДВА РАЗНЫХ ДЕЙСТВИЯ (схема заказчика 13.09.2026): галочка — только ПОКАЗ, слой в
+    # расчёте остаётся; «Применить к расчёту» и следующий «Построить карту» — слой уходит
+    # из весов. Спутать их — значит либо пересчитывать карту на каждый клик, либо молча
+    # считать то, что человек на карте уже не видит.
+    _lay = "track"
+    def _in_calc():
+        g = m.grid
+        return g is not None and _lay in g.layers and float(g.layers[_lay].sum()) > 0
+    m.set_enabled_layers(None); m.build()
+    v._open_data_dialog(); _d = v._data_dialog
+    check(all(ch.isChecked() for ch in _d._checks.values()), "при запуске все галочки включены")
+    check(not _d.btn_apply.isEnabled(), "«Применить» погашена, пока менять нечего")
+    _d._checks[_lay].setChecked(False)
+    check(v._vec_visible[_lay] is False, "снятая галочка сразу скрывает слой")
+    check(m.enabled_layers is None and _in_calc(), "но в расчёте слой остаётся")
+    check(_d.btn_apply.isEnabled(), "«Применить» загорается при расхождении")
+    _d._apply(); m.build()
+    check(not _in_calc(), "«Применить» + «Построить карту» убирают слой из весов")
+    _d._checks[_lay].setChecked(True); _d._apply(); m.build()
+    check(m.enabled_layers is None and _in_calc(), "вернули галочку и применили — слой в расчёте")
+    _d.close()
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
         return 1
     print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои, окно исходных данных, история "
-         "полётов, анализ размещения, линейка «Расстояние» и анализ моделирования "
-         "по направлениям — в норме.")
+         "полётов, анализ размещения, линейка «Расстояние», анализ моделирования "
+         "и полнота слоёв — в норме.")
     return 0
 
 

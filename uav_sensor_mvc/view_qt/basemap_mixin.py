@@ -14,12 +14,34 @@ VIEW (Qt) · Переиспользуемый слой ТАЙЛОВОЙ ПОДЛ
 Класс-миксин рассчитан на носителя с атрибутами self.plot/self.pi/self.vb
 (pyqtgraph PlotWidget/PlotItem/ViewBox) и методами-геттерами текущего слоя/офлайна.
 """
+import os
+
 import numpy as np
 from pyqtgraph.Qt import QtCore
 import pyqtgraph as pg
 
 from config import THEME
 from . import geomap as gm
+from .tile_layer import TileLayer, set_span_x   # подложка поштучными тайлами (10.10)
+
+# ⚠️ ВОЗВРАТ К СТАРОМУ ПУТИ — на случай, если поштучная укладка себя не покажет.
+# UAV_TILES_MOSAIC=1 возвращает склейку всей подложки в одну картинку (как было до
+# 13.09.2026). Держится до тех пор, пока новый путь не обкатан; потом убрать вместе с
+# `_BasemapTask` и `build_raster_basemap`.
+TILES_MOSAIC = os.environ.get("UAV_TILES_MOSAIC", "0") == "1"
+
+# ПРИВЯЗКА МАСШТАБА К УРОВНЯМ ТАЙЛОВ — то, чем браузерная карта отличается от нашей.
+# Тайлы существуют только на целых зумах, каждый следующий вдвое подробнее. Пока зум
+# вида плавный, тайл почти всегда приходится масштабировать: замер 13.09.2026 —
+# масштаб 1:1 лишь в 23 % случаев, в остальных от 0.71 до 1.41. Любой такой множитель
+# портит подписи, потому что буквы на тайле нарисованы попиксельно.
+# Слиппи-карты (Leaflet, OSM в браузере) решают это `zoomSnap`: после жеста вид
+# подтягивается к ближайшему уровню, и тайл всегда рисуется пиксель в пиксель.
+# UAV_ZOOM_SNAP=0 — выключить и вернуть полностью плавный зум.
+ZOOM_SNAP = os.environ.get("UAV_ZOOM_SNAP", "1") == "1"
+# Насколько близко к 1:1 считаем «уже достаточно» — чтобы не дёргать вид из-за мелочи
+# и не зациклить подгонку (она сама вызывает сигнал об изменении вида).
+SNAP_TOL = 0.02
 
 
 class _BasemapSignals(QtCore.QObject):
@@ -85,6 +107,9 @@ class BasemapMixin:
         self._scheme_step_deg = float(step_deg)
         self._map_req = 0
 
+        # ⚠️ СГЛАЖИВАНИЕ ЖИВЁТ У САМОГО ТАЙЛА (`tile_layer._TileImage`), а НЕ у виджета.
+        # Включённое на весь виджет, оно размыло весовую карту: её ячейки 500 м должны
+        # читаться квадратиками — так видно сетку расчёта (заказчик 13.09.2026).
         self.basemap = pg.ImageItem(); self.basemap.setZValue(-20)
         # Чёткость обеспечивает _pick_zoom (мозаика ≥ экрана) + гладкое масштабирование
         # изображения Qt. autoDownsample НЕ включаем: он пересчитывает картинку на КАЖДЫЙ
@@ -92,6 +117,11 @@ class BasemapMixin:
         self.basemap.setOpts(axisOrder="row-major")
         self.basemap.setVisible(False)
         self.pi.addItem(self.basemap)
+        # ПОШТУЧНЫЕ ТАЙЛЫ (задача 10.10). При старом пути слоя нет вовсе, и `self.basemap`
+        # работает как прежде — одной картинкой на всё окно.
+        self._tiles = None if TILES_MOSAIC else TileLayer(
+            self.pi, self._geo_lon0, self._geo_lat0, get_layer, get_offline,
+            area=tile_area, fade_fn=self._fade_basemap)
 
         self.graticule = self.pi.plot([], [], pen=pg.mkPen(gm_qcolor(THEME["grid"], 150),
                                                            width=1.0))
@@ -113,7 +143,12 @@ class BasemapMixin:
         self._map_signals.done.connect(self._on_basemap_ready)
         self._map_timer = QtCore.QTimer(self); self._map_timer.setSingleShot(True)
         self._map_timer.timeout.connect(lambda: self._refresh_basemap())
-        self.vb.sigRangeChanged.connect(lambda *a: self._map_timer.start(180))
+        # ЗАДЕРЖКА ПЕРЕД ПЕРЕСЧЁТОМ. Старый путь пересобирал мозаику целиком, и 180 мс
+        # были платой за то, чтобы не делать этого на каждом кадре жеста. Поштучным
+        # тайлам столько не нужно: уже показанные остаются, доезжают только недостающие —
+        # и 40 мс убирают ту самую задержку, из-за которой карта «догоняла» мышь.
+        self._map_delay = 180 if self._tiles is None else 40
+        self.vb.sigRangeChanged.connect(lambda *a: self._map_timer.start(self._map_delay))
 
     def _set_view_limits(self, bbox_km, pad_km=5.0, min_ref=None):
         """РАЙОН ОТОБРАЖЕНИЯ: рамка участка плюс `pad_km` километров поля вокруг.
@@ -141,10 +176,29 @@ class BasemapMixin:
         # предел приближения — от рамки ДАННЫХ, а не от границ: границы растут вместе с
         # окном, и приближение молча слабело бы на широком мониторе
         mx0, mx1, my0, my1 = min_ref if min_ref else (kx0, kx1, ky0, ky1)
+        min_x, min_y = (mx1 - mx0) / 60.0, (my1 - my0) / 60.0
+        # ⚠️ ПРЕДЕЛ ПРИБЛИЖЕНИЯ ДОЛЖЕН ПУСКАТЬ ДО САМЫХ ПОДРОБНЫХ ТАЙЛОВ. Доля участка
+        # (1/60) для области 302 км даёт 5.04 км — а тайлы есть до зума 15, где вид
+        # 1:1 занимает ~2.6 км. Вид упирался в предел, колесо продолжало крутиться, и
+        # карта дрожала на месте (замечание заказчика «после 10 прокруток дёргается»).
+        deep = self._deep_zoom_span_km()
+        if deep:                                   # тайлы позволяют ближе, чем доля участка
+            min_x = min(min_x, deep)               # берём то, что мельче
+            min_y = min(min_y, deep * (my1 - my0) / max(mx1 - mx0, 1e-9))
         self.vb.setLimits(xMin=kx0 - pad, xMax=kx1 + pad,
                           yMin=ky0 - pad, yMax=ky1 + pad,
-                          minXRange=(mx1 - mx0) / 60.0,
-                          minYRange=(my1 - my0) / 60.0)
+                          minXRange=min_x, minYRange=min_y)
+
+    def _deep_zoom_span_km(self):
+        # Самый узкий осмысленный вид: тайлы предельного зума, растянутые вдвое.
+        # Отдаёт: ширину вида в км либо None, если считать не из чего.
+        try:
+            width_px = max(self.plot.width(), 256)
+            km_per_deg = gm._km_per_deg_lon(self._geo_lat0)
+        except Exception:                          # виджет ещё не разложен
+            return None
+        one_to_one = (width_px / 256.0) / (2.0 ** gm.ZOOM_MAX) * 360.0 * km_per_deg
+        return one_to_one * 0.5                    # разрешаем приблизиться ещё вдвое
 
     def _refresh_basemap(self, force=False):
         # ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ (вкладка 2): при некоторых промежуточных масштабах
@@ -158,6 +212,9 @@ class BasemapMixin:
         # сигналу изменения вида — иначе тайлы вернулись бы при первом же движении мыши.
         if getattr(self, "_basemap_off", False):
             self.basemap.setVisible(False)
+            tiles = getattr(self, "_tiles", None)
+            if tiles is not None:
+                tiles.set_visible(False)
             self._set_scheme_visible(False)
             return
         try:
@@ -167,11 +224,23 @@ class BasemapMixin:
         if not np.isfinite([kx0, kx1, ky0, ky1]).all():
             return
         layer = self._get_layer()
-        if layer == "scheme":
+        if layer == "scheme":                         # тайлов нет — рисуем векторную схему
             self.basemap.setVisible(False)
+            tiles = getattr(self, "_tiles", None)
+            if tiles is not None:
+                tiles.set_visible(False)
             self._draw_scheme(kx0, kx1, ky0, ky1)
             return
         self._set_scheme_visible(False)
+        # ЛОГИЧЕСКАЯ ширина (без DPR) — см. ниже, у старого пути причина та же.
+        tiles = getattr(self, "_tiles", None)
+        if tiles is not None:                         # новый путь: каждый тайл сам по себе
+            if layer != getattr(self, "_tiles_layer", None):   # слой сменили — старые не годятся
+                tiles.clear()                                  # чужие картинки убрать разом
+                self._tiles_layer = layer
+            tiles.set_visible(True)
+            tiles.set_view((kx0, kx1, ky0, ky1), max(self.plot.width(), 256))
+            return
         self._map_req += 1
         # ЛОГИЧЕСКАЯ ширина (без DPR): даёт зум ~1:1 и родной размер подписей, как в
         # обычном OSM. С домножением на DPR брался зум на уровень выше -> подписи мельче.
@@ -182,6 +251,41 @@ class BasemapMixin:
                                           self._geo_lon0, self._geo_lat0,
                                           self._map_signals,
                                           getattr(self, "_tile_area", None)))
+
+    def snap_view_to_zoom(self):
+        """Подогнать масштаб вида так, чтобы тайлы рисовались ПИКСЕЛЬ В ПИКСЕЛЬ.
+
+        Зовётся ПОСЛЕ вписывания (`frame_bbox`, «Весь участок»), а не на каждое движение:
+        колесо и так ходит ровно по уровням (`SteppedViewBox`), а вписывание даёт
+        произвольный масштаб — вот его и приводим к уровню.
+
+        ⚠️ ОХВАТ ТОЛЬКО РАСТЁТ. Уменьшить его — значит обрезать то, что только что
+        вписали: чёрная рамка области перестала бы помещаться целиком. Поэтому берётся
+        уровень, при котором вид не уже вписанного, и картинка выходит крупнее не более
+        чем вдвое."""
+        if not ZOOM_SNAP or getattr(self, "_tiles", None) is None:
+            return
+        try:
+            (kx0, kx1), _ = self.vb.viewRange()
+        except Exception:
+            return
+        span_km = float(kx1 - kx0)
+        width_px = max(self.plot.width(), 256)
+        if span_km <= 0:
+            return
+        km_per_deg = gm._km_per_deg_lon(self._geo_lat0)
+        # ⚠️ ОТ КРУПНОГО ЗУМА К МЕЛКОМУ, и берётся первый уровень НЕ УЖЕ вписанного. До
+        # 13.09.2026 цикл шёл от мелкого к крупному и брал первый «не шире» — то есть
+        # СУЖАЛ вид: область arh 302 км в окне 1142 px вписывалась в 320 км, а привязка
+        # сжимала её до 165 км (z9 вместо z8), и чёрная рамка при запуске обрезалась.
+        for z in range(gm.ZOOM_MAX, gm.ZOOM_MIN - 1, -1):
+            # ширина вида, при которой тайлов ровно столько, сколько «окон» по 256 px
+            want_km = (width_px / 256.0) / (2.0 ** z) * 360.0 * km_per_deg
+            if want_km >= span_km * (1.0 - SNAP_TOL):  # первый уровень, что не уже вписанного
+                cx = (kx0 + kx1) * 0.5                 # центр держим, двигаем только края
+                set_span_x(self.vb, (cx - want_km * 0.5, cx + want_km * 0.5))
+                return
+        # вписанное шире самого мелкого уровня — привязывать не к чему, оставляем как есть
 
     def _on_basemap_ready(self, payload):
         req_id, layer, res = payload

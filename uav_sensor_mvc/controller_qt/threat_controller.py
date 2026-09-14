@@ -114,6 +114,9 @@ class ThreatController:
             on_routes_data=self._routes_data_for_viewer,
             on_route_preview=self.on_route_preview,
             on_route_preview_reset=self.on_route_preview_reset,
+            # галочка «обобщать одинаковые проходы» загруженной истории (14.09.2026)
+            on_generalize_loaded=self.on_generalize_loaded,
+            on_generalize_state=self._generalize_state_for_viewer,
             # окно «Анализ моделирования» (план 8, задача 8.9, довесок 06.09.2026)
             on_analysis_data=self._analysis_html)
         # СТАРТ: район не задан — расчётные кнопки закрыты, синей рамки нет
@@ -454,12 +457,17 @@ class ThreatController:
         if reason:
             self.view.flash_title("Файл не подходит: %s" % reason)
             return
-        n = self.model.load_routes_lonlat(routes_deg)
+        n = self.model.load_routes_lonlat(routes_deg, report.get("groups"))   # маршрутов в выборке
         self.model.show_loaded_routes = True
         self.view.set_loaded_routes_checked(True)
         msg = "Загружено маршрутов: %d, точек: %d." % (n, report["n_points"])
-        if report["rejected"]:
+        if report["rejected"]:                    # были нечитаемые строки
             msg += "  Отброшено строк: %d." % len(report["rejected"])
+        if report.get("routes_with_repeats"):     # в файле были одинаковые проходы подряд
+            msg += ("  %d из %d записей в файле состояли из одинаковых проходов — каждый проход "
+                    "загружен отдельным маршрутом, без возвратов в начало. Обобщить до одного "
+                    "прохода на запись — галочка в окне «Посмотреть маршруты»."
+                    % (report["routes_with_repeats"], report["routes_in_file"]))
         self.view.flash_title(msg)
         self._render_all()
         self.view.refresh_route_viewer()   # «Загруженная история» появилась/сменилась
@@ -482,6 +490,26 @@ class ThreatController:
         """Данные для окна просмотра: свои пройденные маршруты и загруженная история,
         оба в градусах — то же представление, что в файле."""
         return self.model.routes_lonlat(), self.model.loaded_routes_lonlat()
+
+    def _generalize_state_for_viewer(self):
+        # Состояние галочки «обобщать одинаковые проходы» для окна просмотра.
+        # Вход: ничего. Отдаёт: (обобщать есть что — bool, включена — bool, записей, проходов).
+        records, passes = self.model.loaded_repeat_info()   # записей файла и проходов всего
+        return records < passes, self.model.generalize_loaded, records, passes
+
+    def on_generalize_loaded(self, on):
+        # Галочка «обобщать одинаковые проходы» в окне «Посмотреть маршруты».
+        # Вход: on — bool. Отдаёт: ничего; перерисовывает карту и список окна.
+        n = self.model.set_generalize_loaded(on)     # маршрутов в выборке после переключения
+        records, passes = self.model.loaded_repeat_info()
+        self.view.flash_title(
+            ("Обобщение включено: по одному проходу на запись — %d маршрутов вместо %d."
+             % (n, passes)) if on else
+            ("Обобщение выключено: все проходы — %d маршрутов (записей в файле %d)."
+             % (n, records)))
+        self.view.render_route_preview(None)         # подсветка указывала на старую нумерацию
+        self._render_all()
+        self.view.refresh_route_viewer()
 
     def on_route_preview(self, is_loaded, index):
         """Подсветить на карте ОДИН выбранный маршрут (км — тот же фрейм, что у карты).
