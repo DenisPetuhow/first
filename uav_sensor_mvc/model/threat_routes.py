@@ -40,6 +40,7 @@ import numpy as np
 from config import (THREAT_LOOKAHEAD_KM, THREAT_LOOKAHEAD_POWER, THREAT_COST_POWER,
                     THREAT_COST_RELIEF, THREAT_COST_MIX_BIAS, THREAT_COST_MIX_STEPS,
                     THREAT_WEIGHT_GAIN, THREAT_SECTOR_ENTRY_COOLDOWN,
+                    THREAT_ENTRY_COOLDOWN_ROUTES, THREAT_ENTRY_COOLDOWN_DEG,
                     THREAT_DEM_K_MIN, THREAT_DEM_K_MAX)
 
 # 8 соседей ячейки: (dy, dx, множитель длины шага). Орт. сосед — шаг h, диагональный — h·√2.
@@ -183,6 +184,11 @@ def passable_mask(grid, max_gap_km, slack_km=None):
     nfz = grid.no_fly_mask() if hasattr(grid, "no_fly_mask") else None
     if nfz is not None:
         pas &= ~np.asarray(nfz, bool)
+    # ЗА ОКРУЖНОСТЬЮ КРУГЛОГО РАЙОНА (план 11, 11.6) — тот же запрет и по той же причине после
+    # буфера: дилатация на уход от ориентира вывела бы коридор на километр за круг
+    out = grid.outside_mask() if hasattr(grid, "outside_mask") else None
+    if out is not None:                                        # район круглый
+        pas &= ~np.asarray(out, bool)                          # — за окружностью не летаем
     return pas
 
 
@@ -202,6 +208,12 @@ def _open_endpoints(pas, cells_yx, grid, radius_km=3.0):
     rc = max(1, int(round(radius_km / grid.h)))
     for cy, cx in cells_yx:
         pas[max(0, cy - rc):cy + rc + 1, max(0, cx - rc):cx + rc + 1] = True
+    # ⚠️ ЗА ОКРУЖНОСТЬ КРУГЛОГО РАЙОНА НЕ ОТКРЫВАЕМ (план 11, 11.6). Точки входа стоят у самого
+    # края круга, и квадрат 3 км наполовину выходил наружу: замер — область залёта заходила за
+    # окружность на 249 ячеек, до 3.4 км. Прямоугольный район маски не имеет — всё как было.
+    out = grid.outside_mask() if hasattr(grid, "outside_mask") else None
+    if out is not None:                                # район круглый
+        pas &= ~np.asarray(out, bool)                  # — снаружи остаётся закрытым
     return pas
 
 
@@ -506,6 +518,29 @@ TURN_HARD_DEG = 45.0
 # 0 — правило выключено.
 TURN_WINDOW_KM = 3.0
 TURN_WINDOW_DEG = 90.0
+# ЗАПРЕТНЫЙ СЕКТОР ПОЗАДИ ПРОЙДЕННОЙ ТОЧКИ (план 11, задача 11.1; предложение заказчика
+# 15.09.2026). Предел поворота и окно разворота мерят КУРС, а петля складывается из
+# разрешённых поворотов: четыре раза по 45° — и маршрут идёт обратно параллельно своей
+# трассе. Поэтому запрет ставится на МЕСТО: у каждой точки трассы с курсом h — сектор с
+# вершиной в точке, осью «назад» (−h), раствором BACK_SECTOR_DEG и радиусом BACK_SECTOR_KM.
+# Вперёд и вбок (до ±110° от курса) — свободно, и плавный поворот не мешает; вернуться к
+# своей трассе можно только дугой шире радиуса. Раствор 140°, а не 180°: края сектора
+# оставлены под разворот. Правило снимается на шаг, если без него прохода нет.
+# 0 — правило выключено, поведение прежнее до бита.
+BACK_SECTOR_KM = 2.0
+BACK_SECTOR_DEG = 140.0
+# «МЯГКАЯ» ТОЧКА ОБХОДА (план 11, 11.1). Участок к VIA раньше заканчивался только В САМОЙ
+# её ячейке, а следующий участок сразу шёл к цели. VIA в стороне от пути означала шпильку:
+# дошёл до точки — развернулся — пошёл обратно по своей же трассе. Замер 15.09.2026: медиана
+# места разворота — 63 % пути, у цели лишь 7–12 % разворотов; запрет сектора позади трассы
+# их не убирал, а снимался 0.8–4.9 раза на попытку — прохода без разворота не было.
+# Теперь участок к VIA кончается, как только маршрут подошёл к ней на VIA_REACH_KM, и
+# поворот к цели начинается дугой. 0 — прежнее поведение (строго в ячейку VIA).
+VIA_REACH_KM = 3.0
+# ПЕРЕВЕС НЕДОБРАВШЕГО ПОЯСА ОБЛЁТА (план 11, 11.5), маршрутов: вес пояса при выборе — его доля
+# плюс недобор, но не больше этого. Без предела пояс, куда облёт не даётся вовсе (за рамкой, не
+# хватает хода), копил бы недобор и забирал себе все попытки облёта.
+ORBIT_QUOTA_CAP = 2.0
 # ПРЯМОЙ УЧАСТОК МЕЖДУ ПОВОРОТАМИ — проверено и ВЫКЛЮЧЕНО (0). Мысль была та же:
 # повороты по 45° подряд складываются в дугу радиусом 0.65 км, и если требовать между
 # доворотами пройти прямо, дуга станет шире. На деле правило конфликтует с весовой картой:
@@ -567,14 +602,77 @@ def _spend_tau(slack_km, slack0_km, frac_done, profile):
     elif profile == "even":             # держимся плана равномерного расхода
         spent_frac = ((slack0_km - slack_km) / slack0_km) if slack0_km > 1e-6 else 1.0
         by_phase = min(1.0, max(0.0, 0.5 + 3.0 * (frac_done - spent_frac)))
-    else:                               # "late" (по умолчанию): виляем, пока запас есть
-        by_phase = 1.0
+    else:                               # "late": виляем в начале, к цели выпрямляемся
+        # ⚠️ ИСПРАВЛЕНО 15.09.2026 (план 11, 11.2). Было by_phase = 1: «виляет, пока запас
+        # есть». Запас мерится абсолютным порогом _SLACK_FULL_KM, и при большом запасе хода
+        # он не кончается никогда — маршрут вилял весь путь, как `even`. Замер при запасе
+        # 129 км: извилистость первой трети 1.195, последней 1.598 (у `even` 1.200 и 1.596).
+        # Теперь фаза убывает с пройденной долей — зеркально `early`.
+        by_phase = 1.0 - frac_done
     return _TAU_TIGHT + (_TAU_FREE - _TAU_TIGHT) * by_slack * by_phase
+
+
+_SECTOR_STENCILS = {}    # трафареты сектора: (шаг сетки, радиус, раствор) -> 8 наборов смещений
+
+
+def _sector_stencils(h):
+    """Смещения ячеек, попадающих в запретный сектор позади точки, — по курсу на каждого из
+    8 соседей. Вход: шаг сетки, км. Отдаёт: список из 8 пар массивов (dy, dx), ячейки."""
+    key = (float(h), float(BACK_SECTOR_KM), float(BACK_SECTOR_DEG))
+    if key not in _SECTOR_STENCILS:                    # ещё не заготовлены
+        rc = int(np.ceil(BACK_SECTOR_KM / h))          # радиус в ячейках
+        dy, dx = np.mgrid[-rc:rc + 1, -rc:rc + 1]
+        dist = np.hypot(dx, dy) * h                    # удаление ячейки, км
+        half = np.cos(np.radians(0.5 * BACK_SECTOR_DEG))
+        out = []
+        for ny_, nx_, mul in _NEIGHBORS:
+            ux, uy = nx_ / mul, ny_ / mul              # орт курса по x и y
+            # косинус угла между «точка → ячейка» и направлением НАЗАД (−курс)
+            cos_back = -(dx * ux + dy * uy) * h / np.maximum(dist, 1e-9)
+            sel = (dist > 1e-9) & (dist <= BACK_SECTOR_KM) & (cos_back >= half)
+            out.append((dy[sel].astype(np.int64), dx[sel].astype(np.int64)))
+        _SECTOR_STENCILS[key] = out
+    return _SECTOR_STENCILS[key]
+
+
+def _new_trail(grid):
+    """Пустая трасса маршрута для запретного сектора: маска запретных ячеек.
+    Вход: сетка. Отдаёт: словарь mask (ny, nx) bool, n — сколько точек записано."""
+    return dict(mask=np.zeros((grid.ny, grid.nx), bool), n=0)
+
+
+def _trail_push(trail, grid, vy, vx, k):
+    """Дописать точку трассы: закрасить её сектор позади в маске.
+    Вход: трасса, сетка, ячейка (iy, ix), номер направления шага в `_NEIGHBORS`. Отдаёт: None."""
+    sy, sx = _sector_stencils(grid.h)[k]
+    yy, xx = sy + vy, sx + vx                          # ячейки сектора этой точки
+    ok = (yy >= 0) & (yy < grid.ny) & (xx >= 0) & (xx < grid.nx)
+    trail["mask"][yy[ok], xx[ok]] = True
+    trail["n"] += 1
+
+
+def _back_sector_bad(trail, grid, cy, cx):
+    """Какие из 8 соседей ячейки попадают в запретный сектор позади пройденных точек.
+    Вход: трасса, сетка, ячейка (iy, ix). Отдаёт: массив (8,) bool либо None (запрета нет)."""
+    if trail["n"] == 0 or BACK_SECTOR_KM <= 0.0:       # трассы нет или правило выключено
+        return None                                    # — запрещать нечего
+    # ⚠️ МАСКА, А НЕ ПЕРЕБОР ТОЧЕК. Первая версия на каждом шаге сравнивала соседей со всеми
+    # точками трассы векторно — 190 тыс. вызовов, 3.8 с на контрольный прогон (+16 %).
+    # Трафарет сектора закрашивается один раз при записи точки, а проверка — чтение ячейки.
+    m = trail["mask"]
+    ny, nx = m.shape
+    bad = np.zeros(8, bool)
+    for k, (dy, dx, _mul) in enumerate(_NEIGHBORS):
+        vy, vx = cy + dy, cx + dx
+        if 0 <= vy < ny and 0 <= vx < nx and m[vy, vx]:   # сосед в чьём-то секторе
+            bad[k] = True
+    return bad
 
 
 def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                 heading0=None, wmode="medium", visited=None, spend="late",
-                done0_km=0.0, tail_km=0.0, dgeo=None, fscale=1.0, bypass_km=0.0):
+                done0_km=0.0, tail_km=0.0, dgeo=None, fscale=1.0, bypass_km=0.0,
+                trail=None, reach_km=0.0):
     """Стохастический спуск по полю расстояний dfield от start к goal (надёжно приходит):
     выбор коридора — по ВЕСУ соседа (тепловая карта, приоритет по режиму wmode) и развилкам.
 
@@ -652,9 +750,14 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     if (bypass_km > 0.0 and tail_km > 1e-9 and dgoal is not None
             and dgoal[start] >= bypass_km and dgoal[goal] >= bypass_km):
         bypass = float(bypass_km)
+    # МЯГКОЕ ДОСТИЖЕНИЕ промежуточной точки (VIA_REACH_KM): «дошли», когда до неё по
+    # коридорам осталось не больше reach_km — поворот к следующей точке начнётся дугой
+    soft = float(reach_km) if (reach_km > 0.0 and tail_km > 1e-9) else 0.0   # км; у цели — строго
     for _ in range(step_cap):
         if cur == goal or dfield[cur] <= reach_eps:
             break
+        if soft > 0.0 and dgeo[cur] <= soft:           # подошли к промежуточной точке
+            break                                      # — участок закончен, дальше к цели
         # СВОБОДНЫЙ ЗАПАС: сколько км ещё можно потратить на виляние, оставшись в бюджете.
         # Отрицательный — дойти уже нельзя, обрываемся сразу (не жжём шаги впустую).
         # Считается по КИЛОМЕТРАМ (`dgeo`), а не по стоимости: это про топливо.
@@ -693,11 +796,17 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         # держим ли сейчас прямую: доворачивать можно, только пройдя прямой участок
         hold_straight = (TURN_MIN_STRAIGHT_KM > 0.0 and heading is not None
                          and dist_since_turn < TURN_MIN_STRAIGHT_KM)
-        limits = [(TURN_MAX_DEG, True, hold_straight), (TURN_MAX_DEG, True, False),
-                  (TURN_MAX_DEG, False, False)]
+        # ЗАПРЕТНЫЙ СЕКТОР ПОЗАДИ ТРАССЫ (BACK_SECTOR_KM): считается один раз на шаг для
+        # всех восьми соседей. Снимается ПОСЛЕДНИМ — после окна разворота: окно лишь
+        # предпочтение, а сектор — то, ради чего возвраты и убираются.
+        back_bad = _back_sector_bad(trail, grid, cy, cx) if trail is not None else None
+        limits = [(TURN_MAX_DEG, True, hold_straight, True), (TURN_MAX_DEG, True, False, True),
+                  (TURN_MAX_DEG, False, False, True)]
+        if back_bad is not None and back_bad.any():   # сектор что-то запрещает
+            limits.append((TURN_MAX_DEG, False, False, False))   # — последний шанс без него
         if TURN_HARD_DEG > TURN_MAX_DEG:
-            limits.append((TURN_HARD_DEG, False, False))
-        for turn_lim, use_win, straight in limits:
+            limits.append((TURN_HARD_DEG, False, False, False))
+        for turn_lim, use_win, straight, use_back in limits:
             win_u = win_u0 if use_win else None
             # ДОПУСК НА ОКРУГЛЕНИЕ: курс хранится с точностью 0.001, и у диагонали
             # скалярное произведение выходит 0.707 против точного cos 45° = 0.70711.
@@ -719,6 +828,8 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                     continue                           # у цели не отворачиваем от неё
                 if bypass > 0.0 and dgoal[vy, vx] < bypass:
                     continue                           # мимо цели идём в обход, а не сквозь неё
+                if use_back and back_bad is not None and back_bad[k]:
+                    continue                           # позади своей трассы — возврат
                 uy, ux = _NB_UNIT[k]
                 if heading is None:
                     hf = 1.0                           # на старте курс свободен
@@ -748,8 +859,11 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                     s *= 0.12                           # но не запрещает (иначе тупики)
                 if s <= 0.0:
                     continue
-                cand.append((vy, vx, mul, (uy, ux))); score.append(s)
+                cand.append((vy, vx, mul, (uy, ux), k)); score.append(s)
             if cand or heading is None:
+                if not use_back and back_bad is not None and back_bad.any():   # прошли, сняв сектор
+                    st = ctx.setdefault("_stats", {})
+                    st["back_relax"] = st.get("back_relax", 0) + 1   # — счётчик для замера
                 break                                   # первый проход удался — второй не нужен
         if not cand:
             return None
@@ -762,7 +876,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         else:                                           # при tau->0: берём лучшего соседа
             cum = np.cumsum(sc)
             j = min(int(np.searchsorted(cum, rng.random() * cum[-1])), len(cand) - 1)
-        vy, vx, mul, unit = cand[j]
+        vy, vx, mul, unit, k_step = cand[j]
         step = mul * h
         route_len += step
         if route_len > budget:
@@ -777,7 +891,11 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         cur = (vy, vx)
         visited.add(vy * nx + vx)
         path.append(cur)
-    return (path, route_len, heading) if (cur == goal or dfield[cur] <= reach_eps) else None
+        if trail is not None:                           # ведём трассу для запретного сектора
+            _trail_push(trail, grid, vy, vx, k_step)
+    done_ok = (cur == goal or dfield[cur] <= reach_eps
+               or (soft > 0.0 and dgeo[cur] <= soft))  # дошли строго или мягко
+    return (path, route_len, heading) if done_ok else None
 
 
 def _nearest_passable_cell(pas, grid, y_km, x_km, max_km=12.0):
@@ -984,6 +1102,9 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                     via_togoal.append(float(gt_geo[vc]))
                     # `via_minlen` здесь НЕ считается: длина вход→via→цель своя у каждой
                     # точки входа и собирается ниже, в надстройках по входам
+    # СРЕДНЕЕ расстояние от точек входа до цели — от него считаются пояса облёта
+    D_mean = float(np.mean([np.hypot(ex - B[0], ey - B[1]) for ex, ey in entries_km]))
+    orbit = _orbit_pool(grid, pas_via, gt_geo, mul, B, D_mean)   # маска с кругом обхода цели
     # НАДСТРОЙКИ ПО ВХОДАМ: всё, что зависит от точки старта. Поля выше общие.
     togoal_arr = np.asarray(via_togoal, float)
     entries = []
@@ -998,6 +1119,8 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
             via_minlen=(np.asarray([float(g[sc]) for g in via_gv_geo]) + togoal_arr
                         if via_gv_geo else np.zeros(0)),
             gt_start=float(gt_geo[sc]),
+            # азимут «цель → вход», градусы (0 — север, по часовой): для паузы повтора по углу
+            az=float(np.degrees(np.arctan2(ex - B[0], ey - B[1])) % 360.0),
             reachable=bool(np.isfinite(gt_geo[sc]))))
     live = [e for e in entries if e["reachable"]]
     ctx = dict(grid=grid, pas=pas, gt=gt, gt_geo=gt_geo, wnorm=wnorm,
@@ -1005,13 +1128,203 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                dgoal=dgoal, ahead=ahead,
                via_cell=via_cell, via_gv=via_gv, via_gv_geo=via_gv_geo,
                via_back=np.asarray(via_back, bool), via_segd=np.asarray(via_segd),
-               via_togoal=togoal_arr, entries=entries,
+               via_togoal=togoal_arr, entries=entries, orbit=orbit,
+               # ⚠️ СЧЁТЧИК ЖИВЁТ В САМОМ КОНТЕКСТЕ массивом: маршрут работает с копией
+               # `{**ctx, **вход}`, и прибавка на месте видна всем следующим маршрутам
+               _orbit_done=(np.zeros(len(orbit["sectors"])) if orbit else None),   # дошедших облётов по поясам, шт.
+               _appr_done=({k: np.zeros(3) for k in ("min", "medium", "max")}
+                           if orbit else None),        # дошедших по повадкам на уровень, шт.
+               target_km=(float(B[0]), float(B[1])),
+               entry_span_deg=_azimuth_span([e["az"] for e in entries]),   # разнос входов, градусы
                # ОСЬ ОТ ЦЕНТРА входов — по ней считались via_segd и «via за целью»
                axis_center=axis_s, ab_center=ab)
     # для кода, знающего про один вход (`ctx["start"]`, показатели, `_pick_via`):
     # представитель — первый ДОСТИЖИМЫЙ вход, иначе просто первый
     ctx.update(live[0] if live else entries[0])
     return ctx
+
+
+def _orbit_pool(grid, pmask, gt_geo, mul, B, D):
+    """Точки облёта по ПОЯСАМ вокруг цели, границы — доли среднего расстояния вход→цель.
+    Вход: сетка, маска (с кругом обхода цели), поле км до цели, множитель цены, цель B км,
+    D — среднее расстояние от входов до цели, км. Отдаёт: словарь sectors, bounds (км), D."""
+    import config as _cfg                              # читаем при вызове: опыты подменяют
+    frac = tuple(float(f) for f in getattr(_cfg, "THREAT_ORBIT_RADII_FRAC", ()))
+    ndir = int(getattr(_cfg, "THREAT_ORBIT_DIRS", 12))
+    mix = getattr(_cfg, "THREAT_APPROACH_MIX", {})
+    if (len(frac) < 2 or ndir < 4 or D <= 0.0
+            or not any(p[1] + p[2] > 0 for p in mix.values())):   # облёт выключен
+        return {}                                      # — поясов не строим
+    # ⚠️ ПОЯСА В ДОЛЯХ, А НЕ В КМ (заказчик 16.09.2026): кольца 10/18/28 км в районе 200 км
+    # жались бы к цели. Граница пояса = доля × D; ближний пояс не заходит в круг обхода цели —
+    # туда шаг и так запрещён, точка там была бы недостижима.
+    bounds = [f * D for f in frac]                     # границы поясов, км
+    r_min = FINAL_BYPASS_KM + 2.0 * grid.h             # ближе к цели точку не ставим, км
+    x0, y0 = grid.ox, grid.oy
+    x1, y1 = grid.ox + grid.nx * grid.h, grid.oy + grid.ny * grid.h   # рамка сетки, км
+    step = 2.0 * np.pi / ndir                          # шаг азимута, радианы
+    sectors = []
+    rows = 2                                           # рядов в поясе: 0 — ближний, 1 — дальний
+    for s in range(len(bounds) - 1):
+        r_in, r_out = max(bounds[s], r_min), bounds[s + 1]
+        slots = []
+        if r_out <= r_in:                              # пояс целиком внутри круга обхода
+            sectors.append(slots)                      # — точек нет
+            continue
+        # ⚠️ ДВА РЯДА СО СДВИГОМ в КАЖДОМ поясе (11.5): точка берётся по случайному углу, и чем
+        # гуще пул, тем разнообразнее облёт; а разброс выбирает ряд — «прямая» ближний, «края»
+        # дальний, — не меняя доли самого пояса. У рамки района второй ряд часто остаётся один.
+        for row in range(rows):
+            r = r_in + (r_out - r_in) * (row + 0.5) / rows     # радиус ряда, км
+            for k in range(ndir):
+                a = step * (k + 0.5 * row)             # азимут точки, радианы (от оси x)
+                px, py = B[0] + r * np.cos(a), B[1] + r * np.sin(a)
+                if not (x0 <= px < x1 and y0 <= py < y1):   # точка за рамкой района
+                    continue                           # — с этой стороны пояса нет
+                vc = _nearest_passable_cell(pmask, grid, py, px,
+                                            max_km=0.5 * (r_out - r_in) / rows + grid.h)
+                if vc is None or not np.isfinite(gt_geo[vc]):   # проходимого рядом нет
+                    continue
+                vx_k = grid.ox + (vc[1] + 0.5) * grid.h
+                vy_k = grid.oy + (vc[0] + 0.5) * grid.h
+                rr = float(np.hypot(vx_k - B[0], vy_k - B[1]))
+                if not (r_in - grid.h <= rr <= r_out + grid.h):   # примагнитилась мимо пояса
+                    continue
+                # ⚠️ ПОЛЯ ЛЕНИВО (`_ring_fields`): точек около сотни, а нужны единицы.
+                slots.append(dict(sector=s, row=row, a=float(np.arctan2(vy_k - B[1], vx_k - B[0])),
+                                  r=rr, cell=vc, xy=(vx_k, vy_k), togoal=float(gt_geo[vc]),
+                                  pmask=pmask, mul=mul, gv_geo=None, gv=None))
+        sectors.append(slots)
+    return dict(sectors=sectors, bounds=bounds, D=float(D))
+
+
+def _ring_fields(grid, slot):
+    """Посчитать поля расстояний к точке облёта, если ещё не считались (кэш в самой точке).
+    Вход: сетка, точка (словарь). Отдаёт: None; заполняет gv_geo (км) и gv (стоимость)."""
+    if slot["gv_geo"] is not None:                     # уже посчитано
+        return
+    slot["gv_geo"] = _dijkstra_dist(slot["pmask"], slot["cell"], grid.h)
+    slot["gv"] = (slot["gv_geo"] if slot["mul"] is None
+                  else _dijkstra_cost(slot["pmask"], slot["cell"], grid.h, slot["mul"]))
+
+
+def _deg_diff(a, b):
+    """Разность азимутов, приведённая в [0, 180]. Вход: градусы. Отдаёт: градусы."""
+    return abs((float(a) - float(b) + 180.0) % 360.0 - 180.0)
+
+
+def _azimuth_span(azs):
+    """Разнос азимутов по кругу: 360° минус наибольший промежуток между соседними.
+    Вход: азимуты, градусы. Отдаёт: градусы (0 — точка одна)."""
+    a = np.sort(np.asarray(azs, float) % 360.0)
+    if len(a) < 2:                                     # точка одна или ни одной
+        return 0.0
+    gaps = np.diff(np.concatenate([a, [a[0] + 360.0]]))   # промежутки по кругу, градусы
+    return float(360.0 - gaps.max())
+
+
+def _angle_diff(a, b):
+    """Разность углов, приведённая в [0, π]. Вход: радианы. Отдаёт: радианы."""
+    return abs((a - b + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def _quota_order(share, done, rng):
+    """Порядок, в котором пробовать варианты (пояса облёта, повадки): первым — разыгранный с
+    учётом недобора. Вход: доли вариантов (сумма 1), дошедших маршрутов по вариантам (шт.),
+    генератор. Отдаёт: список номеров вариантов (все, без повторов)."""
+    # ⚠️ ДОЛЯ ДЕРЖИТСЯ СРЕДИ ДОШЕДШИХ (заказчик 16.09.2026: «чтобы всегда процент такой был»).
+    # Простой розыгрыш по долям её не держит: дальний облёт чаще не укладывается в запас или
+    # упирается в рамку. В 11.4 «края» заказывали дальнему поясу 15 %, а получали 5 %; уровень
+    # «максимальный» заказывал облёту 35 %, а в выборку попадало 25 %. Поэтому вес варианта = его
+    # доля плюс недобор в маршрутах; перевес ограничен ORBIT_QUOTA_CAP, чтобы вариант, который не
+    # даётся вовсе, не забирал себе все попытки.
+    N = float(done.sum())                              # дошедших маршрутов всего, шт.
+    w = np.clip(share * (N + 1.0) - done, 0.0, ORBIT_QUOTA_CAP)   # вес варианта, маршрутов
+    left = list(range(len(share)))
+    order = []
+    while left:
+        ww = np.asarray([w[s] for s in left], float)
+        if ww.sum() <= 0.0:                            # у оставшихся недобора нет
+            ww = np.asarray([share[s] for s in left], float) + 1e-9   # — просто по долям
+        k = int(np.searchsorted(np.cumsum(ww), rng.random() * ww.sum()))
+        order.append(left.pop(min(k, len(left) - 1)))
+    return order
+
+
+def _orbit_chain(ctx, behav, spread, rng, L_max):
+    """Цепочка точек облёта для flank/rear: пояс по долям с учётом недобора, углы — случайно.
+    Вход: контекст (со своим входом), повадка, режим разброса (без mix), генератор, запас км.
+    Отдаёт: (список точек, номер пояса) либо (None, None) — облёт не по силам ни в каком поясе."""
+    orb = ctx.get("orbit") or {}
+    if not orb:                                        # поясов нет
+        return None, None
+    import config as _cfg
+    sectors = orb["sectors"]
+    share = np.asarray(tuple(_cfg.THREAT_ORBIT_SECTOR_SHARE)[:len(sectors)], float)
+    share = share / max(float(share.sum()), 1e-9)      # доли поясов, сумма 1
+    done = ctx.get("_orbit_done")                      # дошедших облётов по поясам, шт.
+    if done is None or len(done) != len(sectors):      # контекст собран без счётчика
+        done = np.zeros(len(sectors))                  # — считаем, что недобора нет
+    B = np.asarray(ctx["target_km"], float)
+    ex, ey = ctx["entry_km"]
+    ae = float(np.arctan2(ey - B[1], ex - B[0]))       # азимут стороны входа, радианы
+    side = 1.0 if rng.random() < 0.5 else -1.0         # обход по или против часовой
+    # УГЛЫ СЛУЧАЙНО В ПРЕДЕЛАХ ПОВАДКИ — маршруты облёта не должны быть одним и тем же путём
+    offs = [np.radians(60.0 + 60.0 * rng.random())]    # сбоку: 60–120° от стороны входа
+    if behav == "rear":                                # облёт: ещё 135–180°
+        offs.append(np.radians(135.0 + 45.0 * rng.random()))
+    row = {"center": 0, "edge": 1}.get(spread)         # ряд пояса по разбросу; None — любой
+    for s in _quota_order(share, done, rng):
+        chain = _chain_in_belt(ctx, sectors, s, ae, side, offs, row, L_max)
+        if chain is not None:                          # в этом поясе облёт по силам
+            st = ctx.setdefault("_stats", {})
+            st["orbit_sector_%d" % s] = st.get("orbit_sector_%d" % s, 0) + 1   # для замера
+            return chain, s
+    return None, None                                  # облёт не по силам ни в каком поясе
+
+
+def _chain_in_belt(ctx, sectors, s, ae, side, offs, row, L_max):
+    """Цепочка облёта с точкой отхода в поясе s. Вход: контекст, пул поясов, номер пояса,
+    азимут входа (радианы), сторона ±1, углы от стороны входа (радианы), ряд или None, запас км.
+    Отдаёт: список точек либо None — в этом поясе облёт не по силам."""
+    tol = np.radians(35.0)                             # точка не дальше 35° от нужного угла
+    grid = ctx["grid"]
+    ex, ey = ctx["entry_km"]
+    s_cell = ctx["start"]
+
+    def nearest(pool, want):
+        """Ближайшая по углу точка пула в допуске, с рядом разброса, если он есть; иначе None."""
+        cand = [c for c in pool if _angle_diff(c["a"], want) <= tol]
+        pref = [c for c in cand if c["row"] == row] if row is not None else cand
+        cand = pref or cand                            # нужного ряда нет — любой ряд пояса
+        return min(cand, key=lambda c: _angle_diff(c["a"], want)) if cand else None
+
+    for sd in (side, -side):
+        first = nearest(sectors[s], ae + sd * offs[0])   # точка ОТХОДА — строго в поясе s
+        if first is None:                              # в поясе с этой стороны дыра
+            continue
+        # ЗАХОД С ОБРАТНОЙ СТОРОНЫ — в том же поясе или ближе к цели: за целью рамка района часто
+        # ближе, чем сбоку (в эталоне 36.5 км против 60), и дальний пояс там пуст. Пояс маршрута
+        # всё равно задаёт точка отхода — именно она уводит маршрут в сторону.
+        seconds = [None]
+        if len(offs) > 1:                              # облёт: нужна вторая точка
+            seconds = [nearest(sectors[sb], ae + sd * offs[1]) for sb in range(s, -1, -1)]
+            seconds = [c for c in seconds if c is not None and c is not first]
+        for second in seconds:
+            chain = [first] if second is None else [first, second]
+            pts = [(ex, ey)] + [c["xy"] for c in chain]
+            lb = sum(float(np.hypot(b[0] - a[0], b[1] - a[1])) for a, b in zip(pts, pts[1:]))
+            if lb + chain[-1]["togoal"] > L_max:       # даже по прямым не укладывается
+                continue                               # — пробуем заход ближе к цели
+            for c in chain:
+                _ring_fields(grid, c)                  # поля — по первому спросу
+            minlen = chain[0]["gv_geo"][s_cell]        # вход → первая точка, км
+            for a, b in zip(chain, chain[1:]):
+                minlen += a["gv_geo"][b["cell"]]       # от точки к точке, км
+            minlen += chain[-1]["togoal"]              # последняя точка → цель, км
+            if np.isfinite(minlen) and minlen <= L_max:   # по коридорам тоже укладывается
+                return chain
+    return None                                        # в поясе s облёт не по силам
 
 
 def _pick_via(ctx, spread, rng, L_max):
@@ -1131,11 +1444,13 @@ def _smooth_safe(raw, grid, pas, eps0):
     return best if best is not None else raw
 
 
-def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spend="late"):
+def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spend="late",
+                     approach="mix"):
     """ОДИН стохастический маршрут вход→цель. mode = приоритет клетки по ВЕСУ
     (max/medium/min/mix). spread = РАЗБРОС по карте (center/middle/edge/mix) — через какую
     VIA-точку строить (center — вдоль прямой, edge — дальний обход/заход с любой стороны).
     spend = профиль РАСХОДА ЗАПАСА ХОДА (late/early/even, см. `_spend_tau`).
+    approach = уровень ОБЛЁТА ЦЕЛИ (min/medium/max/mix, см. `_pick_approach`).
     None, если не уложились в запас хода.
 
     ТОЧКА ВХОДА разыгрывается здесь: если задан сектор появления, их пять, и каждая
@@ -1150,6 +1465,7 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
     и в `plan_routes`, и в итерациях — они делят один контекст. Если доступных точек
     не осталось (недостижимые), пауза снимается: маршрут важнее ровности чередования."""
     ents = ctx.get("entries")
+    picked = None                           # номер разыгранной точки входа; None — вход один
     if ents and len(ents) > 1:
         live = [i for i, e in enumerate(ents) if e["reachable"]]
         if not live:
@@ -1159,11 +1475,28 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
         avail = [i for i in live if i not in recent[-cool:]] if cool else live
         if not avail:                       # точек меньше, чем длина паузы
             avail = live
+        # ПАУЗА ПО УГЛУ (план 11, 11.6, заказчик 16.09.2026): старт не берётся в зоне шириной
+        # THREAT_ENTRY_COOLDOWN_DEG вокруг стартов последних THREAT_ENTRY_COOLDOWN_ROUTES маршрутов.
+        # ⚠️ Только при разносе точек шире (маршрутов + 1) × зона: в секторе 60° правило запретило
+        # бы всё — там остаётся пауза по номеру, и случайность тратится ровно как раньше.
+        n_ang = max(0, int(THREAT_ENTRY_COOLDOWN_ROUTES))       # сколько стартов помнить
+        zone = float(THREAT_ENTRY_COOLDOWN_DEG)                  # ширина зоны, градусы
+        # ⚠️ ПОМНИМ СТАРТЫ ДОШЕДШИХ МАРШРУТОВ, а не попыток: заказчик говорил о «следующих
+        # маршрутах». По попыткам (как пауза по номеру) замер дал 28 нарушений зоны на 150
+        # принятых маршрутов — не дошедшая попытка занимала место в истории.
+        recent_ok = ctx.setdefault("_recent_ok_entries", [])      # старты дошедших, номера точек
+        if n_ang and recent_ok and ctx.get("entry_span_deg", 0.0) > (n_ang + 1) * zone:   # точки разнесены
+            last = [ents[j]["az"] for j in recent_ok[-n_ang:]]   # азимуты недавних стартов
+            far = [i for i in live
+                   if all(_deg_diff(ents[i]["az"], a) >= 0.5 * zone for a in last)]
+            if far:                         # есть точки вне всех зон
+                avail = far                 # — берём из них; нет — остаётся пауза по номеру
         # РАВНОМЕРНО: при неизвестном нарушителе это честнее, чем взвешивать по весу
         pick = avail[int(rng.integers(len(avail)))]
         recent.append(pick)
         del recent[:-8]                     # история нужна короткая, не растим список
         ctx = {**ctx, **ents[pick]}
+        picked = pick
     if not ctx["reachable"]:
         return None
     wmode = ("max", "medium", "min")[rng.integers(3)] if mode == "mix" else mode
@@ -1182,12 +1515,34 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
     else:
         fmix, gt_use, via_use = ctx.get("cost_scale", 1.0), ctx["gt"], ctx["via_gv"]
     grid = ctx["grid"]
-    j = (None if (spread == "center" and rng.random() < 0.5)
-         else _pick_via(ctx, spread, rng, L_max))
-    if j is None:                                       # прямой маршрут (через центр)
+    # ТРАССА ДЛЯ ЗАПРЕТНОГО СЕКТОРА — одна на весь маршрут: второй участок через VIA обязан
+    # видеть трассу первого, иначе возврат «дошёл до VIA и пошёл обратно» остался бы
+    trail = _new_trail(grid) if BACK_SECTOR_KM > 0.0 else None
+    # ПОВАДКА ЗАХОДА (план 11, 11.3–11.4): обычный заход, сбоку или облёт — отдельным
+    # критерием; разброс решает, в каком поясе облёт. Поясов нет — случайность не
+    # тратится, и выборка прежняя до бита.
+    behav, spread, lvl = _pick_approach(ctx, approach, spread, rng)
+    chain, belt = (_orbit_chain(ctx, behav, spread, rng, L_max) if behav != "direct"
+                   else (None, None))                   # цепочка облёта и её пояс
+    st = ctx.setdefault("_stats", {})
+    if behav != "direct":                               # разыграли облёт
+        key = ("appr_try_" if chain is not None else "appr_nohop_") + behav
+        st[key] = st.get(key, 0) + 1                    # — счётчик для замера
+    if chain is not None:                               # облёт по цепочке точек кольца
+        a_fld = fields[fi]["a"] if fields else 1.0      # «жадность»: 0 — геометрия
+        cells = _walk_chain(ctx, chain, gt_use, fmix, a_fld, L_max, turn_interval_km,
+                            rng, wmode, spend, trail)
+        j = -1                                          # метка: путь уже построен
+    else:
+        behav = "direct"
+        j = (None if (spread == "center" and rng.random() < 0.5)
+             else _pick_via(ctx, spread, rng, L_max))
+    if j == -1:                                         # облёт построен выше
+        pass
+    elif j is None:                                     # прямой маршрут (через центр)
         r = _walk_field(ctx, gt_use, ctx["start"], ctx["goal"], L_max,
                         turn_interval_km, rng, wmode=wmode, spend=spend,
-                        dgeo=ctx.get("gt_geo"), fscale=fmix)
+                        dgeo=ctx.get("gt_geo"), fscale=fmix, trail=trail)
         cells = r[0] if r else None
     else:                                               # через VIA (обход/заход со стороны)
         via = ctx["via_cell"][j]
@@ -1210,12 +1565,16 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
         r1 = _walk_field(ctx, f1, ctx["start"], via, budget1,
                          turn_interval_km, rng, wmode=wmode, spend=spend,
                          done0_km=0.0, tail_km=togoal, dgeo=g1, fscale=fmix,
-                         bypass_km=(FINAL_BYPASS_KM if back else 0.0))
+                         bypass_km=(FINAL_BYPASS_KM if back else 0.0), trail=trail,
+                         reach_km=VIA_REACH_KM)
         if r1 is None:                                  # каждый участок — свой набор visited
             return None
+        if VIA_REACH_KM > 0.0:                          # мягкая VIA
+            via = r1[0][-1]                             # — второй участок оттуда, куда пришли
         r2 = _walk_field(ctx, gt_use, via, ctx["goal"], L_max - r1[1],
                          turn_interval_km, rng, heading0=r1[2], wmode=wmode, spend=spend,
-                         done0_km=r1[1], tail_km=0.0, dgeo=ctx.get("gt_geo"), fscale=fmix)
+                         done0_km=r1[1], tail_km=0.0, dgeo=ctx.get("gt_geo"), fscale=fmix,
+                         trail=trail)
         if r2 is None:
             return None
         cells = r1[0] + r2[0][1:]                        # склейка без дубля via
@@ -1229,4 +1588,80 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
     poly = _smooth_safe(_cells_yx_to_km(grid, cells), grid, ctx["pas"], eps)
     # Запас хода — строго: длина маршрута не может его превышать (сглаживание маршрут
     # только СПРЯМЛЯЕТ, т.е. укорачивает, поэтому прежний допуск ×1.15 был лишним).
-    return poly if _poly_len_km(poly) <= L_max else None
+    if _poly_len_km(poly) > L_max:                      # не уложился в запас
+        return None
+    st["last_belt"] = -1 if behav == "direct" else belt  # пояс этого маршрута — для замера
+    st["last_behav"] = behav                            # повадка этого маршрута — для замера
+    appr = (ctx.get("_appr_done") or {}).get(lvl)       # счётчик повадок уровня
+    if appr is not None:                                # облёт включён
+        appr[BEHAVS.index(behav)] += 1                  # — повадка получила своё
+    if behav != "direct":                               # облёт дошёл — счётчики
+        st["appr_ok_" + behav] = st.get("appr_ok_" + behav, 0) + 1
+        done = ctx.get("_orbit_done")
+        if done is not None and 0 <= belt < len(done):  # счётчик поясов есть
+            done[belt] += 1                             # — пояс получил своё, недобор меньше
+        D = ctx["orbit"]["D"]
+        st.setdefault("orbit_rD", []).append(          # радиус облёта этого маршрута / D
+            float(np.mean([c["r"] for c in chain])) / D if D > 0 else float("nan"))
+    if picked is not None:                              # старт разыгран из нескольких точек
+        ok_hist = ctx["_recent_ok_entries"]             # тот же список, что в общем контексте
+        ok_hist.append(picked)                          # — маршрут дошёл: старт в историю паузы по углу
+        del ok_hist[:-8]                                # история нужна короткая
+    return poly
+
+
+BEHAVS = ("direct", "flank", "rear")                    # повадки захода в порядке долей config
+
+
+def _pick_approach(ctx, approach, spread, rng):
+    """Разыграть повадку захода по долям уровня облёта (config.THREAT_APPROACH_MIX) с учётом
+    недобора (`_quota_order`). Вход: контекст, уровень облёта (min/medium/max/mix), режим
+    разброса, генератор. Отдаёт: (повадка, режим разброса — для облёта без mix, уровень или None)."""
+    if not ctx.get("orbit"):                            # поясов облёта нет
+        return "direct", spread, None                   # — случайность не тратим
+    import config as _cfg                               # читаем при вызове: опыты подменяют
+    lvl = ("min", "medium", "max")[rng.integers(3)] if approach == "mix" else approach
+    p = np.asarray(_cfg.THREAT_APPROACH_MIX.get(lvl, (1.0, 0.0, 0.0)), float)
+    p = p / max(float(p.sum()), 1e-9)                   # доли повадок уровня, сумма 1
+    done = (ctx.get("_appr_done") or {}).get(lvl)       # дошедших по повадкам этого уровня, шт.
+    if done is None:                                    # контекст без счётчика
+        done = np.zeros(len(BEHAVS))                    # — недобора нет
+    behav = BEHAVS[_quota_order(p, done, rng)[0]]
+    if behav == "direct":                               # обычный заход
+        return behav, spread, lvl                       # разброс разыграет `_pick_via`
+    sp = ("center", "middle", "edge")[rng.integers(3)] if spread == "mix" else spread
+    return behav, sp, lvl
+
+
+def _walk_chain(ctx, chain, gt_use, fmix, a_fld, L_max, turn_interval_km, rng,
+                wmode, spend, trail):
+    """Облёт: вход → точки кольца по порядку → цель, участок за участком.
+    Вход: контекст, цепочка точек кольца, поле к цели, масштаб поля, «жадность» (0 — геометрия),
+    запас км, длина прямого км, генератор, режимы, трасса. Отдаёт: ячейки пути или None."""
+    # сколько хода минимум понадобится ПОСЛЕ каждого участка: до следующих точек и цели, км
+    tails = []
+    for i in range(len(chain)):
+        t = chain[-1]["togoal"]
+        for a, b in zip(chain[i:], chain[i + 1:]):
+            t += a["gv_geo"][b["cell"]]
+        tails.append(float(t))
+    cur, done, heading = ctx["start"], 0.0, None
+    cells = [cur]
+    for wp, tail in zip(chain, tails):
+        fld = wp["gv_geo"] if a_fld <= 0.0 else wp["gv"]   # геометрия или стоимость, как у маршрута
+        r = _walk_field(ctx, fld, cur, wp["cell"], L_max - done - tail, turn_interval_km, rng,
+                        heading0=heading, wmode=wmode, spend=spend, done0_km=done,
+                        tail_km=tail, dgeo=wp["gv_geo"], fscale=fmix,
+                        bypass_km=FINAL_BYPASS_KM, trail=trail, reach_km=VIA_REACH_KM)
+        if r is None:                                   # участок не дошёл
+            return None
+        cells += r[0][1:]
+        done += r[1]
+        heading = r[2]
+        cur = r[0][-1]
+    r = _walk_field(ctx, gt_use, cur, ctx["goal"], L_max - done, turn_interval_km, rng,
+                    heading0=heading, wmode=wmode, spend=spend, done0_km=done, tail_km=0.0,
+                    dgeo=ctx.get("gt_geo"), fscale=fmix, trail=trail)
+    if r is None:                                       # последний участок к цели не дошёл
+        return None
+    return cells + r[0][1:]

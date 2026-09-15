@@ -65,7 +65,8 @@ from config import (THREAT_BBOX_LONLAT, THREAT_WORK_LONLAT, THREAT_CELL_M, THREA
                     THREAT_SECTOR_EDGE_KM, THREAT_SECTOR_WIN_ALONG,
                     THREAT_SECTOR_WIN_ACROSS, THREAT_SECTOR_MIN_SEP_KM,
                     THREAT_SECTOR_MIN_ANGLE_FRAC, THREAT_LAYER_MARGIN_KM,
-                    THREAT_COMPASS_STEP_DEG, THREAT_COMPASS_APPROACH_KM)
+                    THREAT_COMPASS_STEP_DEG, THREAT_COMPASS_APPROACH_KM,
+                    THREAT_SECTOR_AUTO_STEP_DEG)
 # кольцо и угловой разнос БОЛЬШИХ датчиков — поля Params (правятся в окне «Датчики»),
 # поэтому берутся оттуда; здесь только умолчания на случай старого Params
 from config import Params as _P
@@ -1094,6 +1095,28 @@ class ThreatGrid:
         self._no_fly = m
         return m
 
+    # ---- КРУГЛЫЙ РАЙОН (план 11, задача 11.6) ----
+    def set_outside_mask(self, mask):
+        """Отметить ячейки ЗА ОКРУЖНОСТЬЮ круглого района: вес и вклады слоёв там обнуляются,
+        пролёт запрещает `passable_mask`. Вход: маска (ny, nx) bool либо None — район
+        прямоугольный. Отдаёт: None."""
+        if mask is None:                            # район прямоугольный
+            self._outside = None                    # — снимать нечего
+            return
+        m = np.asarray(mask, bool)
+        self._outside = m
+        # ⚠️ ОБНУЛЯЕМ И ВКЛАДЫ СЛОЁВ, а не только сумму: разбивку по слоям читают отладка и
+        # отчёт, и за окружностью в ней остался бы вес, которого в расчёте нет
+        self.weight[m] = 0.0
+        for arr in self.layers.values():
+            if isinstance(arr, np.ndarray) and arr.shape == m.shape:   # поячеечный вклад слоя
+                arr[m] = 0
+
+    def outside_mask(self):
+        """Маска «за окружностью» (ny, nx) либо None у прямоугольного района — как у
+        запретных зон, None значит «ничего не делать», и прямоугольник считается по-прежнему."""
+        return getattr(self, "_outside", None)
+
     # ---- выгрузка ----
     def water_mask(self):
         return self._water
@@ -1752,6 +1775,83 @@ def _edge_point(p_in, p_out, clip):
     return p_in + max(0.0, min(1.0, t)) * d
 
 
+def _clip_layers_circle(layers, circle, margin_km):
+    """Оставить в слоях то, что попало в КРУГЛЫЙ район плюс запас (план 11, 11.6).
+    Вход: слои (как у `_clip_layers_km`), круг (cx, cy, R) км, запас км.
+    Отдаёт: новый словарь слоёв; линии порваны по окружности, контуры отобраны целиком."""
+    cx, cy, R = (float(v) for v in circle)
+    rr = R + float(margin_km)                          # радиус отсечки с запасом, км
+    line_layers = {n for n, d in THREAT_LAYERS.items() if d.get("geom") == "line"}
+    out = {}
+    for name, parts in layers.items():
+        if name in ("place_names", "place_pts"):       # связанная пара — не трогаем, как у рамки
+            out[name] = parts
+            continue
+        if name in line_layers:                        # линия — рвём по окружности
+            out[name] = _clip_parts_circle(parts, cx, cy, rr)
+            continue
+        kept = []
+        for arr in parts:
+            a = np.asarray(arr)
+            if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] < 2 or a.dtype.kind in "US":
+                kept.append(arr)                       # не координаты — оставляем как есть
+                continue
+            # КОНТУР ЦЕЛИКОМ, как у рамки: разрезанный перестал бы быть замкнутым. Берём, если
+            # хоть одна вершина в круге либо круг задевает габарит контура (большой контур
+            # может накрывать край круга, не имея вершин внутри)
+            d = np.hypot(a[:, 0].astype(float) - cx, a[:, 1].astype(float) - cy)
+            nx_ = min(max(cx, float(a[:, 0].min())), float(a[:, 0].max()))   # ближайшая к центру
+            ny_ = min(max(cy, float(a[:, 1].min())), float(a[:, 1].max()))   # точка габарита, км
+            if d.min() <= rr or np.hypot(nx_ - cx, ny_ - cy) <= rr:          # контур задевает круг
+                kept.append(arr)
+        out[name] = kept
+    return out
+
+
+def _clip_parts_circle(parts, cx, cy, rr):
+    """Куски линий внутри круга (cx, cy, rr) км — правило то же, что у `_clip_parts`: на выходе
+    за край ставится точка ПЕРЕСЕЧЕНИЯ с окружностью, а не дальняя вершина. Отдаёт: список кусков."""
+    out = []
+    for p in parts:
+        P = np.asarray(p, float)
+        if P.ndim != 2 or len(P) < 2:
+            continue
+        inside = np.hypot(P[:, 0] - cx, P[:, 1] - cy) <= rr
+        if inside.all():                               # линия целиком в круге
+            out.append(P)
+            continue
+        if not inside.any():                           # целиком снаружи
+            continue
+        idx = np.nonzero(inside)[0]
+        for s in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
+            a, b = int(s[0]), int(s[-1])
+            piece = [P[a:b + 1]]
+            if a > 0:                                  # кусок начался на входе в круг
+                piece.insert(0, _circle_point(P[a], P[a - 1], cx, cy, rr)[None, :])
+            if b < len(P) - 1:                         # кусок кончился на выходе из круга
+                piece.append(_circle_point(P[b], P[b + 1], cx, cy, rr)[None, :])
+            seg = np.vstack(piece)
+            if len(seg) >= 2:
+                out.append(seg)
+    return out
+
+
+def _circle_point(p_in, p_out, cx, cy, rr):
+    """Точка на отрезке p_in→p_out (p_in внутри круга), лежащая на окружности (cx, cy, rr) км.
+    Отдаёт: (2,) км."""
+    # |p_in + t·d − c|² = rr² — квадратное уравнение по t; нужен корень на [0, 1]
+    d = p_out - p_in
+    f = p_in - np.array([cx, cy], float)
+    a = float(d @ d)
+    if a < 1e-18:                                      # отрезок вырожден
+        return p_in.copy()
+    b = 2.0 * float(f @ d)
+    c = float(f @ f) - rr * rr
+    disc = max(0.0, b * b - 4.0 * a * c)
+    t = (-b + np.sqrt(disc)) / (2.0 * a)               # больший корень — выход наружу
+    return p_in + max(0.0, min(1.0, t)) * d
+
+
 def _places_from_osm(osm, lon0, lat0, clip):
     """Населённые пункты -> (точки, контуры).
 
@@ -2079,7 +2179,18 @@ class ThreatModel:
         # СЕКТОР ПОЯВЛЕНИЯ БПЛА: точка клика по краю карты задаёт ось «цель → клик»,
         # раствор ±THREAT_SECTOR_HALF_DEG. None — сектор не задан, вход один (демо-точка).
         self.sector_point_km = None
-        self.entry_points = []         # отобранные точки входа на краю карты, список (x,y)
+        # ВИД СЕКТОРА (план 11, 11.6): None — не задан; "click" — ось по клику, раствор из Params;
+        # "auto" — «Построить сектор», все 360° долями по THREAT_SECTOR_AUTO_STEP_DEG
+        self.sector_kind = None
+        # ⚠️ ТОЧКИ ВХОДА — ТРИ ПОЛЯ. `entry_points` — ИТОГОВЫЙ список, его читают отрисовка,
+        # ключ контекста, свободные зоны и запас хода; он всегда собирается `_compose_entries`
+        # из точек сектора и точек, заданных человеком, и руками не присваивается.
+        self.entry_points = []         # итоговые точки входа, список (x, y) км
+        self._sector_pts = []          # отобранные сектором, (x, y) км — пересчитываются
+        # ТОЧКИ СТАРТА, ЗАДАННЫЕ ЧЕЛОВЕКОМ (кнопка «Точки старта») — входные данные, как датчики
+        # человека: переживают пересчёт сектора, смену цели и пересборку карты
+        self.manual_entries = []       # (x, y) км
+        self.area_circle = None        # КРУГЛЫЙ район (cx, cy, R) км; None — прямоугольный
         self.routes = []               # примеры коридоров-центров (список (M,2) км)
         self.iter_routes = []          # итерационные (стохастические) маршруты — накопление
         self.iter_iteration = 0        # номер текущей итерации (как t во вкладке 2)
@@ -2191,8 +2302,38 @@ class ThreatModel:
         self.route_area = None
         self.target_km = None                       # цель задавалась в прежних км
         self.sector_point_km = None
+        self.sector_kind = None
+        self._sector_pts = []
+        # точки старта человека — тоже: в чужом районе их километры бессмысленны (план 11, Р10)
+        self.manual_entries = []
         self.entry_points = []
+        self.area_circle = None                     # прямоугольник; круг ставит `set_area_circle`
         return self.bbox_km
+
+    def set_area_circle(self, cx_km, cy_km, r_km):
+        """Задать КРУГЛЫЙ район моделирования (план 11, 11.6): вход — центр и радиус, км.
+        Сетка — описанный квадрат, ячейки за окружностью вне расчёта (`build`); центр —
+        цель по умолчанию (`target_only_km`). Отдаёт: рамку описанного квадрата, км."""
+        cx, cy = float(cx_km), float(cy_km)
+        # ⚠️ НЕ МЕНЬШЕ ДВУХ ЯЧЕЕК: круг в одну ячейку не даёт ни края для точек входа, ни пути
+        R = max(float(r_km), 2.0 * THREAT_CELL_M / 1000.0)   # радиус, км
+        lo, la = km_to_lonlat(cx - R, cy - R, self.lon0, self.lat0)
+        ho, ha = km_to_lonlat(cx + R, cy + R, self.lon0, self.lat0)
+        self.set_area((float(lo), float(la), float(ho), float(ha)))   # сбросит всё, как у рамки
+        self.area_circle = (cx, cy, R)
+        self.sync_auto_L_max()                      # цель теперь центр — |AB| другой
+        return self.bbox_km
+
+    def in_area(self, xs, ys):
+        """Точки внутри района: прямоугольника либо круга. Вход: массивы x, y км одной формы.
+        Отдаёт: массив bool той же формы."""
+        xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+        x0, x1, y0, y1 = self.bbox_km
+        ok = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+        if self.area_circle is not None:            # район круглый
+            cx, cy, R = self.area_circle
+            ok &= np.hypot(xs - cx, ys - cy) <= R   # — ещё и внутри окружности
+        return ok
 
     def clear_area(self):
         """Убрать рабочий район: карта, слои, датчики и маршруты обнуляются.
@@ -2225,7 +2366,11 @@ class ThreatModel:
         self.route_area = None
         self.target_km = None
         self.sector_point_km = None
+        self.sector_kind = None
+        self._sector_pts = []
+        self.manual_entries = []
         self.entry_points = []
+        self.area_circle = None
         self._metrics = {}
 
     def area_size_km(self):
@@ -2442,7 +2587,21 @@ class ThreatModel:
         Грузится лениво — только когда включили показ карты высот, дальше из памяти."""
         if self._dem_display is None:
             self._dem_display = load_dem_display(self.lon0, self.lat0, self.bbox_km) or False
+            if self._dem_display and self.area_circle is not None:   # район круглый
+                self._dem_display = self._mask_display_circle(*self._dem_display)
         return self._dem_display or None
+
+    def _mask_display_circle(self, arr, extent):
+        """Высоты для показа за окружностью круглого района — в NaN (показ делает их прозрачными).
+        Вход: растр (строка 0 — юг), extent (x0, x1, y0, y1) км. Отдаёт: (растр, extent)."""
+        a = np.array(arr, float)                    # копия: кэш растра общий
+        ny, nx = a.shape[:2]
+        x0, x1, y0, y1 = extent
+        xs = x0 + (np.arange(nx) + 0.5) * (x1 - x0) / nx   # центры столбцов, км
+        ys = y0 + (np.arange(ny) + 0.5) * (y1 - y0) / ny   # центры строк, км
+        gx, gy = np.meshgrid(xs, ys)
+        a[~self.in_area(gx, gy)] = np.nan
+        return a, extent
 
     # ---- построение карты (наложение цифровых слоёв на сетку) ----
     def build(self):
@@ -2475,7 +2634,8 @@ class ThreatModel:
         # слоёв, нажали «Применить». Замер до кэша: чтение `.osm.pbf` 4.3 с + чтение
         # высот 6.0 с = 9.6 с НА КАЖДОЕ построение, причём высоты читались даже когда
         # рельеф выключен. С кэшем повторное построение — доли секунды.
-        key = (self.bbox_lonlat, src_path, THREAT_SOURCE_FILE)
+        # круг входит в ключ: у круга и прямоугольника с той же рамкой слои режутся по-разному
+        key = (self.bbox_lonlat, src_path, THREAT_SOURCE_FILE, self.area_circle)
         if getattr(self, "_read_key", None) == key and self._layers_cache is not None:
             self.layers, self.source = dict(self._layers_cache), self._source_cache
             self.dem = self._dem_cache
@@ -2489,6 +2649,10 @@ class ThreatModel:
             # район по умолчанию тоже меньше области показа, и слои уходили за него.
             self.layers = _clip_layers_km(self.layers, self.bbox_km,
                                           THREAT_LAYER_MARGIN_KM)
+            if self.area_circle is not None:        # район круглый (план 11, 11.6)
+                # «где есть слои — там идёт работа» (заказчик 04.09.2026): режем и по окружности
+                self.layers = _clip_layers_circle(self.layers, self.area_circle,
+                                                  THREAT_LAYER_MARGIN_KM)
             if self.area_custom:
                 self.source += " · свой район"
             probe = ThreatGrid(self.bbox_km, THREAT_CELL_M / 1000.0)   # сетка для высот
@@ -2515,6 +2679,11 @@ class ThreatModel:
         # ЗАПРЕТНЫЕ ЗОНЫ ПЕРЕЖИВАЮТ ПЕРЕСБОРКУ. Они нарисованы пользователем и от слоёв
         # с рельефом не зависят: сетка новая — зоны те же. Убираются только «Сбросом».
         self.grid.set_no_fly_zones(self.no_fly_zones)
+        if self.area_circle is not None:            # район круглый (план 11, 11.6)
+            # ⚠️ МАСКА — ПОСЛЕ сборки сетки: населённые пункты и рельеф считаются по квадрату, и
+            # обнуление до них вернуло бы вес городским краям у окружности
+            gx, gy = self.grid.cell_centers_km()
+            self.grid.set_outside_mask(~self.in_area(gx, gy))
         if self.dem is not None and self.relief_on:
             self.source += " + рельеф"
         # маркеры переправ — по РЕАЛЬНЫМ координатам мостов, а не по центрам ячеек
@@ -2612,7 +2781,7 @@ class ThreatModel:
             tries += 1
             r = sample_one_route(ctx, wmode, self.p.threat_L_max,
                                  self.p.threat_turn_interval_km, rng,
-                                 spread="mix", spend="mix")
+                                 spread="mix", spend="mix", approach="mix")
             if r is None:
                 since_new += 1
                 continue
@@ -2694,6 +2863,11 @@ class ThreatModel:
         На «возможные маршруты» не влияет: там перебирается веер всех профилей."""
         return getattr(self.p, "threat_spend", "late")
 
+    def _approach(self):
+        """Уровень облёта цели для ИТЕРАЦИЙ (панель справа): min/medium/max/mix.
+        Отдаёт: строку-ключ config.THREAT_APPROACH_LABELS; «возможные маршруты» берут mix."""
+        return getattr(self.p, "threat_iter_approach", "mix")
+
     # ---- ИТЕРАЦИОННЫЕ маршруты (стохастические пути по коридорам) ----
     # Пошаговая модель как во вкладке 2: iter_reset -> iter_step (××T) / iter_batch.
     def iter_reset(self):
@@ -2702,6 +2876,11 @@ class ThreatModel:
         self.ensure_built()
         entry, target = self._refresh_envelope()       # авто-L_max + огибающая
         self._ensure_ctx(entry, target)                # веер VIA-полей — один раз на (разрыв, цель)
+        done = self._iter_ctx.get("_orbit_done")       # дошедших облётов по поясам (план 11, 11.5)
+        if done is not None:                           # контекст с поясами облёта
+            done[:] = 0.0                              # — новая выборка набирает доли заново
+        for arr in (self._iter_ctx.get("_appr_done") or {}).values():   # и по повадкам захода
+            arr[:] = 0.0
         self._iter_rng = np.random.default_rng()
         self.iter_routes = []
         self.iter_iteration = 0
@@ -2719,7 +2898,7 @@ class ThreatModel:
             route = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
                                      self.p.threat_L_max, self.p.threat_turn_interval_km,
                                      self._iter_rng, spread=self.p.threat_iter_spread,
-                                     spend=self._spend())
+                                     spend=self._spend(), approach=self._approach())
             if route is not None:
                 break
         if route is not None:
@@ -2751,7 +2930,7 @@ class ThreatModel:
             r = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
                                  self.p.threat_L_max, self.p.threat_turn_interval_km,
                                  self._iter_rng, spread=self.p.threat_iter_spread,
-                                 spend=self._spend())
+                                 spend=self._spend(), approach=self._approach())
             if r is None:
                 since_new += 1
                 continue
@@ -2862,6 +3041,9 @@ class ThreatModel:
         ys = np.arange(ky0 + 0.5 * step, ky1, step)
         gx, gy = np.meshgrid(xs, ys)
         cand = np.column_stack([gx.ravel(), gy.ravel()])
+        if self.area_circle is not None:            # район круглый (план 11, 11.6)
+            # ⚠️ сетка кандидатов квадратная — без этого датчик встал бы в угол за окружностью
+            cand = cand[self.in_area(cand[:, 0], cand[:, 1])]
         if self.p.threat_exclude_water and g.water_mask().any():
             cand = cand[~self._on_water(cand)]
         return cand
@@ -3945,9 +4127,10 @@ class ThreatModel:
         self._iter_ctx = None                          # цель сменилась — контекст устарел
         self._ctx_built_key = None
         # СЕКТОР ОТСЧИТЫВАЕТСЯ ОТ ЦЕЛИ: сменилась цель — сместился и он, точки входа
-        # пересчитываются по той же точке клика
-        if self.sector_point_km is not None:
-            self.entry_points = self.compute_entry_points()
+        # пересчитываются по той же точке клика (или заново по 360° у авто-сектора)
+        if self.sector_kind is not None:
+            self._sector_pts = self.compute_entry_points()
+            self._compose_entries()                 # ручные точки старта остаются на месте
         self.sync_auto_L_max()
         if self.grid is not None:
             self.build()      # свободная зона привязана к цели -> карту пересобрать
@@ -3960,16 +4143,26 @@ class ThreatModel:
             return (float(p[0]), float(p[1]))
         _, elon, elat = THREAT_ENTRY
         ex, ey = lonlat_to_km(elon, elat, self.lon0, self.lat0)
+        if self.area_circle is not None:            # район круглый, точек входа нет (11.6)
+            # ДЕМО-ТОЧКА — НА ОКРУЖНОСТЬ, в её направлении от центра: в круге 25 км вокруг цели
+            # демо-точка участка лежала за 163 км, и из угла сетки за кругом маршрут не строился
+            cx, cy, R = self.area_circle
+            d = float(np.hypot(ex - cx, ey - cy))   # до демо-точки от центра, км
+            if d > R - THREAT_CELL_M / 1000.0:      # демо-точка за краем круга
+                k = (R - THREAT_CELL_M / 1000.0) / max(d, 1e-9)   # на ячейку внутрь от края
+                ex, ey = cx + (ex - cx) * k, cy + (ey - cy) * k
         return (float(ex), float(ey))
 
     def entry_points_km(self):
-        """ВСЕ точки входа списком: пять точек сектора либо одна демо-точка."""
+        """ВСЕ точки входа списком: точки сектора и заданные человеком либо одна демо-точка."""
         return list(self.entry_points) if self.entry_points else [self.entry_km()]
 
     def target_only_km(self):
-        """Цель в км: заданная кликом либо демо-метка участка."""
+        """Цель в км: заданная кликом; у круглого района — его центр; иначе демо-метка участка."""
         if self.target_km is not None:
             return self.target_km
+        if self.area_circle is not None:            # круглый район строится вокруг цели (11.6)
+            return (float(self.area_circle[0]), float(self.area_circle[1]))
         _, tlon, tlat = THREAT_TARGET
         tx, ty = lonlat_to_km(tlon, tlat, self.lon0, self.lat0)
         return (float(tx), float(ty))
@@ -3988,25 +4181,141 @@ class ThreatModel:
         return (pts if len(pts) > 1 else pts[0]), self.target_only_km()
 
     # ---- СЕКТОР ПОЯВЛЕНИЯ БПЛА ----
+    def sector_half_deg(self):
+        """Полураствор сектора из `Params` (окно «Сектор налёта»), градусы, в пределах 1…180."""
+        return float(np.clip(float(getattr(self.p, "threat_sector_half_deg",
+                                           THREAT_SECTOR_HALF_DEG)), 1.0, 180.0))
+
+    def sector_entries_n(self):
+        """Сколько точек входа отбирать (окно «Сектор налёта»), шт., не меньше одной."""
+        return max(1, int(getattr(self.p, "threat_sector_entries", THREAT_SECTOR_ENTRIES)))
+
     def set_sector(self, x_km, y_km):
-        """Задать сектор кликом по краю карты: ось «цель → клик», по
-        `THREAT_SECTOR_HALF_DEG` (30°) в каждую сторону — полный раствор 60°.
+        """Задать сектор кликом по краю карты: ось «цель → клик», полураствор —
+        `sector_half_deg` (по умолчанию 30°, полный раствор 60°).
         Пересчитывает точки входа и сбрасывает всё, что от входа зависит."""
         self.sector_point_km = (float(x_km), float(y_km))
-        self.entry_points = self.compute_entry_points()
+        self.sector_kind = "click"
+        return self._apply_sector()
+
+    def set_sector_auto(self):
+        """«Построить сектор» (план 11, 11.6): все 360° вокруг цели, край делится по
+        `THREAT_SECTOR_AUTO_STEP_DEG`, точки — приоритетные направления по тому же правилу.
+        Отдаёт: итоговые точки входа, список (x, y) км."""
+        self.sector_point_km = None                 # оси нет — сектор круговой
+        self.sector_kind = "auto"
+        return self._apply_sector()
+
+    def set_sector_params(self, half_deg, n_entries):
+        """Раствор и число точек из окна «Сектор налёта» — применяются СРАЗУ: сектор задан —
+        точки переотбираются. Вход: полураствор, градусы; число точек, шт. Отдаёт: точки входа."""
+        self.p.threat_sector_half_deg = float(np.clip(float(half_deg), 1.0, 180.0))
+        self.p.threat_sector_entries = max(1, int(n_entries))
+        if self.sector_kind is None:                # сектора нет
+            return list(self.entry_points)          # — параметры запомнены до следующего
+        return self._apply_sector()
+
+    def _apply_sector(self):
+        """Переотобрать точки сектора, собрать итоговый список и сбросить зависящее от входа.
+        Отдаёт: итоговые точки входа, список (x, y) км."""
+        self._sector_pts = self.compute_entry_points()
+        self._compose_entries()
         self._reset_after_entry_change()
         if self.grid is not None and self.entry_points:
             self.build()      # свободные зоны привязаны к точкам входа -> пересобрать
         return self.entry_points
 
     def clear_sector(self):
-        """Убрать сектор: вход снова один — демо-точка участка."""
-        if self.sector_point_km is None and not self.entry_points:
+        """Убрать сектор. Точки старта, заданные человеком, остаются; нет и их — вход снова
+        один (демо-точка участка). Отдаёт: True, если было что убрать."""
+        if self.sector_kind is None and not self._sector_pts:
             return False
         self.sector_point_km = None
-        self.entry_points = []
+        self.sector_kind = None
+        self._sector_pts = []
+        self._compose_entries()
         self._reset_after_entry_change()
         return True
+
+    # ---- ТОЧКИ СТАРТА, ЗАДАННЫЕ ЧЕЛОВЕКОМ (план 11, 11.6, кнопка «Точки старта») ----
+    ENTRY_PICK_KM = 0.05      # допуск поиска точки по координатам, км (точки мышью не ближе)
+
+    def _compose_entries(self):
+        """Собрать ИТОГОВЫЕ точки входа: сначала отобранные сектором, затем заданные человеком."""
+        self.entry_points = ([(float(x), float(y)) for x, y in self._sector_pts]
+                             + [(float(x), float(y)) for x, y in self.manual_entries])
+
+    def _entry_changed(self):
+        """После правки точек человеком: собрать список, сбросить зависящее от входа и
+        пересобрать карту (свободные зоны вокруг точек входа; с кэшем чтения 0.05 с)."""
+        self._compose_entries()
+        self._reset_after_entry_change()
+        if self.grid is not None:
+            self.build()
+
+    def _find_entry(self, x_km, y_km):
+        """Где лежит точка входа: ("sector" | "manual", индекс) либо (None, -1).
+        Ищем ПО КООРДИНАТЕ, а не по номеру строки: номер меняется от любой правки."""
+        best = (None, -1, self.ENTRY_PICK_KM)
+        for kind, pts in (("sector", self._sector_pts), ("manual", self.manual_entries)):
+            for i, (px, py) in enumerate(pts):
+                d = float(np.hypot(px - float(x_km), py - float(y_km)))   # до точки, км
+                if d <= best[2]:                    # ближе прежней находки
+                    best = (kind, i, d)
+        return best[0], best[1]
+
+    def add_manual_entry(self, x_km, y_km):
+        """Добавить точку старта в точке клика. Вне района — не добавляем (маршрут оттуда не
+        построится). Отдаёт: True, если добавлена."""
+        if not bool(self.in_area(float(x_km), float(y_km))):   # клик за районом
+            return False
+        self.manual_entries.append((float(x_km), float(y_km)))
+        self._entry_changed()
+        return True
+
+    def move_entry(self, x0_km, y0_km, x1_km, y1_km):
+        """Перенести точку входа из (x0, y0) в (x1, y1) км. Точка сектора при переносе
+        становится заданной человеком — иначе пересчёт сектора вернул бы её на место
+        (как у перенесённого датчика). Отдаёт: True, если точка найдена и перенесена."""
+        kind, i = self._find_entry(x0_km, y0_km)
+        if kind is None or not bool(self.in_area(float(x1_km), float(y1_km))):   # нет точки или вне района
+            return False
+        if kind == "sector":                        # точка сектора
+            self._sector_pts.pop(i)                 # — уходит из сектора в ручные
+            self.manual_entries.append((float(x1_km), float(y1_km)))
+        else:                                       # ручная — просто новые координаты
+            self.manual_entries[i] = (float(x1_km), float(y1_km))
+        self._entry_changed()
+        return True
+
+    def remove_entry(self, x_km, y_km):
+        """Убрать точку входа по координате (сектора — до его пересчёта, ручную — насовсем).
+        Отдаёт: True, если точка найдена."""
+        kind, i = self._find_entry(x_km, y_km)
+        if kind is None:                            # в этом месте точки нет
+            return False
+        (self._sector_pts if kind == "sector" else self.manual_entries).pop(i)
+        self._entry_changed()
+        return True
+
+    def clear_manual_entries(self):
+        """Убрать все точки старта, заданные человеком («Сброс»). Отдаёт: True, если были."""
+        if not self.manual_entries:
+            return False
+        self.manual_entries = []
+        self._compose_entries()
+        self._reset_after_entry_change()
+        return True
+
+    def sector_points(self):
+        """Точки входа, отобранные сектором (без заданных человеком), список (x, y) км."""
+        return list(self._sector_pts)
+
+    def entry_rows(self):
+        """Точки входа для выбора мышью: список dict(n, x_km, y_km, manual)."""
+        n_sec = len(self._sector_pts)
+        return [dict(n=i + 1, x_km=float(x), y_km=float(y), manual=(i >= n_sec))
+                for i, (x, y) in enumerate(self.entry_points)]
 
     def _reset_after_entry_change(self):
         """Сброс после смены входа: контекст, маршруты, область залёта, запас хода."""
@@ -4019,9 +4328,10 @@ class ThreatModel:
         self.sync_auto_L_max()
 
     def sector_edges_km(self):
-        """Две крайние точки сектора на рамке участка — для отрисовки. None, если
-        сектор не задан. Возвращает (вершина=цель, точка на левой границе, на правой)."""
-        if self.sector_point_km is None:
+        """Две крайние точки сектора на краю района — для отрисовки. None, если сектор не
+        задан кликом (у авто-сектора границ нет — он круговой). Возвращает (вершина=цель,
+        точка на левой границе, на правой)."""
+        if self.sector_kind != "click" or self.sector_point_km is None:
             return None
         B = np.asarray(self.target_only_km(), float)
         P = np.asarray(self.sector_point_km, float)
@@ -4029,13 +4339,25 @@ class ThreatModel:
         n = float(np.hypot(*d))
         if n < 1e-9:
             return None
-        half = np.radians(float(THREAT_SECTOR_HALF_DEG))
+        half = np.radians(self.sector_half_deg())
         out = [B]
         for sign in (+1.0, -1.0):
             c, s = np.cos(sign * half), np.sin(sign * half)
             u = np.array([c * d[0] - s * d[1], s * d[0] + c * d[1]]) / n
-            out.append(B + u * self._ray_to_bbox(B, u))
+            out.append(B + u * self._ray_to_edge(B, u))
         return tuple(tuple(map(float, p)) for p in out)
+
+    def _ray_to_edge(self, origin, u):
+        """Длина луча из `origin` по орту `u` до края района: окружности у круглого,
+        рамки у прямоугольного. Отдаёт: км."""
+        if self.area_circle is not None:            # район круглый
+            cx, cy, R = self.area_circle
+            f = np.asarray(origin, float) - np.array([cx, cy], float)
+            b = float(f @ u)                        # |f + t·u|² = R², |u| = 1
+            disc = b * b - (float(f @ f) - R * R)
+            if disc >= 0.0 and -b + np.sqrt(disc) > 1e-9:   # луч пересекает окружность
+                return float(-b + np.sqrt(disc))    # — дальний корень: выход из круга
+        return self._ray_to_bbox(origin, u)
 
     def _ray_to_bbox(self, origin, u):
         """Длина луча из `origin` по орту `u` до рамки участка (км)."""
@@ -4066,27 +4388,35 @@ class ThreatModel:
         стоит дёшево.
 
         ВЕС УЧАСТВУЕТ ТОЛЬКО ЗДЕСЬ. Сам старт маршрута разыгрывается между отобранными
-        точками равномерно (решение заказчика) — см. `sample_one_route`."""
-        if self.sector_point_km is None or self.grid is None:
+        точками равномерно (решение заказчика) — см. `sample_one_route`.
+
+        АВТО-СЕКТОР («Построить сектор», план 11, 11.6): направление не ограничено — весь край по
+        360°. Край делится на доли по `THREAT_SECTOR_AUTO_STEP_DEG`, от каждой остаётся лучшая по
+        перспективе точка, и из этих приоритетных направлений берутся N тем же жадным отбором."""
+        if self.sector_kind is None or self.grid is None:
             return []
         from .threat_routes import passable_mask, _cell_of, _dijkstra_dist, _open_endpoints
         g = self.grid
         B = np.asarray(self.target_only_km(), float)
-        d = np.asarray(self.sector_point_km, float) - B
-        n = float(np.hypot(*d))
-        if n < 1e-9:
-            return []
-        u = d / n
-        cos_half = float(np.cos(np.radians(float(THREAT_SECTOR_HALF_DEG))))
+        auto = self.sector_kind == "auto"           # круговой сектор — без оси
+        if not auto:                                # сектор по клику — нужна ось
+            if self.sector_point_km is None:
+                return []
+            d = np.asarray(self.sector_point_km, float) - B
+            n = float(np.hypot(*d))
+            if n < 1e-9:
+                return []
+            u = d / n
+            half_deg = self.sector_half_deg()       # полураствор из окна «Сектор налёта», градусы
+            cos_half = float(np.cos(np.radians(half_deg)))
 
         gx, gy = g.cell_centers_km()
-        x0, x1, y0, y1 = self.bbox_km
-        band = float(THREAT_SECTOR_EDGE_KM)
-        edge = ((gx - x0 <= band) | (x1 - gx <= band) |
-                (gy - y0 <= band) | (y1 - gy <= band))
+        edge = self._edge_band(gx, gy)
         vx, vy = gx - B[0], gy - B[1]
         r = np.hypot(vx, vy)
-        inside = edge & (r > 1e-6) & ((vx * u[0] + vy * u[1]) >= cos_half * r)
+        inside = edge & (r > 1e-6)
+        if not auto:                                # только то, что попало в раствор
+            inside &= (vx * u[0] + vy * u[1]) >= cos_half * r
         if not inside.any():
             return []
         # проходимость — теми же правилами, что у маршрутов: разрыв и уход от ориентира
@@ -4112,12 +4442,25 @@ class ThreatModel:
         iy, ix = np.nonzero(ok)
         wx, wy = gx[iy, ix], gy[iy, ix]
         score = self._entry_window_score(wx, wy, B)  # перспектива движения, а не вес точки
-        want = max(1, int(THREAT_SECTOR_ENTRIES))
+        want = self.sector_entries_n()
+        ang = np.arctan2(wy - B[1], wx - B[0])
+        if auto:                                    # круговой сектор
+            # ⚠️ ЛУЧШАЯ ТОЧКА НА КАЖДУЮ ДОЛЮ, а не N лучших по всему краю: иначе все точки
+            # собрались бы на одной «горячей» стороне, и «по 360°» осталось бы на словах
+            step = np.radians(float(THREAT_SECTOR_AUTO_STEP_DEG))   # доля края, радианы
+            part = np.floor((ang % (2.0 * np.pi)) / step).astype(int)   # номер доли точки
+            best = {}                               # доля -> индекс её лучшей точки
+            for i in np.argsort(-score, kind="stable"):
+                best.setdefault(int(part[i]), int(i))
+            keep = np.asarray(sorted(best.values()), int)
+            wx, wy, score, ang = wx[keep], wy[keep], score[keep], ang[keep]
+            span = 2.0 * np.pi                      # раствор — весь круг, радианы
+        else:
+            span = 2.0 * np.radians(half_deg)       # раствор сектора, радианы
         # УГЛОВОЙ разнос: доля от идеального шага (раствор сектора / число точек)
-        ideal = 2.0 * np.radians(float(THREAT_SECTOR_HALF_DEG)) / want
+        ideal = span / want
         need_ang = ideal * float(THREAT_SECTOR_MIN_ANGLE_FRAC)
         sep = float(THREAT_SECTOR_MIN_SEP_KM)
-        ang = np.arctan2(wy - B[1], wx - B[0])
 
         def take(min_sep, min_ang):
             out, outa = [], []
@@ -4143,6 +4486,19 @@ class ThreatModel:
         if len(picked) < want:
             picked = take(0.0, 0.0)
         return picked
+
+    def _edge_band(self, gx, gy):
+        """Ячейки у КРАЯ района, откуда может появиться БПЛА: полоса `THREAT_SECTOR_EDGE_KM` вдоль
+        рамки либо кольцо той же ширины у окружности круглого района (план 11, 11.6).
+        Вход: центры ячеек gx, gy (ny, nx) км. Отдаёт: маска (ny, nx) bool."""
+        band = float(THREAT_SECTOR_EDGE_KM)          # ширина полосы, км
+        if self.area_circle is not None:            # район круглый
+            cx, cy, R = self.area_circle
+            rc = np.hypot(gx - cx, gy - cy)         # удаление от центра круга, км
+            return (rc <= R) & (R - rc <= band)
+        x0, x1, y0, y1 = self.bbox_km
+        return ((gx - x0 <= band) | (x1 - gx <= band) |
+                (gy - y0 <= band) | (y1 - gy <= band))
 
     def _entry_window_score(self, xs, ys, target_km):
         """ПЕРСПЕКТИВА ДВИЖЕНИЯ из точки: средний вес прямоугольника, вытянутого от неё

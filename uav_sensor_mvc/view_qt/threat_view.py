@@ -28,7 +28,7 @@ import matplotlib.cm as cm
 
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
-                    THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS,
+                    THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS, THREAT_APPROACH_LABELS,
                     THREAT_SPEND_LABELS, THREAT_TILE_AREA,
                     THREAT_CELL_M, THREAT_COMPASS_LINE_KM, THREAT_AREA_LABEL,
                     THREAT_AREA_SOURCE, THREAT_AREA_ERROR)
@@ -251,6 +251,11 @@ THREAT_COLORS = {
     "sector_edge": "#101418",           # тёмная подложка под пунктиром (контраст на светлом)
     "entry_pt":    "#ffffff",           # точки входа: белая заливка
     "entry_pt_edge": "#101418",         # и тёмная обводка
+    # ТОЧКИ СТАРТА, ПОСТАВЛЕННЫЕ ЧЕЛОВЕКОМ (план 11, 11.6) — розовая заливка: чёрная обводка
+    # «рукой», как у датчиков, на скриншоте не отличалась от тёмной обводки точек сектора, а
+    # розового в turbo нет — на весовой карте не сливается
+    "entry_manual": "#ff4fd8",
+
     # КОМПАСНЫЕ СЕКТОРА «АНАЛИЗА МОДЕЛИРОВАНИЯ» (довесок 06.09.2026) — та же логика
     # различимости, что у сектора появления: белый читается на любом фоне turbo.
     # Красный — направление, не набравшее заданную кратность (по всем типам разом).
@@ -444,7 +449,16 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._zone_mode = False           # идёт рисование запретной зоны
         self._zone_pts = []               # вершины зоны, которую рисуют прямо сейчас
         self._area_mode = False           # идёт задание РАЙОНА МОДЕЛИРОВАНИЯ (8.2)
-        self._area_pts = []               # два угла района, которые тянут сейчас
+        self._area_pts = []               # два угла района (или центр и точка радиуса) сейчас
+        # ФОРМА СЛЕДУЮЩЕГО РАЙОНА — переключатель «район / радиус» у заголовка панели (план 11,
+        # 11.6). Уже заданный район переключатель не трогает: он выбирает, ЧЕМ рисовать.
+        self._area_shape = "rect"         # "rect" — прямоугольник, "circle" — круг
+        self._area_circle = None          # круг заданного района (cx, cy, R) км; None — рамка
+        # ТОЧКИ СТАРТА МЫШЬЮ (план 11, 11.6) — режим по образцу правки датчиков
+        self._edit_entry = False          # включён режим «Точки старта»
+        self._entry_handle = None         # подвижная метка выбранной точки
+        self._entry_pick = None           # выбранная точка: dict(n, x_km, y_km, manual)
+        self._sector_dlg = None           # окно «Сектор налёта»
         self._data_path = None            # текущий источник (для префилла окна выбора)
         self._enabled_layers = None       # текущий набор слоёв (None = все)
 
@@ -463,6 +477,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_set_target = lambda x, y: None
         self.on_set_sector = lambda x, y: None      # задан сектор появления БПЛА
         self.on_clear_sector = lambda: None         # сектор убран
+        # ПЛАН 11, 11.6: круглый район, окно «Сектор налёта», точки старта мышью
+        self.on_set_area_circle = lambda cx, cy, r: None   # круг района: центр и радиус, км
+        self.on_sector_params = lambda half_deg, n: None   # раствор (полу-, °) и число точек
+        self.on_sector_auto = lambda: None                 # «Построить сектор» по 360°
+        self.on_sector_state = lambda: {}                  # что показать в окне сектора
+        self.on_entry_rows = lambda: []                    # точки входа для выбора мышью
+        self.on_entry_add = lambda x, y: False             # двойной клик — новая точка старта
+        self.on_entry_move = lambda x0, y0, x1, y1: False  # точку перетащили
+        self.on_entry_delete = lambda x, y: False          # DELETE по выбранной точке
         self.on_zone_added = lambda poly: None      # нарисована запретная зона
         self.on_zone_undo = lambda: None            # убрать последнюю зону
         self.on_choose_data = lambda path, layers: None
@@ -473,6 +496,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_iter_mode = lambda key: None
         self.on_iter_spread = lambda key: None
         self.on_iter_spend = lambda key: None
+        self.on_iter_approach = lambda key: None
         self.on_iter_play = lambda: None
         self.on_iter_step = lambda: None
         self.on_iter_batch = lambda: None
@@ -561,17 +585,200 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # ---- режим «указать цель» (клик по карте) ----
     def _begin_target(self):
         self._end_measure()               # режимы мыши взаимно исключают друг друга
+        self._end_sector_mode()
+        self._end_edit_entry()
         self._target_mode = True
-        self._sector_mode = False
         self.set_title("Кликните точку ЦЕЛИ на карте")
 
-    # ---- режим «задать сектор появления» (клик по краю карты) ----
+    # ══════════════════════════════════════════════════════════════════════════
+    # ОКНО «СЕКТОР НАЛЁТА» И РЕЖИМ ЗАДАНИЯ СЕКТОРА КЛИКАМИ (план 11, 11.6)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _open_sector_window(self):
+        """Кнопка «Сектор налёта»: открыть окно сектора (одно на всё время работы)."""
+        if self._sector_dlg is None:
+            from .sector_window import SectorDialog
+            self._sector_dlg = SectorDialog(
+                self, on_params=lambda h, n: self.on_sector_params(h, n),
+                on_auto=self._sector_auto_clicked, on_click_mode=self._begin_sector,
+                on_clear=lambda: self.on_clear_sector())
+        self.refresh_sector_window()
+        self._sector_dlg.show()
+        self._sector_dlg.raise_()
+        self._sector_dlg.activateWindow()
+
+    def refresh_sector_window(self):
+        """Подтянуть в открытое окно сектора свежее состояние (зовёт контроллер после правок)."""
+        dlg = self._sector_dlg
+        if dlg is None:                    # окно ни разу не открывали
+            return
+        st = self.on_sector_state() or {}
+        dlg.set_state(st.get("half_deg", 30.0), st.get("entries", 5), st.get("kind"),
+                      st.get("n_sector", 0), st.get("n_manual", 0), self._sector_mode)
+
+    def _sector_auto_clicked(self):
+        """«Построить сектор» в окне: режим кликов (если был) закончить и считать по 360°."""
+        self._end_sector_mode()
+        self.on_sector_auto()
+
     def _begin_sector(self):
+        """«Задать сектор кликом»: каждый левый щелчок по карте задаёт ось сектора заново.
+
+        ⚠️ РЕЖИМ НЕ ОДНОРАЗОВЫЙ (заказчик 16.09.2026): щёлкать край можно сколько угодно раз,
+        выход — ПРАВАЯ КНОПКА, и она же закрывает окно сектора. Поэтому правая кнопка на
+        время режима забирается у pyqtgraph, как в правке датчиков."""
         self._end_measure()               # режимы мыши взаимно исключают друг друга
-        self._sector_mode = True
+        self._end_pick_sensor()
+        self._end_edit_sensor()
+        self._end_edit_entry()
         self._target_mode = False
-        self.set_title("Кликните точку на КРАЮ карты — ось сектора пойдёт от цели к ней "
-                       "(по 30° в каждую сторону)")
+        self._sector_mode = True
+        self._grab_right_button(True)     # правая кнопка = выход из режима
+        self.refresh_sector_window()
+        self.set_title("СЕКТОР: щёлкните край района — ось пойдёт от цели к нему (раствор — в "
+                       "окне «Сектор налёта»). Правая кнопка мыши — выход и закрытие окна.")
+
+    def _end_sector_mode(self, close_window=False):
+        """Закончить режим кликов сектора; close_window — ещё и закрыть окно сектора."""
+        if self._sector_mode:              # режим был включён
+            self._sector_mode = False
+            self._grab_right_button(False)  # вернуть правую кнопку pyqtgraph
+            self.set_title("")
+        if close_window and self._sector_dlg is not None:   # выход правой кнопкой
+            self._sector_dlg.close()
+        self.refresh_sector_window()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ТОЧКИ СТАРТА МЫШЬЮ (план 11, 11.6) — по образцу правки датчиков
+    # ══════════════════════════════════════════════════════════════════════════
+    def _begin_edit_entry(self):
+        """Кнопка «Точки старта» (переключатель): двойной клик — добавить точку, щелчок —
+        выбрать, перетаскивание — перенести, DELETE — удалить, правая кнопка / Esc — выход.
+
+        ⚠️ ОДИН РЕЖИМ НА ДОБАВЛЕНИЕ И ПРАВКУ, а не два, как у датчиков: у датчика при
+        постановке спрашиваются тип и режим, у точки старта спрашивать нечего — и два режима
+        заставляли бы переключаться между «поставил» и «подвинул» на каждой точке."""
+        if self._edit_entry:               # повторное нажатие — выход
+            self._end_edit_entry()
+            return
+        self._end_pick_sensor()            # режимы мыши взаимно исключают друг друга
+        self._end_edit_sensor()
+        self._end_measure()
+        self._end_sector_mode()
+        self._target_mode = False
+        self._edit_entry = True
+        self._grab_right_button(True)      # правая кнопка = выход из режима
+        self._lock_panel_for_entry(True)
+        self.btn_entry.setText("Правлю точки")
+        self.set_title("ТОЧКИ СТАРТА: двойной клик — добавить, щелчок — выбрать, тащить — "
+                       "перенести, DELETE — удалить. Правая кнопка мыши или Esc — выход.")
+
+    def _lock_panel_for_entry(self, lock):
+        """Погасить панель на время режима — та же причина, что у правки датчиков: режим
+        забирает клики карты себе, и соседняя кнопка перехватила бы их."""
+        if lock:                           # режим включают
+            self._entry_locked = [w for w in self._panel_widgets()
+                                  if w is not self.btn_entry and w.isEnabled()]
+            for w in self._entry_locked:
+                w.setEnabled(False)
+        else:                              # режим выключают — вернуть, что было доступно
+            for w in getattr(self, "_entry_locked", []):
+                w.setEnabled(True)
+            self._entry_locked = []
+
+    def _end_edit_entry(self):
+        """Выйти из режима «Точки старта» (если он был включён)."""
+        if not self._edit_entry:           # режим и так выключен
+            return
+        self._edit_entry = False
+        self._grab_right_button(False)     # вернуть правую кнопку pyqtgraph
+        self._lock_panel_for_entry(False)
+        self.btn_entry.setText("Точки старта")
+        self._drop_entry_handle()
+        self.set_title("")
+
+    def _drop_entry_handle(self):
+        """Убрать метку выбранной точки старта с карты."""
+        h = self._entry_handle
+        if h is not None:                  # метка есть
+            try:
+                self.pi.removeItem(h)
+            except Exception:              # уже снята перерисовкой
+                pass
+        self._entry_handle = None
+        self._entry_pick = None
+
+    def _edit_entry_click(self, ev):
+        """Щелчок в режиме «Точки старта»: двойной — добавить, одинарный — выбрать ближайшую."""
+        pt = self.vb.mapSceneToView(ev.scenePos())
+        x, y = float(pt.x()), float(pt.y())            # точка клика, км
+        try:
+            double = bool(ev.double())
+        except Exception:                  # у синтетического события нет double()
+            double = False
+        if double:                         # двойной клик — новая точка
+            self._drop_entry_handle()
+            if self.on_entry_add(x, y):    # модель приняла
+                self.set_title("Точка старта добавлена (%.1f, %.1f км). «Применить» — "
+                               "пересчёт маршрутов." % (x, y))
+            else:                          # клик за районом
+                self.set_title("Точка старта ставится только внутри района.")
+            return
+        rows = self.on_entry_rows() or []
+        if not rows:                       # точек нет вовсе
+            self.set_title("Точек старта нет: двойной клик внутри района — добавить.")
+            return
+        # ⚠️ ДОПУСК ВЫБОРА — В ЭКРАННЫХ ПИКСЕЛЯХ, как у датчиков: километры при увеличении
+        # превращаются в пол-окна, а на общем виде — в пару точек экрана
+        best = min(rows, key=lambda r: (r["x_km"] - x) ** 2 + (r["y_km"] - y) ** 2)
+        d = ((best["x_km"] - x) ** 2 + (best["y_km"] - y) ** 2) ** 0.5   # до ближайшей, км
+        if d > 25.0 * self._km_per_pixel():   # дальше 25 точек экрана
+            self._drop_entry_handle()
+            self.set_title("Мимо: щёлкните ближе к точке старта (двойной клик — новая точка).")
+            return
+        self._show_entry_handle(best)
+
+    def _show_entry_handle(self, row):
+        """Показать подвижную метку на выбранной точке старта.
+
+        ⚠️ ПЕРЕТАСКИВАНИЕ ДЕЛАЕТ `pg.TargetItem`, как у датчиков: у сцены pyqtgraph нет пары
+        «нажал — веду — отпустил», а метка умеет это сама и сообщает об отпускании."""
+        self._drop_entry_handle()
+        self._entry_pick = dict(row)
+        h = pg.TargetItem(pos=(row["x_km"], row["y_km"]), size=18, symbol="t1",
+                          pen=pg.mkPen(_qcolor(THREAT_COLORS["sensor_hand"]), width=3),
+                          brush=pg.mkBrush(255, 255, 255, 70), movable=True)
+        h.setZValue(40)                    # выше точек входа: за неё и тащат
+        h.sigPositionChangeFinished.connect(self._entry_handle_moved)
+        self.pi.addItem(h)
+        self._entry_handle = h
+        self.set_title("Точка старта №%d (%s) выбрана: тащите мышью или нажмите DELETE."
+                       % (row["n"], "задана вручную" if row.get("manual") else "из сектора"))
+
+    def _entry_handle_moved(self):
+        """Метку отпустили — перенести точку в модели. За районом модель отказывает, и
+        метка возвращается на прежнее место, иначе она показывала бы точку, которой нет."""
+        row, h = self._entry_pick, self._entry_handle
+        if row is None or h is None:       # метку успели снять
+            return
+        p = h.pos()
+        x1, y1 = float(p.x()), float(p.y())            # куда отпустили, км
+        if self.on_entry_move(row["x_km"], row["y_km"], x1, y1):   # модель приняла
+            self._entry_pick = dict(row, x_km=x1, y_km=y1, manual=True)
+            self.set_title("Точка старта перенесена — теперь она задана вручную. «Применить» — "
+                           "пересчёт маршрутов.")
+        else:                              # за районом — вернуть метку
+            h.setPos(row["x_km"], row["y_km"])
+            self.set_title("Точку старта нельзя вынести за район — возвращена на место.")
+
+    def _delete_selected_entry(self):
+        """DELETE в режиме «Точки старта» — убрать выбранную точку (по координате)."""
+        row = self._entry_pick
+        if row is None:                    # ничего не выбрано
+            self.set_title("Сначала выберите точку старта щелчком.")
+            return
+        self.on_entry_delete(row["x_km"], row["y_km"])
+        self._drop_entry_handle()
+        self.set_title("Точка старта убрана. «Применить» — пересчёт маршрутов.")
 
     def _show_click_coords(self, ev):
         """Координаты точки клика — в строку под картой (план 8, задача 8.3).
@@ -597,10 +804,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         карте просто чтобы посмотреть координаты в строке под ней. Ставить датчик на
         каждый такой клик значило бы засорять карту случайными точками."""
         self._pick_sensor = not self._pick_sensor
-        self._target_mode = self._sector_mode = False
+        self._target_mode = False
         if self._pick_sensor:
             self._end_edit_sensor()                  # два режима мыши разом невозможны
             self._end_measure()
+            self._end_sector_mode()
+            self._end_edit_entry()
         self._grab_right_button(self._pick_sensor)   # правая кнопка = выход из режима
         self._lock_panel_for_pick(self._pick_sensor)
         self.btn_pick_sensor.setText("Ставлю по клику"
@@ -645,7 +854,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if self._edit_sensor:
             self._end_pick_sensor()                   # два режима мыши разом невозможны
             self._end_measure()
-            self._target_mode = self._sector_mode = False
+            self._end_sector_mode()
+            self._end_edit_entry()
+            self._target_mode = False
         self._grab_right_button(self._edit_sensor)    # правая кнопка = выход из режима
         self._lock_panel_for_edit(self._edit_sensor)
         self.btn_edit_sensor.setText("Правлю датчики"
@@ -798,6 +1009,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if not box or len(box) != 4:
             return True
         x0, x1, y0, y1 = box
+        circ = getattr(self, "_area_circle", None)
+        if circ is not None:               # район круглый (план 11, 11.6)
+            return (x_km - circ[0]) ** 2 + (y_km - circ[1]) ** 2 <= circ[2] ** 2
         return (x0 <= x_km <= x1) and (y0 <= y_km <= y1)
 
     def _ask_clear_sensors(self):
@@ -927,7 +1141,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # ПРАВАЯ КНОПКА В РЕЖИМАХ МЫШИ — меню с выходом (заказчик 05.09.2026). Проверяем
         # до всего остального: в этих режимах панель погашена, и другого пути к выходу
         # под рукой нет.
-        if self._pick_sensor or self._edit_sensor or self._measure_mode:
+        if (self._pick_sensor or self._edit_sensor or self._measure_mode
+                or self._edit_entry or self._sector_mode):
             try:
                 right = ev.button() == QtCore.Qt.RightButton
             except Exception:
@@ -937,8 +1152,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     ev.accept()
                 except Exception:
                     pass
+                if self._sector_mode:      # сектор кликами: выход и закрытие окна (11.6)
+                    self._end_sector_mode(close_window=True)
+                    self.set_title("Задание сектора завершено.")
+                    return
+                if self._edit_entry:       # точки старта: выход, всё уже в модели
+                    self._end_edit_entry()
+                    self.set_title("Правка точек старта завершена, данные сохранены.")
+                    return
                 self._right_button_exit()
                 return
+        if self._edit_entry:               # точки старта мышью (11.6) — раньше прочих
+            self._edit_entry_click(ev)
+            return
         if self._edit_sensor:              # правка датчиков: выбрать ближайший
             try:
                 if not ev.double():
@@ -966,9 +1192,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         except Exception:
             pass
         pt = self.vb.mapSceneToView(ev.scenePos())
-        if self._sector_mode:
-            self._sector_mode = False
+        if self._sector_mode:              # режим НЕ снимается: щёлкать можно ещё (11.6)
             self.on_set_sector(float(pt.x()), float(pt.y()))
+            self.refresh_sector_window()
             return
         self._target_mode = False
         self.on_set_target(float(pt.x()), float(pt.y()))
@@ -979,13 +1205,27 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # принимает. Разница в том, что точек ровно две — противоположные углы, а по ним
     # строится прямоугольник: сетка 500 м прямоугольная, и никакой другой формы район
     # принимать не может.
+    def _area_shape_changed(self, *_):
+        """Переключатель «район / радиус»: запомнить форму следующего района. Уже заданный
+        район не трогается (план 11, Р1); начатое рисование бросается — форма сменилась."""
+        self._area_shape = "circle" if self.chk_shape_circle.isChecked() else "rect"
+        if self._area_mode:                # рисовали прежней формой
+            self._end_area(False)
+        self.btn_area.setText(self._area_button_text())
+
     def _begin_area(self):
         self._end_measure()               # режимы мыши взаимно исключают друг друга
+        self._end_sector_mode()
+        self._end_edit_entry()
         self._area_mode = True
         self._area_pts = []
         self._draw_area_preview()
-        self.set_title("Район моделирования: два клика — противоположные углы, "
-                       "КОЛЁСИКО — принять, Esc — отмена")
+        if self._area_shape == "circle":  # район кругом (план 11, 11.6)
+            self.set_title("Район радиусом: клик — ЦЕНТР (он же цель), клик — точка на "
+                           "окружности, КОЛЁСИКО — принять, Esc — отмена")
+        else:
+            self.set_title("Район моделирования: два клика — противоположные углы, "
+                           "КОЛЁСИКО — принять, Esc — отмена")
 
     def _end_area(self, apply_it):
         pts = list(self._area_pts)
@@ -996,6 +1236,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.set_title("")
             return
         (x0, y0), (x1, y1) = pts[0], pts[-1]
+        if self._area_shape == "circle":  # круг: центр и точка на окружности (11.6)
+            r_km = float(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5)   # радиус, км
+            self.on_set_area_circle(float(x0), float(y0), r_km)
+            return
         kx0, kx1 = min(x0, x1), max(x0, x1)
         ky0, ky1 = min(y0, y1), max(y0, y1)
         # Отдаём ровно то, что очертили. Приведение к целому числу ячеек делает МОДЕЛЬ
@@ -1029,8 +1273,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._draw_area_preview()
         if len(self._area_pts) == 2:
             (ax, ay), (bx, by) = self._area_pts
-            self.set_title("Район %.1f × %.1f км — КОЛЁСИКО принять, клик — сдвинуть угол"
-                           % (abs(bx - ax), abs(by - ay)))
+            if self._area_shape == "circle":   # круг
+                self.set_title("Радиус %.1f км — КОЛЁСИКО принять, клик — сдвинуть точку "
+                               "окружности" % ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5)
+            else:
+                self.set_title("Район %.1f × %.1f км — КОЛЁСИКО принять, клик — сдвинуть угол"
+                               % (abs(bx - ax), abs(by - ay)))
 
     def _clear_area(self):
         """Кнопка «Убрать» рядом с районом — сброс к состоянию «район не задан»."""
@@ -1044,6 +1292,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.area_draw_item.setData([], [])
             return
         (ax, ay), (bx, by) = pts[0], pts[-1]
+        if self._area_shape == "circle":  # круг и его радиус
+            r = ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
+            xs, ys = self._circle_xy(ax, ay, r)
+            xs, ys = list(xs) + [np.nan, ax, bx], list(ys) + [np.nan, ay, by]
+            self.area_draw_item.setData(xs, ys, connect="finite")
+            return
         xs = [ax, bx, bx, ax, ax]
         ys = [ay, ay, by, by, ay]
         self.area_draw_item.setData(xs, ys)
@@ -1105,9 +1359,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             if self._measure_mode:
                 self._end_measure()
                 return
+            if self._edit_entry:           # точки старта (11.6)
+                self._end_edit_entry()
+                return
+            if self._sector_mode:          # сектор кликами (11.6): окно остаётся
+                self._end_sector_mode()
+                return
         if ev.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace) \
                 and self._edit_sensor:
             self._delete_selected_sensor()
+            return
+        if ev.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace) \
+                and self._edit_entry:      # выбранная точка старта (11.6)
+            self._delete_selected_entry()
             return
         super().keyPressEvent(ev)
 
@@ -1188,11 +1452,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # и постановки датчиков) — выходим из всего, что могло быть включено раньше
         self._end_pick_sensor()
         self._end_edit_sensor()
+        self._end_sector_mode()
+        self._end_edit_entry()
         if self._zone_mode:
             self._end_zone(False)
         if self._area_mode:
             self._end_area(False)
-        self._target_mode = self._sector_mode = False
+        self._target_mode = False
         self._measure_mode = True
         self._measure_pts = []
         self._draw_measure()
@@ -1907,15 +2173,37 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # Раньше здесь стояли N, R, k и шаг сетки, а остальное пряталось в двух окнах —
         # параметры одного расчёта были разложены по трём местам. Всё переехало в одно
         # окно «Исходные данные»: типы датчиков, маршрут и таблица датчиков вместе.
-        col.addWidget(self._header("КАРТА УГРОЗ"))
+        # ПЕРЕКЛЮЧАТЕЛЬ «РАЙОН / РАДИУС» — в строке заголовка, справа (план 11, 11.6, заказчик
+        # 16.09.2026). Выбирает, ЧЕМ рисовать следующий район: прямоугольником или кругом.
+        row_head = QtWidgets.QHBoxLayout(); row_head.setSpacing(6)
+        row_head.addWidget(self._header("КАРТА УГРОЗ"))
+        row_head.addStretch(1)
+        self.chk_shape_rect = QtWidgets.QCheckBox("район")
+        self.chk_shape_rect.setToolTip(
+            "Район моделирования — прямоугольник: два клика — противоположные углы.")
+        self.chk_shape_circle = QtWidgets.QCheckBox("радиус")
+        self.chk_shape_circle.setToolTip(
+            "Район моделирования — круг вокруг цели: клик — центр (он же цель), клик — точка "
+            "на окружности, колёсико — принять.\nЗа окружностью вес не считается, пролёт и "
+            "датчики запрещены. Всё остальное — как у прямоугольника.")
+        # две галочки ведут себя как переключатель: ровно одна включена всегда
+        self._shape_group = QtWidgets.QButtonGroup(self)
+        self._shape_group.setExclusive(True)
+        for chk in (self.chk_shape_rect, self.chk_shape_circle):
+            self._shape_group.addButton(chk)
+            row_head.addWidget(chk)
+        self.chk_shape_rect.setChecked(True)
+        self._shape_group.buttonToggled.connect(self._area_shape_changed)
+        col.addLayout(row_head)
         # РАЙОН МОДЕЛИРОВАНИЯ — первым: пока он не задан, считать не по чему, и все
         # остальные кнопки недоступны. Два способа задать: очертить мышью либо загрузить
         # свою карту — её рамка станет районом (правило заказчика 04.09.2026).
         row_area = QtWidgets.QHBoxLayout(); row_area.setSpacing(6)
         self.btn_area = QtWidgets.QPushButton("Задать район")
         self.btn_area.setToolTip(
-            "Очертить прямоугольник мышью: два клика — противоположные углы, "
-            "КОЛЁСИКО — принять, Esc — отмена.\n"
+            "Очертить район мышью (форма — переключатель «район / радиус» справа вверху).\n"
+            "Район: два клика — противоположные углы. Радиус: клик — центр, клик — точка "
+            "окружности. КОЛЁСИКО — принять, Esc — отмена.\n"
             "Внутри него строятся сетка, весовая карта, рельеф и векторные слои; "
             "снаружи остаётся только подложка и своя карта-картинка.")
         self._tint(self.btn_area, THEME["accent2"])
@@ -1989,24 +2277,26 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.btn_target.clicked.connect(self._begin_target)
 
         row_sector = QtWidgets.QHBoxLayout(); row_sector.setSpacing(6)
-        self.btn_sector = QtWidgets.QPushButton("Задать сектор")
+        # ⚠️ «ЗАДАТЬ СЕКТОР» И «УБРАТЬ СЕКТОР» ПЕРЕЕХАЛИ В ОКНО «СЕКТОР НАЛЁТА» (план 11, 11.6):
+        # к ним добавились раствор, число точек и сектор по 360°, и в строку панели всё это не
+        # помещалось. Здесь осталась одна кнопка, открывающая окно.
+        self.btn_sector = QtWidgets.QPushButton("Сектор налёта")
         self.btn_sector.setToolTip(
-            "Откуда может появиться БПЛА. Кликните точку на КРАЮ карты: от цели к ней "
-            "проводится ось, и от оси откладывается по 30° в каждую сторону — сектор "
-            "возможных направлений раствором 60°.\n\n"
-            "На попавшем в сектор крае карты по весам местности отбираются 5 точек "
-            "входа (разнесённых между собой). Старт каждого маршрута — случайно "
-            "выбранная из этих пяти.")
-        self.btn_sector.clicked.connect(self._begin_sector)
-        self.btn_sector_clear = QtWidgets.QPushButton("Убрать сектор")
-        self.btn_sector_clear.setToolTip(
-            "Убрать сектор: точка появления снова одна (метка участка).")
-        self.btn_sector_clear.clicked.connect(lambda: self.on_clear_sector())
-        # «Указать цель» и «Задать сектор» — одна тема: откуда и куда летит БПЛА.
-        # «Убрать» узкая: она относится только к сектору.
-        row_sector.addWidget(self.btn_target, 2)
-        row_sector.addWidget(self.btn_sector, 2)
-        row_sector.addWidget(self.btn_sector_clear, 1)
+            "Окно сектора появления БПЛА: раствор и число точек входа, «Построить сектор» по "
+            "всем 360° (по 10°) и «Задать сектор» кликом по краю района.\n\n"
+            "Старт каждого маршрута — случайно выбранная из отобранных точек.")
+        self.btn_sector.clicked.connect(self._open_sector_window)
+        self.btn_entry = QtWidgets.QPushButton("Точки старта")
+        self.btn_entry.setToolTip(
+            "Свои точки старта БПЛА мышью: двойной клик — добавить, щелчок — выбрать, "
+            "перетаскивание — перенести, DELETE — удалить. Правая кнопка мыши или Esc — выход.\n"
+            "Перенесённая точка сектора становится заданной вручную. Заданные вручную точки "
+            "переживают пересчёт сектора и смену цели; убираются сменой района и «Сбросом».")
+        self.btn_entry.clicked.connect(self._begin_edit_entry)
+        # цель, сектор и точки старта — одна тема: откуда и куда летит БПЛА
+        row_sector.addWidget(self.btn_target, 1)
+        row_sector.addWidget(self.btn_sector, 1)
+        row_sector.addWidget(self.btn_entry, 1)
         col.addLayout(row_sector)
 
         row_zone = QtWidgets.QHBoxLayout(); row_zone.setSpacing(6)
@@ -2136,6 +2426,27 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.combo_spread.currentIndexChanged.connect(self._spread_changed)
         row_sp2.addWidget(self.combo_spread, 1)
         col.addLayout(row_sp2)
+        # 2а-й список: ОБЛЁТ ЦЕЛИ — как часто маршрут заходит сбоку или с обратной стороны
+        # (план 11, 11.4). Отдельно от разброса: разброс решает, в каком ПОЯСЕ облёт, этот
+        # список — КАК ЧАСТО. «Смесь» разыгрывает уровень каждому маршруту.
+        row_ap = QtWidgets.QHBoxLayout()
+        row_ap.addWidget(QtWidgets.QLabel("облёт цели:"))
+        self.combo_approach = QtWidgets.QComboBox()
+        self._approach_keys = list(THREAT_APPROACH_LABELS)
+        for k in self._approach_keys:
+            self.combo_approach.addItem(THREAT_APPROACH_LABELS[k])
+        cur = getattr(params, "threat_iter_approach", "mix")
+        self.combo_approach.setCurrentIndex(self._approach_keys.index(cur)
+                                            if cur in self._approach_keys else 0)
+        self.combo_approach.setToolTip(
+            "Как часто маршрут огибает цель (доли: обычный заход / сбоку / с обратной стороны):\n"
+            "• обычный заход — 85/10/5;  • умеренный — 60/25/15;  • максимальный — 30/35/35;\n"
+            "• смесь — уровень случайно у каждого маршрута.\n"
+            "Радиус облёта задаёт «разброс по карте»: центр — ближе к цели, края — дальше.\n"
+            "Не хватает запаса хода на облёт — маршрут облетает ближе или заходит обычно.")
+        self.combo_approach.currentIndexChanged.connect(self._approach_changed)
+        row_ap.addWidget(self.combo_approach, 1)
+        col.addLayout(row_ap)
         # 3-й список: РАСХОД ЗАПАСА ХОДА — когда БПЛА виляет, а когда идёт прямо на цель.
         # Действует на ИТЕРАЦИИ. На «возможные маршруты» (до итераций) не влияет: там
         # перебирается веер всех повадок, чтобы область покрывалась целиком.
@@ -2601,6 +2912,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def _spend_changed(self, i):
         self.on_iter_spend(self._spend_keys[i])
 
+    def _approach_changed(self, i):
+        """Список «облёт цели»: передать выбранный ключ контроллеру. Вход: номер строки."""
+        self.on_iter_approach(self._approach_keys[i])
+
     # ==================================================================
     def _build_scene_items(self):
         """Создать ВСЕ постоянные слои-элементы карты один раз (потом только меняем данные,
@@ -2856,6 +3171,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             brush=pg.mkBrush(_qcolor(THREAT_COLORS["entry_pt"])),
             pen=pg.mkPen(_qcolor(THREAT_COLORS["entry_pt_edge"]), width=2.2))
         self.entries_scatter.setZValue(22); self.pi.addItem(self.entries_scatter)
+        # ТОЧКИ СТАРТА, ЗАДАННЫЕ ЧЕЛОВЕКОМ (план 11, 11.6) — тот же значок, розовая заливка:
+        # видно, что сектор их не выбирал
+        self.entries_manual_scatter = pg.ScatterPlotItem(size=18, symbol="t1",
+            brush=pg.mkBrush(_qcolor(THREAT_COLORS["entry_manual"])),
+            pen=pg.mkPen(_qcolor(THREAT_COLORS["entry_pt_edge"]), width=2.2))
+        self.entries_manual_scatter.setZValue(22.5); self.pi.addItem(self.entries_manual_scatter)
 
     # ==================================================================
     # API для контроллера
@@ -2902,7 +3223,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         """Кнопки, которым нужен заданный РАЙОН МОДЕЛИРОВАНИЯ (план 8, задача 8.2)."""
         return (self.btn_data, self.btn_build, self.btn_target, self.btn_place,
                 self.btn_apply, self.btn_reset, self.btn_pick_sensor,
-                self.btn_sector, self.btn_sector_clear, self.btn_zone,
+                self.btn_sector, self.btn_entry, self.btn_zone,
                 self.btn_zone_undo, self.btn_input_data, self.btn_analysis)
 
     def _panel_widgets(self):
@@ -2945,11 +3266,31 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         finally:
             self._suppress = False
 
-    def set_area_rect(self, bbox_km):
-        """Перерисовать СИНЮЮ рамку по текущему району и перенести на него ноль осей."""
+    @staticmethod
+    def _circle_xy(cx, cy, r, n=181):
+        """Окружность ломаной: центр и радиус, км; n — точек. Отдаёт: (xs, ys) км."""
+        a = np.linspace(0.0, 2.0 * np.pi, n)
+        return cx + r * np.cos(a), cy + r * np.sin(a)
+
+    def _area_button_text(self):
+        """Надпись кнопки района: форма и размер заданного, иначе приглашение."""
+        if not getattr(self, "_area_ready", False):     # района нет
+            return "Задать радиус" if self._area_shape == "circle" else "Задать район"
+        if self._area_circle is not None:               # задан круг
+            return "Радиус %.0f км" % self._area_circle[2]
+        x0, x1, y0, y1 = self.bbox_km
+        return "Район %.0f × %.0f км" % (x1 - x0, y1 - y0)
+
+    def set_area_rect(self, bbox_km, circle_km=None):
+        """Перерисовать СИНЮЮ рамку по текущему району и перенести на него ноль осей.
+        circle_km — (cx, cy, R) у круглого района (план 11, 11.6): рисуется окружность."""
         kx0, kx1, ky0, ky1 = bbox_km
         self.bbox_km = tuple(bbox_km)
-        self.bbox_item.setData([kx0, kx1, kx1, kx0, kx0], [ky0, ky0, ky1, ky1, ky0])
+        self._area_circle = tuple(circle_km) if circle_km else None
+        if self._area_circle is not None:  # район круглый
+            self.bbox_item.setData(*self._circle_xy(*self._area_circle))
+        else:
+            self.bbox_item.setData([kx0, kx1, kx1, kx0, kx0], [ky0, ky0, ky1, ky1, ky0])
         self._apply_view_limits()             # район сменился — предел вида считается от него
         # ГАЛОЧКА ВКЛЮЧАЕТСЯ САМА: район задан — значит отсчёт от него и нужен (правило
         # заказчика 04.09.2026). Снять её можно вручную, тогда ноль вернётся в угол области.
@@ -2962,7 +3303,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 self._group_busy = False
         self._apply_axis_origin()
 
-    def set_area_ready(self, ready, size_km=None, bbox_km=None):
+    def set_area_ready(self, ready, size_km=None, bbox_km=None, circle_km=None):
         """Район задан или нет: от этого зависит вся остальная панель.
 
         Пока район не задан, активны РОВНО ТРИ кнопки — «Задать район», «Добавить карту»
@@ -2972,21 +3313,23 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._area_ready = bool(ready)
         # две кнопки-входа плюс «Исходные данные»: там выбираются ОБЛАСТЬ и папка тайлов
         # (план 10 §10.5), и у области без района иначе не на что было бы её сменить
-        keep = {self.btn_area, self.btn_map_img, self.btn_input_data}
+        keep = {self.btn_area, self.btn_map_img, self.btn_input_data,
+                self.chk_shape_rect, self.chk_shape_circle}   # форму выбирают ДО района
         for w in self._panel_widgets():
             if w not in keep:
                 w.setEnabled(bool(ready))
         for w in keep:
             w.setEnabled(True)
         if ready and bbox_km is not None:
-            self.set_area_rect(bbox_km)
+            self.set_area_rect(bbox_km, circle_km)
         self.bbox_item.setVisible(bool(ready))
         if ready:
             self.set_busy(False)                      # вернуть обычную доступность
             if size_km:
-                self.btn_area.setText("Район %.0f × %.0f км" % size_km)
+                self.btn_area.setText(self._area_button_text())
         else:
-            self.btn_area.setText("Задать район")
+            self._area_circle = None
+            self.btn_area.setText(self._area_button_text())
             self.set_title("Район не задан: очертите его мышью либо загрузите свою карту "
                            "— её рамка станет районом")
 
@@ -3489,7 +3832,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.builtup_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.builtup_img.setVisible(True)
 
-    def render_threat(self, weight, extent, toggles):
+    def render_threat(self, weight, extent, toggles, outside=None):
+        """Весовая карта. outside — маска ячеек за окружностью круглого района (план 11, 11.6)
+        либо None: там карта прозрачна."""
         if not toggles["show_threat"] or weight is None:
             self.threat_img.setVisible(False)
             self._update_scale()                        # шкала перейдёт к тепловой карте
@@ -3497,6 +3842,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         vmax = float(np.percentile(weight[weight > 0], 97)) if np.any(weight > 0) else 1.0
         vmax = max(vmax, 1e-6)
         disp = np.clip(weight / vmax, 0.0, 1.0)
+        if outside is not None:                         # район круглый
+            # ⚠️ NaN, а не 0: ноль — первый цвет шкалы, и за кругом стоял тёмный квадрат
+            # описанной сетки (скриншот 16.09.2026); NaN pyqtgraph рисует прозрачным
+            disp = np.where(np.asarray(outside, bool), np.nan, disp)
         self.threat_img.setImage(disp, levels=(0, 1), lut=self._lut, autoLevels=False)
         x0, x1, y0, y1 = extent
         self.threat_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
@@ -3997,9 +4346,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.entry_scatter.setData([entry[0]], [entry[1]])
         self.target_scatter.setData([target[0]], [target[1]])
 
-    def render_sector(self, sector, entry_points, toggles=None):
+    def render_sector(self, sector, entry_points, toggles=None, manual_points=None):
         """Сектор появления БПЛА: `sector` = (вершина-цель, край, край) или None,
-        `entry_points` — отобранные точки входа.
+        `entry_points` — отобранные сектором точки входа, `manual_points` — заданные
+        человеком (план 11, 11.6; рисуются с обводкой «поставлено рукой»).
 
         ДВА НЕЗАВИСИМЫХ СЛОЯ, у каждого своя галка: точки входа (по умолчанию видны —
         они участвуют в расчёте) и границы сектора (по умолчанию скрыты — это служебная
@@ -4017,12 +4367,15 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         else:
             self.sector_lines.setData([], [])
             self.sector_shadow.setData([], [])
+        man = [] if manual_points is None else list(manual_points)
         if show_pts:
             self.entries_scatter.setData([p[0] for p in pts], [p[1] for p in pts])
+            self.entries_manual_scatter.setData([p[0] for p in man], [p[1] for p in man])
         else:
             self.entries_scatter.setData([], [])
-        # при заданном секторе одиночный значок входа лишний — точек несколько
-        if pts:
+            self.entries_manual_scatter.setData([], [])
+        # при заданном секторе или своих точках одиночный значок входа лишний
+        if pts or man:
             self.entry_scatter.setData([], [])
 
     def showEvent(self, e):

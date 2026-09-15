@@ -335,9 +335,46 @@ def main(argv=None):
                 break
         check(ok_all, "три включения-выключения подряд без сбоя")
 
+    # ---- 5а. точки входа и круглый район (план 11, 11.6) ----
+    # ЧТО ЛОВИТ: точки старта человека — входные данные, как его датчики, и обязаны пережить
+    # пересборку, смену цели и снятие сектора; а ключ контекста выборки обязан их видеть,
+    # иначе маршруты строились бы из прежних точек молча.
+    print("\n5а. ТОЧКИ ВХОДА И КРУГЛЫЙ РАЙОН (план 11, 11.6)")
+    B5 = np.asarray(m.target_only_km(), float)
+    m.set_sector(B5[0] + 200.0, B5[1] - 200.0)
+    n_sec = len(m.sector_points())
+    key0 = m._ctx_key()
+    x0_, x1_, y0_, y1_ = m.bbox_km
+    added = m.add_manual_entry(0.5 * (x0_ + x1_) + 3.0, 0.5 * (y0_ + y1_) + 3.0)
+    check(added and len(m.entry_points) == n_sec + 1, "точка старта человека добавилась к сектору",
+          "сектора %d + ручных %d" % (n_sec, len(m.manual_entries)))
+    check(m._ctx_key() != key0, "ключ контекста выборки видит новую точку")
+    m.build()
+    check(len(m.manual_entries) == 1, "пересборка карты точку старта сохраняет")
+    m.set_target(float(B5[0]), float(B5[1]))
+    check(len(m.manual_entries) == 1 and m.sector_kind == "click",
+          "смена цели: сектор переотобран, точка человека на месте")
+    m.clear_sector()
+    check(m.entry_points == m.manual_entries, "«Убрать сектор» оставляет точки человека")
+    m.set_area_circle(float(B5[0]), float(B5[1]), 25.0)
+    check(not m.manual_entries and m.sector_kind is None and m.area_circle is not None,
+          "круглый район сбрасывает сектор и точки старта, как смена рамки")
+    m.build()
+    area5, _ = m.grid.outside_mask(), None
+    m._refresh_envelope()
+    check(area5 is not None and not bool((np.asarray(m.route_area, bool) & area5).any()),
+          "область залёта не выходит за окружность",
+          "ячеек залёта %d" % int(np.asarray(m.route_area, bool).sum()))
+    m.set_sector_auto()
+    check(len(m.sector_points()) >= 1
+          and bool(m.in_area(*np.asarray(m.sector_points(), float).T).all()),
+          "сектор по 360°: точки входа внутри круга", "точек %d" % len(m.sector_points()))
+
     # ---- 6. снятие района обнуляет ВСЁ ----
     print("\n6. СНЯТИЕ РАЙОНА")
     m.clear_area()
+    check(m.area_circle is None and not m.entry_points and m.sector_kind is None,
+          "круг, сектор и точки входа сброшены")
     check(m.grid is None, "сетка сброшена")
     check(len(m.layers) == 0, "слои сброшены")
     check(len(m.sensors) == 0 and len(m.sensors_big) == 0, "датчики сброшены")

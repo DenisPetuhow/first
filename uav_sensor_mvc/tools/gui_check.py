@@ -105,6 +105,18 @@ def main():
     v.set_area_ready(True, m.area_size_km(), m.bbox_km)
     check(len([w for w in v._panel_widgets() if not w.isEnabled()]) < 5,
           "после задания района панель ожила")
+    # СПИСОК «ОБЛЁТ ЦЕЛИ» (план 11, 11.4): отдельный критерий маршрута. Ловит список, не
+    # доведённый до модели: подписи есть, а выбор до `Params` не доходит.
+    from config import THREAT_APPROACH_LABELS
+    keys = list(THREAT_APPROACH_LABELS)
+    check(v.combo_approach.count() == len(keys) == 4, "в списке «облёт цели» четыре уровня",
+          " · ".join(THREAT_APPROACH_LABELS[k].split(" (")[0] for k in keys))
+    check(keys[v.combo_approach.currentIndex()] == p.threat_iter_approach == "mix",
+          "по умолчанию — смесь")
+    v.combo_approach.setCurrentIndex(keys.index("max"))
+    check(m.p.threat_iter_approach == "max", "выбор в списке дошёл до модели",
+          m.p.threat_iter_approach)
+    v.combo_approach.setCurrentIndex(keys.index("mix"))
 
     print("\n4. СВОЯ КАРТА КАРТИНКОЙ")
     check(v.map_img_item.zValue() < -9.0, "слой лежит ПОД всеми слоями карты",
@@ -1170,13 +1182,124 @@ def main():
     check(m.enabled_layers is None and _in_calc(), "вернули галочку и применили — слой в расчёте")
     _d.close()
 
+    # РАЙОН РАДИУСОМ, ОКНО «СЕКТОР НАЛЁТА», ТОЧКИ СТАРТА (план 11, 11.6). Ловит то, чего не
+    # видят расчётные проверки: круг нарисован, а в модель ушёл прямоугольник; режим кликов
+    # сектора не отпускает правую кнопку; перенос точки за район оставляет метку «в пустоте».
+    print("\n13. РАЙОН РАДИУСОМ, СЕКТОР НАЛЁТА, ТОЧКИ СТАРТА (план 11, 11.6)")
+
+    class _Ev:                                   # клик по карте: кнопка и двойной ли
+        def __init__(self, x_km, y_km, button=Qt.LeftButton, double=False):
+            self._pos = v.vb.mapViewToScene(QPointF(x_km, y_km))
+            self._btn, self._dbl = button, double
+
+        def scenePos(self):
+            return self._pos
+
+        def button(self):
+            return self._btn
+
+        def double(self):
+            return self._dbl
+
+        def accept(self):
+            pass
+
+    check(v.chk_shape_rect.isChecked() and not v.chk_shape_circle.isChecked(),
+          "переключатель «район / радиус» есть, по умолчанию — район")
+    v.set_area_ready(False)
+    check(v.chk_shape_circle.isEnabled(), "форму можно выбрать и без района")
+    v.chk_shape_circle.setChecked(True)
+    check(v._area_shape == "circle" and not v.chk_shape_rect.isChecked(),
+          "«радиус» включается, «район» гаснет сам")
+    cx, cy = (float(q) for q in m.target_only_km())
+    R12 = 30.0
+    v._begin_area()
+    v._on_scene_click(_Ev(cx, cy))
+    v._on_scene_click(_Ev(cx + R12, cy))
+    v._on_scene_click(_Ev(cx + R12, cy, button=Qt.MiddleButton))   # колёсико — принять
+    circ = m.area_circle
+    check(circ is not None and abs(circ[2] - R12) < 0.05,
+          "два клика и колёсико задали КРУГ в модели",
+          "R = %.2f км" % (circ[2] if circ else float("nan")))
+    xs_b, _ = v.bbox_item.getData()
+    check(xs_b is not None and len(xs_b) > 100 and v.btn_area.text().startswith("Радиус"),
+          "синяя рамка — окружность, кнопка — «Радиус …»", v.btn_area.text())
+    check(tuple(float(q) for q in m.target_only_km()) == (circ[0], circ[1]) if circ else False,
+          "цель — центр круга")
+    m.build(); c._render_all()
+    out12 = m.grid.outside_mask()
+    cand12 = m.candidate_positions()
+    check(out12 is not None and float(np.abs(m.grid.weight[out12]).max()) == 0.0,
+          "за окружностью вес 0", "%d ячеек" % int(out12.sum()))
+    check(bool(len(cand12)) and bool(m.in_area(cand12[:, 0], cand12[:, 1]).all()),
+          "кандидаты датчиков только внутри круга", "%d шт." % len(cand12))
+
+    check(v.btn_sector.text() == "Сектор налёта", "кнопка «Сектор налёта» в панели")
+    v._open_sector_window()
+    sd = v._sector_dlg
+    check(sd is not None and sd.isVisible(), "окно сектора открывается")
+    sd.spin_angle.setValue(90); sd.spin_n.setValue(7); sd._apply_params()
+    check(abs(m.sector_half_deg() - 45.0) < 1e-9 and m.sector_entries_n() == 7,
+          "раствор и число точек из окна дошли до модели",
+          "полураствор %.0f°, точек %d" % (m.sector_half_deg(), m.sector_entries_n()))
+    sd.btn_auto.click()
+    n_auto = len(m.sector_points())
+    check(m.sector_kind == "auto" and n_auto >= 1, "«Построить сектор» — по 360°",
+          "точек %d" % n_auto)
+    check("360" in sd.lbl_state.text(), "окно показывает вид сектора", sd.lbl_state.text()[:50])
+    sd.btn_click.click()
+    check(v._sector_mode and not v.vb.menuEnabled(),
+          "«Задать сектор кликом» включает режим и забирает правую кнопку")
+    v._on_scene_click(_Ev(cx + R12 - 0.5, cy - 5.0))
+    v._on_scene_click(_Ev(cx - R12 + 0.5, cy + 5.0))
+    check(m.sector_kind == "click" and v._sector_mode,
+          "клик по краю задаёт сектор, режим остаётся для следующего",
+          "точек %d" % len(m.sector_points()))
+    v._on_scene_click(_Ev(cx, cy, button=Qt.RightButton))
+    check(not v._sector_mode and not sd.isVisible() and v.vb.menuEnabled(),
+          "правая кнопка — выход из режима и закрытие окна сектора")
+
+    n_before = len(m.entry_points)
+    v.btn_entry.click()
+    check(v._edit_entry and not v.btn_target.isEnabled(),
+          "«Точки старта» включают режим и гасят панель")
+    px, py = cx - 8.0, cy + 6.0
+    v._on_scene_click(_Ev(px, py, double=True))
+    check(len(m.manual_entries) == 1 and len(m.entry_points) == n_before + 1,
+          "двойной клик ставит точку старта", "всего точек %d" % len(m.entry_points))
+    mx_, _ = v.entries_manual_scatter.getData()
+    check(mx_ is not None and len(mx_) == 1, "точка человека нарисована своим значком")
+    v._on_scene_click(_Ev(px + 0.05, py))
+    check(v._entry_handle is not None and v._entry_pick is not None and v._entry_pick["manual"],
+          "щелчок рядом выделяет точку")
+    v._entry_handle.setPos(px + 2.0, py + 1.0); v._entry_handle_moved()
+    check(abs(m.manual_entries[0][0] - (px + 2.0)) < 1e-6,
+          "перетаскивание переносит точку в модели")
+    v._entry_handle.setPos(cx + 3 * R12, cy); v._entry_handle_moved()
+    hp = v._entry_handle.pos()
+    check(abs(m.manual_entries[0][0] - (px + 2.0)) < 1e-6 and abs(float(hp.x()) - (px + 2.0)) < 1e-6,
+          "за район не переносится, метка возвращается на место")
+    from PyQt5.QtGui import QKeyEvent
+    from PyQt5.QtCore import QEvent
+    v.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+    check(not m.manual_entries and len(m.entry_points) == n_before, "DELETE убирает точку")
+    v._on_scene_click(_Ev(cx, cy, button=Qt.RightButton))
+    check(not v._edit_entry and v.btn_target.isEnabled() and v.vb.menuEnabled(),
+          "правая кнопка — выход, панель ожила")
+    m.add_manual_entry(px, py)
+    c.on_reset()
+    check(not m.manual_entries and m.sector_kind is None, "«Сброс» убирает сектор и точки старта")
+    v.chk_shape_rect.setChecked(True)
+    check(v._area_shape == "rect" and m.area_circle is not None,
+          "переключатель не трогает уже заданный круг (меняет только форму следующего)")
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
         return 1
     print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои, окно исходных данных, история "
-         "полётов, анализ размещения, линейка «Расстояние», анализ моделирования "
-         "и полнота слоёв — в норме.")
+         "полётов, анализ размещения, линейка «Расстояние», анализ моделирования, "
+         "полнота слоёв, район радиусом, окно сектора и точки старта — в норме.")
     return 0
 
 

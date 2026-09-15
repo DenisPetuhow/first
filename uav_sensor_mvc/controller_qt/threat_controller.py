@@ -92,11 +92,18 @@ class ThreatController:
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
             on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
             on_iter_spread=self.on_iter_spread, on_iter_spend=self.on_iter_spend,
+            on_iter_approach=self.on_iter_approach,
             on_iter_play=self.on_iter_play, on_iter_step=self.on_iter_step,
             on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed,
             on_iter_gen_frac=self.on_iter_gen_frac,
             on_zone_added=self.on_zone_added, on_zone_undo=self.on_zone_undo,
             on_set_sector=self.on_set_sector, on_clear_sector=self.on_clear_sector,
+            # план 11, 11.6: круглый район, окно «Сектор налёта», точки старта мышью
+            on_set_area_circle=self.on_set_area_circle,
+            on_sector_params=self.on_sector_params, on_sector_auto=self.on_sector_auto,
+            on_sector_state=self._sector_state,
+            on_entry_rows=self.model.entry_rows, on_entry_add=self.on_entry_add,
+            on_entry_move=self.on_entry_move, on_entry_delete=self.on_entry_delete,
             on_sensors_apply=self.on_sensors_apply, on_set_area=self.on_set_area,
             on_clear_area=self.on_clear_area,
             # датчики, заданные человеком (задача 8.7)
@@ -122,7 +129,8 @@ class ThreatController:
         # СТАРТ: район не задан — расчётные кнопки закрыты, синей рамки нет
         view.set_area_ready(model.area_ready,
                             model.area_size_km() if model.area_ready else None,
-                            model.bbox_km if model.area_ready else None)
+                            model.bbox_km if model.area_ready else None,
+                            model.area_circle)
         # перерисовка слоёв при смене масштаба/панораме: прореживание считается по
         # ВИДИМОЙ области, а застройка переключается растр <-> контуры
         self.view.on_view_changed = self._on_view_changed
@@ -854,6 +862,15 @@ class ThreatController:
                 and not self._busy):
             self._run_async("iter", self.model.iterate_routes)
 
+    # ---- смена уровня облёта цели (min/medium/max/mix) ----
+    def on_iter_approach(self, key):
+        """Панель: новый уровень облёта цели. Вход: ключ THREAT_APPROACH_LABELS.
+        Отдаёт: None; при включённых итерациях пересчитывает выборку в фоне."""
+        self.model.p.threat_iter_approach = key
+        if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
+                and not self._busy):                  # итерации показаны и расчёт свободен
+            self._run_async("iter", self.model.iterate_routes)   # — пересчитать выборку
+
     # ---- смена профиля расхода запаса хода (late/early/even) ----
     # Влияет только на ИТЕРАЦИИ: «возможные маршруты» строятся веером всех повадок,
     # чтобы показывать возможности целиком, а не один выбранный сценарий.
@@ -986,9 +1003,20 @@ class ThreatController:
         пределами, туда просто не заходит расчёт. Пересборка тяжёлая (чтение `.osm.pbf`
         и наложение слоёв — десятки секунд), поэтому идёт в фоновом потоке."""
         self.model.set_area(bbox_lonlat)
+        self._area_changed()
+
+    def on_set_area_circle(self, cx, cy, r_km):
+        """Задать КРУГЛЫЙ район (план 11, 11.6): центр и радиус в км. Центр — цель; за
+        окружностью вес не считается, пролёт и датчики запрещены. Остальное — как у рамки."""
+        self.model.set_area_circle(cx, cy, r_km)
+        self._area_changed()
+
+    def _area_changed(self):
+        """Район задан (рамкой или кругом): показать его и напомнить про «Построить карту»."""
         w_km, h_km = self.model.area_size_km()
         # синяя рамка — по НОВОМУ району: иначе она осталась бы вокруг прежнего
-        self.view.set_area_ready(True, (w_km, h_km), self.model.bbox_km)
+        self.view.set_area_ready(True, (w_km, h_km), self.model.bbox_km, self.model.area_circle)
+        self.view.refresh_sector_window()      # сектор и точки старта сброшены вместе с районом
         # ⚠️ ПРЕДЕЛ РАЙОНА. Дальше ~150 км по широте подложка расходится с векторными
         # слоями сильнее радиуса малого датчика (план 8 §0.4): тайлы в Меркаторе,
         # наши слои — в равнопромежуточной проекции, привязка идёт по углам.
@@ -1000,10 +1028,11 @@ class ThreatController:
         # местность, и часто поправляют два-три раза подряд; автоматический пересчёт после
         # каждого движения — это десятки секунд чтения `.osm.pbf` впустую. Считает кнопка
         # «Построить карту» — как и с выбором цифровых карт (`on_choose_data`).
-        self.view.set_title("Район %.1f × %.1f км задан. Нажмите «Построить карту».%s"
-                            % (w_km, h_km, warn))
+        what = ("Район радиусом %.1f км (центр — цель)" % self.model.area_circle[2]
+                if self.model.area_circle is not None else "Район %.1f × %.1f км" % (w_km, h_km))
+        self.view.set_title("%s задан. Нажмите «Построить карту».%s" % (what, warn))
         self.view.set_source("район задан · карта не построена")
-        self.view.set_metrics(["Район %.1f × %.1f км." % (w_km, h_km),
+        self.view.set_metrics([what + ".",
                                "Нажмите «Построить карту», чтобы наложить слои",
                                "и посчитать веса."])
         self._render_all()          # показать новую рамку и убрать старые слои
@@ -1018,6 +1047,7 @@ class ThreatController:
         # кнопка рельефа возвращается в исходное «Добавить рельеф»: сам рельеф сброшен
         self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
         self.view.set_area_ready(False)
+        self.view.refresh_sector_window()
         self.view.set_source("район не задан")
         self.view.set_metrics(["Район не задан.",
                                "Очертите его мышью либо загрузите свою карту —",
@@ -1047,6 +1077,7 @@ class ThreatController:
         self.model.set_target(x, y)                       # пересчитает авто-запас хода
         self._pending_recalc = True
         self._render_after_input(f"Цель задана: ({x:.0f}, {y:.0f}) км. ")
+        self.view.refresh_sector_window()                 # сектор переотобран от новой цели
 
     # ---- «задать сектор появления» кликом по краю карты ----
     def on_set_sector(self, x, y):
@@ -1062,12 +1093,81 @@ class ThreatController:
             return
         self._pending_recalc = True
         self._render_after_input("Сектор задан: %d точек входа. " % len(pts))
+        self.view.refresh_sector_window()
 
     def on_clear_sector(self):
         if not self.model.clear_sector():
             return
         self._pending_recalc = True
-        self._render_after_input("Сектор убран: точка появления одна. ")
+        left = len(self.model.manual_entries)          # точки старта человека остаются
+        self._render_after_input("Сектор убран: %s. " % (
+            "остались точки старта, заданные вручную (%d)" % left if left
+            else "точка появления одна"))
+        self.view.refresh_sector_window()
+
+    # ---- ОКНО «СЕКТОР НАЛЁТА» (план 11, 11.6) ----
+    def _sector_state(self):
+        """Что показать в окне сектора: dict(half_deg, entries, kind, n_sector, n_manual)."""
+        m = self.model
+        return dict(half_deg=m.sector_half_deg(), entries=m.sector_entries_n(),
+                    kind=m.sector_kind, n_sector=len(m.sector_points()),
+                    n_manual=len(m.manual_entries))
+
+    def on_sector_params(self, half_deg, n):
+        """Окно сектора: раствор или число точек изменились — применить сразу."""
+        was = self.model.sector_kind                   # был ли сектор до правки
+        self.model.set_sector_params(half_deg, n)
+        self.view.refresh_sector_window()
+        if was is None:                                # сектора нет — только запомнили
+            self.view.set_title("Раствор %.0f°, точек %d — применятся к следующему сектору."
+                                % (2.0 * float(half_deg), int(n)))
+            return
+        self._pending_recalc = True
+        self._render_after_input("Сектор переотобран: раствор %.0f°, точек входа %d. "
+                                 % (2.0 * float(half_deg), len(self.model.sector_points())))
+
+    def on_sector_auto(self):
+        """«Построить сектор»: по всем 360°, лучшая точка на каждые 10°."""
+        if self.model.grid is None:
+            self.view.set_title("Сектор строится по построенной карте — «Построить карту».")
+            return
+        self.model.set_sector_auto()
+        self.view.refresh_sector_window()
+        if not self.model.sector_points():             # край без проходимых ячеек
+            self.view.set_title("На краю района не нашлось точек входа — проверьте карту и цель.")
+            return
+        self._pending_recalc = True
+        self._render_after_input("Сектор по 360° построен: %d приоритетных направлений. "
+                                 % len(self.model.sector_points()))
+
+    # ---- ТОЧКИ СТАРТА МЫШЬЮ (план 11, 11.6) ----
+    def on_entry_add(self, x, y):
+        """Двойной клик в режиме «Точки старта». Отдаёт: True, если точка добавлена."""
+        if not self.model.add_manual_entry(x, y):      # клик за районом
+            return False
+        self._entry_changed("Точка старта добавлена: всего точек %d. "
+                            % len(self.model.entry_points))
+        return True
+
+    def on_entry_move(self, x0, y0, x1, y1):
+        """Точку старта перетащили. Отдаёт: True, если модель перенос приняла."""
+        if not self.model.move_entry(x0, y0, x1, y1):  # за район или точка не найдена
+            return False
+        self._entry_changed("Точка старта перенесена. ")
+        return True
+
+    def on_entry_delete(self, x, y):
+        """DELETE по выбранной точке старта. Отдаёт: True, если точка найдена и убрана."""
+        if not self.model.remove_entry(x, y):
+            return False
+        self._entry_changed("Точка старта убрана: осталось %d. " % len(self.model.entry_points))
+        return True
+
+    def _entry_changed(self, msg):
+        """После правки точек старта: пересчёт маршрутов — по «Применить», как после сектора."""
+        self._pending_recalc = True
+        self._render_after_input(msg)
+        self.view.refresh_sector_window()
 
     def _render_after_input(self, msg):
         """Показать заданное (цель, сектор, точки входа) и напомнить про «Применить».
@@ -1098,8 +1198,9 @@ class ThreatController:
         self.model.clear_loaded_routes()   # загруженная история полётов — тоже входные данные
         self.view.set_loaded_routes_checked(False)
         self.view.render_route_preview(None)   # подсветка маршрута могла указывать в никуда
-        self.model.target_km = None
+        self.model.target_km = None        # у круглого района цель снова в центре (11.6)
         self.model.clear_sector()          # сектор отсчитывается от цели — уходит вместе с ней
+        self.model.clear_manual_entries()  # свои точки старта — входные данные, как датчики человека
         self._pending_recalc = False       # считать после сброса нечего
         self.model.routes = []
         self.model.iter_routes = []
@@ -1111,8 +1212,9 @@ class ThreatController:
         self._render_all()
         self.view.refresh_sensor_table([])          # таблица в окне тоже пустеет
         self.view.refresh_route_viewer()            # оба списка маршрутов опустели
+        self.view.refresh_sector_window()           # сектор и точки старта убраны
         self.view.set_title("Сброшено: датчики (малые, большие и заданные вручную), "
-                            "цель, зоны и загруженная история полётов убраны. "
+                            "цель, сектор, точки старта, зоны и загруженная история полётов убраны. "
                             "Карта сохранена.")
         if self.model.grid is None:
             self._idle_metrics()
@@ -1208,7 +1310,8 @@ class ThreatController:
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, target)
         # сектор появления рисуется здесь же: иначе он пропадал бы при любой перерисовке
-        self.view.render_sector(self.model.sector_edges_km(), self.model.entry_points, t)
+        self.view.render_sector(self.model.sector_edges_km(), self.model.sector_points(), t,
+                                manual_points=self.model.manual_entries)
         self.view.render_no_fly(self.model.no_fly_zones, t)
         # |AB| вход->цель (для окна входных данных)
         ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
@@ -1259,7 +1362,7 @@ class ThreatController:
         else:
             self.view.render_relief(None, None, t)
         self.view.render_relief_priority(g.relief_k(), g.relief_cut(), extent, t)
-        self.view.render_threat(g.weight, extent, t)
+        self.view.render_threat(g.weight, extent, t, outside=g.outside_mask())   # за кругом — прозрачно
         self.view.render_exclusions(g.water_mask(), g.urban_mask(), extent, t)
         self.view.render_layers(self.model.layers,
                                 self.model.layers.get("bridge_pts", []), t,
