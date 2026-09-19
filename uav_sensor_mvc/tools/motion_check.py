@@ -20,7 +20,7 @@
     python tools/motion_check.py --save base.json       # сохранить замер для сравнения
     python tools/motion_check.py --compare base.json    # сравнить с сохранённым
 
-Разбор показателей — теория/планы/11_ПЛАН_МОДЕЛЬ_ДВИЖЕНИЯ.md §2.
+Разбор показателей — теория/архив/11_ПЛАН_МОДЕЛЬ_ДВИЖЕНИЯ.md §2.
 """
 import argparse
 import json
