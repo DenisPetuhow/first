@@ -144,7 +144,16 @@ def paragraphs(path):
     """(номер первой строки, текст абзаца). Абзацы разделены пустой строкой."""
     lines = io.open(path, encoding="utf-8").read().split("\n")
     buf, start, out = [], 1, []
+    in_code = False                                  # идём внутри ```-блока
     for i, s in enumerate(lines, 1):
+        if s.lstrip().startswith("```"):             # граница блока кода
+            in_code = not in_code                    # — переключаем и строку не берём
+            continue
+        # ⚠️ КОД — НЕ УТВЕРЖДЕНИЕ. Комментарий вроде «# засечек, но не больше k» скрипт
+        # принимал за «не сделано» и выдавал ложную тему (находка 20.09.2026 на новом
+        # документе разбора). В коде пишут про механизм, а не про его готовность.
+        if in_code:
+            continue
         if s.strip():
             if not buf:
                 start = i
