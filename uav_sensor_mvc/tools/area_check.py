@@ -134,6 +134,36 @@ def main():
     name, box, err = config_under(geo)
     check(5, name == "arh" and err != "-", "папка без файла → откат на arh, причина: %s" % err[:60])
 
+    print("5а. ПАПКА ТАЙЛОВ ПОДБИРАЕТСЯ ПО ИМЕНИ ОБЛАСТИ")
+    # ⚠️ Память «тайлы» жила отдельно от выбора области: сменил область — корень остался
+    # от прежней, и подложка искалась не там (правило заказчика 20.09.2026).
+    proj = af.tile_cache_root()
+    arh_dir = os.path.join(geo, "arh")
+    check("5а", af.tiles_root_for_area("arh", arh_dir, "") == "",
+          "ничего не выбрано → проектный tile_cache/")
+    tmp = tempfile.mkdtemp(prefix="uav_tiles_")               # чужой корень без этой области
+    check("5а", af.tiles_root_for_area("arh", arh_dir, tmp) == "",
+          "чужой корень без папки области → проектный")
+    os.makedirs(os.path.join(tmp, "arh"), exist_ok=True)      # теперь область там есть
+    check("5а", af.tiles_root_for_area("arh", arh_dir, tmp) == tmp,
+          "свой корень С папкой области → выбор человека сохранён")
+    check("5а", af.tiles_root_for_area("нет_такой", arh_dir, tmp) == tmp,
+          "папки нет нигде → корень не трогаем")
+    ext = tempfile.mkdtemp(prefix="uav_ext_")                 # область на внешнем диске
+    os.makedirs(os.path.join(ext, "tile_cache", "д"), exist_ok=True)
+    check("5а", af.tiles_root_for_area("д", os.path.join(ext, "д"), "")
+          == os.path.join(ext, "tile_cache"), "tile_cache рядом с областью → найден")
+    check("5а", os.path.isdir(os.path.join(proj, "arh")),
+          "у области arh есть своя папка тайлов в проекте")
+    # ⚠️ Человек выбирает папку с именем области вместо корня — имя добавлялось второй раз
+    # (`tile_cache/arh` + участок `arh` → `tile_cache/arh/arh`), и докачка уходила в пустоту.
+    check("5а", af.normalize_tiles_root(os.path.join(proj, "arh"), "arh") == proj,
+          "выбрана ПАПКА УЧАСТКА → корнем берётся родитель")
+    check("5а", af.normalize_tiles_root(proj, "arh") == proj,
+          "выбран настоящий корень → остаётся как есть")
+    check("5а", af.normalize_tiles_root(tmp, "arh") == tmp,
+          "чужая раскладка → не трогаем")
+
     print("6. УПАКОВАННЫЙ ФОРМАТ СЛОЁВ ЧИТАЕТСЯ ТАК ЖЕ, КАК ПРЕЖНИЙ")
     # ⚠️ 14.09.2026: слои Marshut (2.6 млн массивов) читались десятки минут; упакованный
     # формат — два массива на слой. Итог обязан быть тем же до бита, иначе поедут веса.

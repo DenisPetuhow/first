@@ -150,7 +150,7 @@ class BasemapMixin:
         self._map_delay = 180 if self._tiles is None else 40
         self.vb.sigRangeChanged.connect(lambda *a: self._map_timer.start(self._map_delay))
 
-    def _set_view_limits(self, bbox_km, pad_km=5.0, min_ref=None):
+    def _set_view_limits(self, bbox_km, pad_km=5.0, min_ref=None, max_span=None):
         """РАЙОН ОТОБРАЖЕНИЯ: рамка участка плюс `pad_km` километров поля вокруг.
         Дальше этого прямоугольника камеру не увести — за ним ни данных, ни тайлов.
         `min_ref` — от какой рамки считать предел ПРИБЛИЖЕНИЯ (по умолчанию от своей).
@@ -185,15 +185,73 @@ class BasemapMixin:
         if deep:                                   # тайлы позволяют ближе, чем доля участка
             min_x = min(min_x, deep)               # берём то, что мельче
             min_y = min(min_y, deep * (my1 - my0) / max(mx1 - mx0, 1e-9))
+        # ⚠️ ОТДАЛЕНИЕ УПИРАЕТСЯ В УРОВЕНЬ, НА КОТОРОМ ОБЛАСТЬ УЖЕ ВИДНА ЦЕЛИКОМ (заказчик
+        # 19.09.2026: «максимальный какой уровень загружается изначально — выше него не
+        # уходит»). Без этого щелчок «за последний уровень» не менял тайлы, а РАСТЯГИВАЛ
+        # вид до границ: 435.3 → 449.9 км на тех же тайлах z = 8, масштаб 1.000 → 0.97, и
+        # дальше он не менялся. `max_span` приходит от `_zoom_out_frame` — это ширина вида
+        # 1:1 на том самом уровне, поэтому предел не «дышит» вместе с формой окна.
+        max_x = float(max_span) if max_span else (kx1 - kx0)     # предел отдаления по X, км
+        max_y = max_x * (ky1 - ky0) / max(kx1 - kx0, 1e-9)       # по Y — в форме кадра
         self.vb.setLimits(xMin=kx0 - pad, xMax=kx1 + pad,
                           yMin=ky0 - pad, yMax=ky1 + pad,
-                          minXRange=min_x, minYRange=min_y)
+                          minXRange=min_x, minYRange=min_y,
+                          maxXRange=max_x, maxYRange=max_y)
+
+    def _map_px(self):
+        # Ширина карты в ФИЗИЧЕСКИХ пикселях — от неё считается уровень тайлов.
+        # Отдаёт: px (float), не меньше 256.
+        # ⚠️ Qt раскладывает виджеты в логических, а рисует в физических: при масштабе
+        # Windows 125 % тайл на 256 логических растянут в 1.25 раза и мылит. При dpr = 1
+        # значение прежнее — поведение обычного монитора не меняется.
+        try:
+            w = float(self.plot.width())
+            dpr = float(self.plot.devicePixelRatioF())    # 1.0 · 1.25 · 1.5 · 2.0 …
+        except Exception:                                # виджет ещё не разложен
+            return 256.0
+        return max(w * (dpr if dpr > 0 else 1.0), 256.0)
+
+    def _report_tiles(self, z, x_range, tiles):
+        # Строка подложки над картой: уровень, число тайлов, масштаб отрисовки.
+        # Вход: уровень (или None), края вида по X (км), слой тайлов. Отдаёт: ничего.
+        # ⚠️ Масштаб — главное число: экранных пикселей на пиксель тайла. 1.00 — резко,
+        # больше — растянут (мыло), меньше — ужат (подписи мельчают).
+        show = getattr(self, "set_tiles_info", None)
+        if show is None:                              # у вкладки нет такой строки
+            return                                    # — молча, это не ошибка
+        if not z:                                     # тайлов нет: схема, своя карта, пусто
+            show("подложка: —")
+            return
+        try:
+            span_km = float(x_range[1] - x_range[0])
+            w_px = self._map_px()                     # та же мера, что при выборе уровня
+            km_per_deg = gm._km_per_deg_lon(self._geo_lat0)
+            nx = span_km / km_per_deg / 360.0 * (2.0 ** z)     # тайлов по ширине вида
+            scale = w_px / max(nx * 256.0, 1e-9)               # экранных px на px тайла
+        except Exception:                             # виджет ещё не разложен
+            show("подложка: уровень %d" % z)
+            return
+        keys = sorted(k for k in getattr(tiles, "_items", {}) if k[0] == z)   # (z,x,y) уровня
+        mark = "1:1" if 0.99 <= scale <= 1.01 else ("растянут" if scale > 1 else "ужат")
+        if keys:
+            # ⚠️ Порядок — от первого к последнему по (x, y): по нему видно, тот ли кусок
+            # карты на экране и нет ли дыр в ряду (заказчик 19.09.2026).
+            xs = [k[1] for k in keys]; ys = [k[2] for k in keys]
+            where = ("x %d–%d · y %d–%d · первый %d/%d/%d … последний %d/%d/%d"
+                     % (min(xs), max(xs), min(ys), max(ys),
+                        keys[0][0], keys[0][1], keys[0][2],
+                        keys[-1][0], keys[-1][1], keys[-1][2]))
+        else:                                         # тайлы ещё едут из потока
+            where = "тайлы грузятся"
+        show("подложка: z = %d · тайлов %d · %s · масштаб %.2f (%s) · вид %.1f км · %s"
+             % (z, len(keys), where, scale, mark, span_km,
+                "офлайн" if self._get_offline() else "сеть"))
 
     def _deep_zoom_span_km(self):
         # Самый узкий осмысленный вид: тайлы предельного зума, растянутые вдвое.
         # Отдаёт: ширину вида в км либо None, если считать не из чего.
         try:
-            width_px = max(self.plot.width(), 256)
+            width_px = self._map_px()
             km_per_deg = gm._km_per_deg_lon(self._geo_lat0)
         except Exception:                          # виджет ещё не разложен
             return None
@@ -239,12 +297,13 @@ class BasemapMixin:
                 tiles.clear()                                  # чужие картинки убрать разом
                 self._tiles_layer = layer
             tiles.set_visible(True)
-            tiles.set_view((kx0, kx1, ky0, ky1), max(self.plot.width(), 256))
+            z = tiles.set_view((kx0, kx1, ky0, ky1), self._map_px())
+            self._report_tiles(z, (kx0, kx1), tiles)
             return
         self._map_req += 1
         # ЛОГИЧЕСКАЯ ширина (без DPR): даёт зум ~1:1 и родной размер подписей, как в
         # обычном OSM. С домножением на DPR брался зум на уровень выше -> подписи мельче.
-        target_px = max(self.plot.width(), 256)
+        target_px = self._map_px()
         allow_net = not self._get_offline()
         self._map_pool.start(_BasemapTask(self._map_req, layer,
                                           (kx0, kx1, ky0, ky1), target_px, allow_net,
@@ -270,7 +329,7 @@ class BasemapMixin:
         except Exception:
             return
         span_km = float(kx1 - kx0)
-        width_px = max(self.plot.width(), 256)
+        width_px = self._map_px()
         if span_km <= 0:
             return
         km_per_deg = gm._km_per_deg_lon(self._geo_lat0)

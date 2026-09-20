@@ -31,7 +31,7 @@ from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS, THREAT_APPROACH_LABELS,
                     THREAT_SPEND_LABELS, THREAT_TILE_AREA,
                     THREAT_CELL_M, THREAT_COMPASS_LINE_KM, THREAT_AREA_LABEL,
-                    THREAT_AREA_SOURCE, THREAT_AREA_ERROR)
+                    THREAT_AREA_SOURCE, THREAT_AREA_ERROR, THREAT_PAN_MARGIN_KM)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from .ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
 from . import geomap as gm
@@ -1944,9 +1944,18 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def _area_info_text(self):
         # Подпись блока «Область и папка тайлов»: что открыто, откуда взято, где тайлы.
         # Отдаёт: HTML-строку; ошибка выбранной папки — красным, чтобы её не пропустить.
+        # ⚠️ ПОКАЗЫВАЕМ ПАПКУ УЧАСТКА, А НЕ ТОЛЬКО КОРЕНЬ (заказчик 20.09.2026: «снова нет
+        # папки после tile_cache»). Тайлы лежат в <корень>/<участок>/<слой>/z/x/y, и по
+        # одному корню не видно, та ли область открыта; нет папки — честно говорим, что
+        # подложка идёт из общей раскладки (старые 13 273 тайла, ОГРАНИЧЕНИЯ 5.1д).
+        root = gm.cache_root()
+        area_dir = os.path.join(root, THREAT_TILE_AREA) if THREAT_TILE_AREA else ""
+        tiles = (area_dir if area_dir and os.path.isdir(area_dir) else
+                 "%s  ⚠️ папки «%s» нет — подложка из общей раскладки"
+                 % (root, THREAT_TILE_AREA) if THREAT_TILE_AREA else root)
         lines = ["Область: <b>%s</b>" % THREAT_AREA_LABEL,
                  "<span style='color:%s'>файл: %s</span>" % (THEME["muted"], THREAT_AREA_SOURCE),
-                 "<span style='color:%s'>тайлы: %s</span>" % (THEME["muted"], gm.cache_root())]
+                 "<span style='color:%s'>тайлы: %s</span>" % (THEME["muted"], tiles)]
         if THREAT_AREA_ERROR:                            # выбранная папка не открылась
             lines.append("<span style='color:#e05050'>⚠️ выбранная область не открыта: %s. "
                          "Открыта область по умолчанию.</span>" % THREAT_AREA_ERROR)
@@ -2131,6 +2140,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # (чекбокс «отсчёт от угла района» в блоке ПОКАЗ).
         self._axis_x = ShiftedAxis("bottom")
         self._axis_y = ShiftedAxis("left")
+        # ⚠️ ШИРИНА ОСИ ЗАКРЕПЛЕНА, ИНАЧЕ МАСШТАБ ПОДЛОЖКИ ПЛЯШЕТ. Подписи меняют длину
+        # при зуме («-100» → «-87.5»), ось становится шире, ViewBox — уже, а при
+        # `setAspectLocked` вид растягивается по X: замер 19.09.2026 — аспект 1.3335 →
+        # 1.3545, охват 171.3 → 174.0 км, масштаб тайлов 1.000 → 0.984 (заказчик: «то 99,
+        # то 97»). С запасом на «-1000.0» — самую длинную подпись на любой области.
+        self._axis_y.setWidth(58)                   # ширина оси Y, px
+        self._axis_x.setHeight(34)                  # высота оси X, px
         # ⚠️ КОЛЕСО ХОДИТ ПО УРОВНЯМ ТАЙЛОВ, а не плавно — иначе тайл почти всегда
         # приходится масштабировать, и подписи на карте рассыпаются (разбор —
         # view_qt/tile_layer.py :: SteppedViewBox).
@@ -2142,6 +2158,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.pi.setLabel("bottom", "X, км", color=THEME["muted"])
         self.pi.setLabel("left", "Y, км", color=THEME["muted"])
         self.vb = self.pi.getViewBox()
+        # ⚠️ ПРЕДЕЛ ПЕРЕСЧИТЫВАЕТСЯ НА КАЖДОЕ ИЗМЕНЕНИЕ ФОРМЫ ОБЛАСТИ РИСОВАНИЯ, а не
+        # только окна: она меняется и сама по себе (заголовок, строка подложки, оси), а
+        # кадр предела считается от её соотношения сторон. Замер 19.09.2026: аспект
+        # 1.3655 → 1.6284 после первого щелчка, предел остался от старого — масштаб 0.990.
+        self.vb.sigResized.connect(self._on_vb_resized)
         self._build_mode_bar()
 
         # КАРТА + СТРОКА КООРДИНАТ ПОД НЕЙ (план 8, задача 8.3). Заказчик просил показ
@@ -2150,6 +2171,25 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # картой при панораме и попадала бы в кадр поверх слоёв.
         map_box = QtWidgets.QVBoxLayout()
         map_box.setContentsMargins(0, 0, 0, 0); map_box.setSpacing(2)
+        # СТРОКА ПОДЛОЖКИ НАД КАРТОЙ (заказчик 19.09.2026: «какой уровень и какие тайлы
+        # показываются сейчас — динамически, для проверки и определения корректности»).
+        # ⚠️ Главное в ней — МАСШТАБ: 1.00 значит «пиксель тайла = пиксель экрана», и
+        # только при нём подложка выходит резкой. Любое другое число — брак показа, и
+        # теперь он виден сразу, без разглядывания подписей на карте.
+        self.lbl_tiles = QtWidgets.QLabel("подложка: —")
+        self.lbl_tiles.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.lbl_tiles.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        # ⚠️ ВЫСОТА ЗАКРЕПЛЕНА, ИНАЧЕ СТРОКА ЛОМАЕТ МАСШТАБ КАРТЫ. Текст меняет длину при
+        # зуме; QLabel переносил его на вторую строку, карта становилась ниже, аспект
+        # прыгал 1.3655 → 1.6822 — и предел вида, считанный от формы кадра, уводил охват
+        # 171.3 → 211.0 км (замер 19.09.2026). Длинное просто обрезается по ширине окна.
+        self.lbl_tiles.setWordWrap(False)
+        self.lbl_tiles.setFixedHeight(16)           # высота строки подложки, px
+        self.lbl_tiles.setMinimumWidth(1)           # не расширять окно под длинный текст
+        self.lbl_tiles.setStyleSheet(
+            "color: %s; font-family: Consolas, monospace; font-size: 11px;"
+            % THEME["muted"])
+        map_box.addWidget(self.lbl_tiles)
         map_box.addWidget(self.plot, stretch=1)
         self.lbl_coords = QtWidgets.QLabel("клик по карте — координаты точки")
         self.lbl_coords.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
@@ -3333,6 +3373,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.set_title("Район не задан: очертите его мышью либо загрузите свою карту "
                            "— её рамка станет районом")
 
+    def set_tiles_info(self, text):
+        """Строка подложки над картой: уровень, тайлы, масштаб. Вход: готовый текст."""
+        self.lbl_tiles.setText(text)
+
     def set_source(self, text):
         self.src_label.setText(f"источник данных: {text}")
 
@@ -3399,14 +3443,79 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # 13.09.2026). Добавка в 100 км жила со времён, когда своя карта не имела своего
         # предела (теперь его даёт `extra_km`). На области 302 км её не видно, а на области
         # Донецка 95 × 75 км без района камера уходила на 100 км в пустоту с каждой стороны.
+        # ⚠️ ПРЕДЕЛ ДЕРЖИТ ПЕРЕМЕЩЕНИЕ, А НЕ МАСШТАБ (решение заказчика 19.09.2026).
+        # Раньше предел был равен кадру области — и зажимал масштаб: привязка к уровню
+        # тайлов просила вид 420 км (1:1 для z8), предел возвращал 380, и вся подложка
+        # рисовалась с растяжением 1.145 — 15 % мыла на КАЖДОМ уровне (замер 19.09.2026).
         asp = self._view_aspect()
         parts = [self._fit_frame(self.area_max_km, asp),                 # кадр под область
                  self._fit_frame(self.bbox_km, asp)]                     # кадр под район
         if extra_km:                                 # своя карта может торчать за область
             parts.append(self._fit_frame(extra_km, asp))
-        self._set_view_limits((min(p[0] for p in parts), max(p[1] for p in parts),
-                               min(p[2] for p in parts), max(p[3] for p in parts)),
-                              0.0, min_ref=self.area_max_km)   # приближение — от области
+        box = (min(p[0] for p in parts), max(p[1] for p in parts),
+               min(p[2] for p in parts), max(p[3] for p in parts))
+        box = self._zoom_out_frame(box)              # ...и до уровня тайлов, если он шире
+        self._set_view_limits(box, THREAT_PAN_MARGIN_KM,   # поле перемещения за краем
+                              min_ref=self.area_max_km,    # приближение — от области
+                              max_span=getattr(self, "_fit_span_km", None))   # отдаление — до уровня
+
+    def _on_vb_resized(self, *_):
+        # Форма области рисования изменилась — пересчитать предел под новый аспект.
+        # ⚠️ Флаг от повторного входа: `setLimits` может подвинуть вид, а тот снова
+        # дёрнет сигнал — без защиты получается бесконечная перерисовка.
+        if getattr(self, "_in_vb_resize", False):    # мы уже внутри пересчёта
+            return                                   # — второй заход не нужен
+        self._in_vb_resize = True
+        try:
+            self._apply_view_limits()
+        finally:
+            self._in_vb_resize = False
+
+    def _zoom_out_frame(self, box):
+        # Расширить кадр предела до ближайшего уровня тайлов, где он ВЕСЬ помещается.
+        # Вход: кадр (x0, x1, y0, y1) км. Отдаёт: кадр не уже входного.
+        # ⚠️ Ширина вида 1:1 дискретна (уровень — вдвое), и кадр области с ней не совпадает:
+        # предел, равный кадру, держал вид МЕЖДУ уровнями — мыло 1.145 (замер 19.09.2026).
+        # Пример: `arh` вписывается в 380 км, ближайший уровень сверху 420 км (z = 8).
+        x0, x1, y0, y1 = box
+        span = float(x1 - x0)
+        if span <= 0:
+            return box
+        try:
+            width_px = self._map_px()                # ФИЗИЧЕСКИЕ пиксели: см. `_map_px`
+            km_per_deg = gm._km_per_deg_lon(self._geo_lat0)
+        except Exception:                            # виджет ещё не разложен
+            return box                               # предел поставим на следующем вызове
+        # ⚠️ УРОВЕНЬ СЧИТАЕТСЯ ОТ ГОЛОЙ РАМКИ, БЕЗ ПОЛЯ 4 %. Уровни отличаются ВДВОЕ, и
+        # кадру, который шире уровня хоть на доли процента, достаётся следующий. С полем
+        # кадр шире рамки на 8 % — и вид прыгал на 809.7 км вместо 438.8 при области
+        # 302 км (замер 19.09.2026: пустоты 168 % вместо 45 %). Поле — косметика у края,
+        # требование «область целиком» относится к самой рамке.
+        # ⚠️ УРОВЕНЬ СЧИТАЕТСЯ ОДИН РАЗ НА СОСТОЯНИЕ ОКНА, иначе он «плывёт». Предел
+        # пересчитывается на каждое движение вида, а кадр зависит от формы области
+        # рисования: замер 19.09.2026 — вид уезжал 342.6 → 211.0 → 422.0 км и масштаб
+        # падал до 0.990. Ключ — ширина в пикселях, форма кадра и сама область: сменилось
+        # что-то из этого — пересчитываем, иначе отдаём запомненное.
+        key = (round(width_px), round(span / max(y1 - y0, 1e-9), 3), tuple(self.area_max_km))
+        if getattr(self, "_fit_key", None) == key and getattr(self, "_fit_box", None):
+            return self._fit_box                     # то же состояние — тот же кадр
+        bare = span / (1.0 + 2.0 * self.VIEW_LIMIT_PAD)   # рамка без поля, км
+        for z in range(gm.ZOOM_MAX, gm.ZOOM_MIN - 1, -1):
+            want = (width_px / 256.0) / (2.0 ** z) * 360.0 * km_per_deg   # вид 1:1 на уровне z
+            if want >= bare:                         # первый уровень, где рамка помещается
+                # ⚠️ ЭТО И ЕСТЬ САМЫЙ ДАЛЬНИЙ РАЗРЕШЁННЫЙ ВИД (заказчик 19.09.2026:
+                # «максимальный какой уровень загружается изначально — выше него не
+                # уходит»). Дальше отдалять некуда: область уже видна целиком, а следующий
+                # уровень вдвое мельче — только пустота вокруг.
+                self._fit_span_km = want             # ширина вида 1:1 на этом уровне, км
+                self._fit_zoom = z                   # сам уровень — для строки подложки
+                k = want / span                      # во столько раз правим, центр на месте
+                cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+                hw, hh = span * k * 0.5, (y1 - y0) * k * 0.5
+                self._fit_key = key                  # запомнили состояние окна
+                self._fit_box = (cx - hw, cx + hw, cy - hh, cy + hh)
+                return self._fit_box
+        return box                                   # кадр шире самого мелкого уровня
 
     def frame_bbox(self, whole_area=False):
         """Вписать в окно район (по умолчанию) или ВСЮ область показа.

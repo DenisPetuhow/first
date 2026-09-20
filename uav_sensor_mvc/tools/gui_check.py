@@ -1293,6 +1293,17 @@ def main():
     check(v._area_shape == "rect" and m.area_circle is not None,
           "переключатель не трогает уже заданный круг (меняет только форму следующего)")
 
+    print("\n14. ПОДПИСЬ «ТАЙЛЫ» ПОКАЗЫВАЕТ ПАПКУ УЧАСТКА, А НЕ ТОЛЬКО КОРЕНЬ")
+    # ⚠️ Тайлы лежат в <корень>/<участок>/<слой>/z/x/y: по одному корню не видно, та ли
+    # область открыта (жалоба заказчика 20.09.2026 «нет папки после tile_cache»).
+    import re as _re
+    from config import THREAT_TILE_AREA as _TA
+    info = _re.sub(r"<[^>]+>", " ", v._area_info_text())
+    tiles_line = [s for s in info.split("тайлы:") if s][-1]
+    check(bool(_TA), "у области задан участок кэша тайлов: %r" % _TA)
+    check(not _TA or _TA in tiles_line, "папка участка видна в подписи")
+    check("строка подложки" not in info, "подпись не разрослась лишним текстом")
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))

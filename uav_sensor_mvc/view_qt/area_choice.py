@@ -93,6 +93,17 @@ def choose_area(parent):
         return False                                 # — ничего не меняем
     folder = os.path.abspath(folder)
     _remember(папка=folder)
+    # ⚠️ ПАПКА ТАЙЛОВ ПОДБИРАЕТСЯ ПОД ОБЛАСТЬ (заказчик 20.09.2026). Память «тайлы» жила
+    # отдельно от выбора области: сменил область — корень остался от прежней, и подложка
+    # искалась не там. Свой выбор человека не перебиваем, пока тайлы области в нём есть.
+    tiles = af.tiles_root_for_area(rec.get("tile_area"), folder,
+                                   os.environ.get(af.ENV_TILES, ""))
+    if tiles != os.environ.get(af.ENV_TILES, ""):    # корень сменился под эту область
+        _remember(тайлы=tiles)                       # — запоминаем и выставляем ниже
+        if tiles:
+            os.environ[af.ENV_TILES] = tiles
+        else:                                        # подошёл проектный tile_cache/
+            os.environ.pop(af.ENV_TILES, None)       # — переменная больше не нужна
     # ⚠️ переменную окружения — ДО перезапуска: новый процесс наследует окружение старого, а
     # `apply_saved_choice` заданную переменную не перебивает — открылась бы прежняя область
     os.environ[af.ENV_AREA] = folder
@@ -115,7 +126,11 @@ def choose_tile_root(parent, view, reset=False):
             gm.cache_root())                         # выбранный корень тайлов
         if not root:                                 # окно закрыли
             return None                              # — ничего не меняем
-        root = os.path.abspath(root)
+        # ⚠️ Человек видит папку с именем области и выбирает ЕЁ, а не корень: тогда имя
+        # участка добавлялось второй раз (`tile_cache/arh` + `arh` → `tile_cache/arh/arh`)
+        # и докачка уходила в пустоту. Берём родителя (заказчик 20.09.2026).
+        import config as _cfg                        # читаем при вызове: область могла смениться
+        root = af.normalize_tiles_root(os.path.abspath(root), _cfg.THREAT_TILE_AREA)
     if root:                                         # задан свой корень
         os.environ[af.ENV_TILES] = root              # — geomap.cache_root прочтёт его сразу
     else:                                            # умолчание

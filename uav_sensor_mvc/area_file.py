@@ -280,12 +280,68 @@ def saved_choice():
     return sec if isinstance(sec, dict) else {}
 
 
+def tile_cache_root():
+    # Корень кэша тайлов ПРОЕКТА — то же правило, что `view_qt.geomap.cache_root`,
+    # но без env: нужен именно проектный путь, с которым сравнивают выбранный.
+    # Вход: ничего. Отдаёт: путь к папке, строка.
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "tile_cache")
+
+
+def normalize_tiles_root(root, area_name):
+    # Человек выбрал ПАПКУ УЧАСТКА вместо корня — вернуть её родителя.
+    # Вход: выбранный путь, имя участка. Отдаёт: путь корня (строка).
+    # ⚠️ Иначе имя участка добавляется второй раз: корень `tile_cache/arh` + участок `arh`
+    # давали `tile_cache/arh/arh/osm/z/x/y` — докачка уходила в пустую вложенную папку
+    # (жалоба заказчика 20.09.2026: «тайлы остановились, хотя была папка arh»).
+    root = str(root or "").strip()
+    name = str(area_name or "").strip()
+    if not root or not name:                         # нечего сравнивать
+        return root
+    # ⚠️ ИМЯ ПАПКИ ПРОВЕРЯЕТСЯ ПЕРВЫМ, а не «есть ли внутри папка участка»: прежняя
+    # докачка успела создать вложенную `tile_cache/arh/arh`, и по внутренней папке
+    # мусорный путь выглядел бы настоящим корнем (поймано `area_check` 20.09.2026).
+    if os.path.basename(os.path.normpath(root)) == name:   # выбрана сама папка участка
+        return os.path.dirname(os.path.normpath(root))     # — корень уровнем выше
+    if os.path.isdir(os.path.join(root, name)):      # внутри есть папка участка
+        return root                                  # — это настоящий корень
+    return root                                      # чужая раскладка — не трогаем
+
+
+def tiles_root_for_area(area_name, folder, current=""):
+    # Корень кэша тайлов, где лежит папка ЭТОЙ области (правило заказчика 20.09.2026:
+    # «при выборе области заранее прописывать папку с тайлами по названию области»).
+    # Вход: имя области, её папка, нынешний корень. Отдаёт: корень или "" — проектный.
+    name = str(area_name or "").strip()
+    if not name:                                     # имени нет (реестр без dir)
+        return current                               # — менять нечего
+    here = os.path.abspath(folder or "")
+    # Порядок: нынешний корень (если он уже верный) → корень проекта → рядом с областью.
+    # ⚠️ Нынешний проверяем ПЕРВЫМ: человек мог указать свою папку через интерфейс, и
+    # перебивать его выбор нельзя, пока тайлы этой области там есть.
+    seen = []
+    for root in (current, tile_cache_root(),
+                 os.path.join(os.path.dirname(here), "tile_cache"),
+                 os.path.join(here, "tile_cache")):
+        root = str(root or "").strip()
+        if not root or root in seen:                 # пусто или уже смотрели
+            continue                                 # — следующий кандидат
+        seen.append(root)
+        if os.path.isdir(os.path.join(root, name)):  # внутри есть папка этой области
+            return "" if os.path.normcase(os.path.abspath(root)) == \
+                         os.path.normcase(tile_cache_root()) else os.path.abspath(root)
+    return current                                   # нигде не нашли — оставляем как было
+
+
 def apply_saved_choice():
     # Сохранённый выбор -> переменные окружения UAV_AREA_DIR, UAV_TILE_CACHE. Звать ДО
     # `import config`. Вход: ничего. Отдаёт: прочитанный раздел памяти, dict.
     sec = saved_choice()                             # что выбирали в прошлый раз
+    # имя участка — по папке области: им правится корень тайлов, если выбрана папка участка
+    area_name = os.path.basename(os.path.normpath(str(sec.get("папка") or "").strip()))
     for env, key in ((ENV_AREA, "папка"), (ENV_TILES, "тайлы")):
         val = str(sec.get(key) or "").strip()        # сохранённый путь или ""
+        if key == "тайлы" and val:                   # корень тайлов из памяти
+            val = normalize_tiles_root(val, area_name)   # — чиним «папку участка как корень»
         # заданную снаружи переменную не перебиваем: явный запуск важнее памяти окна
         if val and not os.environ.get(env):          # выбор есть, снаружи не задано
             os.environ[env] = val                    # — выставляем
