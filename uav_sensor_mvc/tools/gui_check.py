@@ -1020,25 +1020,54 @@ def main():
     x0, y0 = m.bbox_km[0] + 5, m.bbox_km[2] + 5
     v._on_scene_click(_MeasureEv(x0, y0))
     v._on_scene_click(_MeasureEv(x0 + 3.0, y0 + 4.0))
-    check(len(v._measure_pts) == 2, "два клика — две точки линейки")
+    check(len(v.measure.pts) == 2, "два клика — две точки линейки")
     # ⚠️ ПОДПИСЕЙ НА ОДНУ БОЛЬШЕ ОТРЕЗКОВ: кроме подписи самого отрезка, у ПОСЛЕДНЕЙ
-    # точки есть ещё подпись «всего: N.NN км» — сумма всей цепочки (заказчик: «у
-    # последней точки сумма расстояний всего»).
-    check(len(v._measure_labels) == 2,
+    # точки есть ещё подпись суммы всей цепочки (заказчик: «у последней точки сумма»).
+    check(len(v.measure._labels) == 2,
           "между двумя точками: подпись отрезка + подпись суммы у последней точки")
     check(abs(np.hypot(3.0, 4.0) - 5.0) < 1e-9,
           "условие теста: отрезок 3-4-5 даёт ровно 5.0 км")
+    check(abs(v.measure.total_km() - 5.0) < 1e-9, "сумма пути посчитана",
+          "%.2f км" % v.measure.total_km())
 
     v._on_scene_click(_MeasureEv(x0 + 3.0, y0 - 2.0))
-    check(len(v._measure_pts) == 3 and len(v._measure_labels) == 3,
+    check(len(v.measure.pts) == 3 and len(v.measure._labels) == 3,
           "третий клик продолжает ЦЕПОЧКУ (2 отрезка + 1 сумма), а не тянется к первой",
-          "точек %d, подписей %d" % (len(v._measure_pts), len(v._measure_labels)))
+          "точек %d, подписей %d" % (len(v.measure.pts), len(v.measure._labels)))
+
+    # ⭐ ЛИНЕЙКА КАК В GOOGLE EARTH (правило заказчика 21.09.2026): предпросмотр за
+    # курсором, время по скорости типа, подписи повёрнуты вдоль отрезка.
+    from view_qt.measure_tool import format_time
+    check(format_time(2.5) == "2 ч 30 мин" and format_time(0.75) == "45 мин",
+          "время в подписи: часы и минуты", format_time(2.5))
+    n_lbl = len(v.measure._labels)                       # подписей до наведения
+    v.measure.move_to(x0 + 9.0, y0 + 9.0)
+    xs_prev, _ = v.measure.preview.getData()
+    check(xs_prev is not None and len(xs_prev) == 2,
+          "при ведении мыши тянется линия-предпросмотр")
+    check(len(v.measure._labels) == n_lbl + 1, "...и у курсора появились километры")
+    check(v.measure.preview.opacity() < 1.0, "предпросмотр полупрозрачный",
+          "%.2f" % v.measure.preview.opacity())
+    v.measure.move_to(None, None)
+    xs_prev2, _ = v.measure.preview.getData()
+    check(xs_prev2 is None or len(xs_prev2) == 0, "курсор ушёл с карты — предпросмотр снят")
+    check("км" in v.measure.status() and "точек 3" in v.measure.status(),
+          "строка состояния показывает точки и сумму", v.measure.status()[:48])
+    # время показывается ТОЛЬКО при выбранном типе
+    _speed_before = v.on_uav_speed
+    v.on_uav_speed = lambda: None
+    check("мин" not in v.measure._text(100.0), "без типа БПЛА время не выдумывается",
+          v.measure._text(100.0))
+    v.on_uav_speed = lambda: 180.0
+    check("мин" in v.measure._text(180.0) and "1 ч" in v.measure._text(180.0),
+          "со скоростью 180 км/ч путь 180 км — это 1 ч", v.measure._text(180.0))
+    v.on_uav_speed = _speed_before
 
     # правая кнопка — выход, с очисткой нарисованного (заказчик: «клик правой кнопки выйти»)
     v._on_scene_click(_MeasureEv(x0, y0, button=Qt.RightButton))
     check(not v._measure_mode, "правая кнопка выходит из режима измерения")
     check(not v.btn_measure.isChecked(), "кнопка отжимается при выходе")
-    check(len(v._measure_pts) == 0 and len(v._measure_labels) == 0,
+    check(len(v.measure.pts) == 0 and len(v.measure._labels) == 0,
           "выход очищает линейку с карты")
 
     # режимы мыши взаимно исключают друг друга — тот же принцип, что у правки датчиков
@@ -1250,10 +1279,15 @@ def main():
     sd.btn_click.click()
     check(v._sector_mode and not v.vb.menuEnabled(),
           "«Задать сектор кликом» включает режим и забирает правую кнопку")
+    # ⚠️ ТОЧКИ СТАВЯТСЯ ДВОЙНЫМ КЛИКОМ (правило заказчика 21.09.2026): одинарный только
+    # показывает координаты — проверяем и это, иначе правило можно сломать незаметно.
+    _kind_before = m.sector_kind
     v._on_scene_click(_Ev(cx + R12 - 0.5, cy - 5.0))
-    v._on_scene_click(_Ev(cx - R12 + 0.5, cy + 5.0))
+    check(m.sector_kind == _kind_before, "одинарный клик сектор НЕ задаёт")
+    v._on_scene_click(_Ev(cx + R12 - 0.5, cy - 5.0, double=True))
+    v._on_scene_click(_Ev(cx - R12 + 0.5, cy + 5.0, double=True))
     check(m.sector_kind == "click" and v._sector_mode,
-          "клик по краю задаёт сектор, режим остаётся для следующего",
+          "двойной клик по краю задаёт сектор, режим остаётся для следующего",
           "точек %d" % len(m.sector_points()))
     v._on_scene_click(_Ev(cx, cy, button=Qt.RightButton))
     check(not v._sector_mode and not sd.isVisible() and v.vb.menuEnabled(),
@@ -1392,8 +1426,10 @@ def main():
     check(not v.vb.menuEnabled(), "правая кнопка забрана под выход из режима")
     sx, sy = cx + 120.0, cy + 80.0                       # точка заведомо за районом
     v._on_scene_click(_Ev(sx, sy))
+    check(m.uav_start_km is None, "одинарный клик точку старта НЕ ставит")
+    v._on_scene_click(_Ev(sx, sy, double=True))
     check(m.uav_start_km is not None and abs(m.uav_start_km[0] - sx) < 1e-6,
-          "клик поставил точку старта в модели", str(m.uav_start_km))
+          "двойной клик поставил точку старта в модели", str(m.uav_start_km))
     check(not v._uav_start_mode and sc.isVisible(), "режим снят, окно условий вернулось")
     check(sd16.isVisible() and v.vb.menuEnabled(),
           "...и остальные окна вернулись вместе с правой кнопкой")

@@ -109,6 +109,7 @@ class ThreatController:
             on_uav_type=self.on_uav_type, on_sim_state=self.on_sim_state,
             on_entry_table_rows=self.model.entry_table_rows,
             on_set_entry_L_max=self.on_set_entry_L_max,
+            on_uav_speed=self.on_uav_speed,
             on_sensors_apply=self.on_sensors_apply, on_set_area=self.on_set_area,
             on_clear_area=self.on_clear_area,
             # датчики, заданные человеком (задача 8.7)
@@ -1131,6 +1132,12 @@ class ThreatController:
         self.view.refresh_entries_table()              # таблица точек
         self.view.refresh_sim_window()
         self.view.set_title(msg)
+
+    def on_uav_speed(self):
+        """Скорость выбранного типа для линейки, км/ч. Отдаёт: число или None — тип не
+        выбран, и тогда линейка время не показывает (выдуманное хуже пустого)."""
+        uav = self.model.uav_type                     # выбранный тип или None
+        return float(uav.speed_kmh) if uav is not None else None
 
     def on_set_entry_L_max(self, i, km):
         """Запас хода одной точки задан в таблице. Вход: номер с нуля, км (None — вернуть

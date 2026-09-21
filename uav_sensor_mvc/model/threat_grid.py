@@ -2744,7 +2744,19 @@ class ThreatModel:
                                                 self._route_gap_km(),
                                                 slack_km=self._route_slack_km())
             self._ctx_built_key = key
+        # ⚠️ ПРЕДЕЛ ПОВОРОТА КЛАДЁМ ПОВЕРХ ГОТОВОГО КОНТЕКСТА, а не внутрь сборки: он зависит
+        # от выбранного ТИПА, а контекст кэшируется по разрыву и цели. Иначе смена типа
+        # заставляла бы пересчитывать веер VIA-полей — самую дорогую часть.
+        self._iter_ctx["turn_max_deg"] = self.turn_max_deg()
         return self._iter_ctx
+
+    def turn_max_deg(self):
+        """Предельный поворот за шаг для выбранного типа БПЛА, градусы.
+        Тип не выбран — базовая константа модели (прежнее поведение)."""
+        from .threat_routes import TURN_MAX_DEG, turn_limit
+        if self.uav_type is None or self.grid is None:   # типа нет или сетки ещё нет
+            return float(TURN_MAX_DEG)
+        return turn_limit(self.uav_type.turn_radius_km(), self.grid.h)
 
     def _route_sig(self, poly):
         """Огрублённая подпись маршрута (для дедупликации почти одинаковых путей)."""
@@ -4599,14 +4611,22 @@ class ThreatModel:
                     break
             return out
 
-        picked = take(sep, need_ang)
+        picked = take(sep, need_ang)                 # отобранные точки входа, км
         # край короткий или беден — ослабляем угловое условие, затем километровое:
         # лучше пять точек рядом, чем три с идеальным разносом
         while len(picked) < want and need_ang > 1e-4:
             need_ang *= 0.6
             picked = take(sep, need_ang)
-        if len(picked) < want:
-            picked = take(0.0, 0.0)
+        # ⚠️ КИЛОМЕТРОВЫЙ ПОРОГ ТОЖЕ ОСЛАБЛЯЕМ ПОСТЕПЕННО, а не сбрасываем в ноль вместе с
+        # угловым. Замер 21.09.2026 на районе 20 км при доле 3 %: порог 1.2 км недостижим,
+        # прежний код снимал ОБА условия разом — и точки сбивались плотнее, чем без порога
+        # вовсе (ближайшая пара 1.00 -> 0.50 км, разброс 6.6 -> 4.0 км). Постепенный спуск
+        # оставляет тот разнос, который край выдержать может.
+        while len(picked) < want and sep > 1e-4:
+            sep *= 0.6
+            picked = take(sep, need_ang)     # с ослабленным порогом, км
+        if len(picked) < want:               # край беден даже без условий
+            picked = take(0.0, 0.0)          # — берём лучшие по перспективе
         return picked
 
     def routes_want(self, base):

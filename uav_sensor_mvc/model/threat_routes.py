@@ -515,6 +515,27 @@ START_BACK_KM = 1.0
 # запрещалось, а лишь получало малый вес (0.05 против 14 у «прямо»), и на десятках тысяч
 # шагов набегало: 69 % маршрутов имели поворот круче 90°, 98 % — «вперёд-назад-вперёд».
 TURN_MAX_DEG = 45.0
+
+
+# ⚠️ СОСЕДИ СЕТКИ ИДУТ ЧЕРЕЗ 45° (восьмисвязность), и предел строже этого означает «только
+# прямо»: замер 21.09.2026 на аппарате 400 км/ч с креном 15° (R_min 4.70 км, предел 6.1°) —
+# **100 % отказов, ни одного маршрута**. Поэтому угол за шаг ограничен снизу шагом сетки.
+GRID_TURN_STEP_DEG = 45.0
+
+
+def turn_limit(r_min_km, step_km, base_deg=TURN_MAX_DEG):
+    """Предел поворота за шаг по радиусу разворота аппарата. Вход: R_min км, шаг сетки км.
+    Отдаёт: градусы — от `GRID_TURN_STEP_DEG` до `base_deg`."""
+    # Поворот на угол a за шаг h идёт по дуге радиуса R = h / (2·sin(a/2)); требуем R ≥ R_min,
+    # отсюда a ≤ 2·arcsin(h / (2·R_min)). «Лютому» (R_min 0.547 км, шаг 0.5 км) формула даёт
+    # 54.4°, то есть прежние 45° его и так устраивают — эталон не сдвигается.
+    if r_min_km <= 0.0:                              # мультиротор — разворот на месте
+        return float(base_deg)                       # — строже базы не делаем
+    s = float(step_km) / (2.0 * float(r_min_km))     # синус половины предельного угла
+    if s >= 1.0:                                     # шаг длиннее диаметра разворота
+        return float(base_deg)                       # — предел не ограничивает
+    want = float(np.degrees(2.0 * np.arcsin(s)))     # чего требует физика, градусы
+    return min(float(base_deg), max(want, GRID_TURN_STEP_DEG))
 # АВАРИЙНОЕ ослабление: если ни один допустимый сосед не проходим (уткнулись в город,
 # воду или край области), предел разово поднимается. По умолчанию ВЫКЛЮЧЕНО (равно
 # основному): замер показал, что и без поблажки строятся все 150 маршрутов, а с ней
@@ -811,12 +832,18 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         # всех восьми соседей. Снимается ПОСЛЕДНИМ — после окна разворота: окно лишь
         # предпочтение, а сектор — то, ради чего возвраты и убираются.
         back_bad = _back_sector_bad(trail, grid, cy, cx) if trail is not None else None
-        limits = [(TURN_MAX_DEG, True, hold_straight, True), (TURN_MAX_DEG, True, False, True),
-                  (TURN_MAX_DEG, False, False, True)]
+        # ПРЕДЕЛ ПОВОРОТА — СВОЙ У ВЫБРАННОГО ТИПА БПЛА (заказчик 21.09.2026: «крен же
+        # влияет на модель маршрутов»). Нет типа — прежняя константа. Подробно — `turn_limit`.
+        t_max = float(ctx.get("turn_max_deg") or TURN_MAX_DEG)   # предел за шаг, градусы
+        # аварийное послабление: не строже основного предела этого аппарата
+        t_hard = max(float(TURN_HARD_DEG), t_max) if TURN_HARD_DEG > TURN_MAX_DEG else t_max
+        # порядок послаблений: (предел °, окно разворота, держать прямо, запретный сектор)
+        limits = [(t_max, True, hold_straight, True), (t_max, True, False, True),
+                  (t_max, False, False, True)]
         if back_bad is not None and back_bad.any():   # сектор что-то запрещает
-            limits.append((TURN_MAX_DEG, False, False, False))   # — последний шанс без него
-        if TURN_HARD_DEG > TURN_MAX_DEG:
-            limits.append((TURN_HARD_DEG, False, False, False))
+            limits.append((t_max, False, False, False))   # — последний шанс без него
+        if t_hard > t_max:
+            limits.append((t_hard, False, False, False))
         for turn_lim, use_win, straight, use_back in limits:
             win_u = win_u0 if use_win else None
             # ДОПУСК НА ОКРУГЛЕНИЕ: курс хранится с точностью 0.001, и у диагонали

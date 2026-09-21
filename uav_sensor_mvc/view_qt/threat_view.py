@@ -501,6 +501,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_sim_state = lambda: {}              # что показать в окне условий
         self.on_entry_table_rows = lambda: []       # строки таблицы точек входа (12.5)
         self.on_set_entry_L_max = lambda i, km: None  # запас точки задан руками
+        self.on_uav_speed = lambda: None            # скорость выбранного типа, км/ч (линейка)
         self.on_zone_added = lambda poly: None      # нарисована запретная зона
         self.on_zone_undo = lambda: None            # убрать последнюю зону
         self.on_choose_data = lambda path, layers: None
@@ -558,8 +559,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._edit_handle = None                     # подвижная метка выбранного датчика
         self._edit_pick = None                       # строка таблицы выбранного датчика
         self._measure_mode = False                    # включена линейка «Расстояние»
-        self._measure_pts = []                        # точки линейки, км
-        self._measure_labels = []                     # подписи отрезков (пересобираются)
+        self.measure = None                           # сам инструмент (measure_tool.py)
         # Сколько датчиков задано вручную. ⚠️ Представление модель не спрашивает (MVC) —
         # число приходит от контроллера через `set_manual_count`. Нужно кнопке «Очистить
         # датчики»: она показывает в вопросе, сколько именно пропадёт.
@@ -603,7 +603,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._end_sector_mode()
         self._end_edit_entry()
         self._target_mode = True
-        self.set_title("Кликните точку ЦЕЛИ на карте")
+        self.set_title("ДВОЙНОЙ клик по карте — точка ЦЕЛИ")
 
     # ══════════════════════════════════════════════════════════════════════════
     # ОКНО «СЕКТОР НАЛЁТА» И РЕЖИМ ЗАДАНИЯ СЕКТОРА КЛИКАМИ (план 11, 11.6)
@@ -671,9 +671,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._target_mode = False
         self._sector_mode = True
         self._grab_right_button(True)     # правая кнопка = выход из режима
+        self._hide_dialogs()              # карту не должно перекрывать ничто (заказчик 21.09.2026)
         self.refresh_sector_window()
-        self.set_title("СЕКТОР: щёлкните край района — ось пойдёт от цели к нему (раствор — в "
-                       "окне «Сектор налёта»). Правая кнопка мыши — выход и закрытие окна.")
+        self.set_title("СЕКТОР: ДВОЙНОЙ клик по краю района — ось пойдёт от цели к нему "
+                       "(раствор — в окне «Сектор налёта»). Правая кнопка — выход и закрытие.")
 
     def _end_sector_mode(self, close_window=False):
         """Закончить режим кликов сектора; close_window — ещё и закрыть окно сектора."""
@@ -681,6 +682,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self._sector_mode = False
             self._grab_right_button(False)  # вернуть правую кнопку pyqtgraph
             self.set_title("")
+            self._restore_dialogs()         # окна, спрятанные на время кликов
         if close_window and self._sector_dlg is not None:   # выход правой кнопкой
             self._sector_dlg.close()
         self.refresh_sector_window()
@@ -742,7 +744,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._uav_start_mode = True
         self._hide_dialogs()              # карту не должно перекрывать ничто
         self._grab_right_button(True)     # правая кнопка = выход из режима
-        self.set_title("Кликните точку СТАРТА БПЛА на карте (двойной клик — тоже). "
+        self.set_title("ДВОЙНОЙ клик по карте — точка СТАРТА БПЛА. "
                        "Правая кнопка мыши — выход без точки.")
 
     def _hide_dialogs(self):
@@ -1321,6 +1323,16 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 return
         except Exception:
             pass
+        # ⚠️ ТОЧКИ СТАВЯТСЯ ДВОЙНЫМ КЛИКОМ (правило заказчика 21.09.2026): «всё, что
+        # выполняется кликом левой кнопки, переделай на двойной». Одинарный лишь показывает
+        # координаты — случайный щелчок по карте больше не двигает цель и не задаёт сектор.
+        # ⚠️ Линейка «Расстояние» живёт по своим правилам (одинарные клики, как в Google
+        # Earth) — так описан пункт 6 того же задания; она сюда не попадает.
+        try:
+            if not ev.double():                # одинарный щелчок
+                return                         # — только координаты в заголовке
+        except Exception:
+            pass
         pt = self.vb.mapSceneToView(ev.scenePos())
         if self._sector_mode:              # режим НЕ снимается: щёлкать можно ещё (11.6)
             self.on_set_sector(float(pt.x()), float(pt.y()))
@@ -1594,24 +1606,40 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self._end_area(False)
         self._target_mode = False
         self._measure_mode = True
-        self._measure_pts = []
-        self._draw_measure()
+        self.measure.reset()
+        # ⚠️ СЛЕДИМ ЗА МЫШЬЮ ТОЛЬКО В ЭТОМ РЕЖИМЕ: сигнал приходит на каждое движение, и
+        # держать его включённым всё время — гонять перерисовку впустую
+        self.plot.scene().sigMouseMoved.connect(self._measure_moved)
         self._grab_right_button(True)       # правая кнопка = выход из режима
         self.btn_measure.setChecked(True)
-        self.set_title("ЛИНЕЙКА: левый клик — точка, между соседними — расстояние. "
-                       "Правая кнопка мыши, Esc или кнопка «Расстояние» — выход.")
+        self.set_title(self.measure.status())
 
     def _end_measure(self):
         if not self._measure_mode:
             return
         self._measure_mode = False
-        self._measure_pts = []
-        self._draw_measure()
+        self.measure.reset()
+        try:
+            self.plot.scene().sigMouseMoved.disconnect(self._measure_moved)
+        except (TypeError, RuntimeError):   # уже отключён — не беда
+            pass
         self._grab_right_button(False)      # вернуть правую кнопку pyqtgraph
         self.btn_measure.setChecked(False)
         self.set_title("")
 
+    def _measure_moved(self, pos):
+        """Мышь двигается в режиме линейки: тянуть предпросмотр за курсором."""
+        if not self._measure_mode or not self.measure.pts:
+            return                          # первой точки ещё нет — тянуть не от чего
+        if not self.plot.sceneBoundingRect().contains(pos):   # курсор ушёл с карты
+            self.measure.move_to(None, None)
+            return
+        pt = self.vb.mapSceneToView(pos)             # курсор в километрах карты
+        self.measure.move_to(float(pt.x()), float(pt.y()))
+
     def _measure_click(self, ev):
+        # ⚠️ ЛИНЕЙКА — ОДИНАРНЫЙ КЛИК, в отличие от постановки цели и старта: так она
+        # работает в Google Earth, и так описан порядок в задании (клик — ведём — клик).
         try:
             btn = ev.button()
         except Exception:
@@ -1623,52 +1651,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         except Exception:
             pass
         pt = self.vb.mapSceneToView(ev.scenePos())
-        self._measure_pts.append((float(pt.x()), float(pt.y())))
-        self._draw_measure()
-        if len(self._measure_pts) >= 2:
-            (ax, ay), (bx, by) = self._measure_pts[-2], self._measure_pts[-1]
-            seg = float(np.hypot(bx - ax, by - ay))
-            total = float(sum(np.hypot(p1[0] - p0[0], p1[1] - p0[1])
-                              for p0, p1 in zip(self._measure_pts, self._measure_pts[1:])))
-            self.set_title("ЛИНЕЙКА: точка %d — отрезок %.2f км, всего %.2f км. "
-                           "Правая кнопка мыши/Esc — выход."
-                           % (len(self._measure_pts), seg, total))
-
-    def _draw_measure(self):
-        """Перерисовать линейку целиком: ломаную, точки и подпись на каждом отрезке."""
-        for lbl in self._measure_labels:
-            self.pi.removeItem(lbl)
-        self._measure_labels = []
-        pts = self._measure_pts
-        if not pts:
-            self.measure_line_item.setData([], [])
-            self.measure_pts_item.setData([], [])
-            return
-        a = np.asarray(pts, float)
-        self.measure_line_item.setData(a[:, 0], a[:, 1])
-        self.measure_pts_item.setData(a[:, 0], a[:, 1])
-        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
-            seg = float(np.hypot(bx - ax, by - ay))
-            lbl = pg.TextItem("%.2f км" % seg,
-                              color=_qcolor(THREAT_COLORS["track_label"]),
-                              fill=pg.mkBrush(_qcolor(THREAT_COLORS["track_label_bg"])),
-                              anchor=(0.5, 0.5))
-            lbl.setPos((ax + bx) / 2.0, (ay + by) / 2.0)
-            lbl.setZValue(30)
-            self.pi.addItem(lbl, ignoreBounds=True)
-            self._measure_labels.append(lbl)
-        if len(pts) >= 2:                  # сумма ВСЕХ отрезков — у последней точки
-            total = float(sum(np.hypot(p1[0] - p0[0], p1[1] - p0[1])
-                              for p0, p1 in zip(pts, pts[1:])))
-            lx, ly = pts[-1]
-            tot_lbl = pg.TextItem("всего: %.2f км" % total,
-                                  color=_qcolor(THREAT_COLORS["track_label"]),
-                                  fill=pg.mkBrush(_qcolor(THREAT_COLORS["track_label_bg"])),
-                                  anchor=(0.5, 1.6))
-            tot_lbl.setPos(lx, ly)
-            tot_lbl.setZValue(30)
-            self.pi.addItem(tot_lbl, ignoreBounds=True)
-            self._measure_labels.append(tot_lbl)
+        self.measure.add_point(float(pt.x()), float(pt.y()))
+        self.set_title(self.measure.status())
 
     def _draw_zone_preview(self):
         """Показать зону, которую пользователь рисует прямо сейчас."""
@@ -3215,16 +3199,16 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.pi.addItem(self.zone_draw_pts)
         # ЛИНЕЙКА «Расстояние» (задача 8.9, довесок 06.09.2026) — поверх всего (Z = 8):
         # служебный инструмент, должен быть виден на фоне любых слоёв и зон.
-        self.measure_line_item = self.pi.plot(
-            [], [], antialias=True, connect="all",
-            pen=pg.mkPen(_qcolor(THREAT_COLORS["measure_line"], 235), width=2.6,
-                         dash=[6, 3]))
-        self.measure_line_item.setZValue(8)
-        self.measure_pts_item = pg.ScatterPlotItem(
-            size=9, symbol="o", brush=pg.mkBrush(_qcolor(THREAT_COLORS["measure_pt"])),
-            pen=pg.mkPen(_qcolor(THREAT_COLORS["measure_pt_edge"]), width=1.6))
-        self.measure_pts_item.setZValue(8.1)
-        self.pi.addItem(self.measure_pts_item)
+        # ⚠️ Линейка целиком живёт в `measure_tool.py` (правило «новый крупный функционал —
+        # свой файл»): предпросмотр за курсором, время по скорости типа, повёрнутые подписи.
+        from .measure_tool import MeasureTool
+        self.measure = MeasureTool(
+            self.pi,
+            {"line": _qcolor(THREAT_COLORS["measure_line"], 235),
+             "point": _qcolor(THREAT_COLORS["measure_pt"]),
+             "point_edge": _qcolor(THREAT_COLORS["measure_pt_edge"]),
+             "label_bg": _qcolor(THREAT_COLORS["track_label_bg"])},
+            speed_fn=lambda: self.on_uav_speed())
         # 2-я тепловая карта — частота пролёта БПЛА (плотность итерационных маршрутов)
         self.iter_heat_img = pg.ImageItem(); self.iter_heat_img.setOpts(axisOrder="row-major")
         self.iter_heat_img.setZValue(-7); self.iter_heat_img.setOpacity(0.62)
