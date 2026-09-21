@@ -104,6 +104,11 @@ class ThreatController:
             on_sector_state=self._sector_state,
             on_entry_rows=self.model.entry_rows, on_entry_add=self.on_entry_add,
             on_entry_move=self.on_entry_move, on_entry_delete=self.on_entry_delete,
+            # план 12, 12.2: условия моделирования — тип БПЛА и точка старта
+            on_set_uav_start=self.on_set_uav_start, on_clear_uav_start=self.on_clear_uav_start,
+            on_uav_type=self.on_uav_type, on_sim_state=self.on_sim_state,
+            on_entry_table_rows=self.model.entry_table_rows,
+            on_set_entry_L_max=self.on_set_entry_L_max,
             on_sensors_apply=self.on_sensors_apply, on_set_area=self.on_set_area,
             on_clear_area=self.on_clear_area,
             # датчики, заданные человеком (задача 8.7)
@@ -554,6 +559,15 @@ class ThreatController:
         r_before = float(getattr(p, "threat_R", 0.0))
         for n, v in vals.items():
             setattr(p, n, v)
+        # ⚠️ ЧИСЛО СЕГМЕНТОВ ЗАЖАТО 1…31 (план 12, 12.6): маска накрытых сегментов лежит в
+        # 32-битном числе, по биту на сегмент, и 32 молча сломали бы счёт покрытия
+        if "L_seg" in vals:
+            p.L_seg = int(min(31, max(1, int(p.L_seg))))
+        # ⚠️ РУЧНОЙ ЗАПАС ОТМЕНЯЕТ ЗАПАС ПО ТОЧКАМ (план 12, 12.4): человек ввёл своё число —
+        # значит хочет один предел на все точки, как было до условий моделирования
+        if vals.get("threat_L_max_manual") and self.model.uav_lmax_per_entry:
+            self.model.uav_lmax_per_entry = False
+            self.view.flash_title("Запас хода задан вручную — один на все точки входа.")
         if p.threat_N < 1 or p.threat_R <= 0:
             self.view.flash_title("Датчиков типа 1 должно быть ≥ 1, радиус > 0.")
             return
@@ -610,12 +624,20 @@ class ThreatController:
             if self.view.get_toggles().get("show_iter") and self.model.iter_routes:
                 self._run_async("iter", self.model.iterate_routes)
             else:
+                # ⚠️ ВЫБОРКА СИНИХ ЛИНИЙ ЗДЕСЬ БОЛЬШЕ НЕ СТРОИТСЯ (решение заказчика
+                # 21.09.2026). Она самая дорогая часть — замер на `arh`: 148 с на 250 линий,
+                # потому что половина попыток не укладывается в запас хода. «Применить»
+                # нажимают часто и подряд, и каждый раз ждать минуты незачем: зону пролёта
+                # пересчитываем сразу (она дешёвая), а линии — по кнопке или по галочке.
                 self.model.routes = []
-                self._run_async("routes", self.model.plan_routes)  # и область залёта, и датчики
+                self._pending_recalc = True          # ждём кнопку, как после клика по цели
+                self._run_async("envelope", self.model._refresh_envelope)
         else:
             self._render_all()
-        self.view.set_title("Входные данные применены — пересчёт области, маршрутов и датчиков."
-                            + (" Разрыв изменён." if gap_changed else ""))
+        self.view.set_title(
+            "Входные данные применены: зона пролёта пересчитана. Синие линии выборки — "
+            "по кнопке «Рассчитать позиции» или галочкой «Маршруты»."
+            + (" Разрыв изменён." if gap_changed else ""))
 
     def _render_sensors(self, empty=False):
         """Отдать датчики на отрисовку вместе с типами и признаком «закреплён».
@@ -893,6 +915,7 @@ class ThreatController:
         titles = {"build": "Строю весовую карту угроз…",
                   "place": "Расставляю датчики по весам…",
                   "routes": "Строю маршруты пролёта…",
+                  "envelope": "Пересчитываю зону пролёта…",
                   "iter": "Генерирую маршруты (итерации)…"}
         self.view.flash_title(titles.get(kind, "Расчёт…"))
         self.view.process_pending()
@@ -927,6 +950,10 @@ class ThreatController:
                 self.view.set_title(
                     "Карта построена. «Расставить датчики» или «Пуск» — "
                     "маршруты посчитаются при первом обращении.")
+        elif kind == "envelope":
+            # зона пролёта пересчитана, синие линии ждут кнопки (решение заказчика 21.09.2026)
+            self._render_all()
+            self._full_metrics()
         elif kind == "place":
             self._render_all()
             self.view.refresh_sensor_table(self._sensor_rows())   # таблица окна
@@ -1078,6 +1105,97 @@ class ThreatController:
         self._pending_recalc = True
         self._render_after_input(f"Цель задана: ({x:.0f}, {y:.0f}) км. ")
         self.view.refresh_sector_window()                 # сектор переотобран от новой цели
+
+    # ---- условия моделирования: тип БПЛА и точка старта (план 12, задача 12.2) ----
+    def on_set_uav_start(self, x, y):
+        """Клик поставил точку старта БПЛА: запас хода пересчитан по точкам, панель и
+        таблица обновлены сами (правило заказчика 21.09.2026)."""
+        self.model.set_uav_start(x, y)
+        self.view.render_uav_start(self.model.uav_start_km)
+        self._after_uav_start("Старт БПЛА задан: (%.0f, %.0f) км." % (x, y))
+
+    def on_clear_uav_start(self):
+        """«Убрать точку старта»: снять точку и метку, вернуть один общий запас."""
+        self.model.clear_uav_start()
+        self.view.render_uav_start(None)
+        self._after_uav_start("Точка старта БПЛА убрана: запас хода снова общий.")
+
+    def _after_uav_start(self, msg):
+        """Обновить всё, что зависит от точки старта: панель, таблицу точек, окно условий.
+        ⚠️ Само, без «Применить»: среднее в панели иначе показывало бы прежнее число."""
+        per = self.model.entry_L_max_km()              # запасы по точкам, км (или None)
+        if per:                                        # условия действуют
+            msg += " Запас по точкам: %.0f…%.0f км, среднее %.0f км." % (
+                min(per), max(per), sum(per) / len(per))
+        self.view.refresh_sensors_dialog()             # среднее в графе запаса хода
+        self.view.refresh_entries_table()              # таблица точек
+        self.view.refresh_sim_window()
+        self.view.set_title(msg)
+
+    def on_set_entry_L_max(self, i, km):
+        """Запас хода одной точки задан в таблице. Вход: номер с нуля, км (None — вернуть
+        расчётный). ⚠️ Маршруты сбрасывать не надо — их пересчитает «Применить»."""
+        if self.model.set_entry_L_max(i, km):
+            self.view.refresh_sensors_dialog()        # среднее в панели изменилось
+
+    def on_uav_type(self, name):
+        """Тип выбран в списке. Вход: название. Отдаёт: ничего — тип кладётся в модель."""
+        from model import uav_types as ut
+        self.model.set_uav_type(ut.by_name(name))
+
+    def on_sim_state(self):
+        """Что показать в окне условий. Отдаёт: словарь (названия типов, выбранное,
+        строка характеристик, строка координат старта)."""
+        from model import uav_types as ut
+        types = ut.load()
+        uav = self.model.uav_type                     # выбранный тип или None
+        if uav is None and types:                     # тип ещё не выбирали
+            uav = types[0]                            # — показываем первый из справочника
+            self.model.set_uav_type(uav)
+        # КНОПКА ОТКРЫТА, КОГДА ЕСТЬ ТОЧКИ ВХОДА: до них и считается остаток хода.
+        # ⚠️ ЦЕЛЬ КЛИКОМ НЕ ТРЕБУЕТСЯ (жалоба заказчика 21.09.2026: «почему не нажимается,
+        # сектор задан»). Цель есть ВСЕГДА — из `область.txt` («Мирный») или как центр
+        # круглого района; `target_km` хранит лишь ТУ, что поставили кликом, и проверять
+        # его значило требовать лишнего щелчка по цели, которая уже на карте.
+        # ⚠️ Смотрим `entry_points` (сектор плюс ручные), а НЕ `entry_points_km()`: тот
+        # никогда не бывает пустым — без сектора он отдаёт демо-точку участка.
+        need = []                                     # чего не хватает, по фразе на нехватку
+        if not self.model.entry_points:               # ни сектора, ни ручных точек
+            need.append("задайте сектор налёта или поставьте точки старта")
+        return {"names": [u.name for u in types],
+                "current": uav.name if uav else "",
+                "type_text": self._uav_type_text(uav),
+                "start_text": self._uav_start_text(),
+                "ready": not need,
+                "why": ("Доступно: точек входа %d." % len(self.model.entry_points)
+                        if not need else "Недоступно: " + ", ".join(need) + ".")}
+
+    def _uav_type_text(self, uav):
+        """Характеристики типа одной строкой. Вход: тип или None. Отдаёт: строку."""
+        if uav is None:                               # справочник пуст
+            return "Тип не выбран — справочник пуст."
+        return ("%s · %s · %.0f км/ч · запас %.0f км · крен %.0f° · высота %.0f м · "
+                "радиус разворота %.2f км" % (uav.name, uav.KIND, uav.speed_kmh,
+                                              uav.L_max_km, uav.bank_deg, uav.alt_m,
+                                              uav.turn_radius_km()))
+
+    def _uav_start_text(self):
+        """Координаты старта и расстояния до точек входа. Отдаёт: строку («» — не задан)."""
+        if self.model.uav_start_km is None:           # точка не поставлена
+            return ""
+        from model.geo_frame import format_deg, km_to_lonlat
+        x, y = self.model.uav_start_km
+        lon, lat = km_to_lonlat(x, y, self.model.lon0, self.model.lat0)
+        dists = self.model.uav_start_dists_km()       # до каждой точки входа, км
+        text = "Старт: %s · X %.1f км, Y %.1f км" % (format_deg(lon, lat), x, y)
+        if dists:                                     # точки входа есть — показать разброс
+            text += ("<br>До точек входа: %d шт., от %.0f до %.0f км, среднее %.0f км"
+                     % (len(dists), min(dists), max(dists), sum(dists) / len(dists)))
+        per = self.model.entry_L_max_km()             # запасы по точкам, км
+        if per:                                       # условия действуют
+            text += ("<br><b>Запас хода по точкам: от %.0f до %.0f км</b> (в панели "
+                     "среднее %.0f км)" % (min(per), max(per), sum(per) / len(per)))
+        return text
 
     # ---- «задать сектор появления» кликом по краю карты ----
     def on_set_sector(self, x, y):
@@ -1309,6 +1427,8 @@ class ThreatController:
             iter=bool(self.model.iter_routes))
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, target)
+        self.view.render_uav_start(self.model.uav_start_km)   # старт БПЛА (12.2), может быть None
+        self.view.refresh_conditions_button()                 # сектор или цель могли смениться
         # сектор появления рисуется здесь же: иначе он пропадал бы при любой перерисовке
         self.view.render_sector(self.model.sector_edges_km(), self.model.sector_points(), t,
                                 manual_points=self.model.manual_entries)

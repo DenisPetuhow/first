@@ -29,7 +29,17 @@ LINE = "=" * 68
 SKIP_FUNCS = {"__init__", "__repr__", "__str__", "__len__", "__enter__", "__exit__", "main"}
 # Короткие служебные имена переменных — пояснять нечего.
 SKIP_VARS = {"i", "j", "k", "n", "x", "y", "z", "t", "d", "p", "s", "w", "h", "r", "c",
-             "self", "_", "out", "res", "tmp", "ok", "app", "fig", "ax"}
+             "self", "_", "out", "res", "tmp", "ok", "app", "fig", "ax",
+             # ⚠️ ЗАКОННЫЕ ОБОРОТЫ (20.09.2026): содержимое видно из правой части, и
+             # комментарий к ним был бы пересказом кода — `hint = QLabel(...)`, `row`,
+             # `item`. Правило про ВЕЛИЧИНЫ с единицами, а не про служебные имена.
+             "val", "text", "row", "rows", "item", "cls", "data", "name", "names",
+             "col", "btn", "box", "hint", "line", "cur", "path", "files", "found",
+             "types", "dlg", "sec", "base", "cmd", "args", "src", "node", "tgt",
+             "v", "st", "note", "end", "first"}
+# ⚠️ ИМЕНА ВИДЖЕТОВ Qt — законный оборот: `btn_close = QPushButton("Закрыть")` содержит
+# и что это, и что делает. Комментарий к ним был бы пересказом правой части.
+SKIP_PREFIXES = ("btn_", "lbl_", "chk_", "rb_", "spin_", "combo_", "grp_", "tbl_")
 
 
 def _find_root(markers=("CLAUDE.md", "config.py")):
@@ -48,19 +58,37 @@ def _find_root(markers=("CLAUDE.md", "config.py")):
 ROOT = _find_root()
 
 
-def changed_lines(base):
-    # Какие строки каких .py изменились относительно base.
-    # Вход: коммит/ветка. Отдаёт: {путь: множество номеров строк}.
-    cmd = ["git", "diff", "--unified=0", base, "--", "*.py"]
+def _run(cmd):
+    # Запустить git и отдать вывод. Вход: список аргументов. Отдаёт: строку ("" — не вышло).
     try:
-        out = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
-                             encoding="utf-8", errors="replace").stdout
-    except OSError:
-        return {}
+        return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace").stdout
+    except OSError:                                   # git не установлен
+        return ""                                     # — работаем вхолостую, но не падаем
+
+
+def repo_root():
+    # Корень РЕПОЗИТОРИЯ: пути в `git diff` отсчитываются от него. Отдаёт: путь строкой.
+    # ⚠️ Он не равен корню ПРОЕКТА, когда проект лежит подпапкой, — и это рушило проверку.
+    out = _run(["git", "rev-parse", "--show-toplevel"]).strip()
+    return os.path.normpath(out) if out else ROOT
+
+
+def _abs(base_dir, rel):
+    # Путь из вывода git — в путь на диске. Вход: корень репозитория, путь через «/».
+    # Отдаёт: абсолютный путь.
+    return os.path.join(base_dir, rel.strip().replace("/", os.sep))
+
+
+def changed_lines(base):
+    # Какие строки каких .py изменились относительно base, плюс новые файлы целиком.
+    # Вход: коммит/ветка. Отдаёт: {абсолютный путь: множество номеров строк}.
+    out = _run(["git", "diff", "--unified=0", base, "--", "*.py"])
+    base_dir = repo_root()                            # от него отсчитаны пути в диффе
     files, cur = {}, None
     for line in out.splitlines():
         if line.startswith("+++ b/"):                 # начался новый файл диффа
-            cur = line[6:].strip()                    # — дальше его куски
+            cur = _abs(base_dir, line[6:])            # — дальше его куски
             files.setdefault(cur, set())
         elif line.startswith("@@") and cur:
             # формат куска: @@ -старое +новое,сколько @@
@@ -71,6 +99,16 @@ def changed_lines(base):
             except (IndexError, ValueError):          # необычная шапка куска
                 continue                              # — пропускаем, не падаем
             files[cur].update(range(start, start + count))
+    # ⚠️ НОВЫЙ ФАЙЛ, ЕЩЁ НЕ ДОБАВЛЕННЫЙ В GIT, `git diff` НЕ ВИДИТ — а правило именно про
+    # новый код. Берём такие целиком: 20.09.2026 модуль типов БПЛА прошёл проверку
+    # вхолостую («файлов с правками 1» при четырёх).
+    # ⚠️ `--full-name` обязателен: без него пути идут от ТЕКУЩЕЙ папки, а у `git diff` —
+    # от корня репозитория; смешаешь два вида — половина файлов не найдётся (и молча).
+    for rel in _run(["git", "ls-files", "--others", "--exclude-standard",
+                     "--full-name", "*.py"]).splitlines():
+        path = _abs(base_dir, rel)
+        files[path] = set(range(1, sum(                                # весь файл новый
+            1 for _ in io.open(path, encoding="utf-8", errors="replace")) + 1))
     return {f: ls for f, ls in files.items() if ls}
 
 
@@ -86,6 +124,15 @@ def doc_lines(node, src_lines):
         n += 1
         i += 1
     return n, n > 0
+
+
+def head_span(node, n_doc):
+    # Строки «шапки» функции: сам `def` и пояснение под ним. Отдаёт: (первая, последняя).
+    # ⚠️ По шапке, а не по телу: правка внутри ДАВНО написанной функции иначе требовала бы
+    # переписать её докстринг вопреки правилу (20.09.2026: `set_area`, `_build_ui`).
+    first = node.body[0] if node.body else None       # первый оператор — возможный докстринг
+    end = getattr(first, "end_lineno", 0) if isinstance(first, ast.Expr) else 0
+    return node.lineno, max(end, node.lineno + n_doc)
 
 
 def check_file(path, lines_of_interest=None):
@@ -107,10 +154,9 @@ def check_file(path, lines_of_interest=None):
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            end = getattr(node, "end_lineno", node.lineno)
-            if not touched(node.lineno, end) or node.name in SKIP_FUNCS:
-                continue
             n, has = doc_lines(node, src_lines)
+            if not touched(*head_span(node, n)) or node.name in SKIP_FUNCS:
+                continue
             if not has:
                 found.append((node.lineno, "функция `%s` без пояснения" % node.name))
             elif n > MAX_DOC_LINES:
@@ -120,6 +166,8 @@ def check_file(path, lines_of_interest=None):
         elif isinstance(node, ast.Assign) and len(node.targets) == 1:
             tgt = node.targets[0]
             if not isinstance(tgt, ast.Name) or tgt.id in SKIP_VARS:
+                continue
+            if tgt.id.startswith(SKIP_PREFIXES):      # имя виджета Qt говорит само за себя
                 continue
             if lines_of_interest is not None and node.lineno not in lines_of_interest:
                 continue
@@ -147,9 +195,11 @@ def main(argv):
         print("изменения против %s: файлов с правками %d" % (base, len(targets)))
     print(LINE)
     total = 0
+    missing = []                                      # что git назвал, а на диске нет
     for rel, lines in sorted(targets.items()):
         path = rel if os.path.isabs(rel) else os.path.join(ROOT, rel)
-        if not os.path.exists(path):                  # файл удалён или переименован
+        if not os.path.exists(path):                  # файл удалён, переименован или путь врёт
+            missing.append(rel)                       # — сказать вслух, а не пропустить молча
             continue
         found = check_file(path, lines)
         if not found:
@@ -159,6 +209,8 @@ def main(argv):
             print("   :%-5d %s" % (ln, what))
         total += len(found)
     print(LINE)
+    if missing:                                       # молчание здесь и скрыло дефект путей
+        print("⚠️ НЕ НАЙДЕНО НА ДИСКЕ: %d — %s" % (len(missing), "; ".join(missing[:3])))
     if total:
         print("НАХОДОК: %d — правило [8_КОММЕНТАРИИ_В_КОДЕ]: пояснение функции до %d строк,\n"
               "новая переменная — справа в той же строке, с единицей измерения."

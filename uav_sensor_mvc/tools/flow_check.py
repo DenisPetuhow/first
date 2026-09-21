@@ -370,6 +370,64 @@ def main(argv=None):
           and bool(m.in_area(*np.asarray(m.sector_points(), float).T).all()),
           "сектор по 360°: точки входа внутри круга", "точек %d" % len(m.sector_points()))
 
+    print("\n5в. РЕЖИМЫ ПАНЕЛИ ДОХОДЯТ ДО «ВОЗМОЖНЫХ МАРШРУТОВ» (жалоба заказчика 21.09.2026)")
+    # ⚠️ Раньше из панели брался только ВЕС, а разброс, расход и заход стояли жёстким "mix":
+    # человек менял режим захода, нажимал «Применить», а синие линии не менялись вовсе.
+    # Замер: средняя длина при min/max была 130.6 и 131.8 км (шум), стала 122.0 и 134.2.
+    import model.threat_routes as _tr
+    seen = []                                        # режимы, с которыми звали розыгрыш
+    _orig_sample = _tr.sample_one_route               # настоящий розыгрыш, вернём в конце
+
+    def _spy(ctx, mode, lmax, turn, rng, spread="mix", spend="late", approach="mix"):
+        """Подменыш розыгрыша: запомнить режимы и ничего не строить."""
+        seen.append((mode, spread, spend, approach))
+        return None                                  # маршрут не нужен — важны аргументы
+
+    m.p.threat_iter_mode, m.p.threat_iter_spread = "max", "edge"
+    m.p.threat_spend, m.p.threat_iter_approach = "early", "medium"
+    _tr.sample_one_route = _spy
+    try:
+        m.plan_routes()
+    except Exception:                                # маршрутов нет — отбор может ругнуться
+        pass                                         # нам хватило записанных аргументов
+    finally:
+        _tr.sample_one_route = _orig_sample
+    check(bool(seen), "розыгрыш вызывался", "вызовов %d" % len(seen))
+    got = set(seen)                                  # все наборы режимов, что ушли в розыгрыш
+    check(got == {("max", "edge", "early", "medium")},
+          "ВСЕ ЧЕТЫРЕ режима панели дошли до выборки", str(sorted(got)[:2]))
+
+    print("\n5б. СВОЙ ЗАПАС ХОДА У КАЖДОЙ ТОЧКИ ВХОДА (план 12, задача 12.4)")
+    from model import uav_types as _ut
+    # ⚠️ ВЫКЛЮЧАЕМОСТЬ В НОЛЬ — главное здесь: пока старт не задан, расчёт обязан идти
+    # ровно как раньше, одним числом (правило проверок, «механизм выключается в ноль»).
+    check(np.isscalar(m.route_L_max()) and m.entry_L_max_km() is None,
+          "без старта БПЛА — один общий запас, как было", str(m.route_L_max()))
+    m.set_uav_type(_ut.defaults()[0])
+    check(np.isscalar(m.route_L_max()),
+          "выбран ТОЛЬКО тип, без старта — по-прежнему один запас")
+    bx5, by5 = m.bbox_km[1], m.bbox_km[2]           # юго-восточный угол области
+    m.set_uav_start(bx5 + 300.0, by5 - 200.0)
+    per5 = m.entry_L_max_km()                        # запасы по точкам, км
+    d5 = m.uav_start_dists_km()                      # расстояния старт→вход, км
+    full5 = float(m.uav_type.L_max_km)               # полный запас аппарата, км
+    check(per5 is not None and len(per5) == len(m.entry_points_km()),
+          "со стартом запас считается по каждой точке", "точек %d" % len(per5 or []))
+    check(per5 and all(abs((full5 - d) - v) < 1e-6 for d, v in zip(d5, per5)),
+          "запас = запас аппарата − прямая от старта")
+    check(per5 and abs(m.p.threat_L_max - sum(per5) / len(per5)) < 0.06,
+          "в панель ушло СРЕДНЕЕ по точкам",
+          "%.1f против %.1f" % (m.p.threat_L_max, sum(per5) / len(per5)))
+    check(per5 and max(per5) - min(per5) > 1.0, "у точек запасы РАЗНЫЕ",
+          "разброс %.1f км" % (max(per5) - min(per5)))
+    m.p.threat_L_max_manual = True                   # человек ввёл своё число
+    m.uav_lmax_per_entry = False                     # (это делает контроллер на «Применить»)
+    check(np.isscalar(m.route_L_max()), "ручной запас отменяет расчёт по точкам")
+    m.clear_uav_start()
+    check(m.entry_L_max_km() is None and np.isscalar(m.route_L_max()),
+          "«Убрать точку старта» возвращает один общий запас")
+    m.p.threat_L_max_manual = False
+
     # ---- 6. снятие района обнуляет ВСЁ ----
     print("\n6. СНЯТИЕ РАЙОНА")
     m.clear_area()
@@ -386,7 +444,7 @@ def main(argv=None):
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
         return 1
-    print("ВСЁ ПРОШЛО. Порядок работы, кэш и сброс — в норме.")
+    print("ВСЁ ПРОШЛО. Порядок работы, кэш, сброс и запас хода по точкам — в норме.")
     return 0
 
 

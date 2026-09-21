@@ -43,6 +43,9 @@ ENV_TILES = "UAV_TILE_CACHE"        # корень кэша тайлов (его
 KEYS = {
     "название": "подпись области",
     "область": "lon_min, lat_min, lon_max, lat_max — чёрная рамка",
+    # ⚠️ КАРТА ШИРЕ ОБЛАСТИ (план 12, задача 12.1): подложка и координаты идут до этой
+    # рамки, а слои, рельеф и весовая сетка — только по «области». Не задана — совпадает с ней.
+    "карта": "lon_min, lat_min, lon_max, lat_max — докуда видно подложку (шире области)",
     "район": "lon_min, lat_min, lon_max, lat_max — район моделирования",
     "исходник": "экстракт .osm.pbf",
     "слои": "кэш слоёв .npz",
@@ -142,6 +145,19 @@ def parse_area_text(text, folder):
 
     bbox = _box(raw["область"], "область")           # чёрная рамка, градусы
     lo, la, ho, ha = bbox
+    # РАМКА ПОКАЗА: докуда видна подложка. Шире области — значит вокруг участка видно
+    # соседнюю карту; уже быть не может, иначе часть расчётной области не показать.
+    view = _box(raw["карта"], "карта") if raw.get("карта") else None
+    if view is not None:                             # карта задана — обязана накрыть область
+        eps = 1e-9                                   # допуск на запись чисел, градусы
+        vlo, vla, vho, vha = view
+        tight = [name for name, bad in (             # края карты, залезшие внутрь области
+                ("западный", vlo > lo + eps), ("южный", vla > la + eps),
+                ("восточный", vho < ho - eps), ("северный", vha < ha - eps))
+                 if bad]
+        if tight:                                    # карта у́же области
+            raise AreaFileError("«карта» должна накрывать «область» целиком, а она у́же: "
+                                "%s край" % ", ".join(tight))
     work = _box(raw["район"], "район") if raw.get("район") else None   # синяя рамка или None
     if work is not None:                             # район задан — обязан лежать в области
         eps = 1e-9                                   # допуск на запись чисел, градусы
@@ -171,6 +187,7 @@ def parse_area_text(text, folder):
         tile_area=name,
         points={"Северо-запад": (lo, ha), "Юго-запад": (lo, la), "Юго-восток": (ho, la)},
         bbox=bbox,
+        view=view,                                   # рамка показа или None — как область
         source=raw.get("исходник") or _find(folder, "*.osm.pbf"),
         layers=raw.get("слои") or _find(folder, "threat_layers*.npz"),
         dem=dem,

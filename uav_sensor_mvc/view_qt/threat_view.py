@@ -409,13 +409,17 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # `view_qt/input_window.py`, вместе со своими подсказками и замерами; панель
     # теперь только управляет расчётом и показом.
 
-    def __init__(self, model_bbox_km, lon0, lat0, params, area_max_km=None):
+    def __init__(self, model_bbox_km, lon0, lat0, params, area_max_km=None, view_max_km=None):
         super().__init__()
         self.bbox_km = model_bbox_km
         # МАКСИМАЛЬНАЯ ОБЛАСТЬ РАСЧЁТА — чёрная рамка на карте. За ней нет ни векторных
         # данных, ни рельефа, поэтому район моделирования дальше неё не имеет смысла.
         # Не задана — совпадает с рамкой (так у прежних участков, где область и район одно).
         self.area_max_km = tuple(area_max_km or model_bbox_km)
+        # РАМКА ПОКАЗА (план 12, 12.1) — докуда можно отодвинуть камеру и докуда грузятся
+        # тайлы. ⚠️ Шире области, но на РАСЧЁТ не влияет: слои и сетка живут в `area_max_km`,
+        # а «Весь участок» по-прежнему вписывает именно её.
+        self.view_max_km = tuple(view_max_km or self.area_max_km)
         self._lon0, self._lat0 = lon0, lat0
         self._map_layer = getattr(params, "map_layer3", "osm")
         self._map_offline = bool(getattr(params, "map_offline3", False))
@@ -459,6 +463,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._entry_handle = None         # подвижная метка выбранной точки
         self._entry_pick = None           # выбранная точка: dict(n, x_km, y_km, manual)
         self._sector_dlg = None           # окно «Сектор налёта»
+        # УСЛОВИЯ МОДЕЛИРОВАНИЯ (план 12, 12.2): окно и одноразовый режим клика
+        self._sim_dlg = None              # окно «Условия моделирования»
+        self._entries_dlg = None          # таблица точек входа (12.5)
+        self._uav_start_mode = False      # ждём клик: точка старта БПЛА
         self._data_path = None            # текущий источник (для префилла окна выбора)
         self._enabled_layers = None       # текущий набор слоёв (None = все)
 
@@ -486,6 +494,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_entry_add = lambda x, y: False             # двойной клик — новая точка старта
         self.on_entry_move = lambda x0, y0, x1, y1: False  # точку перетащили
         self.on_entry_delete = lambda x, y: False          # DELETE по выбранной точке
+        # ПЛАН 12, 12.2: условия моделирования — тип БПЛА и точка старта
+        self.on_set_uav_start = lambda x, y: None   # клик поставил точку старта, км
+        self.on_clear_uav_start = lambda: None      # «Убрать точку старта»
+        self.on_uav_type = lambda name: None        # выбран тип по названию
+        self.on_sim_state = lambda: {}              # что показать в окне условий
+        self.on_entry_table_rows = lambda: []       # строки таблицы точек входа (12.5)
+        self.on_set_entry_L_max = lambda i, km: None  # запас точки задан руками
         self.on_zone_added = lambda poly: None      # нарисована запретная зона
         self.on_zone_undo = lambda: None            # убрать последнюю зону
         self.on_choose_data = lambda path, layers: None
@@ -600,7 +615,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self._sector_dlg = SectorDialog(
                 self, on_params=lambda h, n: self.on_sector_params(h, n),
                 on_auto=self._sector_auto_clicked, on_click_mode=self._begin_sector,
-                on_clear=lambda: self.on_clear_sector())
+                on_clear=lambda: self.on_clear_sector(),
+                on_data=self._open_entries_table)          # «Показать данные» (12.5)
         self.refresh_sector_window()
         self._sector_dlg.show()
         self._sector_dlg.raise_()
@@ -614,6 +630,28 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         st = self.on_sector_state() or {}
         dlg.set_state(st.get("half_deg", 30.0), st.get("entries", 5), st.get("kind"),
                       st.get("n_sector", 0), st.get("n_manual", 0), self._sector_mode)
+
+    def _open_entries_table(self):
+        """«Показать данные» в окне сектора: таблица точек входа (план 12, 12.5)."""
+        if self._entries_dlg is None:
+            from .entries_table import EntriesTableDialog
+            self._entries_dlg = EntriesTableDialog(
+                self, rows=lambda: self.on_entry_table_rows(),
+                on_L_max=lambda i, km: self._set_entry_L_max(i, km))
+        self._entries_dlg.refresh()
+        self._entries_dlg.show()
+        self._entries_dlg.raise_()
+        self._entries_dlg.activateWindow()
+
+    def _set_entry_L_max(self, i, km):
+        """Запас хода точки правят в таблице: отдать контроллеру и обновить окно условий."""
+        self.on_set_entry_L_max(i, km)
+        self.refresh_sim_window()
+
+    def refresh_entries_table(self):
+        """Подтянуть свежие строки в открытую таблицу точек (зовёт контроллер)."""
+        if self._entries_dlg is not None and self._entries_dlg.isVisible():
+            self._entries_dlg.refresh()
 
     def _sector_auto_clicked(self):
         """«Построить сектор» в окне: режим кликов (если был) закончить и считать по 360°."""
@@ -646,6 +684,94 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if close_window and self._sector_dlg is not None:   # выход правой кнопкой
             self._sector_dlg.close()
         self.refresh_sector_window()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ОКНО «УСЛОВИЯ МОДЕЛИРОВАНИЯ» И ТОЧКА СТАРТА БПЛА (план 12, задача 12.2)
+    # ══════════════════════════════════════════════════════════════════════════
+    def open_sim_conditions(self):
+        """Кнопка «Задать условия моделирования»: открыть окно (одно на всё время работы)."""
+        if self._sim_dlg is None:
+            from .sim_conditions_window import SimConditionsDialog
+            self._sim_dlg = SimConditionsDialog(
+                self, on_pick_start=self._begin_uav_start,
+                on_clear_start=self._clear_uav_start, on_type=lambda n: self._pick_uav_type(n),
+                on_edit_types=self._open_uav_types)
+        self.refresh_sim_window()
+        self._sim_dlg.show()
+        self._sim_dlg.raise_()
+        self._sim_dlg.activateWindow()
+
+    def refresh_conditions_button(self):
+        """Доступность кнопки «Задать условия моделирования»: нужны сектор и цель."""
+        dlg = self._input_dlg
+        if dlg is None:                    # окно исходных данных ещё не открывали
+            return
+        st = self.on_sim_state() or {}
+        dlg.set_conditions_ready(st.get("ready", False), st.get("why", ""))
+
+    def refresh_sim_window(self):
+        """Подтянуть в открытое окно условий свежее состояние (зовёт контроллер после правок)."""
+        self.refresh_conditions_button()   # сектор или цель могли появиться
+        dlg = self._sim_dlg
+        if dlg is None:                    # окно ни разу не открывали
+            return
+        st = self.on_sim_state() or {}
+        dlg.set_state(st.get("names", []), st.get("current", ""),
+                      st.get("type_text", ""), st.get("start_text", ""))
+
+    def _pick_uav_type(self, name):
+        """Тип выбран в списке — сообщить контроллеру и обновить подписи окна."""
+        self.on_uav_type(name)
+        self.refresh_sim_window()
+
+    def _open_uav_types(self):
+        """Кнопка «Виды БПЛА»: справочник типов; после записи список в окне пересобрать."""
+        from .uav_types_window import UavTypesDialog
+        UavTypesDialog(self, on_saved=lambda _types: self.refresh_sim_window()).exec_()
+        self.refresh_sim_window()
+
+    def _begin_uav_start(self):
+        """«Задать точку старта БПЛА»: все окна прячутся, клик по карте ставит точку.
+        Правая кнопка — выход без точки; двойной клик ставит так же, как одинарный."""
+        self._end_measure()               # режимы мыши взаимно исключают друг друга
+        self._end_sector_mode()
+        self._end_pick_sensor()
+        self._end_edit_sensor()
+        self._end_edit_entry()
+        self._target_mode = False
+        self._uav_start_mode = True
+        self._hide_dialogs()              # карту не должно перекрывать ничто
+        self._grab_right_button(True)     # правая кнопка = выход из режима
+        self.set_title("Кликните точку СТАРТА БПЛА на карте (двойной клик — тоже). "
+                       "Правая кнопка мыши — выход без точки.")
+
+    def _hide_dialogs(self):
+        """Спрятать ВСЕ окна, кроме основного (правило заказчика 21.09.2026), запомнив,
+        какие были открыты. ⚠️ Прячем именно видимые: иначе вернём то, чего не открывали."""
+        self._hidden_dlgs = [d for d in self.findChildren(QtWidgets.QDialog) if d.isVisible()]
+        for d in self._hidden_dlgs:
+            d.hide()
+
+    def _restore_dialogs(self):
+        """Вернуть окна, спрятанные на время клика, и поднять их над картой."""
+        for d in getattr(self, "_hidden_dlgs", ()):
+            d.show()
+            d.raise_()
+        self._hidden_dlgs = []
+
+    def _end_uav_start_mode(self):
+        """Закончить режим клика и вернуть на место все спрятанные окна."""
+        if self._uav_start_mode:          # режим был включён
+            self._uav_start_mode = False
+            self._grab_right_button(False)   # вернуть правую кнопку pyqtgraph
+            self.set_title("")
+        self._restore_dialogs()
+        self.refresh_sim_window()
+
+    def _clear_uav_start(self):
+        """«Убрать точку старта»: снять точку и обновить карту с окном."""
+        self.on_clear_uav_start()
+        self.refresh_sim_window()
 
     # ══════════════════════════════════════════════════════════════════════════
     # ТОЧКИ СТАРТА МЫШЬЮ (план 11, 11.6) — по образцу правки датчиков
@@ -1142,7 +1268,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # до всего остального: в этих режимах панель погашена, и другого пути к выходу
         # под рукой нет.
         if (self._pick_sensor or self._edit_sensor or self._measure_mode
-                or self._edit_entry or self._sector_mode):
+                or self._edit_entry or self._sector_mode or self._uav_start_mode):
             try:
                 right = ev.button() == QtCore.Qt.RightButton
             except Exception:
@@ -1152,6 +1278,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     ev.accept()
                 except Exception:
                     pass
+                if self._uav_start_mode:   # старт БПЛА: выход без точки, окна вернуть (12.2)
+                    self._end_uav_start_mode()
+                    self.set_title("Выбор точки старта отменён.")
+                    return
                 if self._sector_mode:      # сектор кликами: выход и закрытие окна (11.6)
                     self._end_sector_mode(close_window=True)
                     self.set_title("Задание сектора завершено.")
@@ -1184,7 +1314,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if self._zone_mode:
             self._zone_click(ev)
             return
-        if not (self._target_mode or self._sector_mode):
+        if not (self._target_mode or self._sector_mode or self._uav_start_mode):
             return
         try:
             if ev.button() != QtCore.Qt.LeftButton:
@@ -1195,6 +1325,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if self._sector_mode:              # режим НЕ снимается: щёлкать можно ещё (11.6)
             self.on_set_sector(float(pt.x()), float(pt.y()))
             self.refresh_sector_window()
+            return
+        if self._uav_start_mode:           # старт БПЛА — ОДИН клик (план 12, 12.2)
+            self.on_set_uav_start(float(pt.x()), float(pt.y()))
+            self._end_uav_start_mode()     # — и окно условий возвращается
             return
         self._target_mode = False
         self.on_set_target(float(pt.x()), float(pt.y()))
@@ -1934,7 +2068,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             # ОБЛАСТЬ И ТАЙЛЫ (план 10 §10.5): область — перезапуск, тайлы — сразу
             dlg.on_pick_area = lambda: area_choice.choose_area(dlg)
             dlg.on_pick_tiles = lambda reset: self._pick_tile_root(dlg, reset)
+            dlg.on_sim_conditions = self.open_sim_conditions      # план 12, 12.2
             self._input_dlg = dlg
+        self.refresh_conditions_button()
         self._input_dlg.set_area_info(self._area_info_text())
         self._input_dlg.refresh(self._params_ref)
         self.refresh_sensor_table()
@@ -3193,6 +3329,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.target_scatter = pg.ScatterPlotItem(size=24, symbol="x",
             brush=pg.mkBrush(_qcolor(THEME["warn"])), pen=pg.mkPen("white", width=2.6))
         self.target_scatter.setZValue(22); self.pi.addItem(self.target_scatter)
+        # СТАРТ БПЛА (план 12, 12.2) — ромб: звезда и крест уже заняты входом и целью, а
+        # точка старта лежит ЗА районом, и путать её с точкой входа нельзя
+        self.uav_start_scatter = pg.ScatterPlotItem(size=22, symbol="d",
+            brush=pg.mkBrush(_qcolor(THEME["accent"])), pen=pg.mkPen("white", width=2.2))
+        self.uav_start_scatter.setZValue(22); self.pi.addItem(self.uav_start_scatter)
 
         # СЕКТОР ПОЯВЛЕНИЯ: две границы от цели и точки входа на краю карты.
         # Пунктир, а не заливка: сектор — служебная разметка, он не должен спорить
@@ -3448,7 +3589,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # тайлов просила вид 420 км (1:1 для z8), предел возвращал 380, и вся подложка
         # рисовалась с растяжением 1.145 — 15 % мыла на КАЖДОМ уровне (замер 19.09.2026).
         asp = self._view_aspect()
-        parts = [self._fit_frame(self.area_max_km, asp),                 # кадр под область
+        # ⚠️ ПРЕДЕЛ СТРОИТСЯ ПО РАМКЕ ПОКАЗА (план 12, 12.1), а она может быть ШИРЕ области:
+        # тогда вокруг участка видно соседнюю карту. Без широкой карты это та же область.
+        parts = [self._fit_frame(self.view_max_km, asp),                 # кадр под показ
                  self._fit_frame(self.bbox_km, asp)]                     # кадр под район
         if extra_km:                                 # своя карта может торчать за область
             parts.append(self._fit_frame(extra_km, asp))
@@ -3496,7 +3639,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # рисования: замер 19.09.2026 — вид уезжал 342.6 → 211.0 → 422.0 км и масштаб
         # падал до 0.990. Ключ — ширина в пикселях, форма кадра и сама область: сменилось
         # что-то из этого — пересчитываем, иначе отдаём запомненное.
-        key = (round(width_px), round(span / max(y1 - y0, 1e-9), 3), tuple(self.area_max_km))
+        # ⚠️ в ключ входит и рамка ПОКАЗА: при широкой карте (12.1) предел строится по ней,
+        # и кадр обязан пересчитаться, хотя область расчёта та же
+        key = (round(width_px), round(span / max(y1 - y0, 1e-9), 3),
+               tuple(self.area_max_km), tuple(getattr(self, "view_max_km", ())))
         if getattr(self, "_fit_key", None) == key and getattr(self, "_fit_box", None):
             return self._fit_box                     # то же состояние — тот же кадр
         bare = span / (1.0 + 2.0 * self.VIEW_LIMIT_PAD)   # рамка без поля, км
@@ -4454,6 +4600,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def render_entry_target(self, entry, target):
         self.entry_scatter.setData([entry[0]], [entry[1]])
         self.target_scatter.setData([target[0]], [target[1]])
+
+    def render_uav_start(self, point):
+        """Метка старта БПЛА. Вход: (x_km, y_km) или None — тогда метка снимается."""
+        if point is None:                  # точка не задана
+            self.uav_start_scatter.setData([], [])
+        else:
+            self.uav_start_scatter.setData([float(point[0])], [float(point[1])])
 
     def render_sector(self, sector, entry_points, toggles=None, manual_points=None):
         """Сектор появления БПЛА: `sector` = (вершина-цель, край, край) или None,

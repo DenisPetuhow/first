@@ -318,9 +318,12 @@ def main():
     # area_max_km — ЧЁРНАЯ рамка: предел, за которым нет ни векторных данных, ни рельефа.
     # Синяя рамка (район моделирования) появится, когда район зададут (план 8, задача 8.2).
     from model.geo_frame import bbox_lonlat_to_km as _bb2km
-    from config import THREAT_BBOX_LONLAT as _AREA_BBOX
+    from config import THREAT_BBOX_LONLAT as _AREA_BBOX, THREAT_VIEW_LONLAT as _VIEW_BBOX
+    # view_max_km — рамка ПОКАЗА (план 12, 12.1): докуда видно подложку. Шире чёрной рамки,
+    # если в `область.txt` задан ключ «карта»; иначе совпадает с ней, и всё как прежде.
     v3 = ThreatMapView(m3.bbox_km, m3.lon0, m3.lat0, p3,
-                       area_max_km=_bb2km(_AREA_BBOX, m3.lon0, m3.lat0))
+                       area_max_km=_bb2km(_AREA_BBOX, m3.lon0, m3.lat0),
+                       view_max_km=_bb2km(_VIEW_BBOX, m3.lon0, m3.lat0))
     c3 = ThreatController(m3, v3)
 
     tabs = QtWidgets.QTabWidget()

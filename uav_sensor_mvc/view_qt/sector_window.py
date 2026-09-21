@@ -21,7 +21,7 @@ class SectorDialog(QtWidgets.QDialog):
 
     APPLY_DELAY_MS = 500      # пауза после последнего изменения поля до применения, мс
 
-    def __init__(self, parent, on_params, on_auto, on_click_mode, on_clear):
+    def __init__(self, parent, on_params, on_auto, on_click_mode, on_clear, on_data=None):
         super().__init__(parent)
         self.setWindowTitle("Сектор налёта")
         self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
@@ -85,6 +85,15 @@ class SectorDialog(QtWidgets.QDialog):
         col.addWidget(self.btn_auto)
         col.addWidget(self.btn_click)
         col.addWidget(self.btn_clear)
+        # ⚠️ ТАБЛИЦА ЖИВЁТ ЗДЕСЬ, А НЕ В ОКНЕ УСЛОВИЙ (уточнение заказчика 20.09.2026):
+        # точки входа отбирает сектор, значит и данные по ним смотрят рядом с ним
+        self.btn_data = QtWidgets.QPushButton("Показать данные")
+        self.btn_data.setToolTip(
+            "Таблица точек входа: координаты, азимут от цели, расстояние от старта БПЛА "
+            "и запас хода — его можно задать каждой точке вручную.")
+        self.btn_data.clicked.connect(on_data if on_data else (lambda: None))
+        self.btn_data.setVisible(on_data is not None)
+        col.addWidget(self.btn_data)
 
         self.lbl_state = QtWidgets.QLabel("")
         self.lbl_state.setWordWrap(True)

@@ -307,10 +307,9 @@ class InputDataWindow(QtWidgets.QDialog):
         ("threat_L_max", "Запас хода L_max, км",
          "Главное ограничение маршрута: полная длина пути вход→цель не может его "
          "превысить."),
-        ("threat_speed_kmh", "Скорость, км/ч",
-         "Крейсерская скорость БПЛА. Вместе с креном задаёт радиус разворота R_min."),
-        ("threat_bank_deg", "Крен, °",
-         "Максимальный угол крена — через него считается радиус разворота R_min."),
+        # ⚠️ СКОРОСТЬ И КРЕН УБРАНЫ ОТСЮДА 21.09.2026 (решение заказчика): они — свойства
+        # ВЫБРАННОГО ТИПА БПЛА и правятся в справочнике «Виды БПЛА», а два места для одной
+        # величины расходятся. Поля `threat_speed_kmh` и `threat_bank_deg` живы в `Params`.
         ("threat_turn_interval_km", "Длина прямого участка, км",
          "Целевая длина прямого отрезка: маршрут держит курс примерно столько "
          "километров, потом доворачивает."),
@@ -341,7 +340,7 @@ class InputDataWindow(QtWidgets.QDialog):
          "цель выйдет из-под наблюдения."),
     )
     INT_FIELDS = {"threat_N", "threat_N2", "threat_N3", "threat_N_big",
-                  "threat_k", "threat_k2", "threat_k3"}
+                  "threat_k", "threat_k2", "threat_k3", "L_seg"}
     # Поля одного типа датчиков: (число, радиус, кратность) — совпадает с `model.sensors`.
     TYPE_FIELDS = {
         1: ("threat_N", "threat_R", "threat_k"),
@@ -374,6 +373,7 @@ class InputDataWindow(QtWidgets.QDialog):
         self.on_view_routes = lambda: None         # «Посмотреть маршруты» (задача 8.6)
         self.on_pick_area = lambda: None           # «Область…» — папка с область.txt (10.5)
         self.on_pick_tiles = lambda reset: None    # «Папка тайлов…», reset — по умолчанию
+        self.on_sim_conditions = lambda: None      # «Задать условия моделирования» (12.2)
 
         self._build_ui()
         self.refresh(params)
@@ -395,6 +395,7 @@ class InputDataWindow(QtWidgets.QDialog):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
 
+        lay.addWidget(self._build_conditions())    # условия моделирования — перед областью (12.2)
         lay.addWidget(self._build_area())          # область и папка тайлов — самое первое
         lay.addWidget(self._build_top())           # режим работы + кратность
         mid = QtWidgets.QHBoxLayout(); mid.setSpacing(10)
@@ -419,6 +420,28 @@ class InputDataWindow(QtWidgets.QDialog):
         scr = QtWidgets.QApplication.primaryScreen()
         avail = scr.availableGeometry() if scr is not None else QtCore.QRect(0, 0, 1200, 800)
         self.resize(min(980, avail.width() - 60), min(760, avail.height() - 60))
+
+    def _build_conditions(self):
+        # Блок «Условия моделирования» (план 12, 12.2) — ПЕРЕД областью, как велел заказчик.
+        # Вход: ничего. Отдаёт: QGroupBox с кнопкой и подписью о доступности.
+        box = QtWidgets.QGroupBox("Условия моделирования")   # рамка блока
+        v = QtWidgets.QVBoxLayout(box)
+        self.btn_conditions = QtWidgets.QPushButton("Задать условия моделирования")
+        self.btn_conditions.setToolTip(
+            "Тип БПЛА со своими характеристиками и точка старта, откуда он вышел к району.")
+        self.btn_conditions.clicked.connect(lambda: self.on_sim_conditions())
+        v.addWidget(self.btn_conditions)
+        self.lbl_conditions = QtWidgets.QLabel("")
+        self.lbl_conditions.setWordWrap(True)
+        self.lbl_conditions.setStyleSheet("color:%s;" % THEME["muted"])
+        v.addWidget(self.lbl_conditions)
+        return box
+
+    def set_conditions_ready(self, ready, why=""):
+        # Доступность кнопки условий: без сектора и цели считать запас хода не от чего.
+        # Вход: можно ли открыть (bool), причина отказа. Отдаёт: ничего.
+        self.btn_conditions.setEnabled(bool(ready))
+        self.lbl_conditions.setText(why)
 
     def _build_area(self):
         # Блок «Область и папка тайлов» — самый первый: от него зависит всё окно (план 10 §10.5).
@@ -559,6 +582,16 @@ class InputDataWindow(QtWidgets.QDialog):
                 form.addWidget(lab, 0, col)
                 form.addWidget(e, 1, col)
             lay.addWidget(grp)
+        # ЧИСЛО СЕГМЕНТОВ — СНИЗУ, ПОСЛЕ ТИПОВ (план 12, задача 12.6, заказчик 20.09.2026).
+        # ⚠️ ПОДСКАЗКИ НЕТ — прямое указание заказчика.
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Сегментов маршрута:"))
+        e_seg = QtWidgets.QLineEdit()            # число сегментов маршрута, шт. (1…31)
+        e_seg.returnPressed.connect(self._apply)
+        self._edits.setdefault("L_seg", e_seg)
+        row.addWidget(e_seg)
+        row.addStretch(1)
+        lay.addLayout(row)
         lay.addStretch(1)
         return box
 
@@ -571,12 +604,16 @@ class InputDataWindow(QtWidgets.QDialog):
 
         self.lbl_ab = QtWidgets.QLabel("—")
         form.addRow("|AB| (вход→цель), км:", self.lbl_ab)
-        self.chk_lmax_auto = QtWidgets.QCheckBox("авто: |AB| + 25 %")
-        self.chk_lmax_auto.setToolTip(
-            "Запас хода = расстояние вход→цель +25 % (не меньше кратчайшего коридора). "
-            "Снимите галочку — задать L_max руками.")
-        self.chk_lmax_auto.stateChanged.connect(self._auto_changed)
-        form.addRow(self.chk_lmax_auto)
+        # ⚠️ ЧЕКБОКС ПЕРЕВЁРНУТ 21.09.2026 (решение заказчика): было «авто», стало «задать
+        # вручную». Так короче объяснить: снят — запас считается сам и у КАЖДОЙ точки входа
+        # свой (минус путь от старта БПЛА); поставлен — одно число на всех, из поля ниже.
+        self.chk_lmax_manual = QtWidgets.QCheckBox("задать вручную (одинаково для всех точек)")
+        self.chk_lmax_manual.setToolTip(
+            "Снят — запас хода считается сам: у каждой точки входа свой, с учётом "
+            "расстояния от старта БПЛА (без старта — |AB| + 25 %).\n"
+            "Поставлен — работает число из поля «Запас хода», одно для всех точек.")
+        self.chk_lmax_manual.stateChanged.connect(self._auto_changed)
+        form.addRow(self.chk_lmax_manual)
         for name, label, tip in self.ROUTE_FIELDS:
             form.addRow(label + ":", self._field(name, tip))
         lay.addLayout(form)
@@ -699,9 +736,9 @@ class InputDataWindow(QtWidgets.QDialog):
         big_k = getattr(self, "_k_big", None)
         if big_k is not None:
             big_k.setText("%d" % int(getattr(p, "threat_k", 3)))
-        self.chk_lmax_auto.blockSignals(True)
-        self.chk_lmax_auto.setChecked(not getattr(p, "threat_L_max_manual", False))
-        self.chk_lmax_auto.blockSignals(False)
+        self.chk_lmax_manual.blockSignals(True)
+        self.chk_lmax_manual.setChecked(bool(getattr(p, "threat_L_max_manual", False)))
+        self.chk_lmax_manual.blockSignals(False)
         self.chk_step_auto.blockSignals(True)
         self.chk_step_auto.setChecked(not getattr(p, "threat_cand_step_manual", False))
         self.chk_step_auto.blockSignals(False)
@@ -727,12 +764,12 @@ class InputDataWindow(QtWidgets.QDialog):
         ⚠️ Цвета НЕ из тёмной темы: это системный светлый диалог, а не карта. Красить
         текст в THEME['text'] (почти белый) значило бы писать белым по белому — так уже
         было с полем L_max."""
-        for chk, field in ((self.chk_lmax_auto, "threat_L_max"),
-                           (self.chk_step_auto, "threat_cand_step_km")):
+        # ⚠️ у запаса хода галочка ПЕРЕВЁРНУТА: «задать вручную» — значит поле ОТКРЫТО
+        for auto, field in ((not self.chk_lmax_manual.isChecked(), "threat_L_max"),
+                            (self.chk_step_auto.isChecked(), "threat_cand_step_km")):
             e = self._edits.get(field)
             if e is None:
                 continue
-            auto = chk.isChecked()
             e.setText("%g" % float(getattr(self._params, field, 0.0)))
             e.setReadOnly(auto)
             e.setStyleSheet("color:#6b7785; background:#f0f0f0;" if auto else "")
@@ -817,7 +854,7 @@ class InputDataWindow(QtWidgets.QDialog):
         vals["threat_spread_types"] = self.chk_spread.isChecked()
         if vals["threat_k_same"]:                  # общая кратность — одно число на всех
             vals["threat_k2"] = vals["threat_k3"] = vals["threat_k"]
-        lmax_auto = self.chk_lmax_auto.isChecked()
+        lmax_auto = not self.chk_lmax_manual.isChecked()   # галочка «задать вручную»
         vals["threat_L_max_manual"] = not lmax_auto
         if lmax_auto:
             vals.pop("threat_L_max", None)         # его считает модель

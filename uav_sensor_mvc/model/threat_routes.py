@@ -232,6 +232,8 @@ def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km, slack_km=None)
     а не пересечение: БПЛА появится из какой-то одной точки, и пролететь он может над
     всем, что достижимо хотя бы из неё.
     Возвращает (mask_возможных_ячеек, min_длина_вход→цель)."""
+    # ⚠️ `L_max` — число ИЛИ список ПО ТОЧКАМ ВХОДА (план 12, 12.4): у дальней от старта
+    # БПЛА точки запаса меньше, и её область залёта честно у́же; общий предел завышал бы её
     entries = _as_entry_list(entry_km)
     starts = [_cell_of(grid, e) for e in entries]
     goal = _cell_of(grid, target_km)
@@ -240,13 +242,22 @@ def flight_envelope(grid, entry_km, target_km, L_max, max_gap_km, slack_km=None)
     gt = _dijkstra_dist(pas, goal, grid.h)
     env = np.zeros(gt.shape, bool)
     dmin = float("inf")
-    for s in starts:
+    for i, s in enumerate(starts):
         ge = _dijkstra_dist(pas, s, grid.h)
         total = ge + gt
-        env |= np.isfinite(total) & (total <= L_max)
+        env |= np.isfinite(total) & (total <= entry_L_max(L_max, i))
         if np.isfinite(ge[goal]):
             dmin = min(dmin, float(ge[goal]))
     return env, dmin
+
+
+def entry_L_max(L_max, i):
+    """Запас хода этой точки входа, км. Вход: число или список по точкам, номер точки.
+    Отдаёт: число. Список — свой запас у каждого входа (план 12, 12.4)."""
+    if np.isscalar(L_max):                          # один предел на всех — как было
+        return float(L_max)
+    arr = np.asarray(L_max, float)                  # запасы по точкам входа, км
+    return float(arr[i if 0 <= i < len(arr) else 0])
 
 
 def count_possible_routes(env, gt, entry_cell, goal_cell):
@@ -1155,13 +1166,18 @@ def _orbit_pool(grid, pmask, gt_geo, mul, B, D):
     if (len(frac) < 2 or ndir < 4 or D <= 0.0
             or not any(p[1] + p[2] > 0 for p in mix.values())):   # облёт выключен
         return {}                                      # — поясов не строим
-    # ⚠️ ПОЯСА В ДОЛЯХ, А НЕ В КМ (заказчик 16.09.2026): кольца 10/18/28 км в районе 200 км
-    # жались бы к цели. Граница пояса = доля × D; ближний пояс не заходит в круг обхода цели —
-    # туда шаг и так запрещён, точка там была бы недостижима.
-    bounds = [f * D for f in frac]                     # границы поясов, км
     r_min = FINAL_BYPASS_KM + 2.0 * grid.h             # ближе к цели точку не ставим, км
     x0, y0 = grid.ox, grid.oy
     x1, y1 = grid.ox + grid.nx * grid.h, grid.oy + grid.ny * grid.h   # рамка сетки, км
+    # ⚠️ ПОЯСА ОТ РАЗМЕРА РАЙОНА (заказчик 21.09.2026): раньше граница считалась как доля от
+    # D — среднего расстояния вход→цель, — и у цели близко к краю D мало, пояса схлопывались,
+    # обход переставал охватывать карту. Ширина и высота района от места цели не зависят.
+    af = tuple(float(f) for f in getattr(_cfg, "THREAT_ORBIT_RADII_AREA_FRAC", ()))
+    if len(af) >= 2:                                   # доли от района заданы
+        size = (x1 - x0) + (y1 - y0)                   # ширина + высота района, км
+        bounds = [f * size for f in af]                # границы поясов, км
+    else:                                              # пустой кортеж — прежний счёт от D
+        bounds = [f * D for f in frac]                 # границы поясов, км
     step = 2.0 * np.pi / ndir                          # шаг азимута, радианы
     sectors = []
     rows = 2                                           # рядов в поясе: 0 — ближний, 1 — дальний
@@ -1499,6 +1515,9 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
         picked = pick
     if not ctx["reachable"]:
         return None
+    # ЗАПАС ХОДА — СВОЙ У ЭТОЙ ТОЧКИ (план 12, 12.4), если пришёл список: до дальней точки
+    # входа БПЛА потратил больше, и в район он приходит с меньшим остатком
+    L_max = entry_L_max(L_max, picked if picked is not None else 0)
     wmode = ("max", "medium", "min")[rng.integers(3)] if mode == "mix" else mode
     if spend == "mix":                                  # веер всех повадок (для «возможных путей»)
         spend = ("late", "early", "even")[rng.integers(3)]

@@ -127,6 +127,13 @@ FIX_TABLE = re.compile(r"\|\s*(?:№\s*\|\s*)?Проблема\s*\|.*\|\s*(?:Р�
 # «не применено» или «задел» там описывают КОД, а не состояние работ. Без этого
 # исключения число «тем с расхождениями» выросло с 3 до 5 — все новые ложные.
 GENERATED_DIRS = {"карта_кода"}
+# ⚠️ ФАЙЛЫ, КОТОРЫЕ НЕ ОПИСЫВАЮТ МЕХАНИЗМЫ, — из сверки вон (21.09.2026):
+#   `РАБОТА.md` — каталог работы, чек-лист: «что сделано» и «не сделано» там по определению,
+#     и каждая закрытая задача плодила ложную тему (план 12 дал тему «область залёта»);
+#   `ЖУРНАЛ_ПАПКИ.md` — генерируются из сообщений коммитов (`check_dates --write-logs`),
+#     и слово «сделано» из заголовка коммита попадает в них как «утверждение о готовности».
+# Замер: тем с расхождениями 4 -> 1, и оставшаяся давняя.
+SKIP_FILES = {"РАБОТА.md", "ЖУРНАЛ_ПАПКИ.md", "0.ЖУРНАЛ_ПАПКИ.md"}
 
 
 def docs(include_history):
@@ -135,7 +142,8 @@ def docs(include_history):
         dirs[:] = [d for d in dirs if d not in GENERATED_DIRS]
         if not include_history:
             dirs[:] = [d for d in dirs if d not in HIST_DIRS]
-        out += [os.path.join(root, f) for f in files if f.endswith(".md")]
+        out += [os.path.join(root, f) for f in files
+                if f.endswith(".md") and f not in SKIP_FILES]
     out.append(os.path.join(ROOT, "CLAUDE.md"))
     return [p for p in out if os.path.exists(p)]
 

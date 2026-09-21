@@ -2176,6 +2176,17 @@ class ThreatModel:
         self.data_path = None          # явный источник цифровых карт (.npz/.osm.pbf)
         self.enabled_layers = None     # набор включённых слоёв (None = все)
         self.target_km = None          # цель, заданная кликом («указать цель»)
+        # УСЛОВИЯ МОДЕЛИРОВАНИЯ (план 12, 12.2): чем летим и откуда стартовали.
+        # ⚠️ ХРАНЯТСЯ, НО В РАСЧЁТ НЕ ИДУТ — их применит задача 12.4 (свой запас хода у
+        # каждой точки входа), там же пересъёмка эталона. До неё расчёт прежний.
+        self.uav_start_km = None       # старт БПЛА, км от якоря; None — не задан
+        self.uav_type = None           # выбранный `uav_types.UavType`; None — не выбран
+        # СВОЙ ЗАПАС ХОДА У КАЖДОЙ ТОЧКИ ВХОДА (12.4) включается, когда задан старт: без
+        # него расход до района неизвестен. Правка поля запаса в панели выключает — тогда
+        # снова один общий предел, как просил заказчик («можно и просто задать запас хода»).
+        self.uav_lmax_per_entry = False
+        # запас, введённый человеком в таблице точек (12.5): {номер точки: км} поверх расчёта
+        self.entry_L_max_manual = {}
         # СЕКТОР ПОЯВЛЕНИЯ БПЛА: точка клика по краю карты задаёт ось «цель → клик»,
         # раствор ±THREAT_SECTOR_HALF_DEG. None — сектор не задан, вход один (демо-точка).
         self.sector_point_km = None
@@ -2301,6 +2312,7 @@ class ThreatModel:
         self._iter_ctx = None
         self.route_area = None
         self.target_km = None                       # цель задавалась в прежних км
+        self.uav_start_km = None                    # и старт БПЛА — тоже в прежних (12.2)
         self.sector_point_km = None
         self.sector_kind = None
         self._sector_pts = []
@@ -2365,6 +2377,7 @@ class ThreatModel:
         self._iter_ctx = None
         self.route_area = None
         self.target_km = None
+        self.uav_start_km = None                    # старт БПЛА — в прежних км (12.2)
         self.sector_point_km = None
         self.sector_kind = None
         self._sector_pts = []
@@ -2539,7 +2552,7 @@ class ThreatModel:
         # достижима ли цель: тот же критерий, что у самих маршрутов
         try:
             from .threat_routes import flight_envelope
-            area, min_len = flight_envelope(self.grid, entry, target, self.p.threat_L_max,
+            area, min_len = flight_envelope(self.grid, entry, target, self.route_L_max(),
                                             self._route_gap_km(), slack_km=self._route_slack_km())
             out["unreachable"] = not np.isfinite(min_len)
         except Exception:
@@ -2769,19 +2782,26 @@ class ThreatModel:
         entry, target = self._refresh_envelope()       # авто-L_max + огибающая
         ctx = self._ensure_ctx(entry, target)          # общий контекст с итерациями (кэш)
         rng = np.random.default_rng()
-        want = max(1, int(THREAT_ROUTE_COUNT))
-        wmode = (getattr(self.p, "threat_iter_mode", "mix")
-                 if THREAT_ROUTE_MODE_SRC == "panel" else "mix")
-        # 1) НАБИРАЕМ пул кандидатов (больше, чем нужно): приоритет по весу — из панели,
-        #    разброс и профиль расхода — веером
+        want = self.routes_want(max(1, int(THREAT_ROUTE_COUNT)))   # больше точек — шире выборка
+        # ⚠️ ВСЕ ЧЕТЫРЕ РЕЖИМА — ИЗ ПАНЕЛИ (жалоба заказчика 21.09.2026: «меняю режим
+        # захода, и такое чувство, что он не меняется»). Раньше из панели брался только
+        # ВЕС, а разброс, расход и заход стояли жёстким "mix" — выбор человека на синие
+        # линии не влиял. ⚠️ Прежнее поведение никуда не делось: «смесь» в самой панели и
+        # есть тот же веер, только теперь это ВЫБОР, а не зашитая константа.
+        panel = THREAT_ROUTE_MODE_SRC == "panel"      # брать режимы из панели
+        wmode = getattr(self.p, "threat_iter_mode", "mix") if panel else "mix"     # вес
+        spread = getattr(self.p, "threat_iter_spread", "mix") if panel else "mix"  # разброс
+        spend = self._spend() if panel else "mix"                                  # расход
+        approach = self._approach() if panel else "mix"                            # заход
+        # 1) НАБИРАЕМ пул кандидатов (больше, чем нужно)
         pool, seen, tries = [], set(), 0
         cap = int(want * THREAT_ROUTE_POOL_MULT)
         since_new = 0
         while len(pool) < cap and tries < cap * 3 and since_new < 400:
             tries += 1
-            r = sample_one_route(ctx, wmode, self.p.threat_L_max,
+            r = sample_one_route(ctx, wmode, self.route_L_max(),
                                  self.p.threat_turn_interval_km, rng,
-                                 spread="mix", spend="mix", approach="mix")
+                                 spread=spread, spend=spend, approach=approach)
             if r is None:
                 since_new += 1
                 continue
@@ -2828,16 +2848,31 @@ class ThreatModel:
             val = (1.0 + float(spread_w) * np.clip(w / max(ref, 1e-6), 0.0, 1.0)).ravel()
         else:
             val = np.ones(ncell, float)
+        # ⭐ КВОТА НА КАЖДУЮ ТОЧКУ СТАРТА (правило заказчика 21.09.2026): выборка делится
+        # ПОРОВНУ между точками входа. Раньше жадный отбор брал лучшие по покрытию, и с
+        # бедного направления в синие линии не попадало почти ничего (замер: 2 маршрута
+        # из 250 при 35 точках). Точка маршрута определяется по ближайшему входу к началу.
+        ents = self.entry_points_km()                  # точки входа, км
+        owner = np.zeros(len(pool), int)               # номер точки старта у каждого кандидата
+        if len(ents) > 1:
+            ex = np.asarray([e[0] for e in ents], float)   # X точек входа, км
+            ey = np.asarray([e[1] for e in ents], float)   # Y точек входа, км
+            for i, r in enumerate(pool):
+                owner[i] = int(np.argmin(np.hypot(r[0, 0] - ex, r[0, 1] - ey)))
+        quota = np.full(max(len(ents), 1),             # сколько взять с каждой точки, шт.
+                        int(np.ceil(want / max(len(ents), 1))), int)
         uncovered = np.ones(ncell, bool)
         chosen = []
         alive = np.ones(len(pool), bool)
         for _ in range(want):
             gain = (M & uncovered) @ val               # НОВАЯ ценность у каждого кандидата
             gain[~alive] = -1.0
+            gain[quota[owner] <= 0] = -1.0             # точка выбрала свою долю — пропускаем
             best = int(np.argmax(gain))
             if gain[best] <= 0.0:                      # новой ценности нет — веер исчерпан
                 break
             alive[best] = False
+            quota[owner[best]] -= 1
             uncovered &= ~M[best]
             chosen.append(pool[best])
         if len(chosen) < want:                         # добить остатком (покрытие уже насыщено)
@@ -2859,8 +2894,8 @@ class ThreatModel:
                                      ctx["start"], ctx["goal"])
 
     def _spend(self):
-        """Профиль расхода запаса хода — повадка БПЛА для ИТЕРАЦИЙ (панель справа).
-        На «возможные маршруты» не влияет: там перебирается веер всех профилей."""
+        """Профиль расхода запаса хода из панели: late/early/even/mix.
+        ⚠️ С 21.09.2026 действует и на «возможные маршруты» — раньше там был жёсткий веер."""
         return getattr(self.p, "threat_spend", "late")
 
     def _approach(self):
@@ -2896,7 +2931,7 @@ class ThreatModel:
         route = None
         for _ in range(12):                             # попытки на итерацию (стохастика)
             route = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
-                                     self.p.threat_L_max, self.p.threat_turn_interval_km,
+                                     self.route_L_max(), self.p.threat_turn_interval_km,
                                      self._iter_rng, spread=self.p.threat_iter_spread,
                                      spend=self._spend(), approach=self._approach())
             if route is not None:
@@ -2921,14 +2956,16 @@ class ThreatModel:
         from .threat_routes import sample_one_route
         if not self.iter_reset():
             return []
-        T = max(1, int(self.p.threat_iter_routes))
+        # ⚠️ ЗАКАЗАННОЕ ЧИСЛО РАСТЁТ С ЧИСЛОМ ТОЧЕК ВХОДА (заказчик 21.09.2026): со всех
+        # сторон на бедное направление приходилось 2 маршрута из 250
+        T = self.routes_want(max(1, int(self.p.threat_iter_routes)))
         cap = int(T * 8)                               # было min(T*6, 800) — см. шапку
         stale = max(350, T)
         seen, tries, since_new = set(), 0, 0
         while len(self.iter_routes) < T and tries < cap and since_new < stale:
             tries += 1
             r = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
-                                 self.p.threat_L_max, self.p.threat_turn_interval_km,
+                                 self.route_L_max(), self.p.threat_turn_interval_km,
                                  self._iter_rng, spread=self.p.threat_iter_spread,
                                  spend=self._spend(), approach=self._approach())
             if r is None:
@@ -2957,10 +2994,10 @@ class ThreatModel:
         entry, target = self.entries_target_km()               # при секторе — все пять точек
         self.sync_auto_L_max()                                 # предварительно |AB|+25 %
         _, self.route_min_len = flight_envelope(               # кратчайший путь (от L_max не зависит)
-            g, entry, target, self.p.threat_L_max, gap, slack_km=slack)
+            g, entry, target, self.route_L_max(), gap, slack_km=slack)
         self.sync_auto_L_max(self.route_min_len)               # поднять до «кратчайший+20 %», если авто
         self.route_area, self.route_min_len = flight_envelope(
-            g, entry, target, self.p.threat_L_max, gap, slack_km=slack)
+            g, entry, target, self.route_L_max(), gap, slack_km=slack)
         return entry, target
 
     def sync_auto_L_max(self, min_corridor_km=None):
@@ -2968,6 +3005,12 @@ class ThreatModel:
         кратчайшего КОРИДОРНОГО пути с запасом THREAT_LMAX_CORRIDOR_FRAC (по прямой цель может
         быть близко, а по коридорам — вдвое дальше; без этого маршрут не уместился бы вовсе).
         Возвращает L_max, км."""
+        # ⚠️ При СВОЁМ запасе у каждой точки (12.4) в панель идёт СРЕДНЕЕ — это витрина,
+        # а считает каждый маршрут по своей точке (`route_L_max`)
+        per = self.entry_L_max_km()                        # свои запасы точек или None
+        if per:                                            # условия моделирования заданы
+            self.p.threat_L_max = round(sum(per) / len(per), 1)
+            return self.p.threat_L_max
         if not getattr(self.p, "threat_L_max_manual", False):
             target = self.target_only_km()
             # при секторе точек входа пять: запас хода считаем по САМОЙ ДАЛЬНЕЙ, иначе
@@ -4135,6 +4178,82 @@ class ThreatModel:
         if self.grid is not None:
             self.build()      # свободная зона привязана к цели -> карту пересобрать
 
+    # ---- условия моделирования: чем летим и откуда (план 12, задача 12.2) ----
+    def set_uav_start(self, x_km, y_km):
+        """Точка старта БПЛА кликом по карте. Вход: км от якоря. Отдаёт: ничего.
+        Включает свой запас хода у каждой точки входа (12.4)."""
+        self.uav_start_km = (float(x_km), float(y_km))
+        self.uav_lmax_per_entry = True               # старт есть — расход известен
+        self.sync_auto_L_max()                       # в панель уйдёт среднее по точкам
+
+    def clear_uav_start(self):
+        """Убрать точку старта БПЛА — и вернуться к одному общему запасу хода."""
+        self.uav_start_km = None
+        self.uav_lmax_per_entry = False
+
+    def set_uav_type(self, uav):
+        """Выбрать тип БПЛА. Вход: `uav_types.UavType` или None. Отдаёт: ничего.
+        ⚠️ Запас типа идёт в расчёт только вместе с точкой старта (см. `entry_L_max_km`)."""
+        self.uav_type = uav
+        if self.uav_lmax_per_entry:                  # запас по точкам уже действует
+            self.sync_auto_L_max()                   # — среднее сменилось вместе с типом
+
+    def entry_L_max_km(self):
+        """Запас хода у КАЖДОЙ точки входа, км: запас типа минус прямая от старта БПЛА.
+        Отдаёт: список по точкам, км; None — действует один общий `threat_L_max`."""
+        if not self.uav_lmax_per_entry or self.uav_type is None:
+            return None                              # условия не заданы — как раньше
+        dists = self.uav_start_dists_km()            # прямая старт → точка входа, км
+        if not dists:                                # старта нет
+            return None
+        full = float(self.uav_type.L_max_km)         # полный запас аппарата, км
+        # ручной запас из таблицы точек (12.5) бьёт расчётный: человек знает лучше
+        return [float(self.entry_L_max_manual.get(i, max(0.0, full - d)))
+                for i, d in enumerate(dists)]
+
+    def set_entry_L_max(self, i, km):
+        """Задать запас хода одной точке входа руками (таблица точек, 12.5).
+        Вход: номер точки с нуля, км (None — вернуть расчётный). Отдаёт: True — принято."""
+        if not 0 <= int(i) < len(self.entry_points_km()):   # номера такой точки нет
+            return False
+        if km is None:                               # «вернуть как считалось»
+            self.entry_L_max_manual.pop(int(i), None)
+        else:
+            self.entry_L_max_manual[int(i)] = max(0.0, float(km))
+        self.sync_auto_L_max()                       # среднее в панели изменилось
+        return True
+
+    def entry_table_rows(self):
+        """Строки таблицы точек входа (12.5): номер, координаты, азимут от цели,
+        расстояние от старта БПЛА и запас хода. Отдаёт: список словарей."""
+        per = self.entry_L_max_km() or []            # запасы по точкам, км
+        dists = self.uav_start_dists_km()            # расстояния от старта, км
+        tx, ty = self.target_only_km()
+        rows = []
+        for i, (x, y) in enumerate(self.entry_points_km()):
+            lon, lat = km_to_lonlat(x, y, self.lon0, self.lat0)
+            rows.append(dict(
+                n=i + 1, lon=float(lon), lat=float(lat),
+                az=float(np.degrees(np.arctan2(x - tx, y - ty)) % 360.0),
+                dist=float(dists[i]) if i < len(dists) else None,
+                L_max=float(per[i]) if i < len(per) else float(self.p.threat_L_max),
+                manual=bool(i in self.entry_L_max_manual)))
+        return rows
+
+    def route_L_max(self):
+        """Что передавать в розыгрыш и область залёта: список по точкам входа либо одно
+        число, как было. Отдаёт: список или float."""
+        per = self.entry_L_max_km()                  # запасы по точкам или None
+        return per if per is not None else self.p.threat_L_max
+
+    def uav_start_dists_km(self):
+        """Расстояния от старта БПЛА по прямой до каждой точки входа, км.
+        Отдаёт: список; старт не задан — пустой. Это заготовка запаса хода (12.4)."""
+        if self.uav_start_km is None:                  # старт не задан
+            return []                                  # — считать не от чего
+        sx, sy = self.uav_start_km
+        return [float(np.hypot(px - sx, py - sy)) for px, py in self.entry_points_km()]
+
     def entry_km(self):
         """ПРЕДСТАВИТЕЛЬ точки входа — для показателей и авто-запаса хода. При заданном
         секторе это середина отобранных точек, иначе демо-точка участка."""
@@ -4244,6 +4363,9 @@ class ThreatModel:
         """Собрать ИТОГОВЫЕ точки входа: сначала отобранные сектором, затем заданные человеком."""
         self.entry_points = ([(float(x), float(y)) for x, y in self._sector_pts]
                              + [(float(x), float(y)) for x, y in self.manual_entries])
+        # ⚠️ РУЧНЫЕ ЗАПАСЫ ПРИВЯЗАНЫ К НОМЕРУ ТОЧКИ, а список только что пересобран: точки
+        # другие, и старые правки относились бы не к тем (план 12, 12.5)
+        self.entry_L_max_manual = {}
 
     def _entry_changed(self):
         """После правки точек человеком: собрать список, сбросить зависящее от входа и
@@ -4460,7 +4582,7 @@ class ThreatModel:
         # УГЛОВОЙ разнос: доля от идеального шага (раствор сектора / число точек)
         ideal = span / want
         need_ang = ideal * float(THREAT_SECTOR_MIN_ANGLE_FRAC)
-        sep = float(THREAT_SECTOR_MIN_SEP_KM)
+        sep = self._entry_min_sep_km()              # разнос по расстоянию, км
 
         def take(min_sep, min_ang):
             out, outa = [], []
@@ -4486,6 +4608,38 @@ class ThreatModel:
         if len(picked) < want:
             picked = take(0.0, 0.0)
         return picked
+
+    def routes_want(self, base):
+        """Сколько маршрутов набирать с учётом числа точек входа. Вход: базовое число, шт.
+        Отдаёт: шт. Правило заказчика 21.09.2026: со всех сторон выборки 250 не хватает."""
+        import config as _cfg                        # читаем при вызове: опыты подменяют
+        n0 = float(getattr(_cfg, "THREAT_ROUTE_ENTRIES_BASE", 0) or 0)   # база, точек
+        lo, hi = getattr(_cfg, "THREAT_ROUTE_ENTRIES_K", (1.0, 1.0))
+        if n0 <= 0:                                  # правило выключено
+            return int(base)                         # — сколько заказано, столько и берём
+        # КОРЕНЬ, а не прямая пропорция: рост «небольшой» (заказчик 21.09.2026) — на 20
+        # точках 500 маршрутов вместо 1 000, а ровность даёт квота в `_spread_over_area`
+        k = float(np.sqrt(len(self.entry_points_km()) / n0))
+        return max(1, int(round(base * min(max(k, float(lo)), float(hi)))))
+
+    def _entry_min_sep_km(self):
+        """Минимальный разнос точек входа, км: доля от (ширина + высота) РАЙОНА.
+        Отдаёт: км, не меньше запасного абсолюта. Правило заказчика 21.09.2026."""
+        import config as _cfg                        # читаем при вызове: доля правится в окне
+        frac = float(getattr(_cfg, "THREAT_SECTOR_MIN_SEP_FRAC", 0.0))   # доля размера
+        if frac <= 0.0:                              # доля выключена
+            return float(THREAT_SECTOR_MIN_SEP_KM)   # — работает прежний абсолют
+        w, h = self.area_size_km()                   # ширина и высота района, км
+        return frac * (w + h)
+
+    def area_size_km(self):
+        """Размер РАЙОНА моделирования: (ширина, высота) в км. У круглого района — сторона
+        описанного квадрата, чтобы доли считались от того же, что у прямоугольного."""
+        if self.area_circle is not None:             # район задан кругом
+            r = float(self.area_circle[2])
+            return (2.0 * r, 2.0 * r)
+        x0, x1, y0, y1 = self.bbox_km
+        return (float(x1 - x0), float(y1 - y0))
 
     def _edge_band(self, gx, gy):
         """Ячейки у КРАЯ района, откуда может появиться БПЛА: полоса `THREAT_SECTOR_EDGE_KM` вдоль

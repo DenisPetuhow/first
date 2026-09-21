@@ -1304,13 +1304,254 @@ def main():
     check(not _TA or _TA in tiles_line, "папка участка видна в подписи")
     check("строка подложки" not in info, "подпись не разрослась лишним текстом")
 
+    print("\n15. ОКНО «ВИДЫ БПЛА»: СПРАВОЧНИК ТИПОВ (план 12, задача 12.3)")
+    # ⚠️ ДВЕ ПОДМЕНЫ, обе обязательны: модальное предупреждение без экрана ждало бы нажатия
+    # вечно, а запись ушла бы в настоящий справочник человека, а не во временный файл.
+    import tempfile as _tmp
+    from PyQt5 import QtWidgets as _QtW
+    from model import uav_types as _ut
+    from view_qt.uav_types_window import UavTypesDialog
+    _said, _warn0, _path0 = [], _QtW.QMessageBox.warning, _ut.path   # что вернуть в конце
+    _file = os.path.join(_tmp.mkdtemp(), _ut.FILE_NAME)              # временный справочник
+    _QtW.QMessageBox.warning = lambda *a, **k: _said.append(a[2] if len(a) > 2 else "")
+    _ut.path = lambda: _file
+    try:
+        n0 = len(_ut.defaults())                         # типов во встроенном списке, шт.
+        dlg = UavTypesDialog(None)
+        check(dlg.table.rowCount() == n0, "таблица открылась со справочником",
+              "строк %d" % dlg.table.rowCount())
+        kinds = {dlg.table.cellWidget(r, 1).currentText() for r in range(n0)}  # классы в таблице
+        check("мультиротор" in kinds and "самолёт" in kinds, "в умолчаниях оба класса",
+              ", ".join(sorted(kinds)))
+        dlg._add()
+        check(dlg.table.rowCount() == n0 + 1, "«Добавить» прибавляет строку")
+        check(not dlg._collect()[1], "новая строка проходит проверку",
+              "; ".join(dlg._collect()[1]))
+        dlg.table.item(0, 2).setText("18000")            # скорость заведомо неверная
+        check(any("скорость" in s for s in dlg._collect()[1]), "кривое число — жалоба",
+              "; ".join(dlg._collect()[1]) or "жалоб нет")
+        said0 = len(_said)                               # предупреждений до попытки записи
+        dlg._save()
+        check(len(_said) > said0, "с жалобой предупреждение показано")
+        check(not os.path.exists(_file), "...и справочник НЕ записан")
+        dlg.table.item(0, 2).setText("180")              # поправили — теперь должно пройти
+        dlg._save()
+        check(os.path.exists(_file), "после правки справочник записан")
+        check(len(_ut.load()) == n0 + 1, "прочитано столько же типов",
+              "%d против %d" % (len(_ut.load()), n0 + 1))
+        dlg.table.item(1, 0).setText(dlg.table.item(0, 0).text())   # два одинаковых названия
+        check(any("повторяется" in s for s in dlg._collect()[1]), "дубль названия — жалоба")
+        dlg._reset()
+        check(dlg.table.rowCount() == n0, "«Вернуть исходные» восстанавливает встроенный список")
+        plane, rotor = _ut.FixedWing("т", 180, 25), _ut.Multirotor("т", 60, 15)
+        check(plane.turn_radius_km() > 0 and rotor.turn_radius_km() == 0,
+              "разворот: у самолёта радиус есть, у мультиротора ноль",
+              "%.2f км против %.2f км" % (plane.turn_radius_km(), rotor.turn_radius_km()))
+    finally:                                             # подмены не должны пережить раздел
+        _QtW.QMessageBox.warning, _ut.path = _warn0, _path0
+
+    print("\n16. УСЛОВИЯ МОДЕЛИРОВАНИЯ: КНОПКА, ОКНО, ТОЧКА СТАРТА (план 12, задача 12.2)")
+    v._open_input_window()
+    iw = v._input_dlg                                    # окно «Исходные данные»
+    c.on_clear_sector()
+    v.refresh_conditions_button()
+    check(not iw.btn_conditions.isEnabled(), "без точек входа кнопка условий недоступна")
+    check("сектор" in iw.lbl_conditions.text(), "подпись говорит, чего не хватает",
+          iw.lbl_conditions.text())
+    # ⚠️ ЦЕЛЬ КЛИКОМ НЕ ТРЕБУЕТСЯ (жалоба заказчика 21.09.2026: «почему не нажимается,
+    # сектор задан»): цель есть всегда — из `область.txt` или как центр круглого района.
+    # Поэтому сектор задаётся БЕЗ `on_set_target`, и кнопка обязана ожить.
+    m.target_km = None                                   # цель кликом не ставили
+    c.on_sector_auto()
+    v.refresh_conditions_button()
+    check(iw.btn_conditions.isEnabled(), "сектор задан — кнопка ожила БЕЗ клика по цели",
+          iw.lbl_conditions.text())
+    c.on_set_target(cx, cy)                              # дальше работаем с явной целью
+
+    iw.btn_conditions.click()
+    sc = v._sim_dlg                                      # окно «Условия моделирования»
+    check(sc is not None and sc.isVisible(), "окно условий открывается")
+    check(sc.combo_type.count() >= 1 and m.uav_type is not None,
+          "список типов заполнен, тип выбран по умолчанию",
+          sc.combo_type.currentText())
+    check("км/ч" in sc.lbl_type.text() and "разворот" in sc.lbl_type.text(),
+          "показаны характеристики типа", sc.lbl_type.text()[:60])
+    sc.combo_type.setCurrentIndex(sc.combo_type.count() - 1)
+    check(m.uav_type is not None and m.uav_type.name == sc.combo_type.currentText(),
+          "выбор в списке дошёл до модели", m.uav_type.name if m.uav_type else "нет")
+
+    # ⚠️ ПРЯЧУТСЯ ВСЕ ОКНА, не только своё (правило заказчика 21.09.2026): карту не должно
+    # перекрывать ничто. Открываем второе окно и проверяем, что спряталось и оно.
+    v._open_sector_window()
+    sd16 = v._sector_dlg                                 # второе открытое окно
+    sc.show()
+    sc.btn_start.click()
+    check(v._uav_start_mode and not sc.isVisible(),
+          "«Задать точку старта» включает режим и прячет окно")
+    check(not sd16.isVisible(), "...и ВСЕ прочие окна тоже спрятаны")
+    check(not v.vb.menuEnabled(), "правая кнопка забрана под выход из режима")
+    sx, sy = cx + 120.0, cy + 80.0                       # точка заведомо за районом
+    v._on_scene_click(_Ev(sx, sy))
+    check(m.uav_start_km is not None and abs(m.uav_start_km[0] - sx) < 1e-6,
+          "клик поставил точку старта в модели", str(m.uav_start_km))
+    check(not v._uav_start_mode and sc.isVisible(), "режим снят, окно условий вернулось")
+    check(sd16.isVisible() and v.vb.menuEnabled(),
+          "...и остальные окна вернулись вместе с правой кнопкой")
+    # ПРАВАЯ КНОПКА — ВЫХОД БЕЗ ТОЧКИ: старая точка остаётся на месте
+    keep = m.uav_start_km                                # точка до отмены
+    sc.btn_start.click()
+    v._on_scene_click(_Ev(cx, cy, button=Qt.RightButton))
+    check(not v._uav_start_mode and m.uav_start_km == keep,
+          "правая кнопка выходит из режима, точку не меняя")
+    check(sc.isVisible() and sd16.isVisible(), "...и все окна вернулись")
+    sd16.close()
+    ux, _uy = v.uav_start_scatter.getData()
+    check(ux is not None and len(ux) == 1, "метка старта нарисована на карте")
+    check("Старт:" in sc.lbl_start.text() and "До точек входа" in sc.lbl_start.text(),
+          "подпись показывает координаты и расстояния до точек входа",
+          sc.lbl_start.text()[:70])
+
+    v._clear_uav_start()
+    ux2, _ = v.uav_start_scatter.getData()
+    check(m.uav_start_km is None and (ux2 is None or len(ux2) == 0),
+          "«Убрать точку старта» снимает и точку, и метку")
+    m.set_uav_start(sx, sy)
+    # ⚠️ ТОЧКА СТАРТА — В КМ ОТ ЯКОРЯ: смена области делает её бессмысленной, как и цель
+    m.set_area(THREAT_BBOX_LONLAT)
+    check(m.uav_start_km is None, "смена области сбрасывает точку старта")
+    check(m.uav_type is not None, "...а выбранный тип остаётся: он к местности не привязан")
+
+    print("\n16а. ПАНЕЛЬ МАРШРУТА: ЧЕКБОКС «ЗАДАТЬ ВРУЧНУЮ», АВТООБНОВЛЕНИЕ (заказчик 21.09)")
+    check("threat_speed_kmh" not in iw._edits and "threat_bank_deg" not in iw._edits,
+          "скорость и крен убраны из «Маршрут БПЛА» — они у типа БПЛА")
+    check(hasattr(iw, "chk_lmax_manual") and "вручную" in iw.chk_lmax_manual.text(),
+          "чекбокс называется «задать вручную»", iw.chk_lmax_manual.text())
+    e_lmax = iw._edits["threat_L_max"]                   # поле запаса хода
+    iw.chk_lmax_manual.setChecked(False)
+    check(e_lmax.isReadOnly(), "галочка снята — поле закрыто, считаем сами")
+    iw.chk_lmax_manual.setChecked(True)
+    check(not e_lmax.isReadOnly(), "галочка стоит — поле открыто для правки")
+    iw._apply()
+    check(m.p.threat_L_max_manual, "«вручную» дошло до модели")
+    iw.chk_lmax_manual.setChecked(False)
+    iw._apply()
+    check(not m.p.threat_L_max_manual, "...и снимается обратно")
+    # ⚠️ СРЕДНЕЕ ОБНОВЛЯЕТСЯ САМО, без «Применить» (правило заказчика 21.09.2026)
+    m.set_uav_type(_ut.defaults()[0])
+    c.on_set_uav_start(cx + 500.0, cy - 400.0)
+    per16 = m.entry_L_max_km()                           # запасы по точкам, км
+    check(per16 and abs(m.p.threat_L_max - sum(per16) / len(per16)) < 0.06,
+          "после клика по старту среднее в панели пересчитано само",
+          "%.1f км" % m.p.threat_L_max)
+    check(e_lmax.text() == "%g" % m.p.threat_L_max, "...и показано в поле окна", e_lmax.text())
+
+    print("\n17. ТАБЛИЦА ТОЧЕК ВХОДА: «ПОКАЗАТЬ ДАННЫЕ» (план 12, задача 12.5)")
+    # ⚠️ ТОЧЕК НУЖНО НЕСКОЛЬКО: на одной проверка «у соседней запас остался расчётным»
+    # вырождается. Круглый район радиусом 25 км из раздела 13 давал ровно одну точку,
+    # поэтому здесь возвращаем прямоугольный участок целиком.
+    m.set_area(THREAT_BBOX_LONLAT)
+    m.build()
+    m.p.threat_sector_entries = 5
+    c.on_sector_auto()
+    v._open_sector_window()
+    sd2 = v._sector_dlg                                  # окно «Сектор налёта»
+    check(sd2.btn_data.isVisible(), "кнопка «Показать данные» есть в окне сектора")
+    sd2.btn_data.click()
+    et = v._entries_dlg                                  # таблица точек входа
+    n_pts = len(m.entry_points_km())                     # точек входа, шт.
+    check(et is not None and et.isVisible() and et.table.rowCount() == n_pts,
+          "таблица открылась, строк по числу точек", "строк %d" % et.table.rowCount())
+    check("—" in et.table.item(0, 4).text(),
+          "без старта БПЛА расстояние показано прочерком", et.table.item(0, 4).text())
+    check("Точка старта не задана" in et.lbl_state.text(), "...и об этом сказано внизу")
+    m.set_uav_type(_ut.defaults()[0])
+    m.set_uav_start(cx + 400.0, cy - 300.0)
+    et.refresh()
+    check(et.table.item(0, 4).text() != "—", "со стартом появилось расстояние",
+          et.table.item(0, 4).text())
+    was0 = float(et.table.item(0, 5).text())             # запас первой точки до правки, км
+    et.table.item(0, 5).setText("123.5")                 # человек ввёл своё число
+    check(abs(m.entry_L_max_km()[0] - 123.5) < 1e-6, "ручной запас дошёл до модели",
+          "%.1f -> %.1f" % (was0, m.entry_L_max_km()[0]))
+    per17 = m.entry_L_max_km()                           # запасы всех точек, км
+    check(len(per17) < 2 or abs(per17[1] - 123.5) > 1.0,
+          "у соседней точки запас остался расчётным",
+          "точек %d" % len(per17))
+    check("вручную" in et.lbl_state.text(), "таблица отмечает, что запас задан вручную",
+          et.lbl_state.text()[-40:])
+    et._reset_all()
+    # ⚠️ допуск 0.05 км: `was0` прочитан из ячейки, а она показывает один знак после запятой
+    check(abs(m.entry_L_max_km()[0] - was0) < 0.05 and not m.entry_L_max_manual,
+          "«Вернуть расчётные» снимает правку",
+          "%.2f против %.1f" % (m.entry_L_max_km()[0], was0))
+    m.set_entry_L_max(0, 99.0)
+    m.set_sector_auto()                                  # точки переотобраны
+    check(not m.entry_L_max_manual, "переотбор точек чистит ручные запасы: номера уже не те")
+
+    print("\n18. ЧИСЛО СЕГМЕНТОВ В РАЗДЕЛЕ «ДАТЧИКИ» (план 12, задача 12.6)")
+    seg = iw._edits.get("L_seg")                          # поле числа сегментов
+    check(seg is not None, "поле сегментов есть в окне исходных данных")
+    iw.refresh(m.p)
+    check(seg.text() == str(int(m.p.L_seg)), "показано текущее значение", seg.text())
+    check(not seg.toolTip(), "подсказки НЕТ — прямое указание заказчика",
+          seg.toolTip()[:30])
+    seg.setText("20")
+    iw._apply()
+    check(m.p.L_seg == 20, "новое значение дошло до модели", str(m.p.L_seg))
+    # ⚠️ ПРЕДЕЛ 31 — маска накрытых сегментов лежит в 32-битном числе, по биту на сегмент
+    seg.setText("99")
+    iw._apply()
+    check(m.p.L_seg == 31, "выше предела зажимается до 31", str(m.p.L_seg))
+    seg.setText("0")
+    iw._apply()
+    check(m.p.L_seg == 1, "ниже единицы зажимается до 1", str(m.p.L_seg))
+    seg.setText("10")
+    iw._apply()
+    check(m.p.L_seg == 10, "умолчание возвращается")
+
+    print("\n19. ШИРОКАЯ КАРТА: ПОКАЗ ШИРЕ ОБЛАСТИ РАСЧЁТА (план 12, задача 12.1)")
+    # ⚠️ Своё представление, а не общее `v`: рамка показа задаётся при создании, и менять
+    # её у работающего вида нельзя — предел уже построен.
+    area_km = bbox_lonlat_to_km(THREAT_BBOX_LONLAT, m.lon0, m.lat0)   # область расчёта, км
+    wide_km = (area_km[0] - 150.0, area_km[1] + 150.0,        # показ шире на 150 км
+               area_km[2] - 150.0, area_km[3] + 150.0)
+    vw = ThreatMapView(m.bbox_km, m.lon0, m.lat0, Params(),      # своя карта — шире области
+                       area_max_km=area_km, view_max_km=wide_km)
+    vw.resize(1200, 800)
+    vw.show()
+    app.processEvents()
+    check(vw.view_max_km == wide_km and vw.area_max_km == tuple(area_km),
+          "рамка показа и рамка расчёта живут раздельно")
+    lim = vw.vb.state["limits"]["xLimits"]                    # предел перемещения по X, км
+    check(lim[0] <= wide_km[0] + 1.0 and lim[1] >= wide_km[1] - 1.0,
+          "предел вида накрывает широкую карту",
+          "предел %.0f…%.0f при карте %.0f…%.0f" % (lim[0], lim[1], wide_km[0], wide_km[1]))
+    check(lim[0] < area_km[0] - 100.0,
+          "...и уходит заметно дальше области расчёта",
+          "%.0f против %.0f" % (lim[0], area_km[0]))
+    vw.frame_bbox(whole_area=True)
+    app.processEvents()
+    x0v, x1v = vw.vb.viewRange()[0]                           # что показано после «Весь участок»
+    # ⚠️ Вид ШИРЕ самой области (302 → 453 км): масштаб привязан к уровню тайлов, иначе
+    # подложка мылит (журнал п. 280). Сравниваем с КАРТОЙ, а не с областью впритык.
+    check(x1v - x0v < (wide_km[1] - wide_km[0]) * 0.85,
+          "«Весь участок» вписывает ОБЛАСТЬ, а не всю карту",
+          "показано %.0f км при карте %.0f км и области %.0f км"
+          % (x1v - x0v, wide_km[1] - wide_km[0], area_km[1] - area_km[0]))
+    xa0, xa1 = area_km[0], area_km[1]
+    check(x0v <= xa0 + 1.0 and x1v >= xa1 - 1.0, "...и область в него помещается целиком",
+          "вид %.0f…%.0f, область %.0f…%.0f" % (x0v, x1v, xa0, xa1))
+    vw.close()
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
         return 1
     print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои, окно исходных данных, история "
          "полётов, анализ размещения, линейка «Расстояние», анализ моделирования, "
-         "полнота слоёв, район радиусом, окно сектора и точки старта — в норме.")
+         "полнота слоёв, район радиусом, окно сектора, точки старта, справочник "
+         "типов БПЛА, условия моделирования, таблица точек входа и широкая карта — "
+         "в норме.")
     return 0
 
 
