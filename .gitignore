@@ -25,3 +25,8 @@ offline_packages/
 *.7z
 *.zip
 uav_sensor_mvc.rar_*
+
+# Картинки к Word-документу: ПРОИЗВОДНЫЕ, собираются одной командой
+# `python docs/make_pictures.py` (780 КБ на четыре файла). Сам .docx в git остаётся —
+# он конечный продукт для заказчика.
+docs/картинки/
