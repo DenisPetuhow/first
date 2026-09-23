@@ -32,6 +32,8 @@ from concurrent.futures import ProcessPoolExecutor
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+if hasattr(sys.stdout, "reconfigure"):   # вывод в файл идёт в cp1251, и знак «×» ронял прогон
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
 

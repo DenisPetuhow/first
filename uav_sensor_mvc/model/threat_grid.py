@@ -66,7 +66,8 @@ from config import (THREAT_BBOX_LONLAT, THREAT_WORK_LONLAT, THREAT_CELL_M, THREA
                     THREAT_SECTOR_WIN_ACROSS, THREAT_SECTOR_MIN_SEP_KM,
                     THREAT_SECTOR_MIN_ANGLE_FRAC, THREAT_LAYER_MARGIN_KM,
                     THREAT_COMPASS_STEP_DEG, THREAT_COMPASS_APPROACH_KM,
-                    THREAT_SECTOR_AUTO_STEP_DEG)
+                    THREAT_SECTOR_AUTO_STEP_DEG, THREAT_TARGETS_MAX)
+from .targets import TargetSet, TargetBag, route_target_index   # объекты защиты (план 13)
 # кольцо и угловой разнос БОЛЬШИХ датчиков — поля Params (правятся в окне «Датчики»),
 # поэтому берутся оттуда; здесь только умолчания на случай старого Params
 from config import Params as _P
@@ -2175,7 +2176,11 @@ class ThreatModel:
         self._dem_display = None       # высоты в родном разрешении — только для показа
         self.data_path = None          # явный источник цифровых карт (.npz/.osm.pbf)
         self.enabled_layers = None     # набор включённых слоёв (None = все)
-        self.target_km = None          # цель, заданная кликом («указать цель»)
+        # ОБЪЕКТЫ ЗАЩИТЫ (план 13, 13.12): целей может быть несколько. Пусто — действует
+        # прежняя цель по умолчанию (центр круга или демо-метка участка, `target_only_km`).
+        # ⚠️ `target_km` оставлен СВОЙСТВОМ над этим списком: его читают и пишут контроллер
+        # и проверки, и «одна цель» обязана вести себя как до плана 13.
+        self.targets = TargetSet(THREAT_TARGETS_MAX)
         # УСЛОВИЯ МОДЕЛИРОВАНИЯ (план 12, 12.2): чем летим и откуда стартовали.
         # ⚠️ ХРАНЯТСЯ, НО В РАСЧЁТ НЕ ИДУТ — их применит задача 12.4 (свой запас хода у
         # каждой точки входа), там же пересъёмка эталона. До неё расчёт прежний.
@@ -2220,6 +2225,10 @@ class ThreatModel:
         self.sensor_source = None      # чем объяснена последняя расстановка: iter/loaded/zone/weight/manual
         self._iter_ctx = None          # контекст выборки (проходимость/поле расстояний/вес)
         self._ctx_built_key = None     # при каком (разрыв, цель) собран контекст — см. _ensure_ctx
+        # КОНТЕКСТЫ ПО ЦЕЛЯМ (план 13, 13.14): поля Дейкстры считаются ОТ цели, и у каждой
+        # свой. `_iter_ctx` — контекст ПЕРВОЙ цели: его читают показатели и проверки.
+        self._ctxs = []                # контексты по целям, в порядке `target_points_km()`
+        self._iter_bag = None          # мешок розыгрыша цели для итераций (TargetBag)
         self._iter_rng = None          # ГПСЧ выборки
         self.route_area = None         # маска ВСЕХ возможных мест пролёта (в пределах L_max)
         self.route_min_len = float("inf")   # мин. длина пути вход->цель, км
@@ -2477,7 +2486,14 @@ class ThreatModel:
         """Все ли T итераций прошли — условие, при котором осмысленно выгружать историю
         полётов (иначе выборка неполная и разная от запуска к запуску, план 8 §8.6.1)."""
         T = int(getattr(self.p, "threat_iter_routes", 0))
-        return T > 0 and len(self.iter_routes) >= T
+        return T > 0 and len(self.iter_routes) >= self.iter_target_count()
+
+    def iter_target_count(self):
+        """Сколько маршрутов наберёт моделирование — ровно число из панели, шт.
+        Одно на пакет, «Пуск», выгрузку и заголовок (правило 2.1в)."""
+        # ⚠️ БЕЗ `routes_want`: √(точек / 5) — только синим линиям ДО итераций (заказчик
+        # 23.09.2026: «при итерациях — то количество, которое написано в интерфейсе»)
+        return max(1, int(getattr(self.p, "threat_iter_routes", 1)))
 
     def cells_lonlat(self):
         """ЦЕНТРЫ ячеек сетки в градусах, (M,2) — вместе с `flat_cells` дают
@@ -2544,17 +2560,20 @@ class ThreatModel:
         if m is None:
             return out
         out["area_km2"] = float(m.sum()) * self.grid.h * self.grid.h
-        entry, target = self.entry_target_km()
-        for key, pt in (("blocked_entry", entry), ("blocked_target", target)):
+        entry, _ = self.entry_target_km()
+        tpts = self.target_points_km()               # все цели (план 13), км
+        for key, pt in [("blocked_entry", entry)] + [("blocked_target", t) for t in tpts]:
             ix = int(np.clip((pt[0] - self.grid.ox) / self.grid.h, 0, self.grid.nx - 1))
             iy = int(np.clip((pt[1] - self.grid.oy) / self.grid.h, 0, self.grid.ny - 1))
-            out[key] = bool(m[iy, ix])
-        # достижима ли цель: тот же критерий, что у самих маршрутов
+            out[key] = out[key] or bool(m[iy, ix])  # хоть одна цель в зоне — уже беда
+        # достижима ли КАЖДАЯ цель: тот же критерий, что у самих маршрутов
         try:
             from .threat_routes import flight_envelope
-            area, min_len = flight_envelope(self.grid, entry, target, self.route_L_max(),
-                                            self._route_gap_km(), slack_km=self._route_slack_km())
-            out["unreachable"] = not np.isfinite(min_len)
+            for t in tpts:
+                area, min_len = flight_envelope(self.grid, entry, t, self.route_L_max(),
+                                                self._route_gap_km(),
+                                                slack_km=self._route_slack_km())
+                out["unreachable"] = out["unreachable"] or not np.isfinite(min_len)
         except Exception:
             pass
         return out
@@ -2674,15 +2693,15 @@ class ThreatModel:
             self._layers_cache = dict(self.layers)
             self._source_cache = self.source
             self._dem_cache = self.dem
-        target = self.target_only_km()
         # вылет — только круг вокруг точки; цель — ещё и её населённый пункт целиком
         # плюс буфер (иначе подлёт к цели в центре города остаётся односторонним).
         # При заданном секторе точек вылета пять — свободна окрестность КАЖДОЙ, иначе
         # часть из них оказалась бы в запрещённой зоне и маршрут оттуда не начался бы.
+        # ⚠️ ТО ЖЕ С ЦЕЛЯМИ (план 13): свободна окрестность каждой — к любой летят маршруты
         free_points = [(e[0], e[1], THREAT_ENTRY_FREE_KM, None)
                        for e in self.entry_points_km()]
-        free_points.append((target[0], target[1], THREAT_TARGET_FREE_KM,
-                            THREAT_TARGET_FREE_KM))
+        free_points += [(t[0], t[1], THREAT_TARGET_FREE_KM, THREAT_TARGET_FREE_KM)
+                        for t in self.target_points_km()]
         # высоты грузим всегда (их можно показать на карте), но в ВЕС отдаём только по
         # кнопке «Добавить рельеф» — иначе карта менялась бы молча, от факта наличия файла
         self.grid = build_threat_grid(self.layers, self.bbox_km,
@@ -2728,27 +2747,51 @@ class ThreatModel:
 
     def _ctx_key(self):
         """От чего зависит кэш контекста выборки: разрыв и уход от ориентира (оба меняют
-        проходимость), цель и ТОЧКИ ВХОДА (сектор). Запас хода L_max сюда НЕ входит —
+        проходимость), ЦЕЛИ и ТОЧКИ ВХОДА (сектор). Запас хода L_max сюда НЕ входит —
         контекст от него не зависит (см. build_iter_context)."""
-        return (self._route_gap_km(), self._route_slack_km(), self.target_km,
-                tuple(self.entry_points))
+        return (self._route_gap_km(), self._route_slack_km(),
+                tuple(self.targets.points_km()), tuple(self.entry_points))
 
-    def _ensure_ctx(self, entry, target):
-        """Контекст выборки (проходимость, поля расстояний, VIA). Пересобирается, только
-        если сменился разрыв, уход от ориентира или цель — иначе переиспользуется
-        (веер VIA-полей дорогой)."""
+    def _ensure_ctx(self, entry):
+        """Контексты выборки — ПО ОДНОМУ НА ЦЕЛЬ (поля Дейкстры считаются от цели). Вход:
+        точки входа. Отдаёт: контекст первой цели. Пересборка — только при смене ключа."""
         from .threat_routes import build_iter_context
         key = self._ctx_key()
         if self._iter_ctx is None or self._ctx_built_key != key:
-            self._iter_ctx = build_iter_context(self.grid, entry, target,
-                                                self._route_gap_km(),
-                                                slack_km=self._route_slack_km())
+            # ⚠️ ИСТОРИЯ СТАРТОВ ОБЩАЯ НА ВСЕ ЦЕЛИ: пауза повтора точки входа живёт в
+            # контексте, и у каждой цели своя видела бы лишь каждый второй-третий маршрут
+            shared = dict(_recent_entries=[], _recent_ok_entries=[])   # списки — одни на всех
+            self._ctxs = []
+            for t in self.target_points_km():
+                c = build_iter_context(self.grid, entry, t, self._route_gap_km(),
+                                       slack_km=self._route_slack_km())
+                c.update(shared)
+                self._ctxs.append(c)
+            self._iter_ctx = self._ctxs[0]
             self._ctx_built_key = key
         # ⚠️ ПРЕДЕЛ ПОВОРОТА КЛАДЁМ ПОВЕРХ ГОТОВОГО КОНТЕКСТА, а не внутрь сборки: он зависит
         # от выбранного ТИПА, а контекст кэшируется по разрыву и цели. Иначе смена типа
         # заставляла бы пересчитывать веер VIA-полей — самую дорогую часть.
-        self._iter_ctx["turn_max_deg"] = self.turn_max_deg()
+        tmax = self.turn_max_deg()                     # предел поворота типа, градусы
+        for c in self._ctxs:
+            c["turn_max_deg"] = tmax
         return self._iter_ctx
+
+    def _new_bag(self):
+        """Мешок розыгрыша по ДОСТИЖИМЫМ целям: к недостижимой каждая попытка провалилась бы,
+        а очередь в мешке ждала бы её вечно. Отдаёт: TargetBag."""
+        return TargetBag([i for i, c in enumerate(self._ctxs) if c.get("reachable")])
+
+    def _sample_route(self, bag, rng, mode, spread, spend, approach):
+        """Один маршрут к цели, чья очередь в мешке (план 13, 13.14). Отдаёт: (M, 2) км или
+        None. ⚠️ Мешок сдвигает ВЫЗЫВАЮЩИЙ (`bag.commit()`) — когда маршрут ПРИНЯТ."""
+        from .threat_routes import sample_one_route
+        ti = bag.peek(rng)                             # чья очередь
+        if ti is None:                                 # ни одна цель не достижима
+            return None
+        return sample_one_route(self._ctxs[ti], mode, self.route_L_max(),
+                                self.p.threat_turn_interval_km, rng,
+                                spread=spread, spend=spend, approach=approach)
 
     def turn_max_deg(self):
         """Предельный поворот за шаг для выбранного типа БПЛА, градусы.
@@ -2787,12 +2830,12 @@ class ThreatModel:
             расходятся по разным коридорам, а не липнут к одному. Ценность учитывает вес
             ячейки (`THREAT_ROUTE_SPREAD_W`): раньше считалось голое число ячеек, и
             пустое поле стоило столько же, сколько река."""
-        from .threat_routes import sample_one_route
         from config import (THREAT_ROUTE_COUNT, THREAT_ROUTE_POOL_MULT,
                             THREAT_ROUTE_SPREAD_W, THREAT_ROUTE_MODE_SRC)
         self.ensure_built()
-        entry, target = self._refresh_envelope()       # авто-L_max + огибающая
-        ctx = self._ensure_ctx(entry, target)          # общий контекст с итерациями (кэш)
+        entry, _ = self._refresh_envelope()            # авто-L_max + огибающая по всем целям
+        self._ensure_ctx(entry)                        # контексты целей — общие с итерациями (кэш)
+        bag = self._new_bag()                          # розыгрыш цели без повторов (план 13)
         rng = np.random.default_rng()
         want = self.routes_want(max(1, int(THREAT_ROUTE_COUNT)))   # больше точек — шире выборка
         # ⚠️ ВСЕ ЧЕТЫРЕ РЕЖИМА — ИЗ ПАНЕЛИ (жалоба заказчика 21.09.2026: «меняю режим
@@ -2811,9 +2854,7 @@ class ThreatModel:
         since_new = 0
         while len(pool) < cap and tries < cap * 3 and since_new < 400:
             tries += 1
-            r = sample_one_route(ctx, wmode, self.route_L_max(),
-                                 self.p.threat_turn_interval_km, rng,
-                                 spread=spread, spend=spend, approach=approach)
+            r = self._sample_route(bag, rng, wmode, spread, spend, approach)
             if r is None:
                 since_new += 1
                 continue
@@ -2822,6 +2863,7 @@ class ThreatModel:
                 since_new += 1
                 continue
             seen.add(sig); pool.append(r); since_new = 0
+            bag.commit()                               # маршрут принят — очередь следующей цели
         # 2) ОТБИРАЕМ из пула самые «расходящиеся» — максимальное покрытие области,
         #    но с учётом ценности ячеек: тяжёлый коридор дороже пустого поля
         self.routes = self._spread_over_area(pool, want, spread_w=THREAT_ROUTE_SPREAD_W)
@@ -2864,15 +2906,20 @@ class ThreatModel:
         # ПОРОВНУ между точками входа. Раньше жадный отбор брал лучшие по покрытию, и с
         # бедного направления в синие линии не попадало почти ничего (замер: 2 маршрута
         # из 250 при 35 точках). Точка маршрута определяется по ближайшему входу к началу.
+        # ⚠️ И ПОРОВНУ МЕЖДУ ЦЕЛЯМИ (план 13): «хозяин» кандидата — пара «вход × цель»,
+        # иначе жадный отбор мог бы отдать синие линии одной цели. Цель одна — как было.
         ents = self.entry_points_km()                  # точки входа, км
-        owner = np.zeros(len(pool), int)               # номер точки старта у каждого кандидата
-        if len(ents) > 1:
+        tpts = self.target_points_km()                 # цели, км
+        n_own = max(len(ents), 1) * len(tpts)          # сколько «хозяев»: входы × цели
+        owner = np.zeros(len(pool), int)               # номер хозяина у каждого кандидата
+        if n_own > 1:
             ex = np.asarray([e[0] for e in ents], float)   # X точек входа, км
             ey = np.asarray([e[1] for e in ents], float)   # Y точек входа, км
             for i, r in enumerate(pool):
-                owner[i] = int(np.argmin(np.hypot(r[0, 0] - ex, r[0, 1] - ey)))
-        quota = np.full(max(len(ents), 1),             # сколько взять с каждой точки, шт.
-                        int(np.ceil(want / max(len(ents), 1))), int)
+                e_i = int(np.argmin(np.hypot(r[0, 0] - ex, r[0, 1] - ey)))   # чей старт
+                owner[i] = e_i * len(tpts) + route_target_index(r, tpts)
+        quota = np.full(n_own,                         # сколько взять с каждого хозяина, шт.
+                        int(np.ceil(want / n_own)), int)
         uncovered = np.ones(ncell, bool)
         chosen = []
         alive = np.ones(len(pool), bool)
@@ -2901,9 +2948,10 @@ class ThreatModel:
         from .threat_routes import count_possible_routes
         if self.grid is None or self.route_area is None or self._iter_ctx is None:
             return 0.0
-        ctx = self._iter_ctx
-        return count_possible_routes(np.asarray(self.route_area), ctx["gt"],
-                                     ctx["start"], ctx["goal"])
+        # целей несколько — маршруты к разным не пересекаются как множества: сумма (план 13)
+        return float(sum(count_possible_routes(np.asarray(self.route_area), c["gt"],
+                                               c["start"], c["goal"])
+                         for c in (self._ctxs or [self._iter_ctx])))
 
     def _spend(self):
         """Профиль расхода запаса хода из панели: late/early/even/mix.
@@ -2921,34 +2969,37 @@ class ThreatModel:
         """Начать выборку заново: пересчитать авто-запас хода и огибающую, подготовить
         контекст выборки, обнулить счётчик. Возвращает True, если цель достижима."""
         self.ensure_built()
-        entry, target = self._refresh_envelope()       # авто-L_max + огибающая
-        self._ensure_ctx(entry, target)                # веер VIA-полей — один раз на (разрыв, цель)
-        done = self._iter_ctx.get("_orbit_done")       # дошедших облётов по поясам (план 11, 11.5)
-        if done is not None:                           # контекст с поясами облёта
-            done[:] = 0.0                              # — новая выборка набирает доли заново
-        for arr in (self._iter_ctx.get("_appr_done") or {}).values():   # и по повадкам захода
-            arr[:] = 0.0
+        entry, _ = self._refresh_envelope()            # авто-L_max + огибающая по всем целям
+        self._ensure_ctx(entry)                        # веер VIA-полей — один раз на (разрыв, цели)
+        for c in self._ctxs:                           # у каждой цели свои счётчики
+            done = c.get("_orbit_done")                # дошедших облётов по поясам (план 11, 11.5)
+            if done is not None:                       # контекст с поясами облёта
+                done[:] = 0.0                          # — новая выборка набирает доли заново
+            for arr in (c.get("_appr_done") or {}).values():   # и по повадкам захода
+                arr[:] = 0.0
         self._iter_rng = np.random.default_rng()
+        self._iter_bag = self._new_bag()               # розыгрыш цели — с чистой колоды
         self.iter_routes = []
         self.iter_iteration = 0
-        return self._iter_ctx["reachable"]
+        return any(c["reachable"] for c in self._ctxs)
 
     def iter_step(self):
         """Одна итерация: сгенерировать ОДИН маршрут (несколько попыток) и добавить его в
         накопление. Счётчик iter_iteration = число накопленных маршрутов. Возвращает
         маршрут (M,2) для анимации или None (не удалось за отведённые попытки)."""
-        from .threat_routes import sample_one_route
         if self._iter_ctx is None and not self.iter_reset():
             return None
+        if self._iter_bag is None:                      # контекст собрал `plan_routes`
+            self._iter_bag = self._new_bag()            # — мешка итераций ещё нет
         route = None
         for _ in range(12):                             # попытки на итерацию (стохастика)
-            route = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
-                                     self.route_L_max(), self.p.threat_turn_interval_km,
-                                     self._iter_rng, spread=self.p.threat_iter_spread,
-                                     spend=self._spend(), approach=self._approach())
+            route = self._sample_route(self._iter_bag, self._iter_rng,   # (M, 2) км или None
+                                       self.p.threat_iter_mode, self.p.threat_iter_spread,
+                                       self._spend(), self._approach())
             if route is not None:
                 break
         if route is not None:
+            self._iter_bag.commit()                     # маршрут принят — очередь следующей цели
             self.iter_routes.append(route)
             self.iter_iteration = len(self.iter_routes)
         return route
@@ -2965,21 +3016,16 @@ class ThreatModel:
         запас. Защита от бесконечного цикла остаётся: `stale` — сколько попыток подряд
         разрешено не давать нового маршрута (тоже от T, иначе крупный заказ обрывался бы
         на середине)."""
-        from .threat_routes import sample_one_route
         if not self.iter_reset():
             return []
-        # ⚠️ ЗАКАЗАННОЕ ЧИСЛО РАСТЁТ С ЧИСЛОМ ТОЧЕК ВХОДА (заказчик 21.09.2026): со всех
-        # сторон на бедное направление приходилось 2 маршрута из 250
-        T = self.routes_want(max(1, int(self.p.threat_iter_routes)))
+        T = self.iter_target_count()                   # число из панели; его же видят заголовок и «Пуск»
         cap = int(T * 8)                               # было min(T*6, 800) — см. шапку
         stale = max(350, T)
         seen, tries, since_new = set(), 0, 0
         while len(self.iter_routes) < T and tries < cap and since_new < stale:
             tries += 1
-            r = sample_one_route(self._iter_ctx, self.p.threat_iter_mode,
-                                 self.route_L_max(), self.p.threat_turn_interval_km,
-                                 self._iter_rng, spread=self.p.threat_iter_spread,
-                                 spend=self._spend(), approach=self._approach())
+            r = self._sample_route(self._iter_bag, self._iter_rng, self.p.threat_iter_mode,
+                                   self.p.threat_iter_spread, self._spend(), self._approach())
             if r is None:
                 since_new += 1
                 continue
@@ -2988,6 +3034,7 @@ class ThreatModel:
                 since_new += 1
                 continue
             seen.add(sig); self.iter_routes.append(r); since_new = 0
+            self._iter_bag.commit()                    # маршрут принят — очередь следующей цели
         self.iter_iteration = len(self.iter_routes)
         return self.iter_routes
 
@@ -2999,18 +3046,27 @@ class ThreatModel:
         """Пересчитать авто-запас хода и огибающую мест пролёта. Возвращает (вход, цель).
         Авто-L_max = |AB|+25 %, НО не меньше кратчайшего коридорного пути +20 % (иначе на
         «узкой» местности маршрут не уместился бы вовсе). Ручной L_max не трогаем."""
-        from .threat_routes import flight_envelope
-        g = self.grid
         gap = self._route_gap_km()                             # тот же порог, что у маршрутов
         slack = self._route_slack_km()                         # и тот же уход от ориентира
         entry, target = self.entries_target_km()               # при секторе — все пять точек
         self.sync_auto_L_max()                                 # предварительно |AB|+25 %
-        _, self.route_min_len = flight_envelope(               # кратчайший путь (от L_max не зависит)
-            g, entry, target, self.route_L_max(), gap, slack_km=slack)
+        _, self.route_min_len = self._envelope_all(entry, gap, slack)   # кратчайший путь
         self.sync_auto_L_max(self.route_min_len)               # поднять до «кратчайший+20 %», если авто
-        self.route_area, self.route_min_len = flight_envelope(
-            g, entry, target, self.route_L_max(), gap, slack_km=slack)
+        self.route_area, self.route_min_len = self._envelope_all(entry, gap, slack)
         return entry, target
+
+    def _envelope_all(self, entry, gap, slack):
+        """Зона пролёта по ВСЕМ целям — ОБЪЕДИНЕНИЕ, как у входов: куда бы ни летел БПЛА,
+        пролететь он может над всем, что достижимо хоть к одной. Отдаёт: (маска, кратчайший
+        путь, км — по САМОЙ ДАЛЬНЕЙ из достижимых целей: запаса должно хватить всем)."""
+        from .threat_routes import flight_envelope
+        env, lens = None, []                          # объединение масок; кратчайшие по целям, км
+        for t in self.target_points_km():
+            m, d = flight_envelope(self.grid, entry, t, self.route_L_max(), gap, slack_km=slack)
+            env = m if env is None else (env | m)    # зона к этой цели добавлена к прежним
+            lens.append(d)
+        fin = [d for d in lens if np.isfinite(d)]      # недостижимая цель запас не задаёт
+        return env, (max(fin) if fin else float("inf"))
 
     def sync_auto_L_max(self, min_corridor_km=None):
         """Если запас хода НЕ задан руками — авто: |AB|·(1+THREAT_LMAX_AUTO_FRAC), но не меньше
@@ -3024,11 +3080,11 @@ class ThreatModel:
             self.p.threat_L_max = round(sum(per) / len(per), 1)
             return self.p.threat_L_max
         if not getattr(self.p, "threat_L_max_manual", False):
-            target = self.target_only_km()
             # при секторе точек входа пять: запас хода считаем по САМОЙ ДАЛЬНЕЙ, иначе
-            # из неё маршрут не уместился бы и точка вылетала бы из выборки
-            ab = max(float(np.hypot(target[0] - e[0], target[1] - e[1]))
-                     for e in self.entry_points_km())
+            # из неё маршрут не уместился бы и точка вылетала бы из выборки.
+            # ⚠️ То же с целями (план 13): самая дальняя пара «вход — цель»
+            ab = max(float(np.hypot(t[0] - e[0], t[1] - e[1]))
+                     for e in self.entry_points_km() for t in self.target_points_km())
             lmax = ab * (1.0 + THREAT_LMAX_AUTO_FRAC)
             if min_corridor_km is not None and np.isfinite(min_corridor_km):
                 lmax = max(lmax, min_corridor_km * (1.0 + THREAT_LMAX_CORRIDOR_FRAC))
@@ -3145,6 +3201,7 @@ class ThreatModel:
         self.initial_sensors = None       # (N,2) км — малые, на момент первой расстановки
         self.initial_sensors_type = None  # тип каждого (1–3)
         self.initial_sensors_big = None   # (K,2) км — большие (тип 4)
+        self._manual_sig_placed = None    # по какой таблице стоит расстановка «Задать позиции»
 
     def _tag_sensors(self):
         """Проставить спутники расстановки: тип датчика, его режим и кто выбрал место.
@@ -3442,6 +3499,11 @@ class ThreatModel:
             # ⚠️ `analysis_freeze` гасит именно ЭТОТ прогон (жадный по `manual_locked`),
             # а не сам путь целиком: без него динамический вручную заданный датчик
             # переезжал бы во время моделирования, что и запрещает режим анализа.
+            # ⚠️ И ТАБЛИЦУ ПРИ ЗАМОРОЗКЕ ПЕРЕЧИТЫВАЕМ, ТОЛЬКО ЕСЛИ ЕЁ ПРАВИЛИ (23.09.2026):
+            # иначе уехавший при моделировании динамический датчик прыгал обратно на место
+            # из таблицы на каждом обновлении — «анализ размещения» показывал ложный сдвиг
+            if analysis_freeze and self._manual_sig() == self._manual_sig_placed:
+                return self.sensors                    # таблицу не трогали — стоим, как стояли
             if self.in_iterations() and self._manual_dynamic_count() and not analysis_freeze:
                 return self._place_manual_iter()
             return self._place_manual()
@@ -3478,13 +3540,37 @@ class ThreatModel:
             # каждые 5 итераций» — на деле снимка не было вовсе, и сравнивать было не с
             # чем. Первый РЕАЛЬНО посчитанный набор — всегда лучшая точка отсчёта,
             # даже если он уже частично учитывает итерации.
-            self.initial_sensors = np.array(self.sensors, float, copy=True)
-            self.initial_sensors_type = np.array(self.sensors_type, int, copy=True)
-            self.initial_sensors_big = np.array(self.sensors_big, float, copy=True)
+            self._take_snapshot()
         cells_xy, cells_w = g.flat_cells(positive_only=False)
         keep = cells_w != 0.0
         self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
         return self.sensors
+
+    def _take_snapshot(self):
+        """Запомнить текущую расстановку как точку отсчёта «анализа размещения» (задача 8.9):
+        от неё считается, куда уехал каждый датчик. Отдаёт: ничего."""
+        self.initial_sensors = np.array(self.sensors, float, copy=True)
+        self.initial_sensors_type = np.array(self.sensors_type, int, copy=True)
+        self.initial_sensors_big = np.array(self.sensors_big, float, copy=True)
+
+    def _drop_snapshot(self):
+        """Забыть точку отсчёта: следующая расстановка станет новым «первым построением»."""
+        self.initial_sensors = None
+        self.initial_sensors_type = None
+        self.initial_sensors_big = None
+
+    def set_manual_mode(self, manual):
+        """«Рассчитать позиции» ⇄ «Задать позиции». Вход: True — задать. ⚠️ Смена режима
+        сбрасывает снимок анализа размещения: расстановки разных режимов не сравнивают."""
+        manual = bool(manual)  # режим «Задать позиции»
+        if manual != bool(getattr(self.p, "threat_manual_mode", False)):   # режим сменился
+            self._drop_snapshot()                    # — прежний снимок чужой расстановки
+        self.p.threat_manual_mode = manual
+
+    def _manual_sig(self):
+        """Подпись таблицы заданных датчиков: тип, режим, место. Меняется от любой правки."""
+        return tuple((m.type_id, bool(m.static), round(m.x_km, 4), round(m.y_km, 4))
+                     for m in self.manual_sensors)
 
     def sensor_movement(self):
         """Сопоставление ПЕРВОГО построения с ТЕКУЩИМ — «анализ размещения» (задача 8.9).
@@ -3541,6 +3627,8 @@ class ThreatModel:
         Почему не оставить «стоят и всё»: до итераций так и есть — человек описал
         обстановку, и её не двигают. А моделирование затем и запускается, чтобы увидеть,
         куда алгоритм переставит то, что переставлять разрешено."""
+        if self.initial_sensors is None:              # режим включили посреди моделирования
+            self._place_manual()                     # — точка отсчёта: места из таблицы
         specs = self._manual_specs()
         small = [s for s in specs if s.kind == "small"]
         n_big = sum(s.n for s in specs if s.kind == "big")
@@ -3551,6 +3639,7 @@ class ThreatModel:
         self.sensors_big = self._place_big(sample, n_big=n_big)
         self._tag_sensors()
         self._mark_manual_placed()
+        self._manual_sig_placed = self._manual_sig()  # по какой таблице стоим
         cells_xy, cells_w = self.grid.flat_cells(positive_only=False)
         keep = cells_w != 0.0
         self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
@@ -3588,6 +3677,12 @@ class ThreatModel:
         self.sensors_manual = np.ones(len(self.sensors), bool)
         self.sensors_big_manual = np.ones(len(self.sensors_big), bool)
         self._mark_manual_placed()
+        self._manual_sig_placed = self._manual_sig()  # по какой таблице стоим
+        # ⚠️ СНИМОК АНАЛИЗА РАЗМЕЩЕНИЯ (23.09.2026): в этом режиме его не брали вовсе, и
+        # сравнение шло с расстановкой другого режима. До моделирования он следует за
+        # таблицей — человек ещё задаёт обстановку; с началом моделирования замирает
+        if self.initial_sensors is None or not self.in_iterations():
+            self._take_snapshot()
         cells_xy, cells_w = self.grid.flat_cells(positive_only=False)
         keep = cells_w != 0.0
         self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
@@ -3715,40 +3810,27 @@ class ThreatModel:
         return sens
 
     def _place_multi_type(self, cand, routes, types):
-        """Расстановка, когда работает НЕ ОДИН малый тип либо есть закреплённые датчики.
-
-        Проход по типам в порядке номеров, у каждого свой радиус и своя кратность.
-        Результат складывается в `self.sensors`, а тип каждого датчика — в
-        `self.sensors_type`.
-
-        ⚠️ ПОЧЕМУ ПО ТИПАМ, А НЕ ОДНИМ ОБЩИМ ЖАДНЫМ ПРОХОДОМ. `CoverageCache` строится
-        под ОДИН радиус: в нём заранее посчитано, какие точки маршрутов видит каждый
-        кандидат, и при разных радиусах общим такой кэш быть не может. Но ОБА правила
-        жадного отбора работают и между типами (требование заказчика 05.09.2026):
-
-        * **кратность** — уже поставленные датчики других типов передаются в кэш
-          (`CoverageCache(placed=…)`), и прирост считается ПОВЕРХ их покрытия: тип 2
-          знает, что этот кусок маршрута уже закрыт типом 1 нужное число раз. Раньше не
-          знал, и это числилось осознанным упрощением (§7) — теперь снято;
-        * **разнос** — `THREAT_SPREAD_PAIR·(R₁+R₂)`, то есть то же «не ближе 1.6·R»,
-          обобщённое на пару разных радиусов: при равных радиусах даёт ровно 1.6·R.
-          Прежняя полусумма (0.5·(R₁+R₂)) была вдвое слабее внутригруппового правила, и
-          типы слипались: при R = 1 и 3 км разнос выходил 2 км против 4.8 внутри типа.
-
-        ⚠️ ГАЛОЧКА «распределять между типами» (`threat_spread_types`) отключает ТОЛЬКО
-        разнос между разными типами; внутри типа он остаётся всегда. Кратность
-        учитывается в любом случае: это не «распределение», а правильный счёт покрытия."""
+        """Расстановка нескольких малых типов (или с закреплёнными): по типам в порядке номеров,
+        у каждого свой R и k. Вход: кандидаты (C,2) км, маршруты, типы. Отдаёт: (N,2) км, типы —
+        в `self.sensors_type`. Как типы видят друг друга — ОГРАНИЧЕНИЯ 1.10а."""
+        # ⚠️ ПО ТИПАМ, А НЕ ОДНИМ ПРОХОДОМ: `CoverageCache` строится под ОДИН радиус
         from .optimization import CoverageCache
         from config import MODES, THREAT_SPREAD_PAIR
         weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
+        # галка «распределять между типами» снимает ТОЛЬКО разнос разных типов; внутри типа он всегда
         spread = bool(getattr(self.p, "threat_spread_types", True))
+        # ⚠️ КРАТНОСТЬ МЕЖДУ ТИПАМИ — ТОЛЬКО ПРИ «ОДНА НА ВСЕХ» (заказчик 24.09.2026, В13.13):
+        # снята галка — у типа своя k, и набирает он её СВОИМИ датчиками (иначе второй тип
+        # добирал до своего k чужие маршруты: 0.4 % своей засечки)
+        k_joint = bool(getattr(self.p, "threat_k_same", True))   # чужие датчики в счёт кратности
         placed = np.empty((0, 2), float)     # уже поставленные, всех типов
         placed_r = np.empty(0, float)        # их радиусы — для разноса между типами
         out_xy, out_tid = [], []
         for spec in types:
             R = float(spec.r_km)
             c = np.asarray(cand, float)
-            # не даём типам садиться друг на друга: то же 1.6·R, обобщённое на пару
+            # не даём типам садиться друг на друга: то же 1.6·R, обобщённое на пару радиусов
+            # (прежняя полусумма была вдвое слабее: при R = 1 и 3 км — 2 км против 4.8 внутри типа)
             if len(placed) and spread:
                 d = np.linalg.norm(c[:, None, :] - placed[None, :, :], axis=2)
                 keep = (d >= THREAT_SPREAD_PAIR * (R + placed_r)[None, :]).all(axis=1)
@@ -3770,11 +3852,11 @@ class ThreatModel:
                 c = np.vstack([c, extra])
             if len(c) == 0:
                 continue
-            # УЖЕ ПОСТАВЛЕННЫЕ ДРУГИЕ ТИПЫ — в кэш: их покрытие входит в стартовое
-            # состояние жадного отбора, и кратность считается общая, а не по типу.
-            cache = CoverageCache(c, R, self.p.L_seg, int(spec.k),
-                                  placed=[(pt[0], pt[1], rr)
-                                          for pt, rr in zip(placed, placed_r)])
+            # УЖЕ ПОСТАВЛЕННЫЕ ДРУГИЕ ТИПЫ — в кэш, только если кратность одна на всех:
+            # тогда их покрытие входит в стартовое состояние жадного отбора
+            others = ([(pt[0], pt[1], rr) for pt, rr in zip(placed, placed_r)]
+                      if k_joint else [])                # чужие датчики (x, y, R), км
+            cache = CoverageCache(c, R, self.p.L_seg, int(spec.k), placed=others)   # кэш покрытия типа
             for r in routes:
                 cache.add_trajectory(r)
             N = int(spec.n)
@@ -3839,10 +3921,19 @@ class ThreatModel:
                 return fixed                    # все места заняты закреплёнными
         if n_big <= 0 or R_big <= 0.0 or not routes:
             return np.empty((0, 2), float)
+        # ⚠️ КОЛЬЦО — У ПРИОРИТЕТНОЙ ЦЕЛИ; доли у нескольких целей равны — кольца нет вовсе
+        # (ответ заказчика на В13.8): какой объект важнее, программа не угадывает
+        ring_c = self.big_ring_target_km()           # центр кольца, км, или None
+        if ring_c is None:                           # приоритеты равны
+            # ⚠️ ВСЕ НАЗВАННЫЕ ЧЕЛОВЕКОМ — и динамические тоже (23.09.2026): при
+            # моделировании `fixed` держит одни статические, и динамический большой из
+            # таблицы пропадал с карты — кольца, куда его переставить, при равных долях нет
+            named = [[m.x_km, m.y_km] for m in self.manual_sensors if m.type_id == 4]
+            return np.asarray(named, float).reshape(-1, 2)   # — стоят, где названы
         cand = self.candidates if len(self.candidates) else self.candidate_positions()
         if not len(cand):
             return fixed if len(fixed) else np.empty((0, 2), float)
-        B = np.asarray(self.target_only_km(), float)
+        B = np.asarray(ring_c, float)                # центр кольца — приоритетная цель, км
         d = np.linalg.norm(cand - B, axis=1)
         lo = float(THREAT_BIG_RING_LO) * R_big
         hi = float(THREAT_BIG_RING_HI) * R_big
@@ -4022,47 +4113,26 @@ class ThreatModel:
             d = np.linalg.norm(xy[:, None, :] - self.sensors[None, :, :], axis=2)
             seen = (d <= rad[None, :]).any(axis=1)
             covered = float(np.sum(w[seen]))
-        det1 = detk = mean_hits = 0.0
-        by_type = {}
         sample = self._sample_for_sensors()
-        if len(self.sensors) and sample:
-            # для каждого маршрута — какие датчики его видят (маска по датчикам)
-            seen_by = np.array([
-                (np.linalg.norm(r[:, None, :] - self.sensors[None, :, :],
-                                axis=2).min(axis=0) <= rad)
-                for r in sample])                      # (маршрутов, датчиков)
-            hits = seen_by.sum(axis=1)
-            det1 = float((hits >= 1).mean())
-            detk = float((hits >= self.p.threat_k).mean())
-            mean_hits = float(hits.mean())
-            from .sensors import sensor_types
-            k_of = {s.type_id: int(s.k) for s in sensor_types(self.p)}
-            tids = (self.sensors_type if len(self.sensors_type) == len(self.sensors)
-                    else np.ones(len(self.sensors), int))
-            for t in sorted(set(int(v) for v in tids)):
-                col = (tids == t)
-                h_t = seen_by[:, col].sum(axis=1)
-                # ⚠️ КРАТНОСТЬ У КАЖДОГО ТИПА СВОЯ (режим «у каждого своя» в окне):
-                # одна общая строка «засечено ≥ k» в этом случае отвечала бы на вопрос,
-                # которого никто не задавал. Здесь — выполнение СОБСТВЕННОГО k типа.
-                k_t = max(1, int(k_of.get(t, self.p.threat_k)))
-                # ДОЛЯ ПОКРЫТИЯ ЭТОГО ТИПА (довесок 06.09.2026) — тот же приём, что у
-                # общего `covered_frac` выше, но по сенсорам ОДНОГО типа: сколько веса
-                # карты видит именно он, а не расстановка целиком.
-                sens_t, rad_t = self.sensors[col], rad[col]
-                if len(sens_t) and len(xy):
-                    dT = np.linalg.norm(xy[:, None, :] - sens_t[None, :, :], axis=2)
-                    covered_t = float(np.sum(w[(dT <= rad_t[None, :]).any(axis=1)]))
-                else:
-                    covered_t = 0.0
-                by_type[t] = dict(n=int(col.sum()),
-                                  r_km=float(rad[col][0]) if col.any() else 0.0,
-                                  k=k_t,
-                                  detect_frac=float((h_t >= 1).mean()),
-                                  detect_k_frac=float((h_t >= k_t).mean()),
-                                  mean_hits=float(h_t.mean()),
-                                  covered_frac=(covered_t / total if total > 0 else 0.0),
-                                  idle=int((seen_by[:, col].sum(axis=0) == 0).sum()))
+        # ЗАСЕЧКА МАРШРУТОВ — отдельным методом (23.09.2026): тот же счёт нужен окну
+        # «Анализ» по каждой цели, на её части выборки
+        det = self._detection(sample)                  # засечка — общая и по типам
+        det1, detk, mean_hits = det["det1"], det["detk"], det["mean_hits"]
+        by_type = {}  # показатели по типам, с долей покрытия
+        same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
+        tids = self.sensors_type if same else np.ones(len(self.sensors), int)   # тип датчика
+        for t, d_t in det["by_type"].items():
+            # ДОЛЯ ПОКРЫТИЯ ЭТОГО ТИПА (довесок 06.09.2026) — тот же приём, что у
+            # общего `covered_frac` выше, но по сенсорам ОДНОГО типа: сколько веса
+            # карты видит именно он, а не расстановка целиком.
+            col = (tids == t)                          # датчики этого типа
+            sens_t, rad_t = self.sensors[col], rad[col]
+            if len(sens_t) and len(xy):
+                dT = np.linalg.norm(xy[:, None, :] - sens_t[None, :, :], axis=2)  # датчик — клетка, км
+                covered_t = float(np.sum(w[(dT <= rad_t[None, :]).any(axis=1)]))  # вес, видимый этим типом
+            else:
+                covered_t = 0.0  # датчиков типа нет
+            by_type[t] = dict(d_t, covered_frac=(covered_t / total if total > 0 else 0.0))
         return dict(total_weight=total, covered_weight=covered,
                     covered_frac=(covered / total if total > 0 else 0.0),
                     detect_frac=det1, detect_k_frac=detk, mean_hits=mean_hits,
@@ -4080,6 +4150,77 @@ class ThreatModel:
                     by_type=by_type,
                     n_candidates=int(len(self.candidates)),
                     by_layer=g.totals_by_layer())
+
+    def _detection(self, sample):
+        """Засечка маршрутов выборки ТЕКУЩЕЙ расстановкой (малые датчики) — общая и по типам.
+        Вход: список маршрутов (M, 2) км. Отдаёт: dict(n, det1, detk, mean_hits, by_type)."""
+        out = dict(n=len(sample) if sample else 0, det1=0.0, detk=0.0, mean_hits=0.0,
+                   by_type={})
+        if not (len(self.sensors) and sample):         # мерить нечем или нечего
+            return out
+        rad = self._sensor_radii()                     # радиус каждого датчика, км
+        # для каждого маршрута — какие датчики его видят (маска по датчикам)
+        seen_by = np.array([
+            (np.linalg.norm(r[:, None, :] - self.sensors[None, :, :],
+                            axis=2).min(axis=0) <= rad)
+            for r in sample])                          # (маршрутов, датчиков)
+        hits = seen_by.sum(axis=1)                     # сколько датчиков видит маршрут
+        out.update(det1=float((hits >= 1).mean()),
+                   detk=float(self._meets_k(seen_by).mean()),   # по правилу галки «одна на всех»
+                   mean_hits=float(hits.mean()))
+        from .sensors import sensor_types
+        k_of = {s.type_id: int(s.k) for s in sensor_types(self.p)}   # кратность типа
+        same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
+        tids = self.sensors_type if same else np.ones(len(self.sensors), int)   # тип датчика
+        for t in sorted(set(int(v) for v in tids)):
+            col = (tids == t)                          # датчики этого типа
+            h_t = seen_by[:, col].sum(axis=1)          # засечки маршрута этим типом
+            # ⚠️ КРАТНОСТЬ У КАЖДОГО ТИПА СВОЯ (режим «у каждого своя» в окне):
+            # одна общая строка «засечено ≥ k» в этом случае отвечала бы на вопрос,
+            # которого никто не задавал. Здесь — выполнение СОБСТВЕННОГО k типа.
+            k_t = max(1, int(k_of.get(t, self.p.threat_k)))
+            out["by_type"][t] = dict(n=int(col.sum()),
+                                     r_km=float(rad[col][0]) if col.any() else 0.0,
+                                     k=k_t,
+                                     detect_frac=float((h_t >= 1).mean()),
+                                     detect_k_frac=float((h_t >= k_t).mean()),
+                                     mean_hits=float(h_t.mean()),
+                                     idle=int((seen_by[:, col].sum(axis=0) == 0).sum()))
+        return out
+
+    def _meets_k(self, seen_by):
+        """Засечён ли маршрут с нужной кратностью. Вход: (маршрутов, датчиков) bool — кто видит.
+        Отдаёт: (маршрутов,) bool: «одна на всех» — всеми ≥ k; иначе хоть один тип своими ≥ своего k."""
+        seen_by = np.atleast_2d(np.asarray(seen_by, bool))   # маршрут × датчик
+        if bool(getattr(self.p, "threat_k_same", True)):   # кратность одна на всех
+            return seen_by.sum(axis=1) >= max(1, int(self.p.threat_k))   # — считают все типы вместе
+        from .sensors import sensor_types
+        k_of = {s.type_id: int(s.k) for s in sensor_types(self.p)}   # своя кратность типа
+        same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
+        tids = self.sensors_type if same else np.ones(len(self.sensors), int)   # тип датчика
+        ok = np.zeros(len(seen_by), bool)              # засечён ли своей кратностью
+        for t in set(int(v) for v in tids):
+            k_t = max(1, int(k_of.get(t, self.p.threat_k)))   # кратность этого типа
+            ok |= seen_by[:, tids == t].sum(axis=1) >= k_t   # тип набрал её своими датчиками
+        return ok
+
+    def routes_by_target(self, sample=None):
+        """Выборка по целям (план 13): список списков маршрутов, по одному на цель.
+        Вход: выборка (None — та, по которой стоят датчики). Отдаёт: [[(M, 2) км, …], …]."""
+        src = self._sample_for_sensors() if sample is None else sample   # что делим
+        tpts = self.target_points_km()               # цели, км
+        out = [[] for _ in tpts]
+        for r in src or []:
+            out[route_target_index(r, tpts)].append(r)
+        return out
+
+    def target_analysis(self, i):
+        """Анализ по ОДНОЙ цели — те же числа, что в общем отчёте, по её маршрутам.
+        Вход: номер цели с нуля. Отдаёт: dict(n, det1, detk, mean_hits, by_type, sectors)."""
+        part = self.routes_by_target()[int(i)]       # маршруты к этой цели
+        out = self._detection(part)
+        out["sectors"] = self.sector_stats(int(i))
+        return out
 
     def _evaluate_current(self):
         """Пересчитать показатели по ТЕКУЩЕЙ расстановке, не трогая сами позиции.
@@ -4108,44 +4249,33 @@ class ThreatModel:
                 return float(np.degrees(np.arctan2(d[0], d[1])) % 360.0)
         return None
 
-    def sector_stats(self):
-        """Статистика прихода БПЛА по 12 направлениям КОМПАСА, шаг
-        `THREAT_COMPASS_STEP_DEG` = 30° (план 8, задача 8.9, довесок 06.09.2026,
-        кнопка «Анализ моделирования»).
-
-        Направление маршрута — азимут ОТ ЦЕЛИ на его КОНЕЧНУЮ часть, направление ЗАХОДА
-        (не старта!): 0° = север (+y), по часовой стрелке (90° = восток, +x) — обычный
-        компас. Сектор k покрывает [k·шаг − шаг/2, k·шаг + шаг/2) и подписан своим
-        центральным углом (0, 30, 60, … 330).
-
-        ⚠️ ИМЕННО ЗАХОД, А НЕ СТАРТ (исправлено 06.09.2026, заказчик: «смотреть...
-        конечную точку захода на цель, это данные каждого маршрута»). Точка ВХОДА общая
-        у всех маршрутов сразу (их THREAT_SECTOR_ENTRIES = 5 на весь сектор появления),
-        и азимут от старта почти всегда стягивался в 3–5 секторов из 12: маршруты
-        огибают рельеф и запретные зоны, и БПЛА визуально заходит на цель со всех
-        сторон, а разбивка по старту этого не показывала. `_approach_bearing` ищет
-        направление С КОНЦА маршрута, пока не отойдёт от цели хотя бы на
-        `THREAT_COMPASS_APPROACH_KM` — сама последняя точка лежит В цели.
-
-        Кратность — ОБЩАЯ, по ВСЕМ типам датчиков разом (то же `hits`, что у верхней
-        строки отчёта «Засечено ≥ k» в `_evaluate`, а не разбивка `by_type`, — заказчик
-        явно просил «по всем типам датчиков», не по каждому отдельно).
-
-        Возвращает список из 12 словарей `dict(deg, n_routes, n_zero, n_ge1, n_ge_k, k,
-        ok)`. `ok=False` — сектор НЕ ПУСТОЙ, и хотя бы один его маршрут не набрал
-        заданную кратность `k` (`Params.threat_k`): направление помечается красным на
-        карте и в тексте отчёта."""
+    def sector_stats(self, target=None):
+        """Приход БПЛА по 12 направлениям компаса (шаг 30°, по ЗАХОДУ на свою цель). Вход:
+        None — вся выборка, номер цели — её маршруты. Отдаёт: 12 × dict(deg, n_routes,
+        n_zero, n_ge1, n_ge_k, k, ok); ok=False — кратности не хватило (красным)."""
+        # План 8, задача 8.9, довесок 06.09.2026 (кнопка «Анализ моделирования»).
+        # Направление — азимут ОТ ЦЕЛИ на КОНЕЧНУЮ часть маршрута: 0° = север (+y), по
+        # часовой (90° = восток, +x); сектор k — [k·шаг − шаг/2, k·шаг + шаг/2).
+        # ⚠️ ИМЕННО ЗАХОД, А НЕ СТАРТ (исправлено 06.09.2026, заказчик: «смотреть конечную
+        # точку захода на цель»): старт общий на весь сектор появления, и азимут от него
+        # стягивался в 3–5 секторов из 12. `_approach_bearing` идёт С КОНЦА, пока не
+        # отойдёт от цели на `THREAT_COMPASS_APPROACH_KM` — последняя точка лежит В цели.
+        # Кратность — по тому же правилу, что «Засечено ≥ k» (`_meets_k`): при «одна на всех»
+        # общая по всем типам, иначе — хоть один тип своими датчиками (В13.13, 24.09.2026).
         step = float(THREAT_COMPASS_STEP_DEG)
         n_sec = max(1, int(round(360.0 / step)))
         out = [dict(deg=int(round(i * step)), n_routes=0, n_zero=0, n_ge1=0, n_ge_k=0,
                     k=int(self.p.threat_k), ok=True) for i in range(n_sec)]
-        sample = self._sample_for_sensors()
+        # `target` (план 13, 23.09.2026): None — вся выборка, номер — только маршруты к этой цели
+        sample = (self._sample_for_sensors() if target is None
+                  else self.routes_by_target()[int(target)])
         if not sample or not len(self.sensors):
             return out
-        B = np.asarray(self.target_only_km(), float)
+        tpts = self.target_points_km()               # цели (план 13), км
         rad = self._sensor_radii()
-        k = max(1, int(self.p.threat_k))
         for r in sample:
+            # направление подхода — к СВОЕЙ цели маршрута, а не к первой (план 13, 13.14)
+            B = np.asarray(tpts[route_target_index(r, tpts)], float)
             bearing = self._approach_bearing(r, B)
             if bearing is None:
                 continue                  # маршрут целиком лежит в цели — без направления
@@ -4157,7 +4287,7 @@ class ThreatModel:
             e["n_routes"] += 1
             e["n_zero"] += int(hits == 0)
             e["n_ge1"] += int(hits >= 1)
-            e["n_ge_k"] += int(hits >= k)
+            e["n_ge_k"] += int(self._meets_k(seen[None, :])[0])   # то же правило, что у «≥ k»
         for e in out:
             e["ok"] = (e["n_routes"] == 0) or (e["n_ge_k"] == e["n_routes"])
         return out
@@ -4173,22 +4303,108 @@ class ThreatModel:
 
     # ---- точка входа (фиксирована у реки) и цель (можно задать кликом) ----
     def set_target(self, x_km, y_km):
-        """Задать целевую точку кликом по карте (режим «указать цель»). Запас хода
+        """Одна цель вместо всех (прежний режим «указать цель» кликом). Запас хода
         (если не задан руками) пересчитывается авто под новое |AB|; маршруты сбросятся."""
-        self.target_km = (float(x_km), float(y_km))
+        self.targets.replace_all(x_km, y_km)
+        self._targets_changed()
+        if self.grid is not None:
+            self.build()      # свободная зона привязана к цели -> карту пересобрать
+
+    @property
+    def target_km(self):
+        """Цель, ПОСТАВЛЕННАЯ человеком (первая из объектов защиты), км; None — не ставили."""
+        pts = self.targets.points_km()               # объекты защиты, км
+        return pts[0] if pts else None
+
+    @target_km.setter
+    def target_km(self, xy):
+        """`target_km = None` убирает все цели, `= (x, y)` — оставляет одну (как до плана 13)."""
+        if xy is None:                               # сброс, смена района
+            self.targets.clear()
+        else:
+            self.targets.replace_all(xy[0], xy[1])
+
+    def _targets_changed(self):
+        """Цели сменились: маршруты и контексты устарели, сектор переотбирается от первой цели."""
         self.routes = []
         self.iter_routes = []
         self.iter_iteration = 0
         self._iter_ctx = None                          # цель сменилась — контекст устарел
         self._ctx_built_key = None
+        self._ctxs = []                                # и контексты остальных целей — память
         # СЕКТОР ОТСЧИТЫВАЕТСЯ ОТ ЦЕЛИ: сменилась цель — сместился и он, точки входа
         # пересчитываются по той же точке клика (или заново по 360° у авто-сектора)
         if self.sector_kind is not None:
             self._sector_pts = self.compute_entry_points()
             self._compose_entries()                 # ручные точки старта остаются на месте
         self.sync_auto_L_max()
-        if self.grid is not None:
-            self.build()      # свободная зона привязана к цели -> карту пересобрать
+
+    # ---- ОБЪЕКТЫ ЗАЩИТЫ: окно и постановка мышью (план 13, 13.13) ----
+    def add_target(self, x_km, y_km):
+        """Поставить ещё одну цель. Вход: км. Отдаёт: '' — принята, иначе причина отказа.
+        ⚠️ Карту НЕ пересобирает: целей ставят несколько подряд, пересчёт — `apply_targets`."""
+        if not bool(self.in_area(x_km, y_km)):       # клик за районом
+            return "цель ставится только внутри района"
+        if not self.targets.add(x_km, y_km):         # предел числа целей
+            return "больше %d целей не поставить" % self.targets.limit
+        return ""
+
+    def move_target(self, i, x_km, y_km):
+        """Перенести цель (правка координат в таблице). Отдаёт: '' — принято, иначе причина."""
+        if not bool(self.in_area(x_km, y_km)):       # за район
+            return "цель ставится только внутри района"
+        return "" if self.targets.move(i, x_km, y_km) else "нет цели №%d" % (int(i) + 1)
+
+    def clear_targets(self):
+        """Кнопка «Очистить»: убрать все цели — вернётся цель по умолчанию."""
+        self.targets.clear()
+
+    def set_target_weight(self, i, w):
+        """Приоритет цели из таблицы. Отдаёт: '' — принят, иначе причина (сумма > 1).
+        ⚠️ Приоритет в розыгрыш маршрутов пока не идёт — только в кольцо больших датчиков."""
+        return self.targets.set_weight(i, w)
+
+    def set_target_sectors(self, i, on):
+        """Показывать ли компас секторов у цели (галочка в таблице окна). Отдаёт: True —
+        такая цель есть. В расчёт не идёт — только показ «анализа моделирования»."""
+        if not 0 <= int(i) < len(self.targets):      # номера нет
+            return False
+        self.targets.items[int(i)].sectors = bool(on)
+        return True
+
+    def apply_targets(self):
+        """Применить цели: карта пересобирается (у каждой цели своя свободная зона), зона
+        пролёта — по всем. Долго, зовётся в фоне. Отдаёт: (входы, цель) или None — карты нет."""
+        self._targets_changed()
+        if self.grid is None:                        # карту ещё не строили
+            return None
+        self.build()
+        return self._refresh_envelope()
+
+    def target_table_rows(self):
+        """Строки таблицы окна «Объекты защиты»: номер, градусы, км, приоритет и признак
+        «приоритетная». Отдаёт: список словарей (пусто — целей не ставили)."""
+        top = self.targets.priority_index()          # приоритетная цель или None
+        rows = []
+        for i, t in enumerate(self.targets.items):
+            lon, lat = km_to_lonlat(t.x_km, t.y_km, self.lon0, self.lat0)
+            rows.append(dict(n=i + 1, lon=float(lon), lat=float(lat), x_km=t.x_km,
+                             y_km=t.y_km, weight=t.weight, top=(i == top),
+                             sectors=t.sectors))
+        return rows
+
+    def target_points_km(self):
+        """ВСЕ цели списком [(x, y)] км: объекты защиты, а нет их — одна цель по умолчанию."""
+        pts = self.targets.points_km()               # поставленные человеком, км
+        return pts if pts else [self.target_only_km()]
+
+    def big_ring_target_km(self):
+        """Вокруг какой цели строить кольцо больших датчиков (ответ заказчика В13.8).
+        Отдаёт: (x, y) км — приоритетная цель; None — у нескольких целей равные доли."""
+        if not len(self.targets):                    # целей не ставили — цель по умолчанию
+            return self.target_only_km()
+        i = self.targets.priority_index()            # у кого доля больше всех
+        return None if i is None else self.targets.points_km()[i]
 
     # ---- условия моделирования: чем летим и откуда (план 12, задача 12.2) ----
     def set_uav_start(self, x_km, y_km):
@@ -4289,8 +4505,9 @@ class ThreatModel:
         return list(self.entry_points) if self.entry_points else [self.entry_km()]
 
     def target_only_km(self):
-        """Цель в км: заданная кликом; у круглого района — его центр; иначе демо-метка участка."""
-        if self.target_km is not None:
+        """Цель в км — ПЕРВАЯ из объектов защиты (представитель: сектор, показатели, |AB|);
+        целей не ставили — центр круглого района, иначе демо-метка участка."""
+        if self.target_km is not None:               # есть поставленная человеком
             return self.target_km
         if self.area_circle is not None:            # круглый район строится вокруг цели (11.6)
             return (float(self.area_circle[0]), float(self.area_circle[1]))

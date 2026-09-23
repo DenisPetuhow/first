@@ -1579,6 +1579,190 @@ def main():
           "вид %.0f…%.0f, область %.0f…%.0f" % (x0v, x1v, xa0, xa1))
     vw.close()
 
+    print("\n20. ОБЪЕКТЫ ЗАЩИТЫ: ОКНО, ПОСТАНОВКА, ПРИОРИТЕТЫ (план 13, задача 13.13)")
+
+    def _wait_async():
+        """Дождаться фоновой задачи контроллера и доставки её сигнала в главный поток."""
+        c._pool.waitForDone(120000)
+        app.processEvents()
+
+    def _title():
+        """Текст заголовка над картой (`set_title` пишет его в заголовок pyqtgraph)."""
+        return str(v.pi.titleLabel.text or "")
+
+    m.clear_uav_start()
+    m.target_km = None                                   # целей не ставили
+    x0t, x1t, y0t, y1t = m.bbox_km                       # район, км
+    p1 = (x0t + 0.40 * (x1t - x0t), y0t + 0.50 * (y1t - y0t))   # первая цель, км
+    p2 = (x0t + 0.60 * (x1t - x0t), y0t + 0.45 * (y1t - y0t))   # вторая цель, км
+    v.btn_target.click()
+    td = v._targets_dlg                                  # окно «Объекты защиты»
+    check(td is not None and td.isVisible() and td.table.rowCount() == 0,
+          "«Указать цель» открывает окно объектов, таблица пуста")
+    check("Целей нет" in td.lbl_state.text(), "...и сказано, что расчёт к цели по умолчанию")
+    v._open_sector_window()
+    sd20 = v._sector_dlg                                 # второе открытое окно
+    td.spin_n.setValue(2)
+    td.btn_place.click()
+    check(v._target_mode and not td.isVisible() and not sd20.isVisible(),
+          "«Задать объект»: режим включён, ВСЕ окна спрятаны")
+    check(not v.vb.menuEnabled(), "правая кнопка забрана под выход")
+    v._on_scene_click(_Ev(*p1))
+    check(len(m.targets) == 0, "одинарный клик цель НЕ ставит")
+    v._on_scene_click(_Ev(*p1, double=True))
+    check(len(m.targets) == 1 and v._target_mode, "двойной клик поставил первую, режим держится")
+    v._on_scene_click(_Ev(x1t + 80.0, y1t + 80.0, double=True))
+    check(len(m.targets) == 1 and "внутри района" in _title(),
+          "клик за районом отклонён с пояснением", _title()[:60])
+    v._on_scene_click(_Ev(*p2, double=True))
+    check(len(m.targets) == 2 and not v._target_mode,
+          "набрали заданное число — режим закрылся сам")
+    check(td.isVisible() and sd20.isVisible() and v.vb.menuEnabled(),
+          "...окна и правая кнопка вернулись")
+    titles20 = []                                        # заголовки, поставленные во время расчёта
+    _set_title0 = v.set_title                            # настоящий, вернём после ожидания
+    v.set_title = lambda t: (titles20.append(t), _set_title0(t))[-1]
+    _wait_async()
+    v.set_title = _set_title0
+    check(any("Целей: 2" in t for t in titles20), "цели применились сами: зона по всем целям",
+          " | ".join(t[:40] for t in titles20))
+    tx, _ty = v.target_scatter.getData()
+    check(tx is not None and len(tx) == 2 and len(v._target_labels) == 2,
+          "на карте два креста и два номера")
+    check(td.table.rowCount() == 2 and td.table.item(0, 5).text() == "0.50",
+          "в таблице две строки, приоритет поровну 0.50", td.table.item(0, 5).text())
+    check("Приоритеты равны" in td.lbl_state.text(),
+          "при равных долях сказано: большие датчики вручную")
+    td.table.item(0, 5).setText("0.7")                   # 0.7 + 0.5 > 1
+    check(abs(m.targets.items[0].weight - 0.5) < 1e-9 and "больше 1" in td.lbl_state.text(),
+          "сумма больше 1 — правка отклонена с пояснением")
+    td.table.item(1, 5).setText("0.3")
+    td.table.item(0, 5).setText("0.7")
+    check(abs(m.targets.weight_sum() - 1.0) < 1e-9 and "у цели №1" in td.lbl_state.text(),
+          "0.7 / 0.3 принято, кольцо больших — у цели №1")
+    td.spin_n.setValue(3)
+    td.btn_place.click()
+    v._on_scene_click(_Ev(p1[0], p2[1] - 5.0, double=True))
+    v._on_scene_click(_Ev(*p1, button=Qt.RightButton))
+    check(not v._target_mode and len(m.targets) == 3 and td.isVisible(),
+          "правая кнопка — досрочный выход, поставленная цель осталась")
+    _wait_async()
+    check([t.weight for t in m.targets.items] == [0.33] * 3,
+          "новая цель — доли снова поровну 0.33")
+    td.btn_clear.click()
+    _wait_async()
+    check(len(m.targets) == 0 and td.table.rowCount() == 0,
+          "«Очистить» убирает все цели и строки")
+    td.close()
+    sd20.close()
+
+    print("\n21. АНАЛИЗ ПО ЦЕЛЯМ, ИТЕРАЦИЙ СТОЛЬКО, СКОЛЬКО В ПАНЕЛИ, АНАЛИЗ РАЗМЕЩЕНИЯ (23.09.2026)")
+    from model.geo_frame import km_to_lonlat as _k2l
+    _B21 = m.target_only_km()                           # цель по умолчанию, км
+    _lo, _la = _k2l(_B21[0] - 35, _B21[1] - 25, m.lon0, m.lat0)
+    _ho, _ha = _k2l(_B21[0] + 35, _B21[1] + 25, m.lon0, m.lat0)
+    m.set_area((float(_lo), float(_la), float(_ho), float(_ha)))   # район 70 × 50 км — быстрее
+    v.set_area_ready(True, m.area_size_km(), m.bbox_km)
+    m.build()
+    # ⚠️ ИТЕРАЦИЙ — РОВНО ЧИСЛО ИЗ ПАНЕЛИ (заказчик 23.09.2026): √(точек / 5) растит только
+    # синие линии ДО итераций; пакет, «Пуск», выгрузка и заголовок знают ОДНО число — заказ
+    m.p.threat_sector_entries = 10
+    c.on_sector_auto()
+    _n_e = len(m.entry_points_km())                      # точек входа, шт.
+    m.p.threat_iter_routes = 20
+    _T = m.iter_target_count()                           # наберёт моделирование, шт.
+    check(_T == 20, "итераций столько, сколько в панели", "20 → %d при %d точках" % (_T, _n_e))
+    check((m.routes_want(20) > 20) == (_n_e > 5),
+          "√(точек / 5) остаётся у синих линий", "20 → %d" % m.routes_want(20))
+    check("/20 " in c._iter_title() and "заказано" not in c._iter_title(),
+          "заголовок без пояснения о множителе", c._iter_title()[:70])
+    m.iter_batch()
+    check(len(m.iter_routes) == _T and m.iterations_complete() and c._iter_finished(),
+          "пакет, «Пуск» и выгрузка сходятся на одном числе", "%d маршрутов" % len(m.iter_routes))
+
+    # СЕКТОРА У КАЖДОЙ ЦЕЛИ (заказчик 23.09.2026) — компас по её маршрутам
+    m.add_target(_B21[0] - 12, _B21[1] + 6)
+    m.add_target(_B21[0] + 12, _B21[1] - 6)
+    m.apply_targets()
+    m.iter_batch()
+    c._work_place()
+    _parts = m.routes_by_target()                        # маршруты по целям
+    check(sum(len(q) for q in _parts) == len(m._sample_for_sensors()) and all(_parts),
+          "выборка делится по целям без потерь", " + ".join(str(len(q)) for q in _parts))
+    check(sum(sum(e["n_routes"] for e in m.sector_stats(i)) for i in range(2))
+          == sum(e["n_routes"] for e in m.sector_stats()),
+          "компасы целей в сумме дают обобщённый")
+    c._render_sector_compass({"show_sector_stats": True})
+    check(len(v._compass_items) == 2 * 24, "у каждой из двух целей свой компас",
+          "%d элементов" % len(v._compass_items))
+    m.set_target_sectors(1, False)
+    c._render_sector_compass({"show_sector_stats": True})
+    check(len(v._compass_items) == 24, "галочка «Сектора» у цели гасит её компас")
+    m.set_target_sectors(1, True)
+    c._render_sector_compass({"show_sector_stats": False})
+
+    # «АНАЛИЗ»: обобщённый и по каждой цели — в том же виде
+    _gen = c._analysis_html()
+    check("ОБОБЩЁННО" in _gen and "ПО ЦЕЛЯМ" in _gen and "СВОЕЙ цели" in _gen,
+          "обобщённый анализ: сводка по целям, компас от своей цели")
+    _one = c._analysis_html(0)  # отчёт по цели №1
+    check(all(s in _one for s in ("ЦЕЛЬ №1", "ПО ТИПАМ", "ПО НАПРАВЛЕНИЯМ"))
+          and "ПО ЦЕЛЯМ" not in _one, "анализ одной цели — те же разделы, её маршруты")
+    v._open_analysis_window()
+    _ad = v._analysis_dlg                                # окно «Анализ моделирования»
+    check(_ad.combo.count() == 3 and _ad.combo.isVisibleTo(_ad),
+          "в окне выбор: обобщённый + по цели", _ad.combo.itemText(1))
+    _ad.combo.setCurrentIndex(2)
+    check("ЦЕЛЬ №2" in _ad.text.toPlainText(), "выбор цели показывает её отчёт")
+    _ad.close()
+
+    # АНАЛИЗ РАЗМЕЩЕНИЯ В РЕЖИМАХ (заказчик: «работает не совсем корректно, точки
+    # пропадают»). Три дефекта найдены прогоном 23.09.2026 — каждый закреплён здесь
+    def _moved():
+        """Сколько датчиков сдвинулось от снимка первой расстановки, шт."""
+        return sum(1 for r in m.sensor_movement()
+                   if r["dist_km"] is not None and r["dist_km"] >= 0.05)
+
+    m.iter_routes = []; m.iter_iteration = 0
+    m.set_target_weight(0, 0.5)                          # доли равны — кольца больших нет
+    c.on_manual_mode(True)
+    check(m.initial_sensors is None or len(m.initial_sensors) + len(m.initial_sensors_big) == 0,
+          "«Задать позиции» сбросил снимок чужой расстановки")
+    c.on_manual_clear()
+    for _tid, _st, _dx, _dy in ((1, True, -10, 5), (1, False, 8, -6), (2, False, -5, -12),
+                                (4, True, 0, 12), (4, False, 10, 0)):
+        _lon, _lat = _k2l(_B21[0] + _dx, _B21[1] + _dy, m.lon0, m.lat0)
+        c.on_manual_add(_tid, _st, float(_lon), float(_lat))
+    check(m.initial_sensors is not None and _moved() == 0
+          and len(m.initial_sensors) + len(m.initial_sensors_big) == 5,
+          "до моделирования снимок следует за таблицей — сдвигов нет")
+    m.iter_reset(); m.iter_batch()
+    c._sensors_at = 0
+    c._maybe_refresh_sensors(force=True)
+    _big_now = len(m.sensors_big)                        # больших на карте, шт.
+    check(len(m.sensors) + _big_now == 5, "при моделировании ни один датчик не пропал",
+          "малых %d, больших %d" % (len(m.sensors), _big_now))
+    check(_big_now == 2, "динамический большой при равных долях целей остался на месте")
+    _stat = [np.array([q.x_km, q.y_km]) for q in m.manual_sensors if q.static]  # места статических, км
+    check(all(np.min(np.hypot(*(np.vstack([m.sensors, m.sensors_big]) - s).T)) < 1e-6
+              for s in _stat), "статические стоят ровно там, где заданы")
+    _pos = np.vstack([m.sensors, m.sensors_big]).copy()  # позиции до заморозки
+    _mv = _moved()                                       # сдвинутых до заморозки
+    v.chk_mode_analysis.setChecked(True)
+    m.iter_batch(); c._sensors_at = 0
+    c._maybe_refresh_sensors(force=True)
+    check(np.allclose(np.vstack([m.sensors, m.sensors_big]), _pos) and _moved() == _mv,
+          "режим анализа: уехавшие динамические не прыгают обратно в таблицу",
+          "сдвинуто %d" % _mv)
+    v.chk_mode_analysis.setChecked(False)
+    c.on_manual_mode(False)
+    check(m.initial_sensors is None, "выход из «Задать позиции» сбросил снимок")
+    c.on_manual_clear()
+    m.iter_routes = []; m.iter_iteration = 0
+    c._work_place()
+    check(m.initial_sensors is not None and _moved() == 0,
+          "в расчёте снимок — новая первая расстановка")
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
@@ -1586,8 +1770,8 @@ def main():
     print("ВСЁ ПРОШЛО. Рамки, оси, панель, слои, окно исходных данных, история "
          "полётов, анализ размещения, линейка «Расстояние», анализ моделирования, "
          "полнота слоёв, район радиусом, окно сектора, точки старта, справочник "
-         "типов БПЛА, условия моделирования, таблица точек входа и широкая карта — "
-         "в норме.")
+         "типов БПЛА, условия моделирования, таблица точек входа, широкая карта, "
+         "объекты защиты, анализ по целям и анализ размещения по режимам — в норме.")
     return 0
 
 

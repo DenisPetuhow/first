@@ -90,6 +90,12 @@ class ThreatController:
             on_mode=self.on_mode, on_toggle=self.on_toggle,
             on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
             on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
+            # план 13, 13.13: объекты защиты — окно и постановка мышью
+            on_targets_rows=self.model.target_table_rows, on_target_add=self.on_target_add,
+            on_targets_done=self.on_targets_done, on_target_weight=self.on_target_weight,
+            on_target_move=self.on_target_move, on_targets_clear=self.on_targets_clear,
+            on_target_sectors=self.on_target_sectors,
+            on_analysis_choices=self._analysis_choices,   # цели в окне «Анализ» (23.09.2026)
             on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
             on_iter_spread=self.on_iter_spread, on_iter_spend=self.on_iter_spend,
             on_iter_approach=self.on_iter_approach,
@@ -239,7 +245,7 @@ class ThreatController:
     def _iter_title(self):
         lab = THREAT_ITER_MODE_LABELS.get(self.model.p.threat_iter_mode,
                                           self.model.p.threat_iter_mode)
-        T = int(self.model.p.threat_iter_routes)
+        T = self.model.iter_target_count()            # число из панели, шт.
         # без `or ()`: sensors_big — массив numpy, его истинность неопределена
         big_arr = getattr(self.model, "sensors_big", None)
         n_big = 0 if big_arr is None else len(big_arr)
@@ -269,7 +275,8 @@ class ThreatController:
         self._anim.start()
 
     def _iter_finished(self):
-        return self.model.iter_iteration >= int(self.model.p.threat_iter_routes)
+        # по тому же числу, что и пакет «Пакетно», — числу из панели
+        return self.model.iter_iteration >= self.model.iter_target_count()
 
     def _maybe_refresh_sensors(self, force=False):
         """Пересчитать датчики по УЖЕ накопленной выборке пролётов — периодически, а не
@@ -443,7 +450,7 @@ class ThreatController:
             self.view.flash_title(
                 "Нет данных: пакет итераций не завершён (%d/%d) — дойдите «Пуск»/"
                 "«Пакетно» до конца."
-                % (len(self.model.iter_routes), int(self.model.p.threat_iter_routes)))
+                % (len(self.model.iter_routes), self.model.iter_target_count()))
             return
         try:
             n_routes, n_points = flight_log.save_flights(path, self.model)
@@ -798,7 +805,7 @@ class ThreatController:
 
     def on_manual_mode(self, manual):
         """Переключение «Рассчитать позиции» ⇄ «Задать позиции»."""
-        self.model.p.threat_manual_mode = bool(manual)
+        self.model.set_manual_mode(manual)            # сбросит снимок анализа размещения
         self._after_manual_change()
 
     def on_mode_analysis(self, checked):
@@ -917,6 +924,7 @@ class ThreatController:
                   "place": "Расставляю датчики по весам…",
                   "routes": "Строю маршруты пролёта…",
                   "envelope": "Пересчитываю зону пролёта…",
+                  "targets": "Применяю цели: карта и зона пролёта по всем целям…",
                   "iter": "Генерирую маршруты (итерации)…"}
         self.view.flash_title(titles.get(kind, "Расчёт…"))
         self.view.process_pending()
@@ -955,6 +963,17 @@ class ThreatController:
             # зона пролёта пересчитана, синие линии ждут кнопки (решение заказчика 21.09.2026)
             self._render_all()
             self._full_metrics()
+        elif kind == "targets":
+            # цели применены (план 13): карта пересобрана, зона — объединение по целям
+            self._render_all()
+            self._full_metrics()
+            self.view.refresh_targets_window()
+            self.view.refresh_sector_window()             # сектор отсчитывается от первой цели
+            n = len(self.model.targets)                   # поставлено целей, шт.
+            self.view.set_title(
+                ("Целей: %d — зона пролёта пересчитана по всем. " % n if n
+                 else "Цели убраны — расчёт к цели по умолчанию. ")
+                + "«Применить» — синие линии; цель каждого маршрута разыгрывается.")
         elif kind == "place":
             self._render_all()
             self.view.refresh_sensor_table(self._sensor_rows())   # таблица окна
@@ -973,11 +992,17 @@ class ThreatController:
                         % me["n_sensors"])
             else:
                 head = "Датчиков %d" % me["n_sensors"]
+            # ⚠️ БОЛЬШИЕ ПРИ РАВНЫХ ПРИОРИТЕТАХ НЕ СТАВЯТСЯ (ответ заказчика В13.8) — сказать
+            # прямо, иначе заказанные и не появившиеся датчики выглядят как поломка
+            big_note = (" · приоритеты целей равны: большие датчики задаются вручную"
+                        if int(getattr(self.model.p, "threat_N_big", 0) or 0) > 0
+                        and self.model.big_ring_target_km() is None else "")
             self.view.set_title(
                 f"{head} · засечено пролётов "
-                f"{me.get('detect_k_frac', 0)*100:.0f}% (кратность ≥{self.model.p.threat_k}) · "
+                f"{me.get('detect_k_frac', 0)*100:.0f}% ("
+                f"{'кратность ≥%d' % self.model.p.threat_k if self.model.p.threat_k_same else self._k_label()}) · "
                 f"покрыто веса {me['covered_frac']*100:.0f}% · "
-                f"режим {MODE_LABELS[self.model.p.mode]}")
+                f"режим {MODE_LABELS[self.model.p.mode]}{big_note}")
             self._full_metrics()
         elif kind == "routes":
             # Датчики стоят по ЭТОЙ ЖЕ выборке (до итераций — по «возможным маршрутам»,
@@ -1045,6 +1070,7 @@ class ThreatController:
         # синяя рамка — по НОВОМУ району: иначе она осталась бы вокруг прежнего
         self.view.set_area_ready(True, (w_km, h_km), self.model.bbox_km, self.model.area_circle)
         self.view.refresh_sector_window()      # сектор и точки старта сброшены вместе с районом
+        self.view.refresh_targets_window()     # и объекты защиты (план 13) — они в прежних км
         # ⚠️ ПРЕДЕЛ РАЙОНА. Дальше ~150 км по широте подложка расходится с векторными
         # слоями сильнее радиуса малого датчика (план 8 §0.4): тайлы в Меркаторе,
         # наши слои — в равнопромежуточной проекции, привязка идёт по углам.
@@ -1076,6 +1102,7 @@ class ThreatController:
         self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
         self.view.set_area_ready(False)
         self.view.refresh_sector_window()
+        self.view.refresh_targets_window()     # цели убраны вместе с районом (план 13)
         self.view.set_source("район не задан")
         self.view.set_metrics(["Район не задан.",
                                "Очертите его мышью либо загрузите свою карту —",
@@ -1106,6 +1133,48 @@ class ThreatController:
         self._pending_recalc = True
         self._render_after_input(f"Цель задана: ({x:.0f}, {y:.0f}) км. ")
         self.view.refresh_sector_window()                 # сектор переотобран от новой цели
+        self.view.refresh_targets_window()                # одна цель вместо всех (план 13)
+
+    # ---- объекты защиты: окно «Указать цель» (план 13, задача 13.13) ----
+    def on_target_add(self, x, y):
+        """Двойной клик в режиме целей. Отдаёт: '' — принята, иначе причина. ⚠️ Карта
+        пересчитывается ОДИН раз — когда постановка закончена (`on_targets_done`)."""
+        if self._busy:                                    # фоновый расчёт читает цели
+            return "идёт расчёт, подождите"
+        why = self.model.add_target(x, y)                 # '' — принята
+        if not why:                                       # показать сразу, не дожидаясь пересчёта
+            self.view.render_entry_target(self.model.entry_km(), self.model.target_points_km())
+        return why
+
+    def on_targets_done(self):
+        """Цели поставлены или поправлены — «применяется само» (заказчик): карта со свободными
+        зонами целей и зона пролёта считаются в фоне; синие линии — по «Применить»."""
+        self._pending_recalc = True
+        if self.model.grid is None:                       # карты нет — только сброс
+            self.model.apply_targets()
+            self._render_after_input("Целей: %d. " % len(self.model.targets))
+            self.view.refresh_targets_window()
+            return
+        self._run_async("targets", self.model.apply_targets)
+
+    def on_target_weight(self, i, w):
+        """Приоритет из таблицы. Отдаёт: '' — принят, иначе причина (сумма больше 1).
+        Пересчёта не нужно: приоритет влияет лишь на кольцо больших при расстановке."""
+        return self.model.set_target_weight(i, w)
+
+    def on_target_move(self, i, lon, lat):
+        """Координаты цели из таблицы, градусы. Отдаёт: '' — принято (и применяется)."""
+        from model.geo_frame import lonlat_to_km
+        x, y = lonlat_to_km(lon, lat, self.model.lon0, self.model.lat0)   # новое место, км
+        why = self.model.move_target(i, float(x), float(y))   # '' — принято, иначе причина
+        if not why:                                       # цель сдвинута — карта и зона заново
+            self.on_targets_done()
+        return why
+
+    def on_targets_clear(self):
+        """«Очистить» в окне целей: все цели убраны, расчёт — к цели по умолчанию."""
+        self.model.clear_targets()
+        self.on_targets_done()
 
     # ---- условия моделирования: тип БПЛА и точка старта (план 12, задача 12.2) ----
     def on_set_uav_start(self, x, y):
@@ -1338,6 +1407,7 @@ class ThreatController:
         self.view.refresh_sensor_table([])          # таблица в окне тоже пустеет
         self.view.refresh_route_viewer()            # оба списка маршрутов опустели
         self.view.refresh_sector_window()           # сектор и точки старта убраны
+        self.view.refresh_targets_window()          # и объекты защиты (план 13)
         self.view.set_title("Сброшено: датчики (малые, большие и заданные вручную), "
                             "цель, сектор, точки старта, зоны и загруженная история полётов убраны. "
                             "Карта сохранена.")
@@ -1433,7 +1503,7 @@ class ThreatController:
             relief=g is not None and g.relief_k() is not None,
             iter=bool(self.model.iter_routes))
         entry, target = self.model.entry_target_km()
-        self.view.render_entry_target(entry, target)
+        self.view.render_entry_target(entry, self.model.target_points_km())   # все цели (план 13)
         self.view.render_uav_start(self.model.uav_start_km)   # старт БПЛА (12.2), может быть None
         self.view.refresh_conditions_button()                 # сектор или цель могли смениться
         # сектор появления рисуется здесь же: иначе он пропадал бы при любой перерисовке
@@ -1464,7 +1534,7 @@ class ThreatController:
             self.view.render_crossings(None, t)
             self._render_sensors(empty=True)
             self.view.render_sensor_track([], {})
-            self.view.render_sector_compass([], None)
+            self.view.render_sector_compass([])
             return
         extent = g.extent_km()
         # рельеф: карта высот берётся в РОДНОМ разрешении (сетка 500 м для показа груба),
@@ -1515,10 +1585,23 @@ class ThreatController:
         """Сектора «анализа моделирования» по направлениям (довесок 06.09.2026): галка
         в группе «пролёт БПЛА» — считает модель (`sector_stats`), рисует представление."""
         if not toggles.get("show_sector_stats"):
-            self.view.render_sector_compass([], None)
+            self.view.render_sector_compass([])
             return
-        self.view.render_sector_compass(self.model.sector_stats(),
-                                        self.model.target_only_km())
+        m = self.model  # модель — короче в списке ниже
+        if not len(m.targets):                         # целей не ставили — цель по умолчанию
+            self.view.render_sector_compass([(m.sector_stats(), m.target_only_km())])
+            return
+        # ⚠️ КОМПАС У КАЖДОЙ ЦЕЛИ ПО ЕЁ МАРШРУТАМ (заказчик 23.09.2026); галочка «Сектора»
+        # в таблице окна целей гасит лишние. Одна цель — те же числа, что раньше
+        self.view.render_sector_compass(
+            [(m.sector_stats(i), t) for i, t in enumerate(m.targets.points_km())
+             if m.targets.items[i].sectors])
+
+    def on_target_sectors(self, i, on):
+        """Галочка «Сектора» у цели в таблице окна: перерисовать компасы. Отдаёт: ''."""
+        self.model.set_target_sectors(i, on)
+        self._render_sector_compass(self.view.get_toggles())
+        return ""
 
     def _render_sensor_track(self, toggles):
         """«Анализ размещения» (задача 8.9) — сравнение ПЕРВОГО построения с ТЕКУЩИМ.
@@ -1626,7 +1709,7 @@ class ThreatController:
                 "",
                 f"ЗАСЕЧКА ПРОЛЁТОВ (по {me.get('n_routes_eval', 0)} маршрутам)",
                 f"  засечено ≥1 датчиком: {me.get('detect_frac', 0)*100:.0f}%",
-                f"  засечено ≥k({p.threat_k}): {me.get('detect_k_frac', 0)*100:.0f}%",
+                f"  засечено {self._k_label()}: {me.get('detect_k_frac', 0)*100:.0f}%",
                 f"  средняя кратность: {me.get('mean_hits', 0):.1f}",
             ] + self._by_type_lines(me)
         self.view.set_metrics(lines)
@@ -1704,55 +1787,86 @@ class ThreatController:
         return out
 
     # ---- окно «Анализ моделирования» (план 8, задача 8.9, довесок 06.09.2026) ----
-    def _analysis_html(self):
-        """HTML-текст окна: сумма засечки, разбивка по типам датчиков (те же числа,
-        что и в боковой панели, `_placement_lines`/`_by_type_lines`) и — НОВОЕ —
-        разбивка по 12 направлениям компаса (`ThreatModel.sector_stats`). Направления,
-        не набравшие заданную кратность k, выделяются красным (заказчик: «те, которые
-        не удовлетворили кратности, помечаются красным»)."""
-        me = self.model.metrics() or {}
-        lines = ["<h3>ЗАСЕЧКА ПРОЛЁТОВ</h3>"]
+    def _analysis_choices(self):
+        """Подписи целей для выбора в окне «Анализ» («Цель №N — маршрутов M»). Отдаёт:
+        список строк; пусто — цель одна, и выбирать нечего."""
+        m = self.model  # модель
+        if len(m.targets) < 2:                         # цель одна — анализ один
+            return []
+        return ["Цель №%d — маршрутов %d" % (i + 1, len(part))
+                for i, part in enumerate(m.routes_by_target())]
+
+    def _k_label(self, html=False):
+        """Подпись «засечено с кратностью»: «≥k(3)» при «одна на всех», иначе «своей кратностью
+        типа» (В13.13). Вход: html — писать «&ge;». Отдаёт: строку."""
+        if bool(getattr(self.model.p, "threat_k_same", True)):   # кратность одна на всех
+            return ("&ge;k(%d)" if html else "≥k(%d)") % int(self.model.p.threat_k)
+        return "своей кратностью типа"                # у каждого типа своя k
+
+    def _analysis_html(self, target=None):
+        """HTML окна «Анализ»: засечка, по типам, по 12 направлениям (красным — кратности не
+        хватает). Вход: None — обобщённый анализ по всем целям, номер с нуля — одна цель."""
+        m = self.model  # модель
+        me = m.metrics() or {}  # показатели расстановки
+        multi = len(m.targets) > 1                     # целей несколько (план 13)
         if not me:
-            lines.append("<p>Показателей ещё нет — сначала расставьте датчики.</p>")
-            return "".join(lines)
+            return ("<h3>ЗАСЕЧКА ПРОЛЁТОВ</h3>"
+                    "<p>Показателей ещё нет — сначала расставьте датчики.</p>")
+        if target is None:                             # обобщённый: вся выборка
+            d = dict(n=int(me.get("n_routes_eval", 0)), det1=me.get("detect_frac", 0),
+                     detk=me.get("detect_k_frac", 0), mean_hits=me.get("mean_hits", 0),
+                     by_type=me.get("by_type") or {}, covered=me.get("covered_frac", 0))
+            stats = m.sector_stats()  # компас по всей выборке
+            title = "ЗАСЕЧКА ПРОЛЁТОВ" + (" — ОБОБЩЁННО, ВСЕ ЦЕЛИ" if multi else "")  # заголовок отчёта
+        else:                                          # одна цель: её часть выборки
+            d = m.target_analysis(int(target))
+            d["covered"] = None                        # доля веса — про карту, а не про цель
+            stats = d["sectors"]  # компас по маршрутам цели
+            title = "ЗАСЕЧКА ПРОЛЁТОВ — ЦЕЛЬ №%d" % (int(target) + 1)  # заголовок отчёта
+        lines = ["<h3>%s</h3>" % title]  # HTML по кускам
         # ⚠️ ВЕЗДЕ «КОЛИЧЕСТВО (ПРОЦЕНТ)», А НЕ ГОЛЫЙ ПРОЦЕНТ (заказчик, довесок
         # 06.09.2026: «пиши количество (процент)») — так же, как уже сделано в разделе
         # «ПО НАПРАВЛЕНИЯМ» ниже. `_evaluate` хранит только долю (`detect_frac`), не
         # само число маршрутов — считаем его обратно, округляя долю × общее число.
-        n_ev = int(me.get("n_routes_eval", 0))
+        n_ev = int(d["n"])                             # маршрутов в разборе, шт.
         lines.append(
-            "<p>по %d маршрутам: засечено &ge;1 — %d (%.0f%%), засечено &ge;k(%d) — "
-            "%d (%.0f%%), средняя кратность %.1f, доля покрытия веса %.0f%%</p>"
-            % (n_ev, round(me.get("detect_frac", 0) * n_ev), me.get("detect_frac", 0) * 100,
-               int(self.model.p.threat_k), round(me.get("detect_k_frac", 0) * n_ev),
-               me.get("detect_k_frac", 0) * 100,
-               me.get("mean_hits", 0), me.get("covered_frac", 0) * 100))
-        by = me.get("by_type") or {}
+            "<p>по %d маршрутам: засечено &ge;1 — %d (%.0f%%), засечено %s — "
+            "%d (%.0f%%), средняя кратность %.1f%s</p>"
+            % (n_ev, round(d["det1"] * n_ev), d["det1"] * 100,
+               self._k_label(html=True), round(d["detk"] * n_ev), d["detk"] * 100, d["mean_hits"],
+               ", доля покрытия веса %.0f%%" % (d["covered"] * 100)
+               if d["covered"] is not None else ""))
+        by = d["by_type"]  # показатели по типам
         if by:
             lines.append("<h3>ПО ТИПАМ ДАТЧИКОВ</h3><ul>")
             for t in sorted(by):
-                d = by[t]
+                bt = by[t]                             # показатели типа
+                cov = ("" if "covered_frac" not in bt   # доля веса — только в обобщённом
+                       else ", покрытие веса %.0f%%" % (bt["covered_frac"] * 100))
                 lines.append(
                     "<li>тип %d: %d шт., R=%.3g км, k=%d — ловит &ge;1: %d (%.0f%%), "
-                    "&ge;k: %d (%.0f%%), средняя кратность %.1f, покрытие веса %.0f%%%s</li>"
-                    % (t, d["n"], d["r_km"], d.get("k", 0),
-                       round(d["detect_frac"] * n_ev), d["detect_frac"] * 100,
-                       round(d.get("detect_k_frac", 0) * n_ev), d.get("detect_k_frac", 0) * 100,
-                       d["mean_hits"], d.get("covered_frac", 0) * 100,
-                       (" · простаивает: %d" % d["idle"]) if d.get("idle") else ""))
+                    "&ge;k: %d (%.0f%%), средняя кратность %.1f%s%s</li>"
+                    % (t, bt["n"], bt["r_km"], bt.get("k", 0),
+                       round(bt["detect_frac"] * n_ev), bt["detect_frac"] * 100,
+                       round(bt.get("detect_k_frac", 0) * n_ev),
+                       bt.get("detect_k_frac", 0) * 100, bt["mean_hits"], cov,
+                       (" · простаивает: %d" % bt["idle"]) if bt.get("idle") else ""))
             lines.append("</ul>")
-        stats = self.model.sector_stats()
+        if target is None and multi:                   # сводка по целям — только в обобщённом
+            lines.append(self._analysis_by_target_html())
         cardinal = {0: " (север)", 90: " (восток)", 180: " (юг)", 270: " (запад)"}
-        lines.append("<h3>ПО НАПРАВЛЕНИЯМ (компас от цели, шаг 30°, по заходу маршрута, "
-                     "не по старту)</h3><ul>")
+        lines.append("<h3>ПО НАПРАВЛЕНИЯМ (компас от %s, шаг 30°, по заходу маршрута, "
+                     "не по старту)</h3><ul>"
+                     % ("СВОЕЙ цели каждого маршрута" if target is None and multi else "цели"))
         for e in stats:
             deg = e["deg"]
             n = e["n_routes"]
             pct = (lambda x: (100.0 * x / n) if n else 0.0)
             row = ("%d&deg;%s: маршрутов %d — не засечено (0 раз) %d (%.0f%%), "
-                  "засечено &ge;1 — %d (%.0f%%), засечено &ge;k(%d) — %d (%.0f%%)"
+                  "засечено &ge;1 — %d (%.0f%%), засечено %s — %d (%.0f%%)"
                   % (deg, cardinal.get(deg, ""), n, e["n_zero"], pct(e["n_zero"]),
-                     e["n_ge1"], pct(e["n_ge1"]), e["k"], e["n_ge_k"], pct(e["n_ge_k"])))
+                     e["n_ge1"], pct(e["n_ge1"]), self._k_label(html=True),
+                     e["n_ge_k"], pct(e["n_ge_k"])))
             if e["n_routes"] and not e["ok"]:
                 lines.append('<li style="color:#ff5555"><b>%s — кратности не хватает'
                             '</b></li>' % row)
@@ -1760,6 +1874,22 @@ class ThreatController:
                 lines.append("<li>%s</li>" % row)
         lines.append("</ul>")
         return "".join(lines)
+
+    def _analysis_by_target_html(self):
+        """Сводка «ПО ЦЕЛЯМ» для обобщённого анализа: у каждой цели маршрутов, засечено ≥1
+        и ≥k — количество (процент). Отдаёт: HTML-строку."""
+        m = self.model  # модель
+        k_lab = self._k_label(html=True)               # «≥k(3)» или «своей кратностью типа»
+        out = ["<h3>ПО ЦЕЛЯМ</h3><ul>"]
+        for i, part in enumerate(m.routes_by_target()):
+            d = m._detection(part)                     # засечка маршрутов к этой цели
+            n = int(d["n"])                            # маршрутов к цели, шт.
+            out.append("<li>цель №%d: маршрутов %d — засечено &ge;1 — %d (%.0f%%), "
+                       "%s — %d (%.0f%%), средняя кратность %.1f</li>"
+                       % (i + 1, n, round(d["det1"] * n), d["det1"] * 100, k_lab,
+                          round(d["detk"] * n), d["detk"] * 100, d["mean_hits"]))
+        out.append("</ul>")
+        return "".join(out)
 
     def run(self):
         self.view.show()

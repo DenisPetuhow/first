@@ -312,6 +312,28 @@ def main(argv=None):
     check(sum(c1._pre_n) == 0 and sum(c2._pre_n) > 0,
           "кэш видит покрытие датчиков ДРУГИХ типов",
           "засечек чужими: %d против %d" % (sum(c2._pre_n), sum(c1._pre_n)))
+    # ⚠️ СВОЯ КРАТНОСТЬ — СВОИМИ ДАТЧИКАМИ (заказчик 24.09.2026, В13.13): галка «одна на
+    # всех» снята и разнос выключен — тип 2 обязан встать одинаково при 6 и при 3 датчиках типа 1
+    k_old = (p.threat_k, p.threat_k2)                            # вернуть после опыта
+    p.threat_k_same, p.threat_spread_types = False, False
+    p.threat_k, p.threat_k2 = 3, 2
+    pos2 = []                                                    # позиции типа 2 в двух расстановках
+    for n_first in (6, 3):
+        p.threat_N = n_first
+        m.place_sensors()
+        pos2.append(np.asarray(m.sensors, float)[np.asarray(m.sensors_type, int) == 2])
+    same_pos = (pos2[0].shape == pos2[1].shape and len(pos2[0]) > 0   # совпали ли позиции типа 2
+                and np.allclose(pos2[0], pos2[1]))
+    check(same_pos, "своя кратность: тип 2 не зависит от датчиков типа 1",
+          "типа 2: %d и %d датчиков" % (len(pos2[0]), len(pos2[1])))
+    me_own = m.metrics()                                         # отчёт при своей кратности
+    by_own = me_own.get("by_type", {})                           # засечка по типам
+    any_own = max((v["detect_k_frac"] for v in by_own.values()), default=0.0)   # лучший из типов, доля
+    check(me_own["detect_k_frac"] >= any_own - 1e-9,
+          "«засечено своей кратностью» не меньше лучшего из типов",
+          "%.3f против %.3f" % (me_own["detect_k_frac"], any_own))
+    p.threat_k_same, p.threat_spread_types = True, True
+    p.threat_k, p.threat_k2 = k_old
     p.threat_N, p.threat_R, p.threat_N2 = n1, 2.0, 0
     m.clear_manual_sensors()
 
@@ -428,6 +450,58 @@ def main(argv=None):
           "«Убрать точку старта» возвращает один общий запас")
     m.p.threat_L_max_manual = False
 
+    print("\n5г. ОБЪЕКТЫ ЗАЩИТЫ: НЕСКОЛЬКО ЦЕЛЕЙ, РОЗЫГРЫШ БЕЗ ПОВТОРОВ (план 13, 13.12–13.14)")
+    from model.targets import TargetBag, route_target_index
+    from model.threat_routes import flight_envelope
+    # ⚠️ ВЫКЛЮЧАЕМОСТЬ В НОЛЬ: мешок из одной цели не трогает ГПСЧ — иначе поток случайных
+    # чисел сместился бы, и эталон §6 разъехался бы без единой настоящей правки
+    rng5 = np.random.default_rng(5)
+    st5 = rng5.bit_generator.state                   # состояние ГПСЧ до розыгрыша
+    one5 = TargetBag([0])                            # мешок из одной цели
+    for _ in range(20):
+        one5.peek(rng5); one5.commit()
+    check(rng5.bit_generator.state == st5, "одна цель: ГПСЧ не тронут")
+    m._refresh_envelope()
+    m._ensure_ctx(m.entries_target_km()[0])
+    check(len(m._ctxs) == 1 and m.target_km is None, "целей не ставили — один контекст, цель по умолчанию")
+    cx5, cy5, r5 = m.area_circle                     # круглый район, км
+    pts5 = [(cx5, cy5), (cx5 + 0.5 * r5, cy5 + 0.3 * r5),   # три цели внутри круга, км
+            (cx5 - 0.4 * r5, cy5 - 0.5 * r5)]
+    for q in pts5:
+        m.add_target(*q)
+    check(len(m.targets) == 3 and [t.weight for t in m.targets.items] == [0.33] * 3,
+          "три цели, приоритеты поровну по 0.33")
+    check(m.add_target(cx5 + 2 * r5, cy5) != "", "цель за районом не ставится")
+    _, t_apply = step(m.apply_targets)               # карта и зона по всем целям, с
+    env5 = np.asarray(m.route_area, bool)            # зона по всем целям
+    singles = [flight_envelope(m.grid, m.entries_target_km()[0], q, m.route_L_max(),   # маски
+                               m._route_gap_km(), slack_km=m._route_slack_km())[0]
+               for q in pts5]                       # зона к каждой цели отдельно
+    check(all(not bool((np.asarray(s, bool) & ~env5).any()) for s in singles),
+          "зона пролёта — объединение по целям",
+          "ячеек %d, по целям %s" % (int(env5.sum()), [int(np.asarray(s).sum()) for s in singles]))
+    check(m.big_ring_target_km() is None, "доли равны — кольца больших нет (В13.8)")
+    m.set_target_weight(1, 0.2); m.set_target_weight(2, 0.2); m.set_target_weight(0, 0.6)
+    check(m.big_ring_target_km() == pts5[0], "0.6 / 0.2 / 0.2 — кольцо у приоритетной цели")
+    check(m.set_target_weight(1, 0.5) != "", "сумма приоритетов больше 1 не принимается")
+    if not quick:
+        m.p.threat_iter_routes = 30
+        rr5, t_it5 = step(m.iter_batch)
+        own5 = [route_target_index(r, pts5) for r in rr5]   # цель каждого маршрута, по порядку
+        rep5 = sum(1 for a, b in zip(own5, own5[1:]) if a == b)   # повторов подряд, шт.
+        rounds5 = all(sorted(own5[k:k + 3]) == [0, 1, 2]           # каждый круг из трёх —
+                      for k in range(0, len(own5) - 2, 3))         # все три цели по разу
+        share5 = [own5.count(i) / max(len(own5), 1) for i in range(3)]   # доли целей
+        check(len(m._ctxs) == 3, "у каждой цели свой контекст", "%.1f с на выборку" % t_it5)
+        check(len(rr5) > 0 and rep5 == 0, "подряд одна цель не выпадает",
+              "маршрутов %d, повторов %d" % (len(rr5), rep5))
+        check(rounds5, "за круг каждая цель ровно по разу")
+        check(max(share5) - min(share5) < 0.05, "доли целей поровну",
+              " / ".join("%.0f %%" % (100 * s) for s in share5))
+    m.target_km = None
+    check(not len(m.targets) and len(m.target_points_km()) == 1,
+          "`target_km = None` убирает все цели", "применение %.1f с" % t_apply)
+
     # ---- 6. снятие района обнуляет ВСЁ ----
     print("\n6. СНЯТИЕ РАЙОНА")
     m.clear_area()
@@ -444,7 +518,7 @@ def main(argv=None):
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
         return 1
-    print("ВСЁ ПРОШЛО. Порядок работы, кэш, сброс и запас хода по точкам — в норме.")
+    print("ВСЁ ПРОШЛО. Порядок работы, кэш, сброс, запас хода по точкам и розыгрыш целей — в норме.")
     return 0
 
 

@@ -29,7 +29,7 @@ import matplotlib.cm as cm
 from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS, THREAT_APPROACH_LABELS,
-                    THREAT_SPEND_LABELS, THREAT_TILE_AREA,
+                    THREAT_SPEND_LABELS, THREAT_TILE_AREA, THREAT_TARGETS_MAX,
                     THREAT_CELL_M, THREAT_COMPASS_LINE_KM, THREAT_AREA_LABEL,
                     THREAT_AREA_SOURCE, THREAT_AREA_ERROR, THREAT_PAN_MARGIN_KM)
 from .basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
@@ -448,7 +448,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._scale_order = ["iter_heat", "threat"]
         self._scale_shown = None
 
-        self._target_mode = False
+        # ПОСТАНОВКА ОБЪЕКТОВ ЗАЩИТЫ (план 13, 13.13): режим держится, пока не поставлено
+        # заданное число целей или не нажата правая кнопка
+        self._target_mode = False         # ждём двойные клики: цели
+        self._targets_left = 0            # сколько целей ещё поставить в этом заходе, шт.
+        self._targets_placed = 0          # сколько поставлено в этом заходе, шт.
+        self._targets_dlg = None          # окно «Объекты защиты»
+        self._target_labels = []          # номера целей на карте (pg.TextItem)
         self._sector_mode = False         # ждём клик по краю карты: сектор появления
         self._zone_mode = False           # идёт рисование запретной зоны
         self._zone_pts = []               # вершины зоны, которую рисуют прямо сейчас
@@ -483,6 +489,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_map_layer = lambda key: None
         self.on_map_offline = lambda flag: None
         self.on_set_target = lambda x, y: None
+        # ПЛАН 13, 13.13: объекты защиты — окно и постановка мышью
+        self.on_targets_rows = lambda: []           # строки таблицы целей
+        self.on_target_add = lambda x, y: ""        # двойной клик: '' — принята, иначе причина
+        self.on_targets_done = lambda: None         # постановка закончена — применить
+        self.on_target_weight = lambda i, w: ""     # приоритет из таблицы
+        self.on_target_move = lambda i, lon, lat: ""  # координаты из таблицы
+        self.on_targets_clear = lambda: None        # «Очистить»
+        self.on_target_sectors = lambda i, on: ""   # галочка «Сектора» у цели
         self.on_set_sector = lambda x, y: None      # задан сектор появления БПЛА
         self.on_clear_sector = lambda: None         # сектор убран
         # ПЛАН 11, 11.6: круглый район, окно «Сектор налёта», точки старта мышью
@@ -545,7 +559,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_flights_clear = lambda: None
         # ОКНО «ПОСМОТРЕТЬ МАРШРУТЫ» (задача 8.6, довесок 06.09.2026)
         self.on_routes_data = lambda: ([], [])
-        self.on_analysis_data = lambda: ""    # HTML отчёта «Анализ моделирования»
+        self.on_analysis_data = lambda target=None: ""   # HTML отчёта «Анализ моделирования»
+        self.on_analysis_choices = lambda: []  # подписи целей для выбора в окне анализа
         self.on_route_preview = lambda is_loaded, index: None
         self.on_route_preview_reset = lambda: None
         self.on_generalize_loaded = lambda on: None             # галочка «обобщать проходы»
@@ -597,13 +612,76 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._refresh_map_detail()
         self.on_view_changed()
 
-    # ---- режим «указать цель» (клик по карте) ----
-    def _begin_target(self):
+    # ══════════════════════════════════════════════════════════════════════════
+    # ОКНО «ОБЪЕКТЫ ЗАЩИТЫ» И ПОСТАНОВКА ЦЕЛЕЙ (план 13, задача 13.13)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _open_targets_window(self):
+        """Кнопка «Указать цель»: окно объектов защиты (одно на всё время работы)."""
+        if self._targets_dlg is None:
+            from .targets_window import TargetsDialog
+            self._targets_dlg = TargetsDialog(
+                self, rows=lambda: self.on_targets_rows(), on_place=self._begin_targets,
+                on_weight=lambda i, w: self.on_target_weight(i, w),
+                on_move=lambda i, lon, lat: self.on_target_move(i, lon, lat),
+                on_clear=lambda: self.on_targets_clear(), limit=THREAT_TARGETS_MAX,
+                on_sectors=lambda i, on: self.on_target_sectors(i, on))
+        self._targets_dlg.refresh()
+        self._targets_dlg.show()
+        self._targets_dlg.raise_()
+        self._targets_dlg.activateWindow()
+
+    def refresh_targets_window(self, note=""):
+        """Подтянуть в открытое окно целей свежие строки (зовёт контроллер после правок)."""
+        if self._targets_dlg is not None:  # окно открывали
+            self._targets_dlg.refresh(note)
+
+    def _begin_targets(self, n):
+        """«Задать объект»: окна прячутся, двойной клик ставит цель, n штук — и режим
+        закрывается сам; правая кнопка или Esc — раньше. Вход: сколько целей, шт."""
         self._end_measure()               # режимы мыши взаимно исключают друг друга
         self._end_sector_mode()
+        self._end_pick_sensor()
+        self._end_edit_sensor()
         self._end_edit_entry()
+        self._end_targets_mode()          # прежний заход, если не закончен
         self._target_mode = True
-        self.set_title("ДВОЙНОЙ клик по карте — точка ЦЕЛИ")
+        self._targets_left = max(1, int(n))
+        self._targets_placed = 0
+        self._hide_dialogs()              # карту не должно перекрывать ничто (заказчик 21.09.2026)
+        self._grab_right_button(True)     # правая кнопка = выход из режима
+        self._targets_title()
+
+    def _targets_title(self, note=""):
+        """Заголовок режима: сколько осталось. Вход: строка перед подсказкой."""
+        self.set_title("%sОБЪЕКТЫ ЗАЩИТЫ: ДВОЙНОЙ клик по карте — поставить цель (осталось %d). "
+                       "Правая кнопка мыши — закончить." % (note, self._targets_left))
+
+    def _target_click(self, x, y):
+        """Двойной клик в режиме целей: поставить, счётчик вниз, набрали — применить."""
+        why = self.on_target_add(x, y)    # '' — модель приняла, иначе причина
+        if why:                           # за районом или предел
+            self._targets_title("Не поставлено: %s. " % why)
+            return
+        self._targets_placed += 1
+        self._targets_left -= 1
+        if self._targets_left <= 0:       # все заказанные поставлены — применяется само
+            self._end_targets_mode()
+        else:
+            self._targets_title("Цель поставлена. ")
+
+    def _end_targets_mode(self):
+        """Закончить постановку целей: правую кнопку вернуть, окна показать, а поставленное
+        — ПРИМЕНИТЬ (слово заказчика «автоматически применяется»). Не включён — ничего."""
+        if not self._target_mode:         # режим и так выключен
+            return
+        self._target_mode = False
+        self._grab_right_button(False)    # вернуть правую кнопку pyqtgraph
+        self.set_title("")
+        self._restore_dialogs()           # окна, спрятанные на время кликов
+        if self._targets_placed:          # что-то поставили — пересчитать зону
+            self.on_targets_done()
+        self._targets_placed = 0
+        self.refresh_targets_window()
 
     # ══════════════════════════════════════════════════════════════════════════
     # ОКНО «СЕКТОР НАЛЁТА» И РЕЖИМ ЗАДАНИЯ СЕКТОРА КЛИКАМИ (план 11, 11.6)
@@ -668,7 +746,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._end_pick_sensor()
         self._end_edit_sensor()
         self._end_edit_entry()
-        self._target_mode = False
+        self._end_targets_mode()
         self._sector_mode = True
         self._grab_right_button(True)     # правая кнопка = выход из режима
         self._hide_dialogs()              # карту не должно перекрывать ничто (заказчик 21.09.2026)
@@ -740,7 +818,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._end_pick_sensor()
         self._end_edit_sensor()
         self._end_edit_entry()
-        self._target_mode = False
+        self._end_targets_mode()
         self._uav_start_mode = True
         self._hide_dialogs()              # карту не должно перекрывать ничто
         self._grab_right_button(True)     # правая кнопка = выход из режима
@@ -792,7 +870,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._end_edit_sensor()
         self._end_measure()
         self._end_sector_mode()
-        self._target_mode = False
+        self._end_targets_mode()
         self._edit_entry = True
         self._grab_right_button(True)      # правая кнопка = выход из режима
         self._lock_panel_for_entry(True)
@@ -932,7 +1010,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         карте просто чтобы посмотреть координаты в строке под ней. Ставить датчик на
         каждый такой клик значило бы засорять карту случайными точками."""
         self._pick_sensor = not self._pick_sensor
-        self._target_mode = False
+        self._end_targets_mode()
         if self._pick_sensor:
             self._end_edit_sensor()                  # два режима мыши разом невозможны
             self._end_measure()
@@ -984,7 +1062,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self._end_measure()
             self._end_sector_mode()
             self._end_edit_entry()
-            self._target_mode = False
+            self._end_targets_mode()
         self._grab_right_button(self._edit_sensor)    # правая кнопка = выход из режима
         self._lock_panel_for_edit(self._edit_sensor)
         self.btn_edit_sensor.setText("Правлю датчики"
@@ -1207,8 +1285,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         """Открыть/обновить окно полной статистики — снимок на момент нажатия кнопки."""
         if self._analysis_dlg is None:
             from .analysis_window import AnalysisDialog
-            self._analysis_dlg = AnalysisDialog(self)
-        self._analysis_dlg.set_html(self.on_analysis_data())
+            self._analysis_dlg = AnalysisDialog(
+                self, data=lambda target: self.on_analysis_data(target),
+                choices=lambda: self.on_analysis_choices())   # цели — план 13
+        self._analysis_dlg.refresh()
         self._analysis_dlg.show()
         self._analysis_dlg.raise_()
         self._analysis_dlg.activateWindow()
@@ -1270,7 +1350,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # до всего остального: в этих режимах панель погашена, и другого пути к выходу
         # под рукой нет.
         if (self._pick_sensor or self._edit_sensor or self._measure_mode
-                or self._edit_entry or self._sector_mode or self._uav_start_mode):
+                or self._edit_entry or self._sector_mode or self._uav_start_mode
+                or self._target_mode):
             try:
                 right = ev.button() == QtCore.Qt.RightButton
             except Exception:
@@ -1280,6 +1361,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     ev.accept()
                 except Exception:
                     pass
+                if self._target_mode:      # цели (план 13): досрочно, поставленные остаются
+                    placed = self._targets_placed      # сколько успели поставить, шт.
+                    self._end_targets_mode()           # поставленные применит контроллер
+                    if not placed:                     # ни одной — применять нечего
+                        self.set_title("Постановка целей отменена: ни одной не поставлено.")
+                    return
                 if self._uav_start_mode:   # старт БПЛА: выход без точки, окна вернуть (12.2)
                     self._end_uav_start_mode()
                     self.set_title("Выбор точки старта отменён.")
@@ -1342,8 +1429,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.on_set_uav_start(float(pt.x()), float(pt.y()))
             self._end_uav_start_mode()     # — и окно условий возвращается
             return
-        self._target_mode = False
-        self.on_set_target(float(pt.x()), float(pt.y()))
+        self._target_click(float(pt.x()), float(pt.y()))   # цели (план 13): режим НЕ снимается
 
     # ---- режим «ЗАДАТЬ РАЙОН МОДЕЛИРОВАНИЯ» (план 8, задача 8.2) ----
     #
@@ -1511,6 +1597,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             if self._sector_mode:          # сектор кликами (11.6): окно остаётся
                 self._end_sector_mode()
                 return
+            if self._target_mode:          # цели (план 13): поставленные применяются
+                self._end_targets_mode()
+                return
         if ev.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace) \
                 and self._edit_sensor:
             self._delete_selected_sensor()
@@ -1604,7 +1693,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self._end_zone(False)
         if self._area_mode:
             self._end_area(False)
-        self._target_mode = False
+        self._end_targets_mode()
         self._measure_mode = True
         self.measure.reset()
         # ⚠️ СЛЕДИМ ЗА МЫШЬЮ ТОЛЬКО В ЭТОМ РЕЖИМЕ: сигнал приходит на каждое движение, и
@@ -2430,11 +2519,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         row_build.addWidget(self.btn_build, 1); row_build.addWidget(self.btn_relief, 1)
         col.addLayout(row_build)
 
+        # ⚠️ С ПЛАНА 13 (13.13) КНОПКА ОТКРЫВАЕТ ОКНО «ОБЪЕКТЫ ЗАЩИТЫ»: целей может быть
+        # несколько, у каждой приоритет; одиночный клик по цели ушёл в режим окна
         self.btn_target = QtWidgets.QPushButton("Указать цель")
         self.btn_target.setToolTip(
-            "Кликните точку ЦЕЛИ на карте. Точка появления БПЛА фиксирована "
-            "(у реки). Цель — задел для построения маршрутов (Этап 3).")
-        self.btn_target.clicked.connect(self._begin_target)
+            "Окно «Объекты защиты»: сколько целей поставить, «Задать объект» (двойной клик по "
+            "карте, правая кнопка — закончить), таблица с приоритетами и «Очистить».\n\n"
+            "Цель каждого маршрута разыгрывается случайно, подряд одна не повторяется.")
+        self.btn_target.clicked.connect(self._open_targets_window)
 
         row_sector = QtWidgets.QHBoxLayout(); row_sector.setSpacing(6)
         # ⚠️ «ЗАДАТЬ СЕКТОР» И «УБРАТЬ СЕКТОР» ПЕРЕЕХАЛИ В ОКНО «СЕКТОР НАЛЁТА» (план 11, 11.6):
@@ -4548,19 +4640,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         ])
         return QtWidgets.QGraphicsPolygonItem(poly)
 
-    def render_sector_compass(self, stats, target_xy):
-        """Сектора «анализа моделирования» по направлениям (довесок 06.09.2026):
-        12 лучей от цели, как у компаса (0° = север, по часовой стрелке), длиной
-        `THREAT_COMPASS_LINE_KM`. Красным — направления, не набравшие кратность
-        (`stats[i]["ok"] is False`); рядом с каждым — сумма пришедших с него маршрутов.
-
-        `stats` — список из `ThreatModel.sector_stats()`, `target_xy` — цель в км
-        (`None`, если район/цель не заданы — тогда просто нечего рисовать)."""
+    def render_sector_compass(self, compasses):
+        """Сектора «анализа моделирования» (довесок 06.09.2026) — компас у КАЖДОЙ цели по её
+        маршрутам (план 13, 23.09.2026). Вход: [(stats из `sector_stats`, (x, y) км), …]."""
         for it in self._compass_items:
             self.pi.removeItem(it)
         self._compass_items = []
-        if not stats or target_xy is None:
-            return
+        for stats, center in compasses or []:
+            if stats and center is not None:          # есть что и где рисовать
+                self._draw_compass(stats, center)
+
+    def _draw_compass(self, stats, target_xy):
+        """12 лучей от цели (0° — север, по часовой), длиной `THREAT_COMPASS_LINE_KM`; красный —
+        кратности не хватает; у конца луча — сколько маршрутов пришло с этой стороны."""
         tx, ty = float(target_xy[0]), float(target_xy[1])
         L = float(THREAT_COMPASS_LINE_KM)
         for e in stats:
@@ -4581,9 +4673,29 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.pi.addItem(lbl, ignoreBounds=True)
             self._compass_items.append(lbl)
 
-    def render_entry_target(self, entry, target):
+    def render_entry_target(self, entry, targets):
+        """Метки входа и целей. Вход: вход (x, y) км; цели — список [(x, y)] км.
+        Целей больше одной — у каждой номер (план 13, 13.15), как у датчиков."""
         self.entry_scatter.setData([entry[0]], [entry[1]])
-        self.target_scatter.setData([target[0]], [target[1]])
+        pts = list(targets)                           # цели, км
+        self.target_scatter.setData([p[0] for p in pts], [p[1] for p in pts])
+        for lbl in self._target_labels:               # прежние номера — снять
+            self.pi.removeItem(lbl)
+        self._target_labels = []
+        if len(pts) < 2:                              # одна цель — номер лишний
+            return
+        for n, (x, y) in enumerate(pts, 1):
+            # ⚠️ ЧЁРНЫЙ И ЖИРНЫЙ, как номера датчиков: белый пропадал на светлой подложке
+            lbl = pg.TextItem("%d" % n, color=_qcolor(THREAT_COLORS["sensor_num"]),
+                              anchor=(0.5, 1.45))
+            f = lbl.textItem.font()                   # шрифт подписи — жирнее и крупнее
+            f.setBold(True)
+            f.setPointSizeF(max(10.0, f.pointSizeF() + 2.0))
+            lbl.setFont(f)
+            lbl.setPos(x, y)
+            lbl.setZValue(23)                         # над крестом цели
+            self.pi.addItem(lbl, ignoreBounds=True)
+            self._target_labels.append(lbl)
 
     def render_uav_start(self, point):
         """Метка старта БПЛА. Вход: (x_km, y_km) или None — тогда метка снимается."""
