@@ -337,6 +337,280 @@ def main(argv=None):
     p.threat_N, p.threat_R, p.threat_N2 = n1, 2.0, 0
     m.clear_manual_sensors()
 
+    # ---- 4е. справочник типов датчиков (план 13, задача 13.1) ----
+    print("\n4е. СПРАВОЧНИК ТИПОВ ДАТЧИКОВ (план 13, 13.1)")
+    from model import sensor_types as st                         # noqa: E402
+    base = st.defaults()                                         # встроенный справочник
+    check([(t.type_id, t.name) for t in base] == [(1, "МОГ"), (2, "ПВН"), (4, "Большой")],
+          "умолчания: МОГ №1, ПВН №2, большой №4",
+          ", ".join("%d %s" % (t.type_id, t.name) for t in base))
+    pvn = st.by_name("ПВН", base)                                # паспорт ПВН
+    check(pvn.zone == "застройка" and pvn.r_km == 0.5 and pvn.k == 4 and pvn.targets,
+          "ПВН: застройка, R 0.5 км, k 4, ставится у целей",
+          "место %s, полоса %g км" % (pvn.zone, pvn.zone_buf_km))
+    check([st.from_row(st.to_row(t)) for t in base] == base and not any(t.validate() for t in base),
+          "паспорт переживает запись в файл и чтение")
+    kept = st._parse([st.to_row(base[0]), dict(st.to_row(base[1]), номер=1),   # что осталось из
+                      {"название": "без номера"}])                            # записей с изъяном
+    check(len(kept) == 1, "повтор номера и запись без номера отброшены", "осталось %d" % len(kept))
+    forced = st.from_row(dict(st.to_row(base[0]), номер=4))     # «малый» под номером большого
+    check(isinstance(forced, st.Big) and st.by_id(4, base).SPEC_KIND == "big",
+          "номер 4 — всегда большой: за ним поля threat_N_big / threat_R_big")
+    check(st.next_id(base) == 5, "новый тип получает номер 5, а не свободный 3",
+          "номер %d" % st.next_id(base))
+    specs = sensor_types(p, base)                                # задание по встроенному справочнику
+    check([s.name for s in specs] == ["МОГ", "ПВН", "Тип 3", "Большой"]
+          and specs[0].r_km == p.threat_R and specs[3].r_km == p.threat_R_big,
+          "номера 1–4: название из паспорта, числа из полей Params",
+          " · ".join("%s R %g" % (s.name, s.r_km) for s in specs))
+    # тип №5: R и k — из паспорта, N — из задания; ставится наравне с прочими малыми
+    extra = base + [st.Small(type_id=5, name="Проба", r_km=1.5, k=2, color="sensor_t3")]
+    real_load = st.load                                          # вернуть после опыта
+    st.load = lambda: list(extra)                                # справочник без записи на диск
+    p.threat_N_types = {"5": 3}                                  # ключ строкой — как из настроек
+    try:
+        spec5 = [s for s in sensor_types(p) if s.type_id == 5]   # тип №5 в задании
+        check(len(spec5) == 1 and spec5[0].n == 3 and spec5[0].r_km == 1.5,
+              "тип №5: R из паспорта, N из задания",
+              "N %d, R %g км" % (spec5[0].n, spec5[0].r_km) if spec5 else "нет в задании")
+        m.place_sensors()
+        got5 = int((np.asarray(m.sensors_type, int) == 5).sum())   # поставлено типа №5
+        check(got5 == 3 and len(m.sensors) == n1 + 3, "тип №5 расставлен наравне с прочими",
+              "типа №5 — %d, всего %d" % (got5, len(m.sensors)))
+        m.add_manual_sensor(5, True, fx, fy)
+        check(m.manual_sensors[-1].type_id == 5, "датчик типа №5 можно задать руками")
+    finally:
+        st.load = real_load
+        p.threat_N_types = {}
+        m.clear_manual_sensors()
+    m.place_sensors()
+    check(len(m.sensors) == n1, "без типа №5 — прежнее число датчиков", "%d" % len(m.sensors))
+
+    # ---- 4ж. места датчиков: постройки, лес, неудобья (план 13, задача 13.17) ----
+    print("\n4ж. МЕСТА ДАТЧИКОВ: ПОСТРОЙКИ, ЛЕС, НЕУДОБЬЯ (план 13, 13.17)")
+    from model import sensor_zones as sz                         # noqa: E402
+    check(sz.file_name("threat_layers_arh.npz") == "sensor_layers_arh.npz",
+          "файл мест датчиков лежит рядом с кэшем слоёв", sz.file_name("threat_layers_arh.npz"))
+    w_before = m.grid.weight.copy()                              # вес до сводки
+    zc = m.sensor_cells()                                        # сводка по ячейкам
+    check(np.array_equal(w_before, m.grid.weight), "сводка мест датчиков вес карты не трогает")
+    check(m.sensor_cells() is zc, "сводка считается раз на сетку")
+    # ранг «кто выше»: этажность → тип → площадь (В13.19). Строки: x, y, этажей, класс, м²
+    probe = np.array([[0, 0, np.nan, 1, 5000], [0, 0, 2, 0, 50],             # «не ясно» 5000 м²; дом в 2 этажа
+                      [0, 0, np.nan, 2, 100], [0, 0, np.nan, 0, 900]], float)  # многоквартирный; гараж 900 м²
+    check(list(np.argsort(-sz.building_rank(probe))) == [2, 1, 0, 3],
+          "кто выше: этажность → тип → площадь", "многоквартирный, 2 эт., большое «не ясно», гараж")
+    if not sz.load():                                            # участок без файла мест датчиков
+        print("   файла %s нет — числа по участку пропущены" % os.path.basename(sz.layers_path()))
+    else:
+        cnt = zc["count"]                                        # построек в ячейке
+        iy, ix = np.nonzero(cnt > 0)
+        xy = zc["top_xy"][iy, ix]                                # самые высокие постройки, км
+        own = ((xy[:, 0] >= m.grid.ox + ix * m.grid.h)             # постройка в своей ячейке & (xy[:, 0] < m.grid.ox + (ix + 1) * m.grid.h)
+               & (xy[:, 1] >= m.grid.oy + iy * m.grid.h) & (xy[:, 1] < m.grid.oy + (iy + 1) * m.grid.h))
+        check(len(own) > 0 and bool(own.all()), "самая высокая постройка лежит в своей ячейке",
+              "%d построек в %d ячейках" % (int(cnt.sum()), len(own)))
+        check(0.0 < zc["forest"].mean() < 1.0 and not np.any(zc["top_floors"][cnt == 0] > 0),
+              "лес найден, у пустых ячеек высоты нет",
+              "лес %.1f %%, неудобья %.1f %% района" % (100 * zc["forest"].mean(), 100 * zc["rough"].mean()))
+
+    # ---- 4з. карта места типа: ПВН только в застройке (план 13, задача 13.4) ----
+    print("\n4з. КАРТА МЕСТА ТИПА: ПВН ТОЛЬКО В ЗАСТРОЙКЕ (план 13, 13.4)")
+    specs = {s.type_id: s for s in sensor_types(p)}              # типы задания по номеру
+    check(m.allowed_mask(specs[1]) is None, "МОГ ставится везде — прежний расчёт, карты нет")
+    zmap = m.allowed_mask(specs[2])                              # карта места ПВН
+    if zmap is None or not zmap.any():                           # без построек карта пуста
+        print("   карта ПВН пуста (нет файла мест датчиков?) — проверки расстановки пропущены")
+    else:
+        check(m.allowed_mask(specs[2]) is zmap, "карта считается раз на сетку",
+              "%.1f км²" % (zmap.sum() * m.grid.h ** 2))
+        # ⚠️ одиночный ПВН при N1 = 0 раньше шёл путём «один тип» и вставал НОЛЬ раз
+        keep_n = (p.threat_N, p.threat_N2, p.threat_R2)          # вернуть после опыта
+        p.threat_N, p.threat_N2, p.threat_R2 = 0, 6, 0.5
+        m.place_sensors()
+        on_map = sz.cells_of(m.grid, m.sensors, zmap)            # стоит ли ПВН на своей карте
+        check(len(m.sensors) == 6 and set(m.sensors_type.tolist()) == {2},
+              "одиночный ПВН ставится, сколько заказано", "%d из 6" % len(m.sensors))
+        check(len(on_map) > 0 and bool(on_map.all()), "все ПВН — на карте места",
+              "%d из %d" % (int(on_map.sum()), len(on_map)))
+        places = m.metrics().get("zone_places", {}).get(2)       # (разрешено, кандидатов)
+        check(bool(places) and places[0] > 0, "число мест ПВН видно в отчёте",
+              "%s из %s" % places if places else "нет")
+        # ---- 4и. своя сетка типа (13.5): на крыше самой высокой постройки либо в центре ячейки ----
+        print("\n4и. СВОЯ СЕТКА ТИПА: ПВН НА КРЫШЕ ИЛИ В ЦЕНТРЕ ЯЧЕЙКИ (план 13, 13.5)")
+        g, zc = m.grid, m.sensor_cells()
+        S = np.asarray(m.sensors, float)                         # позиции ПВН, км
+        ix = np.floor((S[:, 0] - g.ox) / g.h).astype(int)        # их ячейки: столбцы
+        iy = np.floor((S[:, 1] - g.oy) / g.h).astype(int)        # и строки
+        has_b = zc["count"][iy, ix] > 0                          # в ячейке есть постройки
+        at_top = np.hypot(*(zc["top_xy"][iy, ix] - S).T) < 1e-6  # стоит на самой высокой
+        at_mid = np.hypot(S[:, 0] - (g.ox + (ix + 0.5) * g.h),                # стоит в центре
+                          S[:, 1] - (g.oy + (iy + 0.5) * g.h)) < 1e-6         # своей ячейки
+        check(bool(np.where(has_b, at_top, at_mid).all()),
+              "ПВН — на самой высокой постройке ячейки или в её центре",
+              "на постройках %d из %d" % (int((has_b & at_top).sum()), len(S)))
+        p.threat_N, p.threat_N2 = n1, 6                           # МОГ R 2 км рядом с ПВН 0.5 км
+        check(abs(min_small_radius(p) - p.threat_R) < 1e-9, "ПВН со своей сеткой общий шаг не дробит",
+              "шаг по R = %g км" % min_small_radius(p))
+        p.threat_N, p.threat_N2, p.threat_R2 = keep_n
+        m.place_sensors()
+
+    # ---- 4к. оценка зазора до оптимума: граница Минью (план 13, задача 13.8) ----
+    print("\n4к. ОЦЕНКА ЗАЗОРА: ГРАНИЦА МИНЬЮ (план 13, 13.8)")
+    from itertools import combinations                           # noqa: E402
+    from config import MODES                                     # noqa: E402
+    from model.optimization import _popcount                     # noqa: E402
+    w = MODES["balanced"]                                        # веса критериев жадного
+    few = m._sample_for_sensors()[:40]                           # маршрутов в малой задаче
+    cand_all = np.asarray(m.candidates, float)                   # общая сетка кандидатов
+    big = CoverageCache(cand_all, p.threat_R, p.L_seg, p.threat_k)   # кэш всей сетки — отобрать лучших
+    for r in few:
+        big.add_trajectory(r)
+    # каждый 5-й из 60 лучших: 12 самых «густых» подряд насыщают критерий тремя датчиками, и
+    # проверка выходит вырожденной (F = OPT = граница); вразнобой граница строго выше — замер 0.54 < 0.63
+    top = np.argsort(-big.routes_covered_by_candidate())[0:60:5]   # 12 кандидатов вразнобой по рейтингу
+    small = CoverageCache(cand_all[top], p.threat_R, p.L_seg, p.threat_k)   # задача, решаемая перебором
+    for r in few:
+        small.add_trajectory(r)
+    small.greedy(3, w)
+    b = small.last_bound                                         # F жадного, граница, доля
+    Hs = np.asarray(small._hit, np.int64)                        # засечки: маршрут × кандидат
+    Ms = np.asarray(small._mask, np.uint32)                      # покрытые сегменты: маршрут × кандидат
+
+    def f_of(idx):
+        """F набора кандидатов — тот же основной критерий, что у жадного. Вход: номера. Отдаёт: float."""
+        n = Hs[:, list(idx)].sum(axis=1)                         # засечек у каждого маршрута
+        seg = np.bitwise_or.reduce(Ms[:, list(idx)], axis=1)     # его покрытые сегменты
+        return float((w[0] * np.minimum(n, p.threat_k) / p.threat_k
+                      + w[1] * _popcount(seg) / p.L_seg).mean())
+
+    opt = max(f_of(c) for c in combinations(range(len(top)), 3))   # настоящий оптимум — перебором
+    check(b["F"] <= opt + 1e-9 and opt <= b["UB"] + 1e-9 and b["UB"] > b["F"] + 1e-6,
+          "граница Минью не ниже настоящего оптимума",
+          "F %.4f ≤ OPT %.4f ≤ граница %.4f" % (b["F"], opt, b["UB"]))
+    gap = m.metrics().get("gap", {})                             # оценка зазора в отчёте
+    check(1 in gap and 0.0 < gap[1] <= 1.0 + 1e-9, "оценка зазора видна в отчёте",
+          "тип 1: не хуже %.0f %% от лучшего" % (100 * gap.get(1, 0.0)))
+
+    # ---- 4л. общий проход по типам вместо очереди (план 13, задача 13.6) ----
+    print("\n4л. ОБЩИЙ ПРОХОД ПО ТИПАМ (план 13, 13.6)")
+    from model.joint_greedy import RULES                         # noqa: E402
+    check(p.threat_type_order == "gain" and "types" in RULES, "по умолчанию — по наибольшему приросту",
+          "правила: %s" % ", ".join(RULES))
+    keep_j = (p.threat_N, p.threat_R, p.threat_N2, p.threat_R2,   # вернуть после опыта
+              p.threat_k_same, p.threat_spread_types, p.threat_type_order)
+    p.threat_N, p.threat_R, p.threat_N2, p.threat_R2 = 6, 1.0, 6, 0.5
+    # ⚠️ без разноса и при своей k типы друг другу не мешают — очерёдность не решает НИЧЕГО (замер §13.6.5)
+    p.threat_k_same, p.threat_spread_types = False, False
+    runs = {}                                                    # правило -> (позиции, типы)
+    for rule in RULES:
+        p.threat_type_order = rule
+        m.place_sensors()
+        runs[rule] = (np.round(np.asarray(m.sensors, float), 6), np.asarray(m.sensors_type, int).copy())
+    same = all(np.array_equal(runs[r][0], runs["gain"][0])   # позиции у всех правил совпали
+               and np.array_equal(runs[r][1], runs["gain"][1]) for r in RULES)
+    check(same, "без разноса при своей k правила дают одно и то же",
+          "%d датчиков, правил %d" % (len(runs["gain"][0]), len(RULES)))
+    p.threat_k_same, p.threat_spread_types, p.threat_type_order = True, True, "gain"
+    m.place_sensors()
+    gap_j = m.metrics().get("gap", {})                           # оценка при общем покрытии
+    check(bool(gap_j) and all(0.0 < v <= 1.0 + 1e-9 for v in gap_j.values()),
+          "одна на всех: оценка общего прохода в пределах 0…1",
+          " · ".join("тип %d: %.0f %%" % (t, 100 * v) for t, v in sorted(gap_j.items())))
+    (p.threat_N, p.threat_R, p.threat_N2, p.threat_R2,
+     p.threat_k_same, p.threat_spread_types, p.threat_type_order) = keep_j
+    m.place_sensors()
+
+    # ---- 4м. ПВН у объектов защиты: этап целей (план 13, задача 13.18) ----
+    print("\n4м. ПВН У ОБЪЕКТОВ ЗАЩИТЫ: ЭТАП ЦЕЛЕЙ (план 13, 13.18)")
+    from model import target_stage as tsg                        # noqa: E402
+    pvn_st = st.by_id(2, st.defaults())                          # паспорт ПВН: доли у целей
+    # таблица §0.4е: вместимость 39 / 23 / 21 (Мирный, Савинский, Оксовский) — число по формуле заказчика
+    table = [([39, 23, 21], [0.5, 0.3, 0.2], 20, [6, 4, 4]), ([39, 23, 21], [1 / 3] * 3, 20, [6, 4, 4]),
+             ([39, 23, 21], [0.5, 0.3, 0.2], 40, [15, 7, 6]), ([39, 23, 21], [0.5, 0.3, 0.2], 60, [24, 10, 8]),
+             ([39, 23], [0.75, 0.25], 20, [9, 5]), ([39], [1.0], 20, [10]), ([39], [1.0], 60, [19])]
+    got_tab = [tsg.allocate(c, pr, n, pvn_st) for c, pr, n, _w in table]   # раскладка по формуле
+    check(all(g == w for g, (_c, _p, _n, w) in zip(got_tab, table)),
+          "число ПВН у целей — таблица §0.4е до штуки",
+          " · ".join("/".join(map(str, g)) for g in got_tab))
+    keep_t = (p.threat_N2, p.threat_R2)                          # вернуть после опыта
+    p.threat_N2, p.threat_R2 = 6, 0.5
+    m.place_sensors()
+    rep_t = m.metrics().get("targets_stage", {}).get(2, [])      # отчёт этапа по целям
+    put = sum(r["placed"] for r in rep_t)                        # поставлено у целей
+    check(len(rep_t) == len(m.target_points_km()) and 0 < put <= 3,
+          "одна цель: у неё ПВН, но не больше половины",
+          "у цели %d из 6, вместимость %s" % (put, [r["capacity"] for r in rep_t]))
+    p.threat_N2, p.threat_R2 = keep_t
+    m.place_sensors()
+
+    # ---- 4н. бонус места: высота крыши и размер пункта (план 13, задача 13.7) ----
+    print("\n4н. БОНУС МЕСТА: ВЫСОТА КРЫШИ И РАЗМЕР ПУНКТА (план 13, 13.7)")
+    mog_st = st.by_id(1, st.defaults())                          # паспорт МОГ
+    check(pvn_st.bonus_height > 0 and mog_st.bonus_height == 0 and mog_st.bonus_city == 0,
+          "бонус — только у ПВН, МОГ считается как прежде",
+          "ПВН: высоте %g, городу %g" % (pvn_st.bonus_height, pvn_st.bonus_city))
+    plain = small.greedy(1, w)                                   # первый выбор без бонуса
+    c0 = int(np.argmin(np.hypot(*(small.cand - plain[0]).T)))    # его номер
+    rank = np.argsort(-small.routes_covered_by_candidate())      # кандидаты по числу маршрутов
+    j = int(next(i for i in rank if i != c0))                    # другой полезный кандидат
+    boost = np.zeros(small.C)                                    # бонус только ему
+    boost[j] = 10.0
+    pick = small.greedy(1, w, bonus=boost)                       # выбор с бонусом
+    same = np.allclose(small.greedy(1, w, bonus=None), plain)    # без бонуса — прежний выбор
+    check(np.allclose(pick[0], small.cand[j]) and same, "бонус меняет выбор, без него — прежний",
+          "кандидат %d вместо %d" % (j, c0))
+
+    # ---- 4о. район защиты цели в лесу (план 13, 13.18, В13.21) ----
+    # ЧТО ЛОВИТ: у точки нет массива построек — зону задаёт человек; пустой район не принимается
+    # (ПВН у цели не встал бы), район идёт в этап целей, перенос цели его снимает
+    print("\n4о. РАЙОН ЗАЩИТЫ ЦЕЛИ В ЛЕСУ (план 13, 13.18, В13.21)")
+    g4 = m.grid                                                  # сетка карты
+    ax, ay = g4.ox + 10 * g4.h, g4.oy + 10 * g4.h                # угол ячейки (10, 10), км
+    n_rect = int(tsg.area_mask(g4, ("rect", ax, ay, ax + 3 * g4.h, ay + 2 * g4.h)).sum())   # 3 × 2 ячейки
+    n_circ = int(tsg.area_mask(g4, ("circle", ax + 0.5 * g4.h, ay + 0.5 * g4.h, 0.49 * g4.h)).sum())   # одна
+    check(n_rect == 6 and n_circ == 1, "маска района: прямоугольник 3 × 2 ячейки, круг — одна",
+          "%d и %d" % (n_rect, n_circ))
+    keep_o = (list(m.targets.items), p.threat_N2, p.threat_R2)   # вернуть после опыта
+    p.threat_N2, p.threat_R2 = 6, 0.5
+    from model.sensor_zones import settled_mask                  # noqa: E402
+    from model.threat_grid import _dilate, _label8               # noqa: E402
+    # ⚠️ разметка массивов — ОДИН раз, как в `target_zone`: перебор точек через неё шёл бы минутами
+    lab4, _n4 = _label8(_dilate(settled_mask(g4) | (m.sensor_cells()["count"] > 0), 1))   # массивы застройки
+    free = np.argwhere(lab4 == 0)                                # ячейки вне массивов (строка, столбец)
+    centers = [(g4.ox + (c + 0.5) * g4.h, g4.oy + (r + 0.5) * g4.h) for r, c in free[len(free) // 2:]]   # км
+    forest = next(((x, y) for x, y in centers if m.in_area(x, y)), None)   # точка в лесу внутри района, км
+    if forest is None:
+        print("   точки вне застройки в районе нет — раздел пропущен")
+    else:
+        m.targets.items = []
+        m.add_target(*forest)
+        check(m.target_needs_area(0) and m.target_table_rows()[0]["zone"] == "укажите район",
+              "цель в лесу: зоны нет — просим район", "(%.1f, %.1f) км" % forest)
+        why0, _n0 = m.set_target_area(0, ("rect", ax - 0.05, ay - 0.05, ax + 0.05, ay + 0.05))   # ни одной ячейки
+        check(bool(why0) and m.targets.items[0].area is None, "пустой район не принят", why0[:48])
+        fx, fy = forest                                          # место цели, км
+        # ⚠️ в глухом лесу разрешённых мест может не быть и в 12 × 12 км (замер: 0 из 625 ячеек) —
+        # район тянется до ближайшей ячейки карты ПВН, чтобы проверять приём, а не местность
+        ok_c = np.argwhere(m.allowed_mask(m._targets_type()))    # разрешённые ячейки (строка, столбец)
+        near = ok_c[np.argmin(np.hypot(g4.ox + (ok_c[:, 1] + 0.5) * g4.h - fx, g4.oy + (ok_c[:, 0] + 0.5) * g4.h - fy))]   # ближайшая к цели ячейка
+        nx_, ny_ = g4.ox + (near[1] + 0.5) * g4.h, g4.oy + (near[0] + 0.5) * g4.h   # её центр, км
+        box = ("rect", min(fx, nx_) - 2, min(fy, ny_) - 2, max(fx, nx_) + 2, max(fy, ny_) + 2)   # район, км
+        why1, n1 = m.set_target_area(0, box)
+        check(not why1 and n1 > 0 and not m.target_needs_area(0)
+              and m.target_table_rows()[0]["zone"] == "задана вручную",
+              "район до ближайшего места ПВН принят, зона — вручную",
+              "мест ПВН %d, район %.1f × %.1f км%s" % (n1, box[3] - box[1], box[4] - box[2],
+                                                    " · " + why1 if why1 else ""))
+        m.place_sensors()
+        rep_o = (m.metrics().get("targets_stage", {}).get(2) or [{}])[0]   # отчёт этапа по цели
+        check(bool(rep_o.get("manual")) and rep_o.get("zone") and rep_o.get("capacity", 0) > 0,
+              "этап целей берёт район человека", "вместимость %s" % rep_o.get("capacity"))
+        m.move_target(0, fx + g4.h, fy)
+        check(m.targets.items[0].area is None, "перенос цели снимает её район")
+    m.targets.items, p.threat_N2, p.threat_R2 = keep_o
+    m.place_sensors()
+
     # ---- 5. рельеф: несколько включений подряд ----
     print("\n5. РЕЛЬЕФ")
     if not m.has_dem():

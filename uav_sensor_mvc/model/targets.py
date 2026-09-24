@@ -26,6 +26,9 @@ class Target:
     y_km: float                   # север от якоря, км
     weight: float = 1.0           # приоритет, доля; сумма по всем целям не больше 1
     sectors: bool = True          # рисовать ли у цели компас секторов (только показ)
+    # район защиты, заданный человеком (В13.21): ("rect", x0, y0, x1, y1) | ("circle", cx, cy, r), км;
+    # None — зона цели по массиву застройки (`target_stage.target_zone`)
+    area: tuple = None
 
 
 def equal_share(n):
@@ -66,6 +69,15 @@ class TargetSet:
         if not 0 <= int(i) < len(self.items):      # номера нет
             return False
         self.items[int(i)].x_km, self.items[int(i)].y_km = float(x_km), float(y_km)
+        self.items[int(i)].area = None             # ⚠️ район чертился под прежнее место — снять
+        return True
+
+    def set_area(self, i, area):
+        """Район защиты цели (В13.21). Вход: номер с нуля, район (см. `Target.area`) или None — снять.
+        Отдаёт: True — такая цель есть."""
+        if not 0 <= int(i) < len(self.items):      # номера нет
+            return False
+        self.items[int(i)].area = tuple(area) if area is not None else None
         return True
 
     def clear(self):

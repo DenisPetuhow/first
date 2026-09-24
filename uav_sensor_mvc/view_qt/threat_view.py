@@ -307,6 +307,18 @@ RELIEF_MAX_ALPHA = 165                     # предел непрозрачно
 # Зоны-исключения (маска), render_exclusions — RGBA 0..255:
 THREAT_URBAN_RGBA = (255, 93, 108, 120)   # город — красный (исключён из пролёта)
 THREAT_WATER_RGBA = (58, 160, 255, 150)   # вода — синий (запрет установки датчика)
+_TYPE_COLOR_KEYS = {1: "sensor", 2: "sensor_t2", 3: "sensor_t3", 4: "sensor_big"}   # цвет номера без паспорта
+
+
+def type_color(tid):
+    """Цвет типа датчика по паспорту справочника (план 13, 13.2): ключ палитры THREAT_COLORS или
+    «#rrggbb». Вход: номер типа. Отдаёт: строку цвета; паспорта нет — прежний цвет номера."""
+    from model import sensor_types as catalog
+    st = catalog.by_id(tid)                        # паспорт типа или None
+    key = st.color if st is not None else _TYPE_COLOR_KEYS.get(int(tid), "sensor")   # ключ или «#…»
+    if isinstance(key, str) and key.startswith("#"):   # цвет выбрал человек
+        return key
+    return THREAT_COLORS.get(key, THREAT_COLORS["sensor"])
 
 
 def _hillshade(h, az_deg=315.0, alt_deg=45.0, z=6.0, lo=0.72, hi=1.22):
@@ -464,6 +476,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # 11.6). Уже заданный район переключатель не трогает: он выбирает, ЧЕМ рисовать.
         self._area_shape = "rect"         # "rect" — прямоугольник, "circle" — круг
         self._area_circle = None          # круг заданного района (cx, cy, R) км; None — рамка
+        # ⚠️ ТЕМ ЖЕ РИСОВАНИЕМ ЧЕРТИТСЯ РАЙОН ЗАЩИТЫ ЦЕЛИ (В13.21): номер цели — район уходит ей,
+        # а не в район расчёта; форма переключателя на время подменяется и потом возвращается
+        self._area_target = None          # номер цели с нуля, чей район чертят; None — район расчёта
+        self._area_shape_keep = "rect"    # форма переключателя до подмены
         # ТОЧКИ СТАРТА МЫШЬЮ (план 11, 11.6) — режим по образцу правки датчиков
         self._edit_entry = False          # включён режим «Точки старта»
         self._entry_handle = None         # подвижная метка выбранной точки
@@ -497,6 +513,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_target_move = lambda i, lon, lat: ""  # координаты из таблицы
         self.on_targets_clear = lambda: None        # «Очистить»
         self.on_target_sectors = lambda i, on: ""   # галочка «Сектора» у цели
+        self.on_target_area = lambda i, area: None  # район защиты цели начерчен (В13.21)
+        self.on_target_area_clear = lambda i: None  # снять район защиты цели
         self.on_set_sector = lambda x, y: None      # задан сектор появления БПЛА
         self.on_clear_sector = lambda: None         # сектор убран
         # ПЛАН 11, 11.6: круглый район, окно «Сектор налёта», точки старта мышью
@@ -516,6 +534,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_entry_table_rows = lambda: []       # строки таблицы точек входа (12.5)
         self.on_set_entry_L_max = lambda i, km: None  # запас точки задан руками
         self.on_uav_speed = lambda: None            # скорость выбранного типа, км/ч (линейка)
+        # ПЛАН 13, 13.2–13.3: окна «Датчики» и «Тип датчика»
+        self.on_types_changed = lambda: None        # справочник типов правили
+        self.on_type_deleted = lambda tid: None     # тип удалён из справочника
+        self.on_type_task = lambda tid, r, k: None  # окно типа поправило R и k номера 1–4
+        self.on_type_zone = lambda tid: None        # показать карту места типа (None — спрятать)
         self.on_zone_added = lambda poly: None      # нарисована запретная зона
         self.on_zone_undo = lambda: None            # убрать последнюю зону
         self.on_choose_data = lambda path, layers: None
@@ -534,6 +557,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_iter_gen_frac = lambda v: None
         self._params_ref = params         # для префилла окна исходных данных
         self._input_dlg = None            # окно «Исходные данные» (задача 8.7)
+        self._sensors_dlg = None          # окно «Датчики» (план 13, 13.2)
+        self._types_dlg = None            # окно «Тип датчика» (план 13, 13.3)
         self._route_viewer_dlg = None     # окно «Посмотреть маршруты» (задача 8.6, довесок)
         self._analysis_dlg = None         # окно «Анализ моделирования» (довесок 06.09.2026)
         self._map_img_dlg = None          # окно «Своя карта» (картинкой)
@@ -624,7 +649,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 on_weight=lambda i, w: self.on_target_weight(i, w),
                 on_move=lambda i, lon, lat: self.on_target_move(i, lon, lat),
                 on_clear=lambda: self.on_targets_clear(), limit=THREAT_TARGETS_MAX,
-                on_sectors=lambda i, on: self.on_target_sectors(i, on))
+                on_sectors=lambda i, on: self.on_target_sectors(i, on),
+                on_area=self._target_area_from_window,               # район защиты (В13.21)
+                on_area_clear=lambda i: self.on_target_area_clear(i))
         self._targets_dlg.refresh()
         self._targets_dlg.show()
         self._targets_dlg.raise_()
@@ -682,6 +709,55 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             self.on_targets_done()
         self._targets_placed = 0
         self.refresh_targets_window()
+
+    # ---- РАЙОН ЗАЩИТЫ ЦЕЛИ В ЛЕСУ (план 13, 13.18, В13.21) ----
+    def ask_target_area(self, i):
+        """Окно «укажите район защиты»: у цели №i нет массива построек. Вход: номер с нуля.
+        Отдаёт: "rect" | "circle" — чертить такой; None — позже."""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Укажите район защиты")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText("Цель №%d стоит вне застройки (лес, поле): зону для датчиков у неё не из чего "
+                    "построить.\n\nУкажите район защиты мышью — датчики встанут в нём там, где им можно "
+                    "стоять (без леса, болот и воды)." % (int(i) + 1))
+        b_rect = box.addButton("Прямоугольник", QtWidgets.QMessageBox.AcceptRole)   # два угла
+        b_circle = box.addButton("Круг", QtWidgets.QMessageBox.AcceptRole)          # центр и радиус
+        box.addButton("Позже", QtWidgets.QMessageBox.RejectRole)
+        box.exec_()
+        return {b_rect: "rect", b_circle: "circle"}.get(box.clickedButton())
+
+    def begin_target_area(self, i, shape):
+        """Чертить район защиты цели №i тем же способом, что район расчёта: два клика, колёсико — принять,
+        Esc — отмена. Вход: номер с нуля, "rect" | "circle"."""
+        if self._area_mode:                # начатое рисование — бросить
+            self._end_area(False)
+        self._end_targets_mode()
+        self._area_shape_keep = self._area_shape
+        self._area_shape = shape
+        self._area_target = int(i)
+        self._hide_dialogs()               # карту не должно перекрывать ничто (заказчик 21.09.2026)
+        self._begin_area()
+        self.set_title("РАЙОН ЗАЩИТЫ цели №%d: %s, КОЛЁСИКО — принять, Esc — отмена"
+                       % (int(i) + 1, "клик — центр, клик — точка на окружности" if shape == "circle"
+                          else "два клика — противоположные углы"))
+
+    def _target_area_from_window(self, i):
+        """Кнопка «Район защиты…» в окне целей: спросить форму и чертить. Вход: номер с нуля."""
+        shape = self.ask_target_area(i)    # "rect" | "circle" | None
+        if shape is not None:              # выбрали форму
+            self.begin_target_area(i, shape)
+
+    def render_target_areas(self, areas):
+        """Контуры районов защиты, заданных человеком. Вход: список районов (см. `Target.area`), км."""
+        xs, ys = [], []                    # контуры через разрыв NaN, км
+        for a in areas:
+            if a[0] == "circle":           # круг
+                cx, cy = self._circle_xy(a[1], a[2], a[3])
+            else:                          # прямоугольник по двум углам
+                cx, cy = [a[1], a[3], a[3], a[1], a[1]], [a[2], a[2], a[4], a[4], a[2]]
+            xs += list(cx) + [np.nan]
+            ys += list(cy) + [np.nan]
+        self.target_area_item.setData(xs, ys, connect="finite")
 
     # ══════════════════════════════════════════════════════════════════════════
     # ОКНО «СЕКТОР НАЛЁТА» И РЕЖИМ ЗАДАНИЯ СЕКТОРА КЛИКАМИ (план 11, 11.6)
@@ -1464,10 +1540,20 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._area_mode = False
         self._area_pts = []
         self._draw_area_preview()
+        tgt, shape = self._area_target, self._area_shape   # чей район и какой формы
+        if tgt is not None:                   # чертили район защиты цели — вернуть режим района расчёта
+            self._area_target = None
+            self._area_shape = self._area_shape_keep
+            self._restore_dialogs()           # окна, спрятанные на время кликов
         if not (apply_it and len(pts) >= 2):
-            self.set_title("")
+            self.set_title("Район защиты цели №%d не задан." % (tgt + 1) if tgt is not None else "")
             return
         (x0, y0), (x1, y1) = pts[0], pts[-1]
+        if tgt is not None:                   # район уходит цели (В13.21), а не в район расчёта
+            r_km = float(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5)   # радиус круга, км
+            area = ("circle", float(x0), float(y0), r_km) if shape == "circle" else ("rect", float(x0), float(y0), float(x1), float(y1))   # район, км
+            self.on_target_area(tgt, area)
+            return
         if self._area_shape == "circle":  # круг: центр и точка на окружности (11.6)
             r_km = float(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5)   # радиус, км
             self.on_set_area_circle(float(x0), float(y0), r_km)
@@ -2129,14 +2215,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if self._input_dlg is None:
             from .input_window import InputDataWindow
             dlg = InputDataWindow(self, self._params_ref, self.on_sensors_apply)
-            dlg.on_manual_add = lambda tid, st, lon, lat: self.on_manual_add(tid, st, lon, lat)
-            dlg.on_manual_remove = lambda i: self.on_manual_remove(i)
-            dlg.on_manual_edit = (lambda i, tid, st, lon, lat:
-                                  self.on_manual_edit(i, tid, st, lon, lat))
-            dlg.on_manual_clear = lambda: self.on_manual_clear()
-            dlg.on_clear_sensors = lambda: self.on_clear_sensors()
-            dlg.on_mode_changed = lambda manual: self.on_manual_mode(manual)
-            dlg.on_pick_mode = self._begin_pick_sensor
+            dlg.on_open_sensors = self._open_sensors_window   # датчики — своё окно (план 13, 13.2)
             dlg.on_view_routes = self._open_route_viewer
             # ОБЛАСТЬ И ТАЙЛЫ (план 10 §10.5): область — перезапуск, тайлы — сразу
             dlg.on_pick_area = lambda: area_choice.choose_area(dlg)
@@ -2146,9 +2225,50 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.refresh_conditions_button()
         self._input_dlg.set_area_info(self._area_info_text())
         self._input_dlg.refresh(self._params_ref)
-        self.refresh_sensor_table()
         self._input_dlg.show(); self._input_dlg.raise_()
         self._input_dlg.activateWindow()
+
+    def _open_sensors_window(self):
+        """Открыть окно «Датчики» (план 13, 13.2). Создаётся один раз и живёт до конца сеанса: так
+        сохраняются набранные значения, выбранный режим и прокрутка таблицы."""
+        if self._sensors_dlg is None:              # окно ещё не создавали
+            from .sensors_window import SensorsWindow
+            dlg = SensorsWindow(self, self._params_ref, self.on_sensors_apply, type_color)   # окно датчиков
+            dlg.on_manual_add = lambda tid, st, lon, lat: self.on_manual_add(tid, st, lon, lat)
+            dlg.on_manual_remove = lambda i: self.on_manual_remove(i)
+            dlg.on_manual_edit = (lambda i, tid, st, lon, lat:
+                                  self.on_manual_edit(i, tid, st, lon, lat))
+            dlg.on_manual_clear = lambda: self.on_manual_clear()
+            dlg.on_clear_sensors = lambda: self.on_clear_sensors()
+            dlg.on_mode_changed = lambda manual: self.on_manual_mode(manual)
+            dlg.on_pick_mode = self._begin_pick_sensor
+            dlg.on_edit_type = self._open_sensor_types
+            dlg.on_types_changed = lambda: self.on_types_changed()
+            dlg.on_type_deleted = lambda tid: self.on_type_deleted(tid)
+            self._sensors_dlg = dlg
+        self._sensors_dlg.refresh(self._params_ref)
+        self.refresh_sensor_table()
+        self._sensors_dlg.show(); self._sensors_dlg.raise_()
+        self._sensors_dlg.activateWindow()
+
+    def _open_sensor_types(self, tid=1):
+        """Окно «Тип датчика» (план 13, 13.3) на номере `tid`. Немодальное: за ним видна карта места."""
+        if self._types_dlg is None:                # окно ещё не создавали
+            from .sensor_types_window import SensorTypesWindow
+            dlg = SensorTypesWindow(self, self._params_ref, type_color)   # справочник типов
+            dlg.on_saved = self._types_saved
+            dlg.on_task = lambda t, r, k: self.on_type_task(t, r, k)
+            dlg.on_show_zone = lambda t: self.on_type_zone(t)
+            self._types_dlg = dlg
+        self._types_dlg.open_on(tid)
+        self._types_dlg.show(); self._types_dlg.raise_()
+        self._types_dlg.activateWindow()
+
+    def _types_saved(self):
+        """Справочник записан окном типа: подтянуть окно «Датчики» и перерисовать карту."""
+        if self._sensors_dlg is not None:          # окно датчиков открывали
+            self._sensors_dlg.refresh(self._params_ref)
+        self.on_types_changed()
 
     def _area_info_text(self):
         # Подпись блока «Область и папка тайлов»: что открыто, откуда взято, где тайлы.
@@ -2183,6 +2303,9 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         «поля окна отстали от параметров модели, подтяни»."""
         if self._input_dlg is not None and self._input_dlg.isVisible():
             self._input_dlg.refresh(self._params_ref)
+        if self._sensors_dlg is not None and self._sensors_dlg.isVisible():   # окно датчиков (13.2)
+            self._sensors_dlg.refresh(self._params_ref)
+            self.refresh_sensor_table()
 
     def set_ab_distance(self, km):
         if self._input_dlg is not None:
@@ -2202,11 +2325,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         `rows` не передан — представление спрашивает их у контроллера колбэком
         `on_sensor_rows`: модель здесь недоступна (MVC), а таблица обязана заполняться
         в ОБОИХ режимах работы окна."""
-        if self._input_dlg is None:
+        if self._sensors_dlg is None:              # таблица живёт в окне «Датчики» (13.2)
             return
         if rows is None:
             rows = self.on_sensor_rows() or []
-        self._input_dlg.set_rows(rows)
+        self._sensors_dlg.set_rows(rows)
 
     def set_iter_checked(self, on):
         """Включить/выключить чекбокс «итерации» без повторного запуска расчёта."""
@@ -2231,6 +2354,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     def set_callbacks(self, **cbs):
         for name, fn in cbs.items():
             setattr(self, name, fn)
+
+    def refresh_legend(self):
+        """Пересобрать легенду под текущие типы и параметры (план 13, 13.2) — прежним кеглем."""
+        self.legend.setHtml(self._legend_html(getattr(self, "_legend_scale", 1.0)))
 
     # Размер общей легенды: базовый кегль при полном участке и предел при зуме. Раньше
     # она была 10 pt и НЕ масштабировалась — на приближении занимала треть экрана.
@@ -2273,13 +2400,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         # которые реально работают: строка «тип 3» при нуле датчиков этого типа лишь
         # засоряет легенду и заставляет искать на карте то, чего там нет.
         marks = []
-        for tid, key, name in ((1, "sensor", "тип 1"), (2, "sensor_t2", "тип 2"),
-                               (3, "sensor_t3", "тип 3"), (4, "sensor_big", "большой")):
-            n = (int(getattr(self._params_ref, "threat_N_big", 0) or 0) if tid == 4 else
-                 int(getattr(self._params_ref,
-                             {1: "threat_N", 2: "threat_N2", 3: "threat_N3"}[tid], 0) or 0))
-            if n > 0:
-                marks.append(f'<span style="color:{c[key]};">&#9679;</span> {name}')
+        from model.sensors import sensor_types
+        # названия и цвета — из справочника типов (план 13, 13.2): «МОГ», «ПВН», свои типы
+        for s in sensor_types(self._params_ref):
+            if s.active:                           # тип работает — есть что искать на карте
+                marks.append(f'<span style="color:{type_color(s.type_id)};">&#9679;</span> {s.name}')
         if marks:
             rows.append("датчики: " + " &nbsp; ".join(marks) + "<br>")
             # ДВА ПРИЗНАКА, И ОБА НУЖНЫ: форма — режим датчика, обводка — кто выбрал
@@ -3248,6 +3373,12 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.route_area_img = pg.ImageItem(); self.route_area_img.setOpts(axisOrder="row-major")
         self.route_area_img.setZValue(-6); self.route_area_img.setVisible(False)
         self.pi.addItem(self.route_area_img)
+        # КАРТА МЕСТА ТИПА (план 13, 13.3): разрешённые ячейки и места — по галочке окна «Тип датчика»
+        self.type_zone_img = pg.ImageItem(); self.type_zone_img.setOpts(axisOrder="row-major")
+        self.type_zone_img.setZValue(-5.5); self.type_zone_img.setVisible(False)
+        self.pi.addItem(self.type_zone_img)
+        self.type_zone_pts = pg.ScatterPlotItem(size=4, symbol="o", pen=None)   # места типа
+        self.type_zone_pts.setZValue(4); self.pi.addItem(self.type_zone_pts)
         # линии-примеры маршрутов поверх фона-огибающей: бирюзовый, но ПОЛУПРОЗРАЧНЫЙ —
         # чтобы не перекрывать датчики и не сливаться в сплошную заливку.
         self.route_item = self.pi.plot([], [], antialias=True, connect="finite",
@@ -3288,6 +3419,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                                            pen=pg.mkPen(_qcolor(THEME["accent"]),
                                                         width=2.5, dash=[10, 5]))
         self.area_draw_item.setZValue(7)
+        # РАЙОНЫ ЗАЩИТЫ ЦЕЛЕЙ, заданные человеком (В13.21) — пунктир цвета креста цели
+        self.target_area_item = self.pi.plot([], [], antialias=True, connect="finite",
+                                             pen=pg.mkPen(_qcolor(THEME["warn"]), width=2.0, dash=[6, 4]))
+        self.target_area_item.setZValue(6.5)
         self.pi.addItem(self.zone_draw_pts)
         # ЛИНЕЙКА «Расстояние» (задача 8.9, довесок 06.09.2026) — поверх всего (Z = 8):
         # служебный инструмент, должен быть виден на фоне любых слоёв и зон.
@@ -4279,6 +4414,23 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.water_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.water_img.setVisible(True)
 
+    def show_type_zone(self, mask=None, extent=None, tid=None, pts=None):
+        """Показать карту места типа и его места (план 13, 13.3). Вход: маска (ny,nx), охват (x0,x1,y0,y1)
+        км, номер типа (цвет), места (M,2) км; маска None — спрятать. Отдаёт: ничего."""
+        if mask is None:                           # спрятать
+            self.type_zone_img.setVisible(False)
+            self.type_zone_pts.setData([], [])
+            return
+        qc = QtGui.QColor(type_color(tid))         # цвет типа
+        rgba = np.zeros(np.asarray(mask).shape + (4,), np.ubyte)   # картинка разрешённых ячеек
+        rgba[np.asarray(mask, bool)] = (qc.red(), qc.green(), qc.blue(), 90)
+        self.type_zone_img.setImage(rgba, autoLevels=False)
+        x0, x1, y0, y1 = extent
+        self.type_zone_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+        self.type_zone_img.setVisible(True)
+        p = np.asarray(pts if pts is not None else np.empty((0, 2)), float).reshape(-1, 2)   # места, км
+        self.type_zone_pts.setData(p[:, 0], p[:, 1], brush=pg.mkBrush(qc))
+
     def render_routes(self, routes, route_area, extent, toggles):
         """ВСЕ возможные места пролёта: розовый ФОН = огибающая (route_area) — КОРРЕКТНО
         посчитанная ГРАФОМ достижимость A→ячейка→цель ≤ L_max (все места, куда может дойти
@@ -4439,9 +4591,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         chk = getattr(self, "chk_sensors", None)
         return chk is not None and not chk.isChecked()
 
-    # Цвет и радиус зоны обзора — СВОИ У КАЖДОГО ТИПА (задача 8.7). Ключ — номер типа.
-    TYPE_COLORS = {1: THREAT_COLORS["sensor"], 2: THREAT_COLORS["sensor_t2"],
-                   3: THREAT_COLORS["sensor_t3"], 4: THREAT_COLORS["sensor_big"]}
+    # Цвет и радиус зоны обзора — СВОИ У КАЖДОГО ТИПА (задача 8.7). Цвет — из паспорта справочника
+    # (`type_color`, план 13, 13.2): человек выбирает его в окне «Датчики».
 
     def render_sensors(self, sensors, R, sensors_big=None, R_big=0.0,
                        types=None, static=None, big_static=None, type_radii=None,
@@ -4510,7 +4661,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                           18 if int(t) == 4 else 20))
         for num, (s, t, is_fix, by_hand, z) in enumerate(items, 1):
             rad = float(radii.get(t, R))
-            color = self.TYPE_COLORS.get(t, self.SENSOR_COLOR)
+            color = type_color(t)                      # цвет типа из паспорта (13.2)
             fill = 30 if t == 4 else 70
             if rad > 0.0:
                 e = QtWidgets.QGraphicsEllipseItem(s[0] - rad, s[1] - rad, 2 * rad, 2 * rad)

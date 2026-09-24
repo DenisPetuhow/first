@@ -8,6 +8,7 @@ VIEW (Qt) · Окно «Объекты защиты» — кнопка «Ука�
 
 ⚠️ ОКНО МОДЕЛИ НЕ ЗНАЕТ (MVC): строки и правки идут через колбэки, как у таблицы точек входа.
 ⚠️ ПРИОРИТЕТ В РОЗЫГРЫШ ПОКА НЕ ИДЁТ (заказчик 21.09.2026) — только в кольцо больших датчиков.
+Колонка «Зона ПВН» и кнопки «Район защиты…» / «Снять район» — цель в лесу (план 13, В13.21).
 """
 from PyQt5 import QtCore, QtWidgets
 
@@ -20,6 +21,7 @@ _COLS = (
     ("Y, км", "y_km", 70, False),
     ("Приоритет", "weight", 90, True),
     ("Сектора", "sectors", 70, True),      # галочка: компас «анализа» у этой цели
+    ("Зона ПВН", "zone", 118, False),      # по застройке · задана вручную · укажите район (В13.21)
 )
 ROW_HEIGHT = 26          # высота строки, px — тёмная тема сплющивает ячейки
 
@@ -27,16 +29,19 @@ ROW_HEIGHT = 26          # высота строки, px — тёмная тем
 class TargetsDialog(QtWidgets.QDialog):
     """Объекты защиты. Колбэки: `rows()` — строки из модели; `on_place(n)` — поставить n
     целей мышью; `on_weight(i, доля)`, `on_move(i, lon, lat)`, `on_sectors(i, вкл)` — правка
-    ('' или причина отказа); `on_clear()` — убрать все. `limit` — сколько целей всего, шт."""
+    ('' или причина отказа); `on_clear()` — убрать все; `on_area(i)` / `on_area_clear(i)` — район
+    защиты цели (В13.21). `limit` — сколько целей всего, шт."""
 
     def __init__(self, parent, rows, on_place, on_weight, on_move, on_clear, limit,
-                 on_sectors=None):
+                 on_sectors=None, on_area=None, on_area_clear=None):
         super().__init__(parent)
         self.setWindowTitle("Объекты защиты")
         self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
         self._rows, self._on_place = rows, on_place
         self._on_weight, self._on_move, self._on_clear = on_weight, on_move, on_clear
         self._on_sectors = on_sectors or (lambda i, on: "")   # галочка «Сектора» у цели
+        self._on_area = on_area or (lambda i: None)           # «Район защиты…» — чертить мышью
+        self._on_area_clear = on_area_clear or (lambda i: None)   # «Снять район»
         self._quiet = False                          # таблицу заполняет программа
         col = QtWidgets.QVBoxLayout(self)
 
@@ -81,6 +86,16 @@ class TargetsDialog(QtWidgets.QDialog):
         self.btn_clear = QtWidgets.QPushButton("Очистить")
         self.btn_clear.setToolTip("Убрать все цели — расчёт вернётся к цели по умолчанию.")
         self.btn_clear.clicked.connect(self._clear)
+        # РАЙОН ЗАЩИТЫ (В13.21): у цели в лесу зону задаёт человек — прямоугольник или круг мышью
+        self.btn_area = QtWidgets.QPushButton("Район защиты…")
+        self.btn_area.setToolTip("Начертить район защиты выбранной цели: датчики у неё встанут в нём, "
+                                 "где им можно стоять (без леса, болот и воды).")
+        self.btn_area.clicked.connect(lambda: self._with_row(self._on_area))
+        self.btn_area_clear = QtWidgets.QPushButton("Снять район")
+        self.btn_area_clear.setToolTip("Зона выбранной цели — снова по массиву застройки.")
+        self.btn_area_clear.clicked.connect(lambda: self._with_row(self._on_area_clear))
+        row.addWidget(self.btn_area)
+        row.addWidget(self.btn_area_clear)
         btn_close = QtWidgets.QPushButton("Закрыть")
         btn_close.clicked.connect(self.close)
         row.addWidget(self.btn_clear)
@@ -130,8 +145,8 @@ class TargetsDialog(QtWidgets.QDialog):
                                 "в группе «пролёт БПЛА»).")
                 self.table.setItem(i, j, item)
                 continue
-            if key == "n":
-                text = str(val)
+            if key in ("n", "zone"):
+                text = str(val if val is not None else "")
             elif key in ("lat", "lon"):
                 text = "%.5f" % val
             elif key == "weight":
@@ -167,4 +182,13 @@ class TargetsDialog(QtWidgets.QDialog):
     def _clear(self):
         """Кнопка «Очистить»: убрать все цели."""
         self._on_clear()
+        self.refresh()
+
+    def _with_row(self, fn):
+        """Кнопка района: позвать колбэк с номером выбранной цели. Вход: колбэк f(номер с нуля)."""
+        i = self.table.currentRow()                  # выбранная строка
+        if i < 0:                                    # не выбрана
+            self.refresh("⚠️ Выберите цель в таблице.")
+            return
+        fn(i)
         self.refresh()

@@ -117,6 +117,11 @@ class ThreatController:
             on_set_entry_L_max=self.on_set_entry_L_max,
             on_uav_speed=self.on_uav_speed,
             on_sensors_apply=self.on_sensors_apply, on_set_area=self.on_set_area,
+            # план 13, 13.2–13.3: окна «Датчики» и «Тип датчика»
+            on_types_changed=self.on_types_changed, on_type_deleted=self.on_type_deleted,
+            on_type_task=self.on_type_task, on_type_zone=self.on_type_zone,
+            # план 13, В13.21: район защиты цели в лесу
+            on_target_area=self.on_target_area, on_target_area_clear=self.on_target_area_clear,
             on_clear_area=self.on_clear_area,
             # датчики, заданные человеком (задача 8.7)
             on_manual_add=self.on_manual_add, on_manual_remove=self.on_manual_remove,
@@ -576,8 +581,11 @@ class ThreatController:
         if vals.get("threat_L_max_manual") and self.model.uav_lmax_per_entry:
             self.model.uav_lmax_per_entry = False
             self.view.flash_title("Запас хода задан вручную — один на все точки входа.")
-        if p.threat_N < 1 or p.threat_R <= 0:
-            self.view.flash_title("Датчиков типа 1 должно быть ≥ 1, радиус > 0.")
+        from model.sensors import sensor_types
+        # ⚠️ ДОВОЛЬНО ЛЮБОГО РАБОТАЮЩЕГО ТИПА (план 13, 13.4): прежде требовался тип 1, и обстановка
+        # «один ПВН» (N1 = 0) не принималась, хотя с 13.4 она считается честно
+        if not any(s.active for s in sensor_types(p)):   # ни у одного типа нет N > 0 и R > 0
+            self.view.flash_title("Нет ни одного работающего типа: нужно N ≥ 1 и радиус > 0.")
             return
         # Шаг сетки кандидатов подгоняется под радиус — но только если радиус СМЕНИЛСЯ,
         # иначе затирали бы значение, которое пользователь только что ввёл в этом окне.
@@ -604,6 +612,64 @@ class ThreatController:
                 " Датчики на карте прежние — нажмите «Расставить датчики», чтобы "
                 "пересчитать их по новым данным." if n else
                 " Нажмите «Расставить датчики»."))
+
+    # ---- окна «Датчики» и «Тип датчика» (план 13, 13.2–13.3) ----
+    def on_types_changed(self):
+        """Справочник типов правили: названия, цвета, правила места — легенда, датчики, окна."""
+        self.view.refresh_legend()
+        self._render_sensors()
+        self.view.refresh_sensors_dialog()
+
+    def on_type_deleted(self, tid):
+        """Тип удалён из справочника: его заданные датчики и его число в задании — тоже. Вход: номер."""
+        tid = int(tid)                               # номер удалённого типа
+        self.model.manual_sensors = [m for m in self.model.manual_sensors if m.type_id != tid]
+        more = dict(getattr(self.model.p, "threat_N_types", {}) or {})   # число типов справочника
+        more.pop(tid, None)
+        more.pop(str(tid), None)
+        self.model.p.threat_N_types = more
+        self._after_manual_change()
+
+    def on_type_task(self, tid, r_km, k):
+        """Окно типа поправило R и k номера моста 1–4 — это числа задания, поля Params (план 13 §13.1.4).
+        Вход: номер, радиус км, кратность."""
+        from model.sensors import _FIELDS
+        p = self.model.p
+        tid = int(tid)                               # номер типа из окна
+        if tid not in _FIELDS:                      # не номер моста — числа в паспорте, задание не трогаем
+            return
+        _f_n, f_r, f_k = _FIELDS[tid]
+        r_before = float(getattr(p, f_r, 0.0))       # радиус до правки, км
+        setattr(p, f_r, float(r_km))
+        same = bool(getattr(p, "threat_k_same", True))   # общая кратность
+        # ⚠️ ПРИ ОБЩЕЙ КРАТНОСТИ окно показывает у 2–3 общее threat_k — записать его в threat_k2/k3
+        # значило бы молча стереть их собственную кратность; общее число правится у типа 1
+        if tid == 1:                                 # тип 1 — его поле и есть общее
+            p.threat_k = int(k)
+        elif tid in (2, 3) and not same:             # своя кратность — своё поле
+            setattr(p, f_k, int(k))
+        if abs(float(r_km) - r_before) > 1e-9:       # радиус сменился — шаг сетки под него
+            self.model.sync_cand_step()
+        self.view.set_param_values(p)
+        self.view.refresh_sensors_dialog()
+
+    def on_type_zone(self, tid):
+        """Показать карту места типа и его места (13.3). Вход: номер типа; None — спрятать."""
+        from model.sensors import sensor_types
+        if tid is None or self.model.grid is None:   # спрятать или карты ещё нет
+            self.view.show_type_zone(None)
+            return
+        spec = next((s for s in sensor_types(self.model.p) if s.type_id == int(tid)), None)   # тип задания
+        mask = self.model.allowed_mask(spec) if spec is not None else None   # карта места
+        if mask is None:                             # тип ставится везде
+            self.view.show_type_zone(None)
+            self.view.flash_title("Тип №%d ставится везде — ограничений места нет." % int(tid))
+            return
+        pts = self.model.type_candidates(spec, mask)   # места типа, км
+        g = self.model.grid                          # сетка карты: охват и шаг ячейки, км
+        self.view.show_type_zone(mask, g.extent_km(), int(tid), pts)
+        self.view.set_title("Тип №%d «%s»: разрешено %.0f км², мест %d"
+                            % (int(tid), spec.name, float(mask.sum()) * g.h * g.h, len(pts)))
 
     def on_input_apply(self, vals, gap_changed=None):
         """Пересчёт после правки параметров МАРШРУТА (запас хода, разрыв, скорость…).
@@ -974,6 +1040,7 @@ class ThreatController:
                 ("Целей: %d — зона пролёта пересчитана по всем. " % n if n
                  else "Цели убраны — расчёт к цели по умолчанию. ")
                 + "«Применить» — синие линии; цель каждого маршрута разыгрывается.")
+            self._ask_target_areas()                      # цель в лесу — «укажите район защиты»
         elif kind == "place":
             self._render_all()
             self.view.refresh_sensor_table(self._sensor_rows())   # таблица окна
@@ -1175,6 +1242,38 @@ class ThreatController:
         """«Очистить» в окне целей: все цели убраны, расчёт — к цели по умолчанию."""
         self.model.clear_targets()
         self.on_targets_done()
+
+    # ---- район защиты цели в лесу (план 13, 13.18, В13.21) ----
+    def _ask_target_areas(self, start=0):
+        """Первой цели в лесу без района — окно «укажите район защиты». Вход: с какого номера искать.
+        ⚠️ По одной: следующую спросим, когда начертят эту; «Позже» — больше не спрашивать."""
+        for i in range(int(start), len(self.model.targets)):
+            if self.model.target_needs_area(i):          # у точки нет массива построек, района нет
+                shape = self.view.ask_target_area(i)      # "rect" | "circle" | None — позже
+                if shape is not None:                     # человек выбрал форму — чертить
+                    self.view.begin_target_area(i, shape)
+                return
+
+    def on_target_area(self, i, area):
+        """Район защиты начерчен (В13.21): зона цели = район ∩ карта ПВН. Пустая — отказ и вопрос снова.
+        Вход: номер цели с нуля, район ("rect", x0, y0, x1, y1) | ("circle", cx, cy, r) км."""
+        why, n = self.model.set_target_area(i, area)     # причина отказа, мест ПВН в зоне
+        if why:                                           # в районе негде ставить
+            self.view.set_title("Район защиты цели №%d не принят: %s." % (int(i) + 1, why))
+            self.view.refresh_targets_window("⚠️ Цель №%d: %s." % (int(i) + 1, why))
+            self._ask_target_areas(i)                     # спросить снова — есть «Позже»
+            return
+        self.view.render_target_areas(self.model.target_areas())
+        note = "Цель №%d: район защиты задан — мест для ПВН %d." % (int(i) + 1, n)   # итог
+        self.view.set_title(note + " Датчики — по «Расставить датчики».")
+        self.view.refresh_targets_window(note)
+        self._ask_target_areas(int(i) + 1)                # следующая цель в лесу
+
+    def on_target_area_clear(self, i):
+        """«Снять район» в окне целей: зона цели — снова по массиву застройки. Вход: номер с нуля."""
+        self.model.clear_target_area(i)
+        self.view.render_target_areas(self.model.target_areas())
+        self.view.refresh_targets_window()
 
     # ---- условия моделирования: тип БПЛА и точка старта (план 12, задача 12.2) ----
     def on_set_uav_start(self, x, y):
@@ -1504,6 +1603,7 @@ class ThreatController:
             iter=bool(self.model.iter_routes))
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, self.model.target_points_km())   # все цели (план 13)
+        self.view.render_target_areas(self.model.target_areas())   # районы защиты человека (В13.21)
         self.view.render_uav_start(self.model.uav_start_km)   # старт БПЛА (12.2), может быть None
         self.view.refresh_conditions_button()                 # сектор или цель могли смениться
         # сектор появления рисуется здесь же: иначе он пропадал бы при любой перерисовке
@@ -1752,6 +1852,22 @@ class ThreatController:
         if len(by) > 1:
             parts = " · ".join(f"тип {t}: {by[t]['n']}" for t in sorted(by))
             out.append(f"  по типам: {parts}")
+        # КАРТА МЕСТА ТИПА (план 13, 13.4): пустая — не ошибка, но видна числом, а не нулём молча
+        for t, (ok, total) in sorted((me.get("zone_places") or {}).items()):
+            out.append(f"  тип {t} · карта места: {ok} из {total} кандидатов"
+                       + ("  ⚠️ мест нет — тип не поставлен" if ok == 0 else ""))
+        # ОЦЕНКА ЗАЗОРА (план 13, 13.8): доля от лучшего на ТЕХ ЖЕ местах — после запрета места
+        # это «лучшее в застройке», а не «лучшее вообще»; подпись обязана это говорить
+        for t, ratio in sorted((me.get("gap") or {}).items()):
+            out.append(f"  тип {t} · не хуже {100 * ratio:.0f} % от лучшего на тех же местах")
+        # ЭТАП ЦЕЛЕЙ (план 13, 13.18): у каждой цели — поставлено из вместимости её зоны; зоны нет —
+        # цель в лесу, район защиты задаёт человек (В13.21)
+        for t, rep in sorted((me.get("targets_stage") or {}).items()):
+            parts = " · ".join(f"№{i + 1}: {r['placed']} из {r['capacity']}"   # по целям
+                               + ("" if r["zone"] else " — зоны нет, укажите район защиты")
+                               + (" (район вручную)" if r.get("manual") else "")
+                               for i, r in enumerate(rep))
+            out.append(f"  тип {t} · у целей: {parts}")
         # ⚠️ ДВЕ РАЗНЫЕ СТРОКИ. «Задано человеком» — сколько позиций он назвал сам;
         # «из них статических» — сколько из них не сдвинется и при итерациях. До
         # итераций стоят все заданные, при итерациях динамические уезжают, и разница

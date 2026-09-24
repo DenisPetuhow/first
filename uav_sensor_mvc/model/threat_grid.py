@@ -476,6 +476,9 @@ class ThreatGrid:
             city |= kind[lab] == 2                             # пятна-города
             village |= kind[lab] == 1                          # пятна-деревни
         village &= ~city
+        # пункты ДО свободных зон — для места датчика (план 13, 13.18): свободная зона у цели снимает
+        # запрет ПРОЛЁТА, а застройка там остаётся — без копии зона ПВН у цели съёживалась вдвое
+        city_all, village_all = city.copy(), village.copy()   # город и деревни без вырезов
         if not (city.any() or village.any()):
             return
         # Свободные зоны (вылет/цель) — там ничего не запрещаем и не гасим
@@ -543,6 +546,15 @@ class ThreatGrid:
         # в слое «village» — фактическое изменение веса, а не сырой штраф: иначе после
         # применения пола слой врал бы (показывал −17 там, где вес упал на 9)
         self.layers["village"] = self.weight - before
+        # ЗАСТРОЙКА ДЛЯ МЕСТА ДАТЧИКА (план 13, 13.18) — как если бы свободных зон не было: город с
+        # буфером и зона штрафа деревень. В вес не идёт; считается заново, только если зоны задели пункты
+        settle = self._built_cells | self._urban | (self._village_penalty != 0)   # застройка, как в §0.3а
+        if (self._free & (city_all | village_all)).any():   # свободная зона вырезала часть пунктов
+            v_all, _info = self._village_size_filter(village_all, village_skip_factor, village_townlike_med)
+            pen_all = (self._village_field(v_all, village_core, village_edge, r_min_km, r_max_km)   # штраф
+                       if v_all.any() else np.zeros_like(self._village_penalty))   # без вырезов
+            settle = settle | (_dilate(city_all, r) if r > 0 else city_all) | (pen_all != 0)   # + пункты целиком
+        self._settle_sensor = settle
 
     def own_place_area_km2(self, buf_cells=0):
         """Для КАЖДОЙ ячейки — площадь её «родного» населённого пункта (км²), то есть
@@ -3282,10 +3294,11 @@ class ThreatModel:
         """Добавить датчик, заданный человеком (клик по карте, строка таблицы, файл).
 
         Возвращает добавленную запись — окну нужно её показать в таблице."""
-        from .sensors import ManualSensor, TYPE_IDS
+        from .sensors import ManualSensor, type_ids
         tid = int(type_id)
-        if tid not in TYPE_IDS:
-            raise ValueError("нет типа датчика %r (есть %s)" % (type_id, list(TYPE_IDS)))
+        known = type_ids(self.p)                     # номера задания, с типами справочника ≥ 5
+        if tid not in known:                         # такого типа нет
+            raise ValueError("нет типа датчика %r (есть %s)" % (type_id, list(known)))
         rec = ManualSensor(type_id=tid, static=bool(static),
                            x_km=float(x_km), y_km=float(y_km))
         self.manual_sensors.append(rec)
@@ -3443,10 +3456,11 @@ class ThreatModel:
         Правит запись НА МЕСТЕ, сохраняя её порядок в списке: строка остаётся там же в
         таблице. `placed` снимается — позиция стала другой, и до следующего расчёта её
         показывают как только что поставленную, иначе правка не была бы видна на карте."""
-        from .sensors import TYPE_IDS
+        from .sensors import type_ids
         tid = int(type_id)
-        if tid not in TYPE_IDS:
-            raise ValueError("нет типа датчика %r (есть %s)" % (type_id, list(TYPE_IDS)))
+        known = type_ids(self.p)                     # номера задания, с типами справочника ≥ 5
+        if tid not in known:                         # такого типа нет
+            raise ValueError("нет типа датчика %r (есть %s)" % (type_id, list(known)))
         x, y = lonlat_to_km(float(lon), float(lat), self.lon0, self.lat0)
         rec.type_id = tid
         rec.static = bool(static)
@@ -3767,7 +3781,11 @@ class ThreatModel:
         # ⚠️ ЧТО ЗАКРЕПЛЕНО, РЕШАЕТ ФАЗА (`manual_locked`): до итераций — любой заданный
         # человеком датчик, при итерациях — только помеченный «статический». Динамический
         # при моделировании перемещается вместе с расстановкой (заказчик 05.09.2026).
-        if len(types) > 1 or any(m.type_id != 4 for m in self.manual_locked()):
+        # ⚠️ ПРЕЖНИМ ПУТЁМ — ТОЛЬКО ОДИНОЧНЫЙ ТИП 1 БЕЗ ПРАВИЛА МЕСТА (план 13, 13.4): путь ниже
+        # читает число и радиус типа 1, и одиночный тип 2 (ПВН) вставал там ноль раз
+        lone_first = (len(types) == 1 and types[0].type_id == 1
+                      and self.allowed_mask(types[0]) is None)   # работает один тип 1, место «везде»
+        if not lone_first or any(m.type_id != 4 for m in self.manual_locked()):
             return self._place_multi_type(cand, routes, types)
         # ⚠️ ОДИН РАБОТАЮЩИЙ ТИП И НИ ОДНОГО ЗАКРЕПЛЁННОГО ДАТЧИКА — ПРЕЖНИЙ КОД БЕЗ
         # ЕДИНОГО ИЗМЕНЕНИЯ. Обычный случай обязан считаться ровно как раньше, иначе
@@ -3807,13 +3825,16 @@ class ThreatModel:
         while len(sens) < N and sep > sep_min:
             sep = max(sep_min, sep * 0.85)
             sens = cache.greedy(N, weights, anchors=anchors, anchor_sep=sep, min_sep=sep)
+        self.gap_bounds = {1: cache.last_bound}      # оценка зазора (13.8) — только учёт, выбор тот же
         return sens
 
     def _place_multi_type(self, cand, routes, types):
-        """Расстановка нескольких малых типов (или с закреплёнными): по типам в порядке номеров,
-        у каждого свой R и k. Вход: кандидаты (C,2) км, маршруты, типы. Отдаёт: (N,2) км, типы —
-        в `self.sensors_type`. Как типы видят друг друга — ОГРАНИЧЕНИЯ 1.10а."""
-        # ⚠️ ПО ТИПАМ, А НЕ ОДНИМ ПРОХОДОМ: `CoverageCache` строится под ОДИН радиус
+        """Расстановка нескольких малых типов (или с закреплёнными) ОДНИМ общим проходом (план 13, 13.6):
+        на каждом шаге пара «тип + позиция» с наибольшим приростом. Вход: кандидаты (C,2) км, маршруты,
+        типы. Отдаёт: (N,2) км, типы — в `self.sensors_type`. Как типы видят друг друга — ОГРАНИЧЕНИЯ 1.10а."""
+        # ⚠️ КЭШ У КАЖДОГО ТИПА СВОЙ: `CoverageCache` строится под ОДИН радиус; общий — только выбор
+        from . import sensor_zones
+        from .joint_greedy import joint_greedy
         from .optimization import CoverageCache
         from config import MODES, THREAT_SPREAD_PAIR
         weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
@@ -3823,24 +3844,23 @@ class ThreatModel:
         # снята галка — у типа своя k, и набирает он её СВОИМИ датчиками (иначе второй тип
         # добирал до своего k чужие маршруты: 0.4 % своей засечки)
         k_joint = bool(getattr(self.p, "threat_k_same", True))   # чужие датчики в счёт кратности
-        placed = np.empty((0, 2), float)     # уже поставленные, всех типов
-        placed_r = np.empty(0, float)        # их радиусы — для разноса между типами
-        out_xy, out_tid = [], []
+        self.zone_places = {}                # номер типа -> (мест на его карте, кандидатов всего)
+        self.gap_bounds = {}                 # номер типа -> оценка зазора его прохода (13.8)
+        self.target_report = {}              # номер типа -> отчёт этапа целей по целям (13.18)
+        manual_mode = bool(getattr(self.p, "threat_manual_mode", False))   # «Задать позиции» — места называет человек
+        kinds = []                           # (тип, закреплённые номера, кэш покрытия, бонус мест) — кому ставить
         for spec in types:
             R = float(spec.r_km)
             c = np.asarray(cand, float)
-            # не даём типам садиться друг на друга: то же 1.6·R, обобщённое на пару радиусов
-            # (прежняя полусумма была вдвое слабее: при R = 1 и 3 км — 2 км против 4.8 внутри типа)
-            if len(placed) and spread:
-                d = np.linalg.norm(c[:, None, :] - placed[None, :, :], axis=2)
-                keep = (d >= THREAT_SPREAD_PAIR * (R + placed_r)[None, :]).all(axis=1)
-                if keep.any():               # все позиции заняты — не терять тип совсем
-                    c = c[keep]
+            zone = self.allowed_mask(spec)   # карта места типа (13.4); None — ставится везде
+            if zone is not None:             # у типа правило места (ПВН — застройка)
+                c = self.type_candidates(spec, zone)   # своя сетка типа (13.5), а не общая
+                # пустая карта — не ошибка: число мест видно в отчёте, а не «ноль датчиков молча»
+                self.zone_places[spec.type_id] = (len(c), len(cand))
             # ЗАКРЕПЛЁННЫЕ ПОЗИЦИИ ЭТОГО ТИПА — прямо в список кандидатов.
             # ⚠️ Именно ДОБАВЛЯЕМ, а не «ищем ближайший узел сетки»: датчик обязан
             # остаться ровно там, куда его поставил человек, а привязка к сетке сдвинула
             # бы его на полшага (до 0.5 км при шаге 1 км — четверть радиуса типа 1).
-            # заданные человеком позиции этого типа — условия моделирования.
             # ⚠️ ЧТО ИМЕННО ЗАКРЕПЛЕНО, РЕШАЕТ ФАЗА (`manual_locked`): до итераций — все
             # заданные, при итерациях — только статические, а динамический едет вместе с
             # расстановкой (правило заказчика 05.09.2026).
@@ -3850,30 +3870,52 @@ class ThreatModel:
                 extra = np.array([[m.x_km, m.y_km] for m in st], float)
                 anchors = list(range(len(c), len(c) + len(extra)))
                 c = np.vstack([c, extra])
+            # ⭐ ЭТАП ЦЕЛЕЙ (13.18): у типа с долей у объектов защиты (ПВН) — позиции у целей ДО общего
+            # прохода; туда они идут закреплёнными: засечки в кратности типа, другие типы — разносом прочь
+            if (zone is not None and spec.passport is not None and spec.passport.targets
+                    and not manual_mode):        # доля у целей есть, места выбирает алгоритм
+                tpos = self._target_stage(spec, zone, routes, weights)   # ПВН у целей, км
+                if len(tpos):
+                    anchors += list(range(len(c), len(c) + len(tpos)))
+                    c = np.vstack([c, tpos])
             if len(c) == 0:
                 continue
-            # УЖЕ ПОСТАВЛЕННЫЕ ДРУГИЕ ТИПЫ — в кэш, только если кратность одна на всех:
-            # тогда их покрытие входит в стартовое состояние жадного отбора
-            others = ([(pt[0], pt[1], rr) for pt, rr in zip(placed, placed_r)]
-                      if k_joint else [])                # чужие датчики (x, y, R), км
-            cache = CoverageCache(c, R, self.p.L_seg, int(spec.k), placed=others)   # кэш покрытия типа
+            cache = CoverageCache(c, R, self.p.L_seg, int(spec.k))   # кэш покрытия типа
             for r in routes:
                 cache.add_trajectory(r)
-            N = int(spec.n)
-            sep_min = max(0.1, float(self.p.threat_min_sep_frac)) * R
-            sep = max(1.6 * R, sep_min)
-            sens = cache.greedy(N, weights, anchors=anchors,
-                                anchor_sep=sep, min_sep=sep)
-            while len(sens) < N and sep > sep_min:
-                sep = max(sep_min, sep * 0.85)
-                sens = cache.greedy(N, weights, anchors=anchors,
-                                    anchor_sep=sep, min_sep=sep)
-            if not len(sens):
+            # бонус места (13.7): высота крыши и размер пункта — только у типа с правилом места
+            bonus = (sensor_zones.bonus_vector(self.grid, self.sensor_cells(), c, spec.passport)
+                     if zone is not None else None)  # None — выбор прежний
+            kinds.append((spec, anchors, cache, bonus))
+        if not kinds:
+            self.sensors_type = np.empty(0, int)
+            return np.empty((0, 2), float)
+        radii = [float(kd[0].r_km) for kd in kinds]   # радиусы типов, км
+        sep_min = [max(0.1, float(self.p.threat_min_sep_frac)) * r for r in radii]   # нижний разнос, км
+        seps = [max(1.6 * r, lo) for r, lo in zip(radii, sep_min)]   # желаемый разнос 1.6·R, км
+        quotas = [int(kd[0].n) for kd in kinds]   # сколько ставить каждого типа
+        # Разнос: желаемый 1.6·R; тип не набрал квоту — его разнос ослабляется ×0.85 до 0.75·R,
+        # и проход повторяется целиком (так же, как прежде у одного типа)
+        while True:
+            picks, bounds = joint_greedy([kd[2] for kd in kinds], quotas, weights, seps,
+                                         [kd[1] for kd in kinds],
+                                         pair=(THREAT_SPREAD_PAIR if spread else 0.0), joint=k_joint,
+                                         rule=str(getattr(self.p, "threat_type_order", "gain")),
+                                         bonuses=[kd[3] for kd in kinds])
+            short = [i for i in range(len(kinds))   # типы, не набравшие квоту при этом разносе
+                     if len(picks[i]) < quotas[i] and seps[i] > sep_min[i]]   # недобравшие типы
+            if not short:
+                break
+            for i in short:
+                seps[i] = max(sep_min[i], seps[i] * 0.85)
+        out_xy, out_tid = [], []
+        # ⚠️ В ТАБЛИЦЕ — ПО ТИПАМ В ПОРЯДКЕ НОМЕРОВ, как в окне, а не в порядке шагов прохода
+        for (spec, _a, cache, _b), idx, bd in zip(kinds, picks, bounds):
+            self.gap_bounds[spec.type_id] = bd
+            if not idx:
                 continue
-            out_xy.append(sens)
-            out_tid.append(np.full(len(sens), spec.type_id, int))
-            placed = np.vstack([placed, sens])
-            placed_r = np.concatenate([placed_r, np.full(len(sens), R)])
+            out_xy.append(cache.cand[idx])
+            out_tid.append(np.full(len(idx), spec.type_id, int))
         if not out_xy:
             self.sensors_type = np.empty(0, int)
             return np.empty((0, 2), float)
@@ -4148,6 +4190,13 @@ class ThreatModel:
                     n_manual=int(np.asarray(self.sensors_manual).sum())
                     + int(np.asarray(self.sensors_big_manual).sum()),
                     by_type=by_type,
+                    # места на карте типа (13.4): номер -> (разрешено, кандидатов всего)
+                    zone_places=dict(getattr(self, "zone_places", {})),
+                    # оценка зазора (13.8): номер типа -> доля от лучшего на тех же местах, не меньше
+                    gap={t: float(b["ratio"]) for t, b in getattr(self, "gap_bounds", {}).items() if b},
+                    # этап целей (13.18): номер типа -> по целям вместимость, заказано, поставлено
+                    targets_stage={t: [dict(r) for r in rep]
+                                   for t, rep in getattr(self, "target_report", {}).items()},
                     n_candidates=int(len(self.candidates)),
                     by_layer=g.totals_by_layer())
 
@@ -4382,16 +4431,68 @@ class ThreatModel:
         return self._refresh_envelope()
 
     def target_table_rows(self):
-        """Строки таблицы окна «Объекты защиты»: номер, градусы, км, приоритет и признак
-        «приоритетная». Отдаёт: список словарей (пусто — целей не ставили)."""
+        """Строки таблицы окна «Объекты защиты»: номер, градусы, км, приоритет, признак
+        «приоритетная» и зона у ПВН. Отдаёт: список словарей (пусто — целей не ставили)."""
         top = self.targets.priority_index()          # приоритетная цель или None
         rows = []
         for i, t in enumerate(self.targets.items):
             lon, lat = km_to_lonlat(t.x_km, t.y_km, self.lon0, self.lat0)
+            zone = ("задана вручную" if t.area is not None          # как выбрана зона цели (В13.21)
+                    else "укажите район" if self.target_needs_area(i) else "по застройке")
             rows.append(dict(n=i + 1, lon=float(lon), lat=float(lat), x_km=t.x_km,
                              y_km=t.y_km, weight=t.weight, top=(i == top),
-                             sectors=t.sectors))
+                             sectors=t.sectors, zone=zone))
         return rows
+
+    # ---- РАЙОН ЗАЩИТЫ ЦЕЛИ В ЛЕСУ (план 13, 13.18, В13.21) ----
+    def _targets_type(self):
+        """Тип задания, который ставится у объектов защиты (ПВН). Отдаёт: SensorSpec или None — такого нет."""
+        from .sensors import sensor_types
+        return next((s for s in sensor_types(self.p) if s.active and s.passport is not None
+                     and s.passport.targets and s.passport.zone != "везде"), None)
+
+    def target_needs_area(self, i):
+        """Цель №i в лесу: у точки нет массива построек, а района человек не задал (В13.21). Вход: номер
+        с нуля. Отдаёт: bool; карты нет или нет типа с долей у целей — False (спрашивать не о чем)."""
+        from .target_stage import target_zone
+        spec = self._targets_type()                  # тип у целей (ПВН)
+        if self.grid is None or spec is None or not 0 <= int(i) < len(self.targets):   # спрашивать не о чем
+            return False
+        t = self.targets.items[int(i)]               # цель
+        if t.area is not None:                       # район уже задан
+            return False
+        every = np.ones((self.grid.ny, self.grid.nx), bool)   # без карты места: вопрос — есть ли массив
+        return target_zone(self.grid, self.sensor_cells(), every, (t.x_km, t.y_km), spec.r_km) is None
+
+    def set_target_area(self, i, area):
+        """Район защиты цели мышью (В13.21): зона = район ∩ карта места ПВН. Вход: номер с нуля, район
+        ("rect", x0, y0, x1, y1) | ("circle", cx, cy, r) км. Отдаёт: (причина отказа или '', мест в зоне)."""
+        from .sensor_zones import type_nodes
+        from .target_stage import area_mask, target_zone
+        if not 0 <= int(i) < len(self.targets):      # номера нет
+            return "нет цели №%d" % (int(i) + 1), 0
+        spec = self._targets_type()                  # тип у целей (ПВН)
+        if self.grid is None or spec is None:        # проверить нечем — принять как есть
+            self.targets.set_area(i, area)
+            return "", 0
+        allowed = self.allowed_mask(spec)            # карта места ПВН
+        zone = target_zone(self.grid, self.sensor_cells(), allowed, (0.0, 0.0), spec.r_km, area)   # район ∩ карта
+        step = max(self.grid.h, 0.5 * float(spec.r_km))   # шаг своей сетки типа, км
+        places, roof = type_nodes(self.grid, step, zone, self.sensor_cells())   # места в районе, км
+        n = len(self._places_filter(places, roof))   # мест после отсечек (круг района, вода)
+        if n == 0:                                   # ⚠️ пустая зона — ПВН у цели не встанет: не принимать
+            return ("в указанном районе нет разрешённых мест: 0 из %d ячеек района"
+                    % int(area_mask(self.grid, area).sum())), 0
+        self.targets.set_area(i, area)
+        return "", n
+
+    def clear_target_area(self, i):
+        """Снять район защиты — зона снова по массиву застройки. Вход: номер с нуля. Отдаёт: True — цель есть."""
+        return self.targets.set_area(i, None)
+
+    def target_areas(self):
+        """Районы защиты, заданные человеком, — для показа контуром. Отдаёт: список районов (без None)."""
+        return [t.area for t in self.targets.items if t.area is not None]
 
     def target_points_km(self):
         """ВСЕ цели списком [(x, y)] км: объекты защиты, а нет их — одна цель по умолчанию."""
@@ -4418,6 +4519,83 @@ class ThreatModel:
         """Убрать точку старта БПЛА — и вернуться к одному общему запасу хода."""
         self.uav_start_km = None
         self.uav_lmax_per_entry = False
+
+    def sensor_cells(self):
+        """Постройки, лес и неудобья по ячейкам текущей сетки (план 13, 13.17) — `sensor_zones.cells`.
+        Отдаёт: dict либо None, пока карты нет. Считается раз на сетку: в вес не идёт, нужен по запросу."""
+        if self.grid is None:                        # карта не построена
+            return None
+        if getattr(self, "_zone_cells_grid", None) is not self.grid:   # сетка новая — сводка устарела
+            from . import sensor_zones
+            self._zone_cells = sensor_zones.cells(self.grid, sensor_zones.load())
+            self._zone_cells_grid = self.grid        # для какой сетки посчитано
+        return self._zone_cells
+
+    def allowed_mask(self, spec):
+        """Карта места типа (план 13, 13.4) — `sensor_zones.allowed_mask`. Вход: `SensorSpec`.
+        Отдаёт: (ny,nx) bool либо None — тип ставится везде. Считается раз на сетку и правило места."""
+        st = getattr(spec, "passport", None)         # паспорт типа из справочника
+        if self.grid is None or st is None or st.zone == "везде":   # ограничения нет
+            return None
+        from . import sensor_zones
+        from .threat_routes import passable_mask
+        if getattr(self, "_allowed_grid", None) is not self.grid:   # сетка новая — карты устарели
+            self._allowed_grid, self._allowed = self.grid, {}       # сетка и её карты по правилу
+        gap, slack = self._route_gap_km(), self._route_slack_km()   # разрыв и запас проходимости, км
+        key = (st.zone, float(st.zone_buf_km), float(st.strip_km), gap, slack)   # правило места
+        if key not in self._allowed:                 # такой карты ещё не считали
+            pas = passable_mask(self.grid, gap, slack)   # куда БПЛА вообще может лететь
+            self._allowed[key] = sensor_zones.allowed_mask(self.grid, self.sensor_cells(), st, pas)
+        return self._allowed[key]
+
+    def _target_stage(self, spec, zone, routes, weights):
+        """Этап целей для типа с долей у объектов защиты (план 13, 13.18) — `target_stage.stage`.
+        Вход: SensorSpec, карта места (ny,nx), выборка, веса жадного. Отдаёт: позиции (K,2) км;
+        отчёт по целям — в `self.target_report`."""
+        from . import target_stage
+        from .sensor_zones import type_nodes
+        zc = self.sensor_cells()                     # постройки, лес по ячейкам
+        step = max(self.grid.h, 0.5 * float(spec.r_km))   # шаг своей сетки типа, км
+        # ⚠️ места — по ВСЕЙ карте, без отсечки зоной пролёта: вместимость — про место, а не про маршруты
+        places, roof = type_nodes(self.grid, step, zone, zc)   # места типа, км; крыша ли
+        places = self._places_filter(places, roof)   # круг района, вода (крыши она не отсекает)
+        items = list(self.targets.items)             # объекты защиты, поставленные человеком
+        targets = ([(t.x_km, t.y_km, float(t.weight)) for t in items] if items   # (x, y, приоритет)
+                   else [tuple(self.target_only_km()) + (1.0,)])   # нет их — цель по умолчанию
+        areas = [t.area for t in items] if items else [None]   # районы защиты человека (В13.21)
+        pos, rep = target_stage.stage(self.grid, zc, zone, places, targets, self.routes_by_target(routes),
+                                      spec.passport, int(spec.n), float(spec.r_km), self.p.L_seg, weights,
+                                      areas=areas)
+        self.target_report[spec.type_id] = rep
+        return pos
+
+    def type_candidates(self, spec, zone):
+        """Своя сетка типа с правилом места (план 13, 13.5): шаг R/2 внутри карты, в ячейке с постройками —
+        самая высокая постройка. Вход: SensorSpec, карта (ny,nx). Отдаёт: (M,2) км с отсечками общей
+        сетки — круг района, вода (1.1), зона пролёта (1.2)."""
+        from .sensor_zones import cells_of, type_nodes
+        # ⚠️ не мельче ЯЧЕЙКИ КАРТЫ: карта поячеечная, и узлы 0.25 км у ПВН новых мест не дают, а
+        # уводят его с крыш — замер: на постройке 6 из 20 против 10 при узле в центре ячейки
+        step = max(self.grid.h, 0.5 * float(spec.r_km))   # шаг своей сетки, км
+        c, roof = type_nodes(self.grid, step, zone, self.sensor_cells())   # кандидаты типа, км; крыша ли
+        c = self._places_filter(c, roof)             # круг района, вода
+        area = self.route_area                       # зона пролёта, как у общей сетки
+        if area is not None and len(c):
+            keep = cells_of(self.grid, c, area)      # кандидат там, куда БПЛА долетает
+            if keep.any():                           # пустая зона — не терять кандидатов
+                c = c[keep]
+        return c
+
+    def _places_filter(self, pts, roof):
+        """Отсечки мест типа: круг района и вода. Вход: точки (M,2) км, крыша ли (M,). Отдаёт: (K,2) км.
+        ⚠️ Крышу вода не отсекает: запрет — поячеечный (русло + 250 м), а дом у реки стоит на суше; без
+        этого у приречных посёлков пропадала половина мест (замер: вместимость 12 против 23)."""
+        keep = np.ones(len(pts), bool)               # точка остаётся
+        if self.area_circle is not None and len(pts):   # район круглый — углы квадрата не наши
+            keep &= self.in_area(pts[:, 0], pts[:, 1])
+        if self.p.threat_exclude_water and len(pts):   # вода — общий запрет, кроме крыш
+            keep &= roof | ~self._on_water(pts)
+        return pts[keep]
 
     def set_uav_type(self, uav):
         """Выбрать тип БПЛА. Вход: `uav_types.UavType` или None. Отдаёт: ничего.

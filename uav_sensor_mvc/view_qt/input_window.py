@@ -13,19 +13,10 @@ VIEW (Qt) · ОКНО «ИСХОДНЫЕ ДАННЫЕ» (задача 8.7) — �
 журнал п. 212). Отдельный модуль здесь ровно один — сам `input_window.py`: дописывать
 окно в `threat_view.py` (под 2 700 строк) значило бы смешать карту и ввод данных.
 
-ЧТО В ОКНЕ (компоновка утверждена заказчиком, план 8, §8.7.1а):
-
-    режим работы + кратность          — вверху, они меняют смысл полей ниже
-    слева параметры ЧЕТЫРЁХ типов     — справа параметры маршрута
-    внизу во всю ширину — ТАБЛИЦА датчиков с прокруткой
-
-ДВА РЕЖИМА РАБОТЫ:
-
-* «Рассчитать позиции» — датчики расставляет алгоритм, таблица показывает РЕЗУЛЬТАТ;
-* «Задать позиции» — датчики стоят там, где их задали, таблица служит ИСТОЧНИКОМ.
-
-Таблица заполняется в обоих: в первом отвечает на вопрос «куда программа их поставила»,
-во втором — задаёт расстановку.
+ЧТО В ОКНЕ (с 24.09.2026, план 13, задача 13.2): условия моделирования, область и тайлы, параметры
+маршрута и расстановки. ДАТЧИКИ — типы, режим «Рассчитать / Задать позиции», кратность, таблица —
+переехали в своё окно `view_qt/sensors_window.py` (кнопка «Датчики…»). Здесь остались файл датчиков
+и диалог «тип и режим»: ими пользуется и окно «Датчики».
 """
 import io
 import os
@@ -124,20 +115,14 @@ def write_sensors_file(path, rows, params=None):
     return len(rows)
 
 
-def read_sensors_file(path):
-    """Прочитать файл датчиков → `(записи, отчёт)`.
-
-    Записи — список `(type_id, static, lon, lat)`. Отчёт — словарь `accepted`,
-    `rejected` (список `(номер строки, причина)`) и `types` (таблица типов из шапки,
-    если она там была).
-
-    ⚠️ ОДНА ПЛОХАЯ СТРОКА НЕ РОНЯЕТ ЧТЕНИЕ. Отчёт «принято 18, отброшено 2 (строки 7,
-    12)» полезнее, чем отказ читать весь файл: файлы правят руками, и опечатка в одной
-    строке — обычное дело.
-
-    ⚠️ НОМЕР ДАТЧИКА В НАЧАЛЕ СТРОКИ НЕОБЯЗАТЕЛЕН. Опора разбора — слово режима: тип
-    стоит перед ним, координаты — сразу после. Поэтому читается и файл, выгруженный
-    программой (с номерами), и строка из трёх полей, набранная руками."""
+def read_sensors_file(path, known=None):
+    """Прочитать файл датчиков. Вход: путь, допустимые номера типов (None — 1–4; окно «Датчики» даёт
+    и справочник ≥ 5, план 13). Отдаёт: (записи [(type_id, static, lon, lat)], отчёт: accepted,
+    rejected [(номер строки, причина)], types — таблица типов из шапки)."""
+    # ⚠️ ОДНА ПЛОХАЯ СТРОКА НЕ РОНЯЕТ ЧТЕНИЕ: «принято 18, отброшено 2 (строки 7, 12)» полезнее отказа —
+    # файлы правят руками. ⚠️ НОМЕР В НАЧАЛЕ СТРОКИ НЕОБЯЗАТЕЛЕН: опора — слово режима, тип перед ним,
+    # координаты после; так читается и выгрузка программы, и строка из трёх полей, набранная руками
+    ids = tuple(known) if known else TYPE_IDS        # допустимые номера типов
     records, rejected, types = [], [], {}
     with io.open(path, encoding="utf-8-sig") as f:      # -sig снимает BOM блокнота
         raw = f.read()
@@ -161,9 +146,9 @@ def read_sensors_file(path):
         except ValueError:
             rejected.append((no, "тип или координаты — не число"))
             continue
-        if tid not in TYPE_IDS:
+        if tid not in ids:                           # такого типа нет
             rejected.append((no, "тип %d: бывают только %s"
-                             % (tid, ", ".join(str(t) for t in TYPE_IDS))))
+                             % (tid, ", ".join(str(t) for t in ids))))
             continue
         if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
             rejected.append((no, "координаты вне земного диапазона"))
@@ -212,9 +197,8 @@ class SensorRowDialog(QtWidgets.QDialog):
 
         self.cb_type = QtWidgets.QComboBox()
         for s in sensor_types(_params_of(parent)):
-            self.cb_type.addItem("%d · %s (R = %g км)"
-                                 % (s.type_id, KIND_LABEL.get(s.kind, s.kind), s.r_km),
-                                 s.type_id)
+            # подпись — название из справочника (13.2): «малый» не отличает МОГ от ПВН
+            self.cb_type.addItem("%d · %s (R = %g км)" % (s.type_id, s.name, s.r_km), s.type_id)
         self._select(self.cb_type, last.get("type_id", 1))
         lay.addRow("Тип датчика:", self.cb_type)
 
@@ -299,10 +283,10 @@ def _params_of(widget):
 # ГЛАВНОЕ ОКНО
 # ══════════════════════════════════════════════════════════════════════════════
 class InputDataWindow(QtWidgets.QDialog):
-    """Окно «Исходные данные»: параметры четырёх типов датчиков, параметры маршрута и
-    таблица датчиков. НЕ блокирует основное окно — карту можно двигать, не закрывая."""
+    """Окно «Исходные данные»: условия, область, параметры маршрута и расстановки. Датчики — в своём
+    окне «Датчики» (план 13, 13.2), отсюда оно открывается кнопкой. НЕ блокирует основное окно."""
 
-    # Параметры маршрута (правая колонка). Кортеж: поле Params, подпись, подсказка.
+    # Параметры маршрута. Кортеж: поле Params, подпись, подсказка. Кортеж: поле Params, подпись, подсказка.
     ROUTE_FIELDS = (
         ("threat_L_max", "Запас хода L_max, км",
          "Главное ограничение маршрута: полная длина пути вход→цель не может его "
@@ -339,76 +323,46 @@ class InputDataWindow(QtWidgets.QDialog):
          "Дальняя граница кольца. 1.0 — цель ровно на краю зоны обзора; больше 1.0 "
          "цель выйдет из-под наблюдения."),
     )
-    INT_FIELDS = {"threat_N", "threat_N2", "threat_N3", "threat_N_big",
-                  "threat_k", "threat_k2", "threat_k3", "L_seg"}
-    # Поля одного типа датчиков: (число, радиус, кратность) — совпадает с `model.sensors`.
-    TYPE_FIELDS = {
-        1: ("threat_N", "threat_R", "threat_k"),
-        2: ("threat_N2", "threat_R2", "threat_k2"),
-        3: ("threat_N3", "threat_R3", "threat_k3"),
-        4: ("threat_N_big", "threat_R_big", "threat_k"),
-    }
-    COLUMNS = ("№", "тип", "режим", "долгота", "широта")
+    INT_FIELDS = {"L_seg"}                         # целые поля окна: число сегментов, шт.
 
     def __init__(self, parent, params, on_apply):
         super().__init__(parent)
         self.setWindowTitle("Исходные данные")
         self.setModal(False)                       # НЕ блокирует основное окно
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.Tool)
-        self._params = params
-        self._on_apply = on_apply
-        self._edits = {}
-        self._rows = []                            # что показано в таблице
-
+        self._params = params                      # параметры модели (общие с картой)
+        self._on_apply = on_apply                  # отдать поля контроллеру
+        self._edits = {}                           # поле Params -> поле окна
         # колбэки — их ставит threat_view (представление ничего не знает о модели)
-        self.on_manual_add = lambda tid, static, lon, lat: None
-        self.on_manual_remove = lambda index: None
-        self.on_manual_edit = lambda index, tid, static, lon, lat: None
-        self.on_manual_clear = lambda: None
-        # ⚠️ ОТДЕЛЬНО ОТ on_manual_clear (см. _clear_rows): та убирает только заданные
-        # вручную, эта — ВСЮ расстановку (нужна в режиме «Рассчитать позиции»).
-        self.on_clear_sensors = lambda: None
-        self.on_mode_changed = lambda manual: None
-        self.on_pick_mode = lambda: None           # «ставить датчики кликом по карте»
+        self.on_open_sensors = lambda: None        # «Датчики…» — своё окно (план 13, 13.2)
         self.on_view_routes = lambda: None         # «Посмотреть маршруты» (задача 8.6)
         self.on_pick_area = lambda: None           # «Область…» — папка с область.txt (10.5)
         self.on_pick_tiles = lambda reset: None    # «Папка тайлов…», reset — по умолчанию
         self.on_sim_conditions = lambda: None      # «Задать условия моделирования» (12.2)
-
         self._build_ui()
         self.refresh(params)
 
     # ---------- построение окна ----------
     def _build_ui(self):
+        """Окно в прокрутке: условия, область, кнопки «Датчики» и маршрутов, параметры маршрута."""
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        # ⚠️ ВСЁ ОКНО В ПРОКРУТКЕ. На ноутбуке 1366×768 форма с четырьмя типами, шестью
-        # параметрами маршрута и таблицей в высоту не помещается, а окно, вылезшее за
-        # край экрана, кнопкой «Применить» не нажать.
-        scroll = QtWidgets.QScrollArea()
+        # ⚠️ ВСЁ ОКНО В ПРОКРУТКЕ: окно, вылезшее за край экрана, кнопкой «Применить» не нажать
+        scroll = QtWidgets.QScrollArea()           # прокрутка всего окна
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        inner = QtWidgets.QWidget()
+        inner = QtWidgets.QWidget()                # содержимое прокрутки
         scroll.setWidget(inner)
         outer.addWidget(scroll)
-        lay = QtWidgets.QVBoxLayout(inner)
+        lay = QtWidgets.QVBoxLayout(inner)         # блоки сверху вниз
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
-
         lay.addWidget(self._build_conditions())    # условия моделирования — перед областью (12.2)
-        lay.addWidget(self._build_area())          # область и папка тайлов — самое первое
-        lay.addWidget(self._build_top())           # режим работы + кратность
-        mid = QtWidgets.QHBoxLayout(); mid.setSpacing(10)
-        mid.addWidget(self._build_types(), 1)      # слева — датчики
-        mid.addWidget(self._build_route(), 1)      # справа — маршрут
-        lay.addLayout(mid)
-        lay.addWidget(self._build_table(), 1)      # внизу — таблица во всю ширину
-
-        row = QtWidgets.QHBoxLayout()
-        self.lbl_note = QtWidgets.QLabel("")
-        self.lbl_note.setStyleSheet("color:%s;" % THEME["muted"])
-        self.lbl_note.setWordWrap(True)
-        row.addWidget(self.lbl_note, 1)
+        lay.addWidget(self._build_area())          # область и папка тайлов
+        lay.addWidget(self._build_sensors_link())  # «Датчики…» и «Посмотреть маршруты»
+        lay.addWidget(self._build_route(), 1)      # параметры маршрута и расстановки
+        row = QtWidgets.QHBoxLayout()              # кнопки окна
+        row.addStretch(1)
         btn_apply = QtWidgets.QPushButton("Применить")
         btn_apply.setDefault(True)
         btn_apply.clicked.connect(self._apply)
@@ -416,10 +370,9 @@ class InputDataWindow(QtWidgets.QDialog):
         btn_close.clicked.connect(self.hide)
         row.addWidget(btn_apply); row.addWidget(btn_close)
         lay.addLayout(row)
-
-        scr = QtWidgets.QApplication.primaryScreen()
-        avail = scr.availableGeometry() if scr is not None else QtCore.QRect(0, 0, 1200, 800)
-        self.resize(min(980, avail.width() - 60), min(760, avail.height() - 60))
+        scr = QtWidgets.QApplication.primaryScreen()   # экран — под него размер окна
+        avail = scr.availableGeometry() if scr is not None else QtCore.QRect(0, 0, 1200, 800)   # доступно
+        self.resize(min(620, avail.width() - 60), min(760, avail.height() - 60))
 
     def _build_conditions(self):
         # Блок «Условия моделирования» (план 12, 12.2) — ПЕРЕД областью, как велел заказчик.
@@ -474,125 +427,20 @@ class InputDataWindow(QtWidgets.QDialog):
         # Вход: HTML-строка. Отдаёт: ничего.
         self.lbl_area.setText(html)
 
-    def _build_top(self):
-        """Режим работы и кратность — вверху: они меняют смысл полей ниже."""
-        box = QtWidgets.QGroupBox("Режим работы")
-        grid = QtWidgets.QGridLayout(box)
-        # ⚠️ ДВЕ ОТДЕЛЬНЫЕ ГРУППЫ ПЕРЕКЛЮЧАТЕЛЕЙ. Радиокнопки Qt объединяет в группу по
-        # ОБЩЕМУ РОДИТЕЛЮ, а здесь их четыре в одном блоке: без явных групп выбор режима
-        # работы снимал бы выбор кратности и наоборот. Поймано `tools/gui_check.py`:
-        # «у каждого своя» не открывала поля, потому что «одна на всех» не снималась.
-        self._grp_mode = QtWidgets.QButtonGroup(self)
-        self._grp_k = QtWidgets.QButtonGroup(self)
-
-        self.rb_calc = QtWidgets.QRadioButton("Рассчитать позиции")
-        self.rb_calc.setToolTip(
-            "Датчики расставляет алгоритм по выборке возможных пролётов — как было до "
-            "сих пор. Таблица внизу покажет РЕЗУЛЬТАТ расстановки с координатами.")
-        self.rb_manual = QtWidgets.QRadioButton("Задать позиции")
-        self.rb_manual.setToolTip(
-            "Датчики стоят ровно там, где их задали: мышью, из файла или строкой в "
-            "таблице. Таблица внизу — ИСТОЧНИК: что в ней, то и на карте.")
-        self.rb_calc.setChecked(True)
-        for rb in (self.rb_calc, self.rb_manual):
-            self._grp_mode.addButton(rb)
-            rb.toggled.connect(self._mode_changed)
-        grid.addWidget(QtWidgets.QLabel("Позиции датчиков:"), 0, 0)
-        grid.addWidget(self.rb_calc, 0, 1)
-        grid.addWidget(self.rb_manual, 0, 2)
-
-        self.rb_k_same = QtWidgets.QRadioButton("одна на всех")
-        self.rb_k_same.setToolTip(
-            "Кратность вводится в одной группе и сразу подставляется во все остальные: "
-            "в полях видно то самое число, с которым программа будет считать.")
-        self.rb_k_own = QtWidgets.QRadioButton("у каждого своя")
-        self.rb_k_own.setToolTip("Кратность задаётся отдельно для каждого типа датчиков.")
-        self.rb_k_same.setChecked(True)
-        for rb in (self.rb_k_same, self.rb_k_own):
-            self._grp_k.addButton(rb)
-            rb.toggled.connect(self._k_mode_changed)
-        grid.addWidget(QtWidgets.QLabel("Кратность засечки:"), 1, 0)
-        grid.addWidget(self.rb_k_same, 1, 1)
-        grid.addWidget(self.rb_k_own, 1, 2)
-
-        # РАСПРЕДЕЛЕНИЕ МЕЖДУ ТИПАМИ (заказчик 05.09.2026). Правило «не ближе 1.6·R»
-        # внутри типа работало всегда, а между типами разнос был вдвое слабее — и группы
-        # слипались. Галочка включает его и между типами; кратность засечки учитывается
-        # между ними в любом случае, это не «распределение», а правильный счёт покрытия.
-        self.chk_spread = QtWidgets.QCheckBox("распределять между типами")
-        self.chk_spread.setToolTip(
-            "ВКЛ (по умолчанию): датчики РАЗНЫХ типов не ставятся ближе, чем датчики "
-            "одного типа между собой, — то же правило 1.6·R, взятое по паре радиусов. "
-            "ВЫКЛ: разнос действует только внутри своего типа, и типы могут стоять "
-            "рядом.\n\nБольших датчиков (тип 4) не касается: у них своё правило кольца "
-            "вокруг цели. Кратность засечки между типами учитывается всегда.")
-        self.chk_spread.setChecked(True)
-        grid.addWidget(QtWidgets.QLabel("Разнос датчиков:"), 2, 0)
-        grid.addWidget(self.chk_spread, 2, 1, 1, 2)
-        grid.setColumnStretch(3, 1)                # растяжка — кнопка ниже прижмётся вправо
-
-        # «ПОСМОТРЕТЬ МАРШРУТЫ» (задача 8.6, довесок 06.09.2026, заказчик): сверху
-        # справа — список пройденных маршрутов и загруженной истории с таблицей точек.
+    def _build_sensors_link(self):
+        """Кнопки «Датчики…» (своё окно, план 13, 13.2) и «Посмотреть маршруты» (8.6). Отдаёт: QGroupBox."""
+        box = QtWidgets.QGroupBox("Датчики и маршруты")   # рамка блока
+        row = QtWidgets.QHBoxLayout(box)           # кнопки строкой
+        self.btn_sensors = QtWidgets.QPushButton("Датчики…")
+        self.btn_sensors.setToolTip("Типы датчиков, их число, радиус и кратность, режим расстановки и "
+                                    "таблица датчиков — в своём окне.")
+        self.btn_sensors.clicked.connect(lambda: self.on_open_sensors())
         self.btn_view_routes = QtWidgets.QPushButton("Посмотреть маршруты")
         self.btn_view_routes.setToolTip(
-            "Список маршрутов, пройденных к этому моменту, и отдельно — загруженная "
-            "история полёта (если есть). Выбор показывает все точки маршрута в таблице "
-            "и умеет подсветить его на карте.")
+            "Список маршрутов, пройденных к этому моменту, и отдельно — загруженная история полёта. "
+            "Выбор показывает все точки маршрута в таблице и умеет подсветить его на карте.")
         self.btn_view_routes.clicked.connect(lambda: self.on_view_routes())
-        grid.addWidget(self.btn_view_routes, 0, 4, 3, 1)
-        return box
-
-    def _build_types(self):
-        """Левая колонка — четыре типа датчиков, каждый своей группой."""
-        box = QtWidgets.QGroupBox("ДАТЧИКИ")
-        lay = QtWidgets.QVBoxLayout(box)
-        lay.setSpacing(6)
-        specs = {s.type_id: s for s in sensor_types(self._params)}
-        for tid in TYPE_IDS:
-            s = specs[tid]
-            grp = QtWidgets.QGroupBox("Тип %d · %s%s"
-                                      % (tid, KIND_LABEL.get(s.kind, s.kind),
-                                         " (щит у цели)" if s.kind == "big" else ""))
-            form = QtWidgets.QGridLayout(grp)
-            form.setContentsMargins(8, 4, 8, 4); form.setSpacing(4)
-            f_n, f_r, f_k = self.TYPE_FIELDS[tid]
-            for col, (name, label, tip) in enumerate((
-                    (f_n, "N, шт.", "Сколько датчиков этого типа ставить. "
-                                    "0 — тип выключен, его настройки сохраняются."),
-                    (f_r, "R, км", "Радиус зоны обнаружения датчика этого типа."),
-                    (f_k, "k", "Сколько РАЗНЫХ датчиков должны увидеть маршрут, чтобы "
-                               "он считался надёжно засечённым."))):
-                lab = QtWidgets.QLabel(label)
-                lab.setStyleSheet("color:%s;" % THEME["muted"])
-                e = QtWidgets.QLineEdit()
-                e.setToolTip(tip)
-                e.returnPressed.connect(self._apply)
-                if name in ("threat_k", "threat_k2", "threat_k3"):
-                    e.textEdited.connect(self._k_edited)
-                # ⚠️ поле кратности типа 4 всегда общее: большие ставятся кольцом ПО УГЛУ,
-                # и кратность в их расстановке не участвует
-                if tid == 4 and label == "k":
-                    e.setToolTip("Кратность у больших датчиков общая: они ставятся "
-                                 "кольцом по углу вокруг цели, и кратность в их "
-                                 "расстановке не участвует.")
-                    e.setReadOnly(True)
-                self._edits.setdefault(name, e)
-                if self._edits[name] is not e:      # тип 4 делит поле k с типом 1
-                    self._k_big = e
-                form.addWidget(lab, 0, col)
-                form.addWidget(e, 1, col)
-            lay.addWidget(grp)
-        # ЧИСЛО СЕГМЕНТОВ — СНИЗУ, ПОСЛЕ ТИПОВ (план 12, задача 12.6, заказчик 20.09.2026).
-        # ⚠️ ПОДСКАЗКИ НЕТ — прямое указание заказчика.
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Сегментов маршрута:"))
-        e_seg = QtWidgets.QLineEdit()            # число сегментов маршрута, шт. (1…31)
-        e_seg.returnPressed.connect(self._apply)
-        self._edits.setdefault("L_seg", e_seg)
-        row.addWidget(e_seg)
-        row.addStretch(1)
-        lay.addLayout(row)
-        lay.addStretch(1)
+        row.addWidget(self.btn_sensors); row.addWidget(self.btn_view_routes); row.addStretch(1)
         return box
 
     def _build_route(self):
@@ -616,6 +464,12 @@ class InputDataWindow(QtWidgets.QDialog):
         form.addRow(self.chk_lmax_manual)
         for name, label, tip in self.ROUTE_FIELDS:
             form.addRow(label + ":", self._field(name, tip))
+        # ЧИСЛО СЕГМЕНТОВ (12.6) — переехало сюда из колонки датчиков (13.2): оно про маршрут.
+        # ⚠️ ПОДСКАЗКИ НЕТ — прямое указание заказчика 20.09.2026.
+        e_seg = QtWidgets.QLineEdit()            # число сегментов маршрута, шт. (1…31)
+        e_seg.returnPressed.connect(self._apply)
+        self._edits["L_seg"] = e_seg
+        form.addRow("Сегментов маршрута:", e_seg)
         lay.addLayout(form)
 
         lay.addWidget(self._sep())
@@ -647,116 +501,25 @@ class InputDataWindow(QtWidgets.QDialog):
         line.setFrameShadow(QtWidgets.QFrame.Sunken)
         return line
 
-    def _build_table(self):
-        """Таблица датчиков во всю ширину — с прокруткой и кнопками справа."""
-        box = QtWidgets.QGroupBox("ДАТЧИКИ НА КАРТЕ")
-        lay = QtWidgets.QVBoxLayout(box)
-
-        top = QtWidgets.QHBoxLayout()
-        self.lbl_count = QtWidgets.QLabel("датчиков: 0")
-        self.lbl_count.setStyleSheet("color:%s;" % THEME["muted"])
-        top.addWidget(self.lbl_count, 1)
-        for text, tip, slot in (
-                ("Из файла…", "Прочитать датчики из текстового файла: номер, тип, "
-                              "режим, долгота, широта.", self._load_file),
-                ("В файл…", "Записать таблицу в текстовый файл — его же программа "
-                            "читает обратно без правки руками.", self._save_file),
-                ("Добавить", "Добавить датчик строкой: тип, режим и координаты.",
-                 self._add_row),
-                ("По клику на карте", "Ставить датчики двойным кликом по карте. "
-                                      "Повторный двойной клик — выход из режима.",
-                 self._pick_mode)):
-            b = QtWidgets.QPushButton(text)
-            b.setToolTip(tip)
-            b.clicked.connect(slot)
-            top.addWidget(b)
-        lay.addLayout(top)
-
-        mid = QtWidgets.QHBoxLayout()
-        self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
-        self.table.setHorizontalHeaderLabels(self.COLUMNS)
-        self.table.setSelectionBehavior(QtWidgets.QTableWidget.SelectRows)
-        self.table.setSelectionMode(QtWidgets.QTableWidget.SingleSelection)
-        self.table.setEditTriggers(QtWidgets.QTableWidget.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
-        # ⚠️ ФИКСИРОВАННАЯ ВЫСОТА + СВОЯ ПРОКРУТКА. Датчиков бывает за полсотни (три типа
-        # по двадцать плюс большие), и таблица, растущая под содержимое, вытолкнула бы
-        # кнопки за край экрана.
-        self.table.setMinimumHeight(180)
-        self.table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        # ⚠️ ТАБЛИЦА — ОБЫЧНАЯ, БЕЛАЯ, С ЧЁРНЫМ ТЕКСТОМ (требование заказчика 05.09.2026).
-        # Тёмная тема THEME живёт на КАРТЕ, где она уместна: там подложка тёмная. Здесь
-        # же таблицу читают как документ и сверяют с распечаткой — на белом это привычнее
-        # и разборчивее. Цвет задаётся явно, а не наследуется: иначе таблица подхватит
-        # системную тему, и у заказчика с тёмной темой Windows текст окажется светлым
-        # на светлом.
-        self.table.setStyleSheet(
-            "QTableWidget { background:#ffffff; color:#000000; "
-            "gridline-color:#c8c8c8; selection-background-color:#cfe3ff; "
-            "selection-color:#000000; }"
-            "QHeaderView::section { background:#eeeeee; color:#000000; "
-            "padding:3px; border:0px; border-right:1px solid #c8c8c8; "
-            "border-bottom:1px solid #c8c8c8; }")
-        self.table.setAlternatingRowColors(False)   # чередование мешает читать координаты
-        hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-        for c in range(2, len(self.COLUMNS)):
-            hh.setSectionResizeMode(c, QtWidgets.QHeaderView.Stretch)
-        mid.addWidget(self.table, 1)
-
-        side = QtWidgets.QVBoxLayout()
-        self.btn_edit = QtWidgets.QPushButton("Изменить")
-        self.btn_edit.setToolTip("Изменить тип, режим или координаты выбранной строки.")
-        self.btn_edit.clicked.connect(self._edit_row)
-        self.btn_del = QtWidgets.QPushButton("Удалить")
-        self.btn_del.setToolTip("Убрать выбранный датчик из таблицы и с карты.")
-        self.btn_del.clicked.connect(self._del_row)
-        self.btn_clear = QtWidgets.QPushButton("Очистить")
-        self.btn_clear.setToolTip(
-            "«Задать позиции» — убрать ВСЕ заданные вручную датчики.\n"
-            "«Рассчитать позиции» — таблица показывает результат расстановки, "
-            "поэтому убирает ВСЮ расстановку (как «Очистить датчики» на панели).")
-        self.btn_clear.clicked.connect(self._clear_rows)
-        side.addWidget(self.btn_edit); side.addWidget(self.btn_del)
-        side.addWidget(self.btn_clear); side.addStretch(1)
-        mid.addLayout(side)
-        lay.addLayout(mid)
-        return box
-
     # ---------- заполнение и чтение полей ----------
     def refresh(self, params=None):
-        """Подставить в поля текущие параметры модели."""
-        if params is not None:
+        """Подставить в поля текущие параметры модели. Вход: Params или None."""
+        if params is not None:                     # пришли свежие параметры
             self._params = params
         p = self._params
         for name, e in self._edits.items():
-            v = getattr(p, name, 0)
+            v = getattr(p, name, 0)                # значение параметра
             e.setText("%d" % int(v) if name in self.INT_FIELDS else "%g" % float(v))
-        big_k = getattr(self, "_k_big", None)
-        if big_k is not None:
-            big_k.setText("%d" % int(getattr(p, "threat_k", 3)))
         self.chk_lmax_manual.blockSignals(True)
         self.chk_lmax_manual.setChecked(bool(getattr(p, "threat_L_max_manual", False)))
         self.chk_lmax_manual.blockSignals(False)
         self.chk_step_auto.blockSignals(True)
         self.chk_step_auto.setChecked(not getattr(p, "threat_cand_step_manual", False))
         self.chk_step_auto.blockSignals(False)
-        same = bool(getattr(p, "threat_k_same", True))
-        (self.rb_k_same if same else self.rb_k_own).setChecked(True)
-        self.chk_spread.setChecked(bool(getattr(p, "threat_spread_types", True)))
-        manual = bool(getattr(p, "threat_manual_mode", False))
-        (self.rb_manual if manual else self.rb_calc).setChecked(True)
         self._auto_changed()
-        self._k_mode_changed()
-        self._sync_counts()
 
     def set_ab(self, km):
         self.lbl_ab.setText("%.0f" % km)
-
-    def is_manual_mode(self):
-        """Окно в режиме «Задать позиции»?"""
-        return self.rb_manual.isChecked()
 
     def _auto_changed(self, *_):
         """Поля в авто-режиме показывают значение, но правке не поддаются.
@@ -774,258 +537,23 @@ class InputDataWindow(QtWidgets.QDialog):
             e.setReadOnly(auto)
             e.setStyleSheet("color:#6b7785; background:#f0f0f0;" if auto else "")
 
-    def _k_mode_changed(self, *_):
-        """«Одна на всех» — поля кратности у типов 2–4 показывают общее число и закрыты
-        для правки; «у каждого своя» — открываются."""
-        same = self.rb_k_same.isChecked()
-        for name in ("threat_k2", "threat_k3"):
-            e = self._edits.get(name)
-            if e is None:
-                continue
-            e.setReadOnly(same)
-            e.setStyleSheet("color:#6b7785; background:#f0f0f0;" if same else "")
-        if same:
-            self._k_edited(self._edits["threat_k"].text())
-
-    def _k_edited(self, text):
-        """Кратность вводится в одной группе и СРАЗУ дублируется в остальные — человек
-        должен видеть в полях то число, с которым программа будет считать, а не
-        догадываться о нём (требование заказчика)."""
-        if not self.rb_k_same.isChecked():
-            return
-        for name in ("threat_k2", "threat_k3"):
-            e = self._edits.get(name)
-            if e is not None and e.text() != text:
-                e.setText(text)
-        big_k = getattr(self, "_k_big", None)
-        if big_k is not None:
-            big_k.setText(text)
-
-    def _mode_changed(self, *_):
-        manual = self.rb_manual.isChecked()
-        self.lbl_note.setText(
-            "Позиции берутся из таблицы: что в ней, то и на карте. "
-            "Количество считается по таблице — задать можно только радиус и кратность."
-            if manual else
-            "Позиции подбирает алгоритм. Датчики, поставленные вручную, он берёт как "
-            "есть и ДОБИРАЕТ остальные до заказанного количества.")
-        self._sync_counts()
-        self.on_mode_changed(manual)
-
-    def _sync_counts(self):
-        """В режиме «Задать позиции» КОЛИЧЕСТВО задаёт таблица, а не человек.
-
-        ⚠️ Требование заказчика 05.09.2026: «интерфейс сам ставит значения в зависимости
-        от того, что ввели, — мы менять не можем, только задать радиус и k». И правда:
-        в этом режиме на карте ровно то, что в таблице, и поле «N = 20» при трёх строках
-        обещало бы то, чего не будет. Поля становятся только для чтения и показывают
-        фактическое число датчиков каждого типа."""
-        manual = self.rb_manual.isChecked()
-        counts = {}
-        for r in self._rows:
-            counts[int(r["type_id"])] = counts.get(int(r["type_id"]), 0) + 1
-        for tid in TYPE_IDS:
-            e = self._edits.get(self.TYPE_FIELDS[tid][0])
-            if e is None:
-                continue
-            e.setReadOnly(manual)
-            e.setStyleSheet("color:#6b7785; background:#f0f0f0;" if manual else "")
-            if manual:
-                e.setText("%d" % counts.get(tid, 0))
-            e.setToolTip("Количество задаётся таблицей: столько датчиков этого типа "
-                         "в ней сейчас. Чтобы изменить — добавьте или удалите строку."
-                         if manual else
-                         "Сколько датчиков этого типа ставить. 0 — тип выключен, его "
-                         "настройки сохраняются.")
-
     def _apply(self):
-        """Собрать поля и отдать контроллеру.
-
-        Нечисловое значение берётся из текущих параметров: опечатка в одном поле не
-        должна ронять остальные."""
-        vals = {}
+        """Собрать поля и отдать контроллеру. Нечисловое значение — из текущих параметров: опечатка в
+        одном поле не роняет остальные."""
+        vals = {}                                  # имя поля Params -> значение
         for name, e in self._edits.items():
-            txt = e.text().strip().replace(",", ".")
+            txt = e.text().strip().replace(",", ".")   # текст поля
             try:
                 vals[name] = int(float(txt)) if name in self.INT_FIELDS else float(txt)
-            except ValueError:
+            except ValueError:                     # не число — прежнее значение
                 vals[name] = getattr(self._params, name, 0)
-        vals["threat_k_same"] = self.rb_k_same.isChecked()
-        vals["threat_spread_types"] = self.chk_spread.isChecked()
-        if vals["threat_k_same"]:                  # общая кратность — одно число на всех
-            vals["threat_k2"] = vals["threat_k3"] = vals["threat_k"]
         lmax_auto = not self.chk_lmax_manual.isChecked()   # галочка «задать вручную»
         vals["threat_L_max_manual"] = not lmax_auto
-        if lmax_auto:
-            vals.pop("threat_L_max", None)         # его считает модель
-        step_auto = self.chk_step_auto.isChecked()
+        if lmax_auto:                              # запас считает модель
+            vals.pop("threat_L_max", None)
+        step_auto = self.chk_step_auto.isChecked()   # шаг сетки — сам
         vals["threat_cand_step_manual"] = not step_auto
-        if step_auto:
+        if step_auto:                              # шаг считает модель
             vals.pop("threat_cand_step_km", None)
-        ui_state.save(STATE_KEY, dict(k_same=vals["threat_k_same"],
-                                      manual_mode=self.is_manual_mode(),
-                                      lmax_auto=lmax_auto, step_auto=step_auto))
+        ui_state.save(STATE_KEY, dict(lmax_auto=lmax_auto, step_auto=step_auto))
         self._on_apply(vals)
-
-    # ---------- таблица ----------
-    def set_rows(self, rows):
-        """Показать датчики в таблице. `rows` — как отдаёт `ThreatModel.sensors_table()`."""
-        self._rows = list(rows or [])
-        self.table.setRowCount(len(self._rows))
-        for i, r in enumerate(self._rows):
-            cells = ("%d" % (i + 1), "%d" % int(r["type_id"]),
-                     mode_word(bool(r.get("static"))),
-                     "%.6f" % float(r["lon"]), "%.6f" % float(r["lat"]))
-            for c, text in enumerate(cells):
-                it = QtWidgets.QTableWidgetItem(text)
-                if c in (0, 1):
-                    it.setTextAlignment(QtCore.Qt.AlignCenter)
-                # НОМЕР — жирным всегда: по нему строку сверяют с подписью на карте,
-                # где номер тоже чёрный и жирный. Закреплённый датчик выделяется целиком.
-                if c == 0 or r.get("static"):
-                    f = it.font(); f.setBold(True); it.setFont(f)
-                self.table.setItem(i, c, it)
-        n_static = sum(1 for r in self._rows if r.get("static"))
-        self.lbl_count.setText("датчиков: %d%s"
-                               % (len(self._rows),
-                                  ("  ·  закреплённых: %d" % n_static) if n_static else ""))
-        self._sync_counts()          # в ручном режиме таблица задаёт количество
-
-    def _selected(self):
-        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
-        return rows[0].row() if rows else -1
-
-    def _add_row(self):
-        dlg = SensorRowDialog(self)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            tid, static, lon, lat = dlg.values()
-            self.on_manual_add(tid, static, lon, lat)
-
-    def _edit_row(self):
-        i = self._selected()
-        if i < 0:
-            self._warn("Выберите строку в таблице.")
-            return
-        r = self._rows[i]
-        dlg = SensorRowDialog(self, lon=r["lon"], lat=r["lat"], title="Изменить датчик")
-        dlg._select(dlg.cb_type, int(r["type_id"]))
-        dlg._select(dlg.cb_mode, bool(r.get("static")))
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            tid, static, lon, lat = dlg.values()
-            # ⚠️ ОДНИМ ДЕЙСТВИЕМ, а не «удалить и добавить» (замечание заказчика
-            # 05.09.2026: «кнопка изменить не работает»). Пара вызовов ломалась о то, что
-            # в режиме расчёта таблица показывает РЕЗУЛЬТАТ расстановки: удаление не
-            # находило ручной записи, отказывалось работать — и правка молча пропадала,
-            # а на её месте появлялся лишний датчик.
-            self.on_manual_edit(i, tid, static, lon, lat)
-
-    def _del_row(self):
-        i = self._selected()
-        if i < 0:
-            self._warn("Выберите строку в таблице.")
-            return
-        self.on_manual_remove(i)
-
-    def _clear_rows(self):
-        """Кнопка «Очистить» под таблицей.
-
-        ⚠️ ДЕЙСТВИЕ ЗАВИСИТ ОТ РЕЖИМА (заказчик 06.09.2026: «кнопка очистить не
-        убирает данные о датчиках в таблице»). В «Задать позиции» все строки —
-        заданные человеком, «убрать вручную заданные» и «очистить таблицу» — одно и
-        то же. В «Рассчитать позиции» таблица показывает РЕЗУЛЬТАТ расстановки
-        (§8.7.1): вручную заданных там обычно нет вовсе, и старое поведение
-        (`on_manual_clear`) убирало ноль строк — кнопка выглядела сломанной. Там нужно
-        убирать ВСЮ расстановку — то же самое, что «Очистить датчики» на панели."""
-        if not self._rows:
-            return
-        if self.is_manual_mode():
-            if QtWidgets.QMessageBox.question(
-                    self, "Очистить", "Убрать все заданные вручную датчики?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes:
-                self.on_manual_clear()
-        else:
-            if QtWidgets.QMessageBox.question(
-                    self, "Очистить",
-                    "Убрать С КАРТЫ ВСЕ датчики — и подобранные алгоритмом, и "
-                    "заданные вручную?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes:
-                self.on_clear_sensors()
-
-    def _pick_mode(self):
-        self.on_pick_mode()
-
-    # ---------- файл ----------
-    def _start_dir(self, kind):
-        """Откуда начинать выбор файла: СВОЯ папка (`датчики/загрузка`, `датчики/выгрузка`).
-
-        ⚠️ ПАМЯТЬ ПОСЛЕДНЕЙ ПАПКИ ЗДЕСЬ НЕ ГОДИТСЯ (правило заказчика 05.09.2026):
-        «изначально при нажатии кнопки — запись туда». Один поход в чужую папку иначе
-        уводил бы туда все следующие выгрузки, и файлы снова расползались бы. Запомнить
-        стоит лишь то, куда человек ушёл САМ, — на случай, если своей папки нет вовсе."""
-        own = sensors_dir(kind)
-        if os.path.isdir(own):
-            return own
-        last = ui_state.get(STATE_FILE).get(kind, "")
-        return last if last and os.path.isdir(last) else os.getcwd()
-
-    @staticmethod
-    def _remember_dir(kind, path):
-        """Запомнить, куда человек ушёл сам. ⚠️ Раздел памяти пишется ЦЕЛИКОМ
-        (`ui_state.save`), поэтому старые ключи переносим — иначе выбор папки для чтения
-        стирал бы запомненную папку записи."""
-        d = dict(ui_state.get(STATE_FILE))
-        d[kind] = os.path.dirname(path)
-        ui_state.save(STATE_FILE, d)
-
-    def _load_file(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Датчики из файла", self._start_dir(DIR_LOAD),
-            "Текстовые файлы (*.txt);;Все файлы (*)")
-        if not path:
-            return
-        self._remember_dir(DIR_LOAD, path)
-        try:
-            records, rep = read_sensors_file(path)
-        except Exception as ex:                    # нет прав, битая кодировка, каталог
-            self._warn("Файл не прочитан:\n%s" % ex)
-            return
-        for tid, static, lon, lat in records:
-            self.on_manual_add(tid, static, lon, lat)
-        msg = "Принято датчиков: %d." % rep["accepted"]
-        if rep["rejected"]:
-            lines = ", ".join(str(no) for no, _ in rep["rejected"][:10])
-            msg += ("\nОтброшено строк: %d (%s%s).\nПричина первой: %s"
-                    % (len(rep["rejected"]), lines,
-                       "…" if len(rep["rejected"]) > 10 else "",
-                       rep["rejected"][0][1]))
-        if rep["types"]:
-            msg += "\n\nВ шапке файла описаны типы: %s. Параметры типов из файла НЕ " \
-                   "применяются — они берутся из полей окна." \
-                   % ", ".join(str(t) for t in sorted(rep["types"]))
-        QtWidgets.QMessageBox.information(self, "Датчики из файла", msg)
-
-    def _save_file(self):
-        if not self._rows:
-            self._warn("Таблица пуста — записывать нечего.")
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Датчики в файл",
-            os.path.join(self._start_dir(DIR_SAVE), default_file_name()),
-            "Текстовые файлы (*.txt);;Все файлы (*)")
-        if not path:
-            return
-        self._remember_dir(DIR_SAVE, path)
-        try:
-            n = write_sensors_file(path, self._rows, self._params)
-        except Exception as ex:
-            self._warn("Файл не записан:\n%s" % ex)
-            return
-        QtWidgets.QMessageBox.information(
-            self, "Датчики в файл",
-            "Записано датчиков: %d.\n\n%s\n\nЭтот же файл читается кнопкой «Из файла…» "
-            "без правки руками." % (n, path))
-
-    def _warn(self, text):
-        QtWidgets.QMessageBox.warning(self, "Исходные данные", text)

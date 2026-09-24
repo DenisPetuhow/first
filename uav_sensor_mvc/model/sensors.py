@@ -19,6 +19,11 @@
 Поэтому тип 1 и тип 4 — это ровно они, а новыми полями заведены только типы 2 и 3.
 Соответствие: тип 1 ← `threat_N`/`threat_R`, тип 2 ← `threat_N2`/`threat_R2`,
 тип 3 ← `threat_N3`/`threat_R3`, тип 4 ← `threat_N_big`/`threat_R_big`.
+
+СПРАВОЧНИК ТИПОВ (план 13, задача 13.1, 23.09.2026). Названия, палитра, правило места и
+режим типа — паспорт из `model/sensor_types.py`; он приходит в `SensorSpec.passport`.
+Числа номеров 1–4 по-прежнему из полей выше (переходный мост до 13.3 и 13.10); малые типы
+справочника с номером ≥ 5 берут R и k из паспорта, N — из `threat_N_types`.
 """
 from dataclasses import dataclass
 
@@ -49,6 +54,7 @@ class SensorSpec:
     r_km: float
     k: int
     kind: str                  # "small" (типы 1–3) | "big" (тип 4)
+    passport: object = None    # паспорт `sensor_types.SensorType`; None — номера нет в справочнике
 
     @property
     def active(self):
@@ -57,8 +63,13 @@ class SensorSpec:
         return int(self.n) > 0 and float(self.r_km) > 0.0
 
     @property
+    def name(self):
+        """Название типа: из паспорта; номера нет в справочнике — «Тип N»."""
+        return self.passport.name if self.passport is not None else "Тип %d" % self.type_id
+
+    @property
     def label(self):
-        return "Тип %d · %s" % (self.type_id, KIND_LABEL.get(self.kind, self.kind))
+        return "%s · %s" % (self.name, KIND_LABEL.get(self.kind, self.kind))
 
 
 @dataclass
@@ -91,13 +102,14 @@ def _num(p, name, default=0):
     return getattr(p, name, default)
 
 
-def sensor_types(p):
-    """Все четыре типа списком, в порядке 1, 2, 3, 4 — собраны из полей `Params`.
-
-    ⚠️ КРАТНОСТЬ ЗАВИСИТ ОТ ПЕРЕКЛЮЧАТЕЛЯ `threat_k_same`. «Одна на всех» (умолчание) —
-    у каждого типа берётся общая `threat_k`; «у каждого своя» — собственное поле типа.
-    Дублирование сделано ЗДЕСЬ, а не при расчёте: в окне человек обязан видеть в полях
-    то самое число, с которым программа будет считать."""
+def sensor_types(p, catalog=None):
+    """Типы задания по возрастанию номера. Вход: Params, справочник (None — файл участка).
+    Отдаёт: [SensorSpec] — номера 1–4 всегда (числа из полей Params), малые ≥ 5 — из справочника."""
+    from . import sensor_types as catalog_mod
+    types = catalog_mod.load() if catalog is None else catalog   # паспорта типов
+    passport = {t.type_id: t for t in types}                     # номер -> паспорт
+    # ⚠️ Кратность — по галке `threat_k_same`: «одна на всех» — общая `threat_k` у каждого
+    # типа, иначе своя. Дублируется ЗДЕСЬ, а не при расчёте: в окне видно то число, с которым считают.
     same = bool(_num(p, "threat_k_same", True))
     k_all = int(_num(p, "threat_k", 3) or 1)
     out = []
@@ -109,8 +121,36 @@ def sensor_types(p):
             n=int(_num(p, f_n, 0) or 0),
             r_km=float(_num(p, f_r, 0.0) or 0.0),
             k=max(1, k),
-            kind="big" if tid == BIG_TYPE else "small"))
+            kind="big" if tid == BIG_TYPE else "small",
+            passport=passport.get(tid)))
+    n_more = _n_types(p)                                         # задание новых типов: номер -> N
+    for t in sorted(types, key=lambda t: t.type_id):
+        if t.type_id in TYPE_IDS:                                # номер моста — уже собран выше
+            continue
+        if t.SPEC_KIND != "small":                               # большой с номером ≥ 5
+            continue                                             # — кольцо умеет только номер 4 (13.9)
+        out.append(SensorSpec(
+            type_id=t.type_id, n=n_more.get(t.type_id, 0), r_km=float(t.r_km),
+            k=max(1, k_all if same else int(t.k)), kind="small", passport=t))
     return out
+
+
+def _n_types(p):
+    """Число датчиков у типов с номером ≥ 5. Вход: Params. Отдаёт: {номер: N}.
+    Ключ приводится к int: из сохранённых настроек он приходит строкой."""
+    out = {}
+    for key, n in dict(_num(p, "threat_N_types", {}) or {}).items():
+        try:
+            out[int(key)] = max(0, int(n))
+        except (TypeError, ValueError):                          # битая запись задания
+            continue                                             # — тип просто не ставится
+    return out
+
+
+def type_ids(p):
+    """Номера всех типов задания — то, что вправе стоять в `ManualSensor.type_id`.
+    Вход: Params. Отдаёт: кортеж номеров по возрастанию."""
+    return tuple(s.type_id for s in sensor_types(p))
 
 
 def active_small(p):
@@ -131,6 +171,10 @@ def min_small_radius(p):
     Нет ни одного работающего малого типа — возвращается радиус типа 1: расстановки всё
     равно не будет, а звать функцию с пустым результатом неудобно."""
     act = active_small(p)
+    # ⚠️ ТИП С ПРАВИЛОМ МЕСТА ОБЩИЙ ШАГ НЕ ДРОБИТ (план 13, 13.5): у него своя сетка шагом R/2 внутри
+    # карты, и ПВН (0.5 км) иначе мельчил бы сетку МОГ по всему району
+    free = [s for s in act if s.passport is None or s.passport.zone == "везде"]   # типы «везде»
+    act = free or act                                # одни ограниченные — берём их
     if act:
         return min(float(s.r_km) for s in act)
     return float(_num(p, "threat_R", 2.0) or 2.0)

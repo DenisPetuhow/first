@@ -25,6 +25,11 @@
     python tools/pack_area.py geo_cache/3.Marshut --only dem       # только рельеф
     python tools/pack_area.py geo_cache/3.Marshut --pbf Mar_2.pbf  # одна часть слоёв
     python tools/pack_area.py geo_cache/3.Marshut --only layers    # доделать части и слить
+    python tools/pack_area.py geo_cache/arh --only sensors         # постройки, лес, неудобья (13.17)
+
+МЕСТА ДАТЧИКОВ (план 13, 13.17): постройки, лес и неудобья — ОТДЕЛЬНЫМ файлом
+`sensor_layers_<участок>.npz` рядом со слоями. В вес карты он не идёт, поэтому кэш слоёв
+ради него не пересобирается (`model/sensor_zones.py`).
 
 Имена выходных файлов — из `область.txt` (`слои`, `рельеф`). Разбор —
 теория/код/УПАКОВКА_ОБЛАСТИ.md, план 10 §10.5.8 и 10.13.
@@ -338,12 +343,50 @@ def pack_layers(folder, rec, pbf_only, force, jobs=1):
     return out_path
 
 
+def pack_sensors(folder, rec):
+    # Шаг «места датчиков» (план 13, 13.17): постройки, лес и неудобья всех .pbf -> один файл.
+    # Вход: папка, запись области. Отдаёт: путь итога. ⚠️ Вес карты этот файл не читает.
+    from model.sensor_zones import BUILDING_LAYER, file_name, sensor_layers_from_osm
+    lon0, lat0 = rec["bbox"][0], rec["bbox"][1]      # якорь — юго-западный угол ОБЛАСТИ, градусы
+    pbfs = _files(folder, "*.pbf")                   # исходники: и в корне, и в `_части/`
+    if not pbfs:                                     # исходников нет
+        raise SystemExit("места датчиков: в папке и в %s нет .pbf" % PARTS_DIR)
+    pts, out, seen = [], {}, {}                      # постройки всех частей; кольца; отпечатки колец
+    for p in pbfs:
+        t0 = time.time()                             # начало разбора части
+        got = sensor_layers_from_osm(p, lon0, lat0, rec["bbox"])   # слои этого .pbf
+        pts += got.pop(BUILDING_LAYER, [])
+        for name, rings in got.items():
+            keys = seen.setdefault(name, set())      # отпечатки колец слоя
+            for r in rings:
+                k = _key(r)                          # отпечаток кольца
+                if k in keys:                        # то же кольцо из соседней полосы
+                    continue                         # — второй раз не кладём
+                keys.add(k)
+                out.setdefault(name, []).append(r)
+        log("места датчиков: %s за %.1f мин" % (os.path.basename(p), (time.time() - t0) / 60))
+    if pts:                                          # постройки нашлись
+        P = np.concatenate([np.asarray(a, np.float32) for a in pts])   # все постройки подряд
+        # дубль со стыка полос — та же точка с точностью до 1 м; порядок первых вхождений сохраняем
+        grid_m = np.round(P[:, :2].astype(np.float64) / DEDUP_KM).astype(np.int64)   # координаты, м
+        _u, first = np.unique(grid_m, axis=0, return_index=True)
+        out[BUILDING_LAYER] = [P[np.sort(first)]]
+    out_name = file_name(rec.get("layers") or "threat_layers_%s.npz" % rec["tile_area"])   # рядом с кэшем слоёв
+    out_path = os.path.join(folder, out_name)        # полный путь итога
+    _save_layers(out_path, out, packed=True)
+    log("места датчиков: %s (%.1f МБ) — %s" % (
+        out_path, os.path.getsize(out_path) / 2 ** 20,
+        ", ".join("%s %d" % (n, len(v) if n != BUILDING_LAYER else len(v[0]))
+                  for n, v in sorted(out.items()))))
+    return out_path
+
+
 def main(argv=None):
     # Разбор ключей и запуск шагов. Вход: argv (None — из командной строки). Отдаёт: код 0.
     ap = argparse.ArgumentParser(description="упаковать область: рельеф и слои в один файл")
     ap.add_argument("folder", help="папка области с файлом «%s»" % af.AREA_FILE_NAME)
-    ap.add_argument("--only", choices=("dem", "layers"), default=None,
-                    help="только рельеф или только слои")
+    ap.add_argument("--only", choices=("dem", "layers", "sensors"), default=None,
+                    help="только рельеф, только слои или только места датчиков (постройки, лес)")
     ap.add_argument("--pbf", action="append", default=None,
                     help="разобрать только этот .pbf (можно повторять) — для параллельных прогонов")
     ap.add_argument("--force", action="store_true", help="пересобрать части слоёв заново")
@@ -364,6 +407,8 @@ def main(argv=None):
         merge_dem(a.folder, rec["dem"])
     if a.only in (None, "layers"):                   # шаг слоёв нужен
         pack_layers(a.folder, rec, set(a.pbf or ()), a.force, max(1, a.jobs))
+    if a.only in (None, "sensors") and not a.pbf:    # шаг мест датчиков нужен (план 13, 13.17)
+        pack_sensors(a.folder, rec)
     return 0
 
 

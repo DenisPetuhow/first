@@ -329,12 +329,16 @@ def main():
     check("°" in txt and "шир" in txt, "показаны градусы, Г/М/С, радианы и км")
     print("      %s" % txt[:100])
 
-    print("\n6. ОКНО «ИСХОДНЫЕ ДАННЫЕ» (задача 8.7)")
+    print("\n6. ОКНО «ДАТЧИКИ» (задача 8.7; с плана 13, 13.2 — своё окно)")
+    # ⚠️ Датчики переехали из «Исходных данных» в своё окно — проверки те же, окно другое
     v._open_input_window()
-    w = v._input_dlg
-    check(w is not None, "окно открывается")
-    check(len(w._edits) >= 16, "поля четырёх типов и маршрута на месте",
-          "%d полей" % len(w._edits))
+    check(hasattr(v._input_dlg, "btn_sensors") and "threat_N" not in v._input_dlg._edits,
+          "в «Исходных данных» датчиков нет — только кнопка «Датчики…»")
+    v._input_dlg.on_open_sensors()
+    w = v._sensors_dlg
+    check(w is not None and w.isVisible(), "кнопка открывает окно «Датчики»")
+    # номера 1–3: N, R, k; у номера 4 — N и R (кратность больших не участвует)
+    check(len(w._edits) == 11, "поля номеров 1–4 на месте", "%d полей" % len(w._edits))
     # кратность «одна на всех»: правка в типе 1 обязана появиться в типах 2–3
     w.rb_k_same.setChecked(True)
     w._edits["threat_k"].setText("5")
@@ -670,9 +674,10 @@ def main():
 
     # ОКНО «ПОСМОТРЕТЬ МАРШРУТЫ» (задача 8.6, довесок 06.09.2026) — на этом шаге и свои
     # маршруты (iter_routes), и загруженная история (loaded_routes) непустые
-    check(hasattr(w, "btn_view_routes"),
+    # ⚠️ кнопка — в «Исходных данных», а `w` с плана 13 (13.2) — окно «Датчики»
+    check(hasattr(v._input_dlg, "btn_view_routes"),
           "кнопка «Посмотреть маршруты» есть в окне «Исходные данные»")
-    w.on_view_routes()
+    v._input_dlg.on_view_routes()
     rv = v._route_viewer_dlg
     check(rv is not None, "окно «Посмотреть маршруты» открылось")
     check(len(rv._own_routes) == len(m.iter_routes)
@@ -1763,6 +1768,157 @@ def main():
     check(m.initial_sensors is not None and _moved() == 0,
           "в расчёте снимок — новая первая расстановка")
 
+    print("\n22. ОКНА «ДАТЧИКИ» И «ТИП ДАТЧИКА»: МИНИ-ТАБЛИЦА, СПРАВОЧНИК, КАРТА МЕСТА (план 13, 13.2–13.3)")
+    # ⚠️ ТРИ ПОДМЕНЫ, как в разделе 15: запись — во временный справочник, а не в папку участка;
+    # вопрос «удалить?» и выбор цвета без экрана ждали бы нажатия вечно
+    import tempfile as _tmp22
+    from PyQt5 import QtGui as _QtG
+    from model import sensor_types as _cat
+    from model.sensors import sensor_types as _specs
+    from view_qt.threat_view import type_color as _tcol
+    _yes = _QtW.QMessageBox.Yes                           # ответ на вопрос «удалить?»
+    _keep = (_QtW.QMessageBox.warning, _QtW.QMessageBox.question, _QtW.QColorDialog.getColor, _cat.path)   # вернуть в конце
+    _said22 = []                                          # предупреждения окна
+    _file22 = os.path.join(_tmp22.mkdtemp(), _cat.FILE_NAME)   # временный справочник
+    _QtW.QMessageBox.warning = lambda *a, **k: _said22.append(a[2] if len(a) > 2 else "")
+    _QtW.QMessageBox.question = lambda *a, **k: _yes
+    _QtW.QColorDialog.getColor = lambda *a, **k: _QtG.QColor("#123456")
+    _cat.path = lambda: _file22
+    _p_keep = {n: getattr(p, n) for n in ("threat_N", "threat_R", "threat_k", "threat_R2", "threat_k2",   # задание до раздела
+                                          "threat_N2", "threat_k_same", "threat_type_order", "threat_N_types")}
+    try:
+        v._open_sensors_window()
+        w = v._sensors_dlg
+        _n_t = len(_specs(p))                             # типов задания, шт.
+        check(w.types.rowCount() == _n_t, "мини-таблица: строка на тип", "%d строк" % w.types.rowCount())
+        check(isinstance(w.types.cellWidget(0, 2), _QtW.QPushButton), "в строке — образец цвета")
+        w._add_type()
+        _new = [t.type_id for t in _cat.load() if t.type_id >= _cat.FIRST_FREE_ID]   # новые номера
+        check(_new == [_cat.FIRST_FREE_ID], "«Добавить тип» заводит номер с 5", str(_new))
+        _tid = _new[0] if _new else _cat.FIRST_FREE_ID   # номер нового типа
+        check(w.types.rowCount() == _n_t + 1 and _tid in w._edits_more, "новый тип — строкой таблицы")
+        check(v._types_dlg is not None and v._types_dlg.isVisible(), "и сразу открыто окно его паспорта")
+        w._edits_more[_tid].setText("2")
+        w._apply()
+        check((p.threat_N_types or {}).get(_tid) == 2, "число нового типа дошло до задания",
+              str(p.threat_N_types))
+        check(any(s.type_id == _tid and s.active for s in _specs(p)), "и тип стал работающим")
+        w._pick_color(_tid)
+        check(_tcol(_tid).lower() == "#123456", "цвет из окна — в паспорт и на карту", _tcol(_tid))
+        _lon22, _lat22 = _k2l(_B21[0] + 3, _B21[1] + 3, m.lon0, m.lat0)
+        c.on_manual_add(_tid, True, float(_lon22), float(_lat22))
+        _row = [r for r in range(w.types.rowCount()) if int(w.types.item(r, 0).data(Qt.UserRole)) == _tid]   # строка нового типа
+        w.types.selectRow(_row[0] if _row else 0)
+        w._del_type()
+        check(_cat.by_id(_tid, _cat.load()) is None, "«Удалить тип» убирает его из справочника")
+        check(not any(q.type_id == _tid for q in m.manual_sensors) and _tid not in (p.threat_N_types or {}),
+              "...вместе с его датчиками и числом")
+        w.types.selectRow(0)
+        _n_said = len(_said22)                            # предупреждений до попытки
+        w._del_type()
+        check(len(_said22) > _n_said and _cat.by_id(1, _cat.load()) is not None,
+              "номер 1–4 не удаляется — предупреждение", (_said22[-1] if _said22 else "")[:50])
+        # ОЧЕРЁДНОСТЬ ТИПОВ (13.6) — правило общего прохода из окна
+        w.cb_order.setCurrentIndex(w.cb_order.findData("tight"))
+        w._apply()
+        check(p.threat_type_order == "tight", "очерёдность типов доходит до параметров", p.threat_type_order)
+        # ⚠️ ДОВОЛЬНО ЛЮБОГО РАБОТАЮЩЕГО ТИПА: прежде N1 = 0 не принималось, а «один ПВН» — законно
+        w._edits["threat_N"].setText("0")
+        w._edits["threat_N2"].setText("5")
+        w._apply()
+        check(p.threat_N == 0 and p.threat_N2 == 5, "задание без типа 1 принимается",
+              "N1 = %d, N2 = %d" % (p.threat_N, p.threat_N2))
+
+        # ОКНО «ТИП ДАТЧИКА»: паспорт, поля ПВН, мост 1–4
+        v._open_sensor_types(2)
+        td = v._types_dlg                                 # окно паспорта
+        check(td._types[td._cur].type_id == 2 and td._w["zone"].currentText() == "застройка",
+              "окно открыто на ПВН, место — застройка", td._w["zone"].currentText())
+        check(td._w["tgt_share"].isEnabled() and not td._w["KIND"].isEnabled(),
+              "поля ПВН открыты, класс номера моста закрыт")
+        td._select(0)
+        check(not td._w["tgt_share"].isEnabled(), "у типа «везде» поля ПВН закрыты")
+        # ⚠️ МОСТ: правка R типа 1 — в Params; открытый, но не тронутый ПВН своего k2 не теряет
+        p.threat_k_same, p.threat_k2 = True, 4
+        td._w["r_km"].setText("1.7")
+        td._save()
+        check(abs(p.threat_R - 1.7) < 1e-9, "R типа 1 из окна — в задание", "R = %g" % p.threat_R)
+        check(p.threat_k2 == 4 and abs(p.threat_R2 - _p_keep["threat_R2"]) < 1e-9,
+              "своя кратность ПВН при общей не затёрта", "k2 = %d" % p.threat_k2)
+        td._w["r_km"].setText("-1")
+        _n_said = len(_said22)                            # предупреждений до попытки
+        td._save()
+        check(len(_said22) > _n_said and abs(p.threat_R - 1.7) < 1e-9,
+              "кривой радиус — предупреждение, задание не тронуто")
+        td._w["r_km"].setText("1.7")
+
+        # КАРТА МЕСТА ТИПА — галка в окне типа кладёт её на карту
+        c.on_type_zone(2)
+        _npts = len(v.type_zone_pts.getData()[0] if v.type_zone_pts.getData()[0] is not None else [])   # мест, шт.
+        check(v.type_zone_img.isVisible() and _npts > 0, "карта места ПВН и его места на карте",
+              "мест %d" % _npts)
+        c.on_type_zone(1)
+        check(not v.type_zone_img.isVisible(), "у типа «везде» карты места нет")
+        c.on_type_zone(None)
+        check(not v.type_zone_img.isVisible(), "и прячется по None")
+    finally:                                              # подмены не должны пережить раздел
+        (_QtW.QMessageBox.warning, _QtW.QMessageBox.question, _QtW.QColorDialog.getColor, _cat.path) = _keep
+        for _n22, _v22 in _p_keep.items():
+            setattr(p, _n22, _v22)
+        m.sync_cand_step()
+
+    print("\n23. РАЙОН ЗАЩИТЫ ЦЕЛИ В ЛЕСУ: ОКНО, РИСОВАНИЕ, ТАБЛИЦА (план 13, 13.18, В13.21)")
+    # ⚠️ Окно вопроса модальное — без экрана ждало бы вечно: подменяется ответом «прямоугольник»
+    from model.sensor_zones import settled_mask as _sm23
+    from model.threat_grid import _dilate as _dl23, _label8 as _lb23
+    from view_qt.targets_window import _COLS as _tcols
+    _g23 = m.grid                                         # сетка карты
+    _lab23, _n23 = _lb23(_dl23(_sm23(_g23) | (m.sensor_cells()["count"] > 0), 1))   # массивы застройки
+    _free23 = np.argwhere(_lab23 == 0)                    # ячейки вне массивов (строка, столбец)
+    _fx, _fy = next(((_g23.ox + (cc + 0.5) * _g23.h, _g23.oy + (rr + 0.5) * _g23.h)   # точка в лесу, км
+                     for rr, cc in _free23[len(_free23) // 2:]
+                     if m.in_area(_g23.ox + (cc + 0.5) * _g23.h, _g23.oy + (rr + 0.5) * _g23.h)), (None, None))
+    _zcol = [k for _t, k, _w, _e in _tcols].index("zone")   # колонка «Зона ПВН»
+    _keep23 = (list(m.targets.items), p.threat_N2, v.ask_target_area)   # вернуть в конце
+    _asked = []                                           # у каких целей спрашивали район
+    v.ask_target_area = lambda i: _asked.append(i) or "rect"
+    try:
+        p.threat_N2 = 5
+        m.targets.items = []
+        m.add_target(_fx, _fy)
+        _shape0 = v._area_shape                           # форма переключателя «район / радиус»
+        c._ask_target_areas()
+        check(_asked == [0] and v._area_mode and v._area_target == 0,
+              "цель в лесу — «укажите район», включено рисование", "(%.1f, %.1f) км" % (_fx, _fy))
+        _ax, _ay = _g23.ox + 10 * _g23.h, _g23.oy + 10 * _g23.h   # угол ячейки, км
+        v._area_pts = [(_ax - 0.05, _ay - 0.05), (_ax + 0.05, _ay + 0.05)]   # ни одного центра ячейки
+        v._end_area(True)
+        check(m.targets.items[0].area is None and _asked == [0, 0] and v._area_mode,
+              "пустой район не принят — спросили снова")
+        v._area_pts = [(_fx - 6, _fy - 6), (_fx + 6, _fy + 6)]
+        v._end_area(True)
+        check(m.targets.items[0].area is not None and not v._area_mode and v._area_target is None
+              and v._area_shape == _shape0, "район принят, переключатель района расчёта цел",
+              str(m.targets.items[0].area[0]))
+        _xs23 = v.target_area_item.getData()[0]           # контур района на карте, км
+        check(_xs23 is not None and len(_xs23) >= 5, "контур района защиты на карте")
+        v._open_targets_window()
+        _td = v._targets_dlg                              # окно «Объекты защиты»
+        check(_td.table.item(0, _zcol).text() == "задана вручную", "в таблице целей — «задана вручную»")
+        _td.table.setCurrentCell(0, 0)
+        _td.btn_area_clear.click()
+        check(m.targets.items[0].area is None and _td.table.item(0, _zcol).text() == "укажите район",
+              "«Снять район» — снова «укажите район»")
+        _td.table.setCurrentCell(0, 0)
+        _td.btn_area.click()
+        check(v._area_mode and v._area_target == 0, "кнопка «Район защиты…» включает рисование")
+        v._end_area(False)
+        check(not v._area_mode and v._area_target is None and m.targets.items[0].area is None,
+              "Esc — район не задан, режим района расчёта не задет")
+    finally:                                              # подмены не должны пережить раздел
+        m.targets.items, p.threat_N2, v.ask_target_area = _keep23
+        v._area_target = None
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
@@ -1771,7 +1927,8 @@ def main():
          "полётов, анализ размещения, линейка «Расстояние», анализ моделирования, "
          "полнота слоёв, район радиусом, окно сектора, точки старта, справочник "
          "типов БПЛА, условия моделирования, таблица точек входа, широкая карта, "
-         "объекты защиты, анализ по целям и анализ размещения по режимам — в норме.")
+         "объекты защиты, анализ по целям, анализ размещения по режимам, окна «Датчики» и "
+         "«Тип датчика», район защиты цели в лесу — в норме.")
     return 0
 
 
