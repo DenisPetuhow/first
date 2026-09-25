@@ -58,6 +58,12 @@ def step(fn, *a, **kw):
 def main(argv=None):
     argv = list(argv if argv is not None else sys.argv[1:])
     quick = "--quick" in argv
+    # ⚠️ СПРАВОЧНИК ТИПОВ — ВСТРОЕННЫЙ, а не файл участка: заказчик правит свой (24.09.2026 — кратность защиты 2,
+    # k ПВН 3), и проверка считала бы его числами
+    import tempfile                                                # noqa: E402
+    from model import sensor_types as _cat0                        # noqa: E402
+    _empty = tempfile.mkdtemp()                                    # пустая папка — файла справочника нет
+    _cat0.path = lambda: os.path.join(_empty, _cat0.FILE_NAME)
 
     p = Params()
     m = ThreatModel(p)
@@ -158,7 +164,8 @@ def main(argv=None):
 
     # второй тип: число датчиков на карте обязано вырасти ровно на заказанное
     p.threat_N2, p.threat_R2 = 4, 3.0
-    check(len(sensor_types(p)) == 4 and len([s for s in sensor_types(p) if s.active]) == 3,
+    # ⚠️ считаются РАБОТАЮЩИЕ: в справочнике ещё «Обычный» №5 (Д1) с N 0 — он в расчёт не идёт
+    check(len([s for s in sensor_types(p) if s.active]) == 3,
           "работающих типов стало три", "N2 = %d" % p.threat_N2)
     check(abs(min_small_radius(p) - min(p.threat_R, p.threat_R2)) < 1e-9,
           "шаг сетки считается по НАИМЕНЬШЕМУ радиусу", "%g км" % min_small_radius(p))
@@ -341,8 +348,8 @@ def main(argv=None):
     print("\n4е. СПРАВОЧНИК ТИПОВ ДАТЧИКОВ (план 13, 13.1)")
     from model import sensor_types as st                         # noqa: E402
     base = st.defaults()                                         # встроенный справочник
-    check([(t.type_id, t.name) for t in base] == [(1, "МОГ"), (2, "ПВН"), (4, "Большой")],
-          "умолчания: МОГ №1, ПВН №2, большой №4",
+    check([(t.type_id, t.name) for t in base] == [(1, "МОГ"), (2, "ПВН"), (4, "Большой"), (5, "Обычный")],
+          "умолчания: МОГ №1, ПВН №2, большой №4, Обычный №5 (Д1)",
           ", ".join("%d %s" % (t.type_id, t.name) for t in base))
     pvn = st.by_name("ПВН", base)                                # паспорт ПВН
     check(pvn.zone == "застройка" and pvn.r_km == 0.5 and pvn.k == 4 and pvn.targets,
@@ -356,15 +363,15 @@ def main(argv=None):
     forced = st.from_row(dict(st.to_row(base[0]), номер=4))     # «малый» под номером большого
     check(isinstance(forced, st.Big) and st.by_id(4, base).SPEC_KIND == "big",
           "номер 4 — всегда большой: за ним поля threat_N_big / threat_R_big")
-    check(st.next_id(base) == 5, "новый тип получает номер 5, а не свободный 3",
+    check(st.next_id(base) == 6, "новый тип — первый свободный номер ≥ 5 (№5 — «Обычный»), а не свободный 3",
           "номер %d" % st.next_id(base))
     specs = sensor_types(p, base)                                # задание по встроенному справочнику
-    check([s.name for s in specs] == ["МОГ", "ПВН", "Тип 3", "Большой"]
-          and specs[0].r_km == p.threat_R and specs[3].r_km == p.threat_R_big,
+    check([s.name for s in specs] == ["МОГ", "ПВН", "Тип 3", "Большой", "Обычный"]
+          and specs[0].r_km == p.threat_R and specs[3].r_km == p.threat_R_big and not specs[4].active,
           "номера 1–4: название из паспорта, числа из полей Params",
           " · ".join("%s R %g" % (s.name, s.r_km) for s in specs))
     # тип №5: R и k — из паспорта, N — из задания; ставится наравне с прочими малыми
-    extra = base + [st.Small(type_id=5, name="Проба", r_km=1.5, k=2, color="sensor_t3")]
+    extra = [t for t in base if t.type_id != 5] + [st.Small(type_id=5, name="Проба", r_km=1.5, k=2, color="sensor_t3")]   # №5 — проба
     real_load = st.load                                          # вернуть после опыта
     st.load = lambda: list(extra)                                # справочник без записи на диск
     p.threat_N_types = {"5": 3}                                  # ключ строкой — как из настроек
@@ -424,6 +431,11 @@ def main(argv=None):
     else:
         check(m.allowed_mask(specs[2]) is zmap, "карта считается раз на сетку",
               "%.1f км²" % (zmap.sum() * m.grid.h ** 2))
+        # Д3 (план 13.1): слагаемые по отдельности — итог обязан быть той же картой; болота — свой слой
+        parts = m.allowed_parts(specs[2])                        # слагаемые карты места ПВН
+        check(np.array_equal(parts["result"], zmap) and not (parts["result"] & parts["nopass"]).any(),
+              "слагаемые карты места: итог — та же карта, в непроходимом мест нет",
+              "болота %d, неудобья %d ячеек" % (int(parts["wetland"].sum()), int(parts["rough"].sum())))
         # ⚠️ одиночный ПВН при N1 = 0 раньше шёл путём «один тип» и вставал НОЛЬ раз
         keep_n = (p.threat_N, p.threat_N2, p.threat_R2)          # вернуть после опыта
         p.threat_N, p.threat_N2, p.threat_R2 = 0, 6, 0.5
@@ -524,23 +536,63 @@ def main(argv=None):
     # ---- 4м. ПВН у объектов защиты: этап целей (план 13, задача 13.18) ----
     print("\n4м. ПВН У ОБЪЕКТОВ ЗАЩИТЫ: ЭТАП ЦЕЛЕЙ (план 13, 13.18)")
     from model import target_stage as tsg                        # noqa: E402
-    pvn_st = st.by_id(2, st.defaults())                          # паспорт ПВН: доли у целей
-    # таблица §0.4е: вместимость 39 / 23 / 21 (Мирный, Савинский, Оксовский) — число по формуле заказчика
-    table = [([39, 23, 21], [0.5, 0.3, 0.2], 20, [6, 4, 4]), ([39, 23, 21], [1 / 3] * 3, 20, [6, 4, 4]),
-             ([39, 23, 21], [0.5, 0.3, 0.2], 40, [15, 7, 6]), ([39, 23, 21], [0.5, 0.3, 0.2], 60, [24, 10, 8]),
-             ([39, 23], [0.75, 0.25], 20, [9, 5]), ([39], [1.0], 20, [10]), ([39], [1.0], 60, [19])]
-    got_tab = [tsg.allocate(c, pr, n, pvn_st) for c, pr, n, _w in table]   # раскладка по формуле
+    pvn_st = st.by_id(2, st.defaults())                          # паспорт ПВН: правила у целей
+    # МИНИМУМЫ (план 13.1, Д9): min(3, вместимость) по убыванию приоритета, пока хватает N — отложены заранее
+    table = [([39, 23, 21], [0.5, 0.3, 0.2], 20, [3, 3, 3]), ([39, 23, 21], [0.2, 0.3, 0.5], 7, [1, 3, 3]),
+             ([39, 2], [0.5, 0.5], 20, [3, 2]), ([39], [1.0], 2, [2])]
+    got_tab = [tsg.floors(c, pr, n, pvn_st) for c, pr, n, _w in table]   # минимумы по правилу
     check(all(g == w for g, (_c, _p, _n, w) in zip(got_tab, table)),
-          "число ПВН у целей — таблица §0.4е до штуки",
+          "минимум у целей — по приоритету, пока хватает N",
           " · ".join("/".join(map(str, g)) for g in got_tab))
+    # ПОРОГ И УРОВЕНЬ ОТ КРАТНОСТИ (заказчик 24–25.09.2026): порог 1 · 3 · 4 · 5 %, уровень 99 · 92 · 89.3 · 86.7 %
+    import dataclasses                                           # noqa: E402
+    thr_lvl = [(tsg.gain_pct(dataclasses.replace(pvn_st, tgt_k=kk)), tsg.level_pct(dataclasses.replace(pvn_st, tgt_k=kk)))  # %
+               for kk in (1, 2, 3, 4, 6)]                        # (порог, уровень) по кратности
+    own_v = (tsg.gain_pct(dataclasses.replace(pvn_st, tgt_gain_pct=2.5)),   # своё значение сильнее умолчания
+             tsg.level_pct(dataclasses.replace(pvn_st, tgt_level_pct=75.0)))
+    check([t for t, _l in thr_lvl] == [1, 3, 4, 5, 7] and [round(lv) for _t, lv in thr_lvl] == [99, 92, 89, 87, 81]
+          and own_v == (2.5, 75.0), "порог и уровень у цели — от кратности, своё значение сильнее",
+          " · ".join("k%d: %g / %.0f %%" % (kk, t, lv) for kk, (t, lv) in zip((1, 2, 3, 4, 6), thr_lvl)))
+    # ПРИОРИТЕТ РАСЧЁТОМ: две цели, у каждой свои маршруты и своё место — ставится место весомой цели;
+    # цель, набравшая уровень, выбывает (её маршруты больше не весят)
+    from model.optimization import CoverageCache                 # noqa: E402
+    two = CoverageCache(np.array([[0.05, 0.0], [10.05, 0.0]]), 0.5, 4, 1)   # место у цели А и у цели Б, км
+    for x0 in (0.0,) * 4 + (10.0,) * 4:                          # по четыре подлёта к каждой
+        two.add_trajectory(np.array([[x0, 0.0], [x0 + 0.1, 0.0]]))
+    pa = two.greedy(1, (1.0, 0.0), traj_w=[0.7] * 4 + [0.3] * 4)   # А весомее
+    pb = two.greedy(1, (1.0, 0.0), traj_w=[0.3] * 4 + [0.7] * 4)   # Б весомее
+    two.greedy(2, (1.0, 0.0), traj_w=[1.0] * 8, groups=[0] * 4 + [1] * 4, goals=[1.0, 1.0], stop_gain=0.01)
+    check(pa[0][0] < 5 < pb[0][0] and two.last_done == {0, 1}, "приоритет — вес маршрутов цели; набравшая уровень выбывает",
+          "А весомее → x %.2f км, Б весомее → x %.2f км" % (pa[0][0], pb[0][0]))
+    # ЧТО ЛОВИТ: число у цели задаёт насыщение подлёта, а не доля N (было 10 при насыщении на 7, §Д9.2);
+    # при малом N минимум 3 сильнее потолка (было: 5 ПВН → у цели 2, §Д9.4б); потолок — бюджет целей
     keep_t = (p.threat_N2, p.threat_R2)                          # вернуть после опыта
-    p.threat_N2, p.threat_R2 = 6, 0.5
-    m.place_sensors()
-    rep_t = m.metrics().get("targets_stage", {}).get(2, [])      # отчёт этапа по целям
-    put = sum(r["placed"] for r in rep_t)                        # поставлено у целей
-    check(len(rep_t) == len(m.target_points_km()) and 0 < put <= 3,
-          "одна цель: у неё ПВН, но не больше половины",
-          "у цели %d из 6, вместимость %s" % (put, [r["capacity"] for r in rep_t]))
+    got_n = {}                                                   # квота ПВН -> (у цели, доля подлёта, почему)
+    for n2 in (20, 5):
+        p.threat_N2, p.threat_R2 = n2, 0.5
+        m.place_sensors()
+        rep_t = m.metrics().get("targets_stage", {}).get(2, [])  # отчёт этапа по целям
+        got_n[n2] = (sum(r["placed"] for r in rep_t), max([r["share"] for r in rep_t] or [0.0]),
+                     ",".join(r["why"] for r in rep_t))
+        if n2 == 20:                                             # рубеж первой засечки (Д9) — строка на цель
+            lines_t = m.metrics().get("targets_line", [])        # медиана и худшие 10 %, км
+            check(len(lines_t) == len(m.target_points_km()) and all(0 <= r["p10"] <= r["med"] for r in lines_t),
+                  "рубеж обнаружения — по строке на цель, худшие 10 % не дальше медианы",
+                  " · ".join("%.1f · %.1f км" % (r["med"], r["p10"]) for r in lines_t))
+            # Д10: «Анализ» у цели — доля не ниже этапа (там только ПВН цели), «ещё ПВН» не убывает с уровнем
+            pr = m.target_protection(0) or {}                    # защита объекта №1
+            need = [v for _lv, v in sorted((pr.get("need") or {}).items())]   # ещё ПВН по уровням
+            mono = (all(a is None or (b is None or a <= b) for a, b in zip(need, need[1:]))   # не убывает,
+                    and (None not in need or need[need.index(None):] == [None] * (len(need) - need.index(None))))
+            check(pr.get("zone") and pr.get("n", 0) > 0 and pr["share"] >= rep_t[0]["share"] - 1e-9 and mono,
+                  "Д10: защита объекта согласована с этапом, «сколько добавить» растёт с уровнем",
+                  "подлёт ≥k %.1f %%, ещё ПВН %s" % (100 * pr.get("share", 0), need))
+    put20, share20, why20 = got_n[20]                            # квота 20: стоп по насыщению
+    check(len(m.target_points_km()) == 1 and 3 <= put20 <= 10 and why20.split()[0] in ("прирост", "уровень")
+          and share20 >= 0.9, "одна цель, 20 ПВН: у цели по насыщению, не больше потолка 10",
+          "у цели %d из 20, подлёт %.1f %%, стоп: %s" % (put20, 100 * share20, why20))
+    check(got_n[5][0] == 3, "5 ПВН: минимум 3 у цели сильнее потолка (50 % × 5 = 2)",
+          "у цели %d из 5, стоп: %s" % (got_n[5][0], got_n[5][2]))
     p.threat_N2, p.threat_R2 = keep_t
     m.place_sensors()
 

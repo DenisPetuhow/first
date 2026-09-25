@@ -8,13 +8,17 @@ MODEL · Этап целей: ПВН у объектов защиты до об�
   тот же массив: город с пригородом, посёлок с дачами), ± R, ∩ карта места типа. У точки массива
   нет (цель в лесу) — зоны нет: район задаёт человек окном «укажите район защиты» (В13.21), и
   зона — этот район ∩ карта места (`area_mask`);
-* ВМЕСТИМОСТЬ — сколько мест помещается в зону жадной укладкой с разносом типа 1.6·R;
-* ЧИСЛО У ЦЕЛИ — ⌊доля · вместимость⌋ × (1 + γ·(p − p̄)/p̄), не меньше min(минимум, вместимость), не
-  больше вместимости; сумма выше потолка (одна цель — cap_one·N, несколько — cap_all·N) — минимумы,
-  а остаток бюджета делится в пропорции желаемому. ⚠️ Потолок — ПОСЛЕ приоритета, иначе он стирает
-  приоритет (замер §0.4е: 4 / 4 / 4 вместо 6 / 4 / 4);
-* ПО УБЫВАНИЮ ПРИОРИТЕТА у каждой цели свой жадный: места — зона минус занятые целями выше,
-  критерий — ПОДЛЁТ (точки маршрутов к ЭТОЙ цели внутри её зоны) с кратностью цели;
+* ВМЕСТИМОСТЬ — сколько мест помещается в зону жадной укладкой с разносом типа 1.6·R; места ближе
+  отступа (доля R, R/2) к самой цели не берутся;
+* ЧИСЛО У ЦЕЛИ — ПО НАСЫЩЕНИЮ (план 13.1, Д9; решения заказчика 24.09.2026): сначала минимум 3 у
+  каждой цели (по убыванию приоритета, пока хватает N — сильнее потолка), затем ОДИН общий жадный по
+  всем целям: маршрут весит приоритет своей цели / её число подлётов, так что ПВН уходит туда, где
+  «приоритет / средний × прирост» больше — приоритет выделяет средства расчётом, а не константой γ.
+  Цель выбывает, набрав УРОВЕНЬ защиты (доля подлёта ≥ k; от k: 99 · 92 · 89.3 … %), или когда никакой
+  ПВН не даёт ≥ ПОРОГА прироста (от k: 1 · 3 · 4 · 5 … %). Бюджет — ПОТОЛОК от N (50 % одной цели,
+  70 % всем): насыщение раньше потолка — потолок не срабатывает. Было: 10 ПВН при насыщении на 7 (§Д9.2),
+  при k 2 первая цель брала 15 из 18 по очереди, а не по пользе;
+* критерий — ПОДЛЁТ (точки маршрутов к ЭТОЙ цели внутри её зоны) с кратностью защиты цели;
 * поставленное здесь идёт в общий проход закреплёнными позициями типа: их засечки считаются в
   кратности типа, другие типы обходят их разносом (§0.4г: иначе засечка ПВН 11.2 → 8.4 %).
 
@@ -65,35 +69,39 @@ def capacity(places, sep):
     return len(taken)
 
 
-def allocate(caps, pri, n_total, st):
-    """Сколько ПВН у каждой цели (формула §0.4е). Вход: вместимости, приоритеты, квота типа N, паспорт
-    (tgt_share, tgt_gamma, tgt_min, tgt_cap_one, tgt_cap_all). Отдаёт: список int по целям."""
-    K = len(caps)                                    # число целей
-    if K == 0:                                       # целей нет
-        return []
-    pbar = 1.0 / K                                   # средний приоритет
-    floor_ = [min(int(st.tgt_min), int(c)) for c in caps]   # минимум у цели, если помещается
-    want = [min(max(int(np.floor(c * st.tgt_share))   # желаемое по вместимости и приоритету
-                    * (1.0 + st.tgt_gamma * (p - pbar) / pbar), f), c)
-            for c, p, f in zip(caps, pri, floor_)]
-    budget = int(np.floor((st.tgt_cap_one if K == 1 else st.tgt_cap_all) * n_total))   # потолок от N
-    if sum(want) <= budget:                          # всё желаемое помещается под потолок
-        return [int(round(w)) for w in want]
-    order = sorted(range(K), key=lambda i: (-pri[i], i))   # цели по убыванию приоритета
-    if sum(floor_) >= budget:                        # даже минимумы не влезают — старшим по приоритету
-        out, left = [0] * K, budget
-        for i in order:
-            out[i] = min(floor_[i], left)
-            left -= out[i]
-        return out
-    room = budget - sum(floor_)                      # бюджет сверх минимумов
-    extra = [w - f for w, f in zip(want, floor_)]    # желаемое сверх минимума
-    share = [e * room / (sum(extra) or 1.0) for e in extra]   # доля бюджета — в пропорции желаемому
-    out = [f + int(np.floor(s)) for f, s in zip(floor_, share)]
-    rest = budget - sum(out)                         # недоданное округлением
-    for i in sorted(range(K), key=lambda i: (-(share[i] - np.floor(share[i])), i))[:max(0, rest)]:
-        out[i] += 1                                  # — наибольшим дробным частям
-    return [min(o, int(c)) for o, c in zip(out, caps)]
+def floors(caps, pri, n_total, st):
+    """Минимум у каждой цели: min(tgt_min, вместимость), по убыванию приоритета, пока хватает N (13.1 Д9).
+    Вход: вместимости, приоритеты, квота типа N, паспорт. Отдаёт: список int по целям."""
+    out, left = [0] * len(caps), int(n_total)        # минимумы; квота, ещё не отложенная
+    for i in sorted(range(len(caps)), key=lambda i: (-pri[i], i)):   # старшим — первыми
+        out[i] = max(0, min(int(st.tgt_min), int(caps[i]), left))
+        left -= out[i]
+    return out
+
+
+def approach_share(tails, pos, R, k):
+    """Доля подлёта, засечённого ≥ k датчиками. Вход: куски подлёта (M,2) км, позиции (K,2) км, радиус км,
+    кратность. Отдаёт: доля 0…1; подлёта нет — 0."""
+    pos = np.asarray(pos, float).reshape(-1, 2)      # позиции датчиков, км
+    if not tails or not len(pos):                    # ловить некого или нечем
+        return 0.0
+    hits = [int((np.linalg.norm(np.asarray(t, float)[:, None, :] - pos[None, :, :], axis=2) <= R).any(axis=0).sum())  # датчиков
+            for t in tails]                          # видит каждый подлёт
+    return float(np.mean(np.asarray(hits) >= int(k)))
+
+
+def first_line(routes, pt, pos, rad):
+    """Рубеж обнаружения (13.1 Д9): расстояние от цели до первой засечки на каждом маршруте. Вход: маршруты
+    (M,2) км от старта к цели, цель (x, y) км, датчики (K,2) км, их радиусы (K,) км. Отдаёт: (маршрутов,) км."""
+    pos = np.asarray(pos, float).reshape(-1, 2)      # датчики, км
+    rad = np.asarray(rad, float).reshape(-1)         # их радиусы, км
+    out = np.zeros(len(routes))                      # не засечён — рубеж 0: дошёл до цели невидимым
+    for j, r in enumerate(routes):
+        pts = np.asarray(r, float)                   # точки маршрута, км
+        seen = (np.linalg.norm(pts[:, None, :] - pos[None, :, :], axis=2) <= rad).any(axis=1)   # под наблюдением
+        if seen.any():                               # засечён — где впервые
+            out[j] = float(np.hypot(*(pts[int(np.argmax(seen))] - np.asarray(pt, float))))
+    return out
 
 
 def approach(routes, grid, zone):
@@ -108,6 +116,77 @@ def approach(routes, grid, zone):
     return out
 
 
+def gain_pct(st):
+    """Порог прироста у цели, %: своё значение паспорта или от кратности (`sensor_types.auto_gain_pct`).
+    Вход: паспорт. Отдаёт: float."""
+    from .sensor_types import auto_gain_pct
+    return float(st.tgt_gain_pct) if float(st.tgt_gain_pct) > 0 else auto_gain_pct(st.tgt_k)   # 0 — от k
+
+
+def level_pct(st):
+    """Уровень защиты цели — доля подлёта ≥ k, %: своё значение или от кратности (`auto_level_pct`).
+    Вход: паспорт. Отдаёт: float."""
+    from .sensor_types import auto_level_pct
+    return float(st.tgt_level_pct) if float(st.tgt_level_pct) > 0 else auto_level_pct(st.tgt_k)   # 0 — от k
+
+
+def _free(cand, taken, sep):
+    """Места, не ближе разноса к занятым. Вход: (M,2) км, (K,2) км, разнос км. Отдаёт: (M',2) км."""
+    if not len(taken) or not len(cand):              # сравнивать не с чем
+        return cand
+    d = np.min(np.linalg.norm(cand[:, None, :] - taken[None, :, :], axis=2), axis=1)   # до ближайшего занятого, км
+    return cand[d >= sep]
+
+
+def protection(tails, places, pos, R, k, sep, L_seg, weights, levels):
+    """Защита объекта (план 13.1, Д10): почему кратность мала и сколько ПВН добавить у цели — только счёт.
+    Вход: подлёт [(M,2) км], места зоны (M,2) км, ПВН типа (K,2) км, радиус км, кратность, разнос км,
+    сегментов, веса жадного, уровни 0…1. Отдаёт: dict — доли, недостижимое, «ещё ПВН» по уровням."""
+    from .optimization import CoverageCache
+    T = len(tails)                                   # подлётов к цели
+    pos = np.asarray(pos, float).reshape(-1, 2)      # ПВН типа, км
+    places = np.asarray(places, float).reshape(-1, 2)   # места зоны цели, км
+    out = dict(n=T, share1=0.0, share=0.0, lack_places=0, lack_sep=0, need={}, best=0.0, room=0)
+    if not T:                                        # ловить некого
+        return out
+
+    def seen(pts):
+        """Сколько из точек pts (J,2) км видит каждый подлёт. Отдаёт: (T, J) bool."""
+        if not len(pts):                             # точек нет
+            return np.zeros((T, 0), bool)
+        return np.array([(np.linalg.norm(np.asarray(t, float)[:, None, :] - pts[None, :, :], axis=2) <= R).any(axis=0)
+                         for t in tails])
+    n_now = seen(pos).sum(axis=1)                    # сколько ПВН видит каждый подлёт сейчас
+    out.update(share1=float((n_now >= 1).mean()), share=float((n_now >= k).mean()))
+    # ПОЧЕМУ НЕ НАБРАНО: у подлёта мест в радиусе R меньше k — «мест мало»; мест хватает, но k штук с разносом
+    # не укладываются — «мешает разнос»; остальным не хватает ПВН (замер Д10.2: мест хватает у 99.6 %)
+    vis = seen(places)                               # какие места видит каждый подлёт, (T, M)
+    for t in np.nonzero(n_now < k)[0]:
+        near = places[vis[t]]                        # места, видящие этот подлёт, км
+        if len(near) < k:                            # мест в радиусе меньше k
+            out["lack_places"] += 1
+        elif capacity(near, sep) < k:                # k с разносом не встают
+            out["lack_sep"] += 1
+    # СКОЛЬКО ДОБАВИТЬ: тот же жадный цели дальше, от стоящих ПВН, до вместимости — расстановку не трогает
+    free = _free(places, pos, sep)                   # свободные места зоны, км
+    shares = np.zeros(0)                             # доля ≥ k после j-го добавленного
+    if len(free):                                    # есть куда добавлять
+        cand = np.vstack([pos, free])                # стоящие — первыми
+        cache = CoverageCache(cand, R, L_seg, k)     # кэш покрытия подлёта
+        for t in tails:
+            cache.add_trajectory(np.asarray(t, float))
+        cache.greedy(len(cand), weights, anchors=range(len(pos)), anchor_sep=sep, min_sep=sep)
+        new = cand[cache.last_idx[len(pos):]]        # добавленные по порядку, км
+        cum = n_now[:, None] + np.cumsum(seen(new), axis=1)   # засечки подлёта после j-го
+        shares = (cum >= k).mean(axis=0)             # доля ≥ k после каждого добавленного
+    out["room"] = int(len(shares))                   # сколько ещё встаёт с разносом
+    out["best"] = float(shares[-1]) if len(shares) else out["share"]
+    for lv in levels:
+        hit = np.nonzero(shares >= lv - 1e-12)[0]    # шаги, где уровень набран
+        out["need"][float(lv)] = 0 if out["share"] >= lv - 1e-12 else (int(hit[0]) + 1 if len(hit) else None)
+    return out
+
+
 def stage(grid, zc, place_mask, places, targets, routes_by_t, st, n_total, R, L_seg, weights, areas=None):
     """Этап целей для одного типа. Вход: сетка, сводка, карта места, места типа (M,2) км, цели
     [(x, y, приоритет)], маршруты по целям, паспорт, квота N, радиус км, сегментов, веса жадного,
@@ -115,30 +194,68 @@ def stage(grid, zc, place_mask, places, targets, routes_by_t, st, n_total, R, L_
     from .optimization import CoverageCache
     from .sensor_zones import bonus_vector, cells_of
     sep = 1.6 * float(R)                             # разнос внутри типа, км
+    gap = float(st.tgt_gap_r) * float(R)             # отступ от самой цели, км (R/2, В13.26)
     places = np.asarray(places, float).reshape(-1, 2)   # места типа, км
-    areas = list(areas) if areas is not None else [None] * len(targets)   # район человека у каждой цели
+    K = len(targets)                                 # число целей
+    areas = list(areas) if areas is not None else [None] * K   # район человека у каждой цели
     zones = [target_zone(grid, zc, place_mask, (x, y), R, a)   # зоны целей
              for (x, y, _p), a in zip(targets, areas)]
     own = [places[cells_of(grid, places, z)] if z is not None else np.empty((0, 2))   # места в зоне цели
            for z in zones]
+    own = [o[np.hypot(o[:, 0] - x, o[:, 1] - y) >= gap] for o, (x, y, _p) in zip(own, targets)]   # не у самой цели
     caps = [capacity(o, sep) for o in own]           # вместимость зон
-    want = allocate(caps, [p for _x, _y, p in targets], n_total, st)   # число у каждой цели
-    report = [dict(zone=z is not None, manual=a is not None,   # отчёт: зона, район ли человека, вместимость,
-                    cells=int(z.sum()) if z is not None else 0, capacity=c, n=n, placed=0)   # заказано, поставлено
-              for z, a, c, n in zip(zones, areas, caps, want)]
-    chosen = np.empty((0, 2))                        # поставлено у целей выше по приоритету, км
-    for i in sorted(range(len(targets)), key=lambda i: (-targets[i][2], i)):
-        cand = own[i]                                # места этой цели
-        if len(chosen) and len(cand):                # занятое целями выше — не место
-            d = np.min(np.linalg.norm(cand[:, None, :] - chosen[None, :, :], axis=2), axis=1)
-            cand = cand[d >= sep]                    # не ближе разноса к занятым
-        if want[i] <= 0 or not len(cand) or not routes_by_t[i]:   # ставить некуда или некого ловить
+    pri = [max(float(p), 0.0) for _x, _y, p in targets]   # приоритеты
+    pri = pri if sum(pri) > 0 else [1.0] * K         # все нули — поровну
+    mins = floors(caps, pri, n_total, st)            # минимум у каждой цели
+    k = int(st.tgt_k)                                # кратность защиты цели
+    thr, lvl = gain_pct(st) / 100.0, level_pct(st) / 100.0   # порог прироста и уровень защиты, доли
+    cap_n = int(np.floor((st.tgt_cap_one if K == 1 else st.tgt_cap_all) * n_total))   # потолок от N, шт.
+    budget = min(int(n_total), max(sum(mins), cap_n))   # бюджет целей: потолок, но не ниже минимумов
+    tails = [approach(routes_by_t[i], grid, zones[i]) if zones[i] is not None and routes_by_t[i] else []  # подлёт
+             for i in range(K)]                      # к каждой цели
+    report = [dict(zone=z is not None, manual=a is not None, cells=int(z.sum()) if z is not None else 0,  # отчёт
+                   capacity=c, n_min=m, placed=0, k=k, share=0.0, why="", budget=budget,
+                   gain_pct=100 * thr, level_pct=100 * lvl) for z, a, c, m in zip(zones, areas, caps, mins)]
+    # 1) МИНИМУМЫ — по убыванию приоритета, у каждой цели свой жадный: младшим места не мешают старшим
+    fixed, owner = np.empty((0, 2)), []              # поставленное и чьё оно
+    for i in sorted(range(K), key=lambda i: (-pri[i], i)):
+        cand = _free(own[i], fixed, sep)             # места этой цели минус занятые
+        if mins[i] <= 0 or not len(cand) or not tails[i]:   # ставить некуда или некого ловить
             continue
-        cache = CoverageCache(cand, R, L_seg, int(st.tgt_k))   # кратность ЦЕЛИ, а не типа
-        for tail in approach(routes_by_t[i], grid, zones[i]):
-            cache.add_trajectory(tail)
-        bonus = bonus_vector(grid, zc, cand, st)     # высота крыши и размер пункта (13.7) или None
-        got = cache.greedy(want[i], weights, min_sep=sep, bonus=bonus)   # позиции у цели, км
-        report[i]["placed"] = len(got)
-        chosen = np.vstack([chosen, got]) if len(got) else chosen   # к занятым целями выше
-    return chosen, report
+        cache = CoverageCache(cand, R, L_seg, k)     # кратность ЦЕЛИ, а не типа
+        for t in tails[i]:
+            cache.add_trajectory(t)
+        got = cache.greedy(mins[i], weights, min_sep=sep, bonus=bonus_vector(grid, zc, cand, st))   # км
+        fixed = np.vstack([fixed, got]) if len(got) else fixed   # к поставленным, км
+        owner += [i] * len(got)
+    # 2) СВЕРХ МИНИМУМОВ — один жадный по всем целям: маршрут весит приоритет цели / её подлётов
+    live = [i for i in range(K) if tails[i]]         # цели, у которых есть подлёт
+    pools = [_free(own[i], fixed, sep) for i in live]   # свободные места живых целей
+    cand = np.vstack([fixed] + pools) if live else fixed   # закреплённые — первыми
+    own_of = owner + sum(([i] * len(pl) for i, pl in zip(live, pools)), [])   # цель каждого места
+    idx = list(range(len(fixed)))                    # выбранные номера кандидатов
+    done, stopped = set(), False                     # цели с набранным уровнем; стоп порогом прироста
+    if live and len(cand) > len(fixed) and budget > len(fixed):   # есть куда и на что ставить
+        psum = sum(pri[i] for i in live)             # сумма приоритетов живых целей
+        w = np.concatenate([np.full(len(tails[i]), pri[i] / (psum * len(tails[i]))) for i in live])   # вес маршрута
+        grp = np.concatenate([np.full(len(tails[i]), g) for g, i in enumerate(live)])   # его цель по счёту
+        cache = CoverageCache(cand, R, L_seg, k)     # один кэш на все цели
+        for i in live:
+            for t in tails[i]:
+                cache.add_trajectory(t)
+        # ⚠️ порог — на (p_i / p̄)·прирост_i: взвешенный прирост (p_i / Σp)·прирост_i сравнивается с порог / K
+        cache.greedy(budget, weights, anchors=idx, anchor_sep=sep, min_sep=sep,
+                     bonus=bonus_vector(grid, zc, cand, st), stop_gain=thr / len(live), stop_min=len(fixed),
+                     traj_w=w, groups=grp, goals=[lvl] * len(live))
+        idx = list(cache.last_idx) or idx            # закреплённые и добавленные
+        done = {live[g] for g in cache.last_done}    # набрали уровень
+        stopped = bool((cache.last_bound or {}).get("stopped"))   # стоп порогом прироста
+    pos = cand[idx] if idx else np.empty((0, 2))     # позиции этапа целей, км
+    for i in range(K):
+        report[i]["placed"] = sum(1 for j in idx if own_of[j] == i)
+        report[i]["share"] = approach_share(tails[i], pos, R, k)
+        report[i]["why"] = ("" if not tails[i] else "уровень %.0f %%" % (100 * lvl) if i in done
+                            else "прирост < %g %%" % (100 * thr) if stopped
+                            else ("потолок %d" % budget if budget < int(n_total) else "квота N")
+                            if len(idx) >= budget else "места")
+    return pos, report

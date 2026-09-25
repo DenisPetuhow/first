@@ -30,9 +30,13 @@ import numpy as np
 BUILDING_LAYER = "building_pts"    # постройки: один массив (N, 5)
 FOREST_LAYER = "forest"            # лес: внешние кольца полигонов
 ROUGH_LAYER = "rough"              # неудобья: внешние кольца полигонов
+WETLAND_LAYER = "wetland"          # болота — отдельно от неудобий (план 13.1, Д3): видеть по отдельности
 
 FOREST_FILTER = {"landuse": ["forest"], "natural": ["wood"]}          # лес — оба способа разметки
-ROUGH_FILTER = {"natural": ["wetland", "scrub", "heath", "sand", "bare_rock", "scree"]}   # неудобья
+# ⚠️ болота вынесены в свой слой (Д3); запрет прежний — по объединению неудобий и болот. Старый файл
+# мест без слоя `wetland` держит болота в `rough` — карта та же
+ROUGH_FILTER = {"natural": ["scrub", "heath", "sand", "bare_rock", "scree"]}   # прочие неудобья
+WETLAND_FILTER = {"natural": ["wetland"]}                                   # болота
 
 # Тип здания — запасной признак высоты: этажность указана лишь у 6 % построек `arh` (В13.19).
 TALL_KINDS = frozenset((  # типы обычно не ниже двух этажей
@@ -150,7 +154,7 @@ def sensor_layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat):
     pts = _buildings(osm, lon0, lat0, clip)          # постройки (N, 5)
     if len(pts):
         out[BUILDING_LAYER] = [pts]
-    for layer, flt in ((FOREST_LAYER, FOREST_FILTER), (ROUGH_LAYER, ROUGH_FILTER)):
+    for layer, flt in ((FOREST_LAYER, FOREST_FILTER), (WETLAND_LAYER, WETLAND_FILTER), (ROUGH_LAYER, ROUGH_FILTER)):
         polys = _polygons(osm, flt, lon0, lat0, clip)   # кольца слоя
         if polys:
             out[layer] = polys
@@ -191,16 +195,18 @@ def building_rank(pts):
 
 
 def cell_buildings(grid, pts):
-    """Постройки по ячейкам сетки. Вход: ThreatGrid, массив (N, 5). Отдаёт: dict — `count` (ny,nx)
-    int32, `top_xy` (ny,nx,2) км, `top_floors` (ny,nx), `top_known` (ny,nx) bool; нет постройки — NaN."""
+    """Постройки по ячейкам сетки. Вход: ThreatGrid, массив (N, 5). Отдаёт: dict — `count` (ny,nx) int32,
+    `top_xy` (ny,nx,2) км, `top_floors`, `mean_floors` (ny,nx) — средняя этажность (Д2), `top_known` bool; нет — NaN."""
     ny, nx = grid.ny, grid.nx
     count = np.zeros((ny, nx), np.int32)             # построек в ячейке
     top_xy = np.full((ny, nx, 2), np.nan)            # самая высокая постройка ячейки, км
     top_floors = np.full((ny, nx), np.nan)           # её этажей (оценка)
     top_known = np.zeros((ny, nx), bool)             # этажность указана в данных
+    mean_floors = np.full((ny, nx), np.nan)          # средняя этажность построек ячейки (оценка, Д2)
     pts = np.asarray(pts, float).reshape(-1, 5)      # постройки: x, y, этажей, класс, м²
     if not len(pts):                                 # построек нет
-        return dict(count=count, top_xy=top_xy, top_floors=top_floors, top_known=top_known)
+        return dict(count=count, top_xy=top_xy, top_floors=top_floors, top_known=top_known,
+                    mean_floors=mean_floors)
     ix = np.floor((pts[:, 0] - grid.ox) / grid.h).astype(np.int64)   # столбец ячейки
     iy = np.floor((pts[:, 1] - grid.oy) / grid.h).astype(np.int64)   # строка ячейки
     ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)   # постройка внутри сетки
@@ -216,7 +222,12 @@ def cell_buildings(grid, pts):
     top_xy[iy[top], ix[top]] = pts[top, :2]
     top_floors[iy[top], ix[top]] = fl[top]
     top_known[iy[top], ix[top]] = np.isfinite(pts[top, 2])
-    return dict(count=count, top_xy=top_xy, top_floors=top_floors, top_known=top_known)
+    fsum = np.zeros((ny, nx))                        # сумма этажей построек ячейки
+    np.add.at(fsum, (iy, ix), fl)
+    has = count > 0                                  # ячейки с постройками
+    mean_floors[has] = fsum[has] / count[has]
+    return dict(count=count, top_xy=top_xy, top_floors=top_floors, top_known=top_known,
+                mean_floors=mean_floors)
 
 
 def polygon_mask(grid, polys):
@@ -257,6 +268,13 @@ def settled_mask(grid):
 def allowed_mask(grid, zc, st, passable):
     """Карта места типа (план 13, 13.4). Вход: ThreatGrid, сводка `cells`, паспорт типа, проходимость
     (ny,nx) bool. Отдаёт: (ny,nx) bool; None — ограничения нет (место «везде», прежний расчёт до бита)."""
+    parts = allowed_parts(grid, zc, st, passable)    # слагаемые карты — из них же и итог (Д3)
+    return None if parts is None else parts["result"]
+
+
+def allowed_parts(grid, zc, st, passable):
+    """Слагаемые карты места (план 13.1, Д3) — для показа по отдельности; `result` — сама карта. Вход: как у
+    `allowed_mask`. Отдаёт: dict (ny,nx) bool — settled, buildings, strip, forest, wetland, rough, nopass, result."""
     from model.threat_grid import _dilate
     if st is None or st.zone != "застройка":         # тип ставится везде
         return None                                  # — фильтровать нечего
@@ -269,11 +287,16 @@ def allowed_mask(grid, zc, st, passable):
         if name in grid._present:                    # слой есть на карте
             roads |= grid._present[name]
     # ⚠️ полоса — только у ПОСТРОЕК, а не у всей застройки: так снят замер §0.4в (карта N2, 473 км²)
-    built = settled | _dilate(bcell, nb)             # застройка ∪ постройки ± полоса
-    # лес и неудобья запрещены, кроме полосы у дорог и построек: в них 158 ячеек с домами
-    cover_ok = ~(zc["forest"] | zc["rough"]) | _dilate(roads | bcell, ns)
+    near = _dilate(bcell, nb)                        # постройки ± полоса
+    built = settled | near                           # застройка ∪ постройки ± полоса
+    strip = _dilate(roads | bcell, ns)               # полоса у дорог и построек, где лес разрешён
+    wet = zc.get("wetland", np.zeros_like(bcell))    # болота; старая сводка — их нет отдельно
+    # лес, болота и неудобья запрещены, кроме полосы у дорог и построек: в них 158 ячеек с домами
+    cover_ok = ~(zc["forest"] | wet | zc["rough"]) | strip
     # ⚠️ ∩ проходимость: в городе пролёт запрещён, и ПВН там не увидит ни одного маршрута
-    return built & cover_ok & np.asarray(passable, bool)
+    pas = np.asarray(passable, bool)                 # куда БПЛА может лететь
+    return dict(settled=settled, buildings=near, strip=strip, forest=zc["forest"], wetland=wet,
+                rough=zc["rough"], nopass=~pas, result=built & cover_ok & pas)
 
 
 def cells_of(grid, pts, mask):
@@ -328,9 +351,10 @@ def bonus_vector(grid, zc, pts, st):
 
 def cells(grid, layers):
     """Всё о местах датчиков по ячейкам сетки. Вход: ThreatGrid, слои (`load()`).
-    Отдаёт: dict — поля `cell_buildings` плюс `forest` и `rough` (ny,nx) bool."""
+    Отдаёт: dict — поля `cell_buildings` плюс `forest`, `wetland`, `rough` (ny,nx) bool."""
     pts = (layers.get(BUILDING_LAYER) or [np.empty((0, 5))])[0]   # постройки участка
     out = cell_buildings(grid, pts)
     out["forest"] = polygon_mask(grid, layers.get(FOREST_LAYER, []))
     out["rough"] = polygon_mask(grid, layers.get(ROUGH_LAYER, []))
+    out["wetland"] = polygon_mask(grid, layers.get(WETLAND_LAYER, []))   # старый файл — пусто, болота в `rough`
     return out

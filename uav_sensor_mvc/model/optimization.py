@@ -103,6 +103,8 @@ class CoverageCache:
         self._pre_n, self._pre_mask, self._pre_cov = [], [], []
         # оценка зазора последнего `greedy` (план 13, 13.8): F набора, верхняя граница OPT, их отношение
         self.last_bound = None
+        self.last_idx = []                 # номера кандидатов, выбранных последним `greedy`
+        self.last_done = set()             # группы маршрутов, набравшие уровень в последнем `greedy`
 
     @property
     def n_traj(self):
@@ -161,10 +163,11 @@ class CoverageCache:
             return np.zeros(self.C, np.int64)
         return np.asarray(self._hit, dtype=np.int64).sum(axis=0)
 
-    def greedy(self, N, weights, anchors=None, anchor_sep=0.0, min_sep=0.0, bonus=None):
+    def greedy(self, N, weights, anchors=None, anchor_sep=0.0, min_sep=0.0, bonus=None, stop_gain=None, stop_min=0,
+               traj_w=None, groups=None, goals=None):
         """Жадный выбор до min(N, C) позиций; ключи по очереди: кратность и равномерность → доля пути → маршрутов.
-        Вход: N, веса (a1, a2), закреплённые номера и их разнос км, разнос км, бонус места (C,) или None (13.7).
-        Отдаёт: (K,2) км; оценка зазора — в `self.last_bound`."""
+        Вход: N, веса (a1, a2), закреплённые номера и разнос км, разнос км, бонус (C,) | None (13.7); 13.1 Д9 — стоп по
+        приросту доли с кратностью k и минимум до него, веса маршрутов (T,), группа маршрута (T,) и уровень группы 0…1."""
         # ⚠️ ТРЕТИЙ КЛЮЧ «сколько маршрутов накрывает кандидат» (резерв кратности) — не украшение: без него
         # при насыщении двух первых счёт нулевой у всех, `argmax` брал ПЕРВОГО по порядку, и датчики уходили
         # в угол карты (4 из 12 не ловили ни одного пролёта). Нулевой и он — расстановка прекращается.
@@ -180,6 +183,15 @@ class CoverageCache:
         M = np.asarray(self._mask, dtype=np.uint32)       # (T, C)
         Fc = np.asarray(self._cov, dtype=np.float64)      # (T, C)
         k, Lseg = self.k, self.L_seg
+        # ВЕСА МАРШРУТОВ (13.1 Д9): у этапа целей маршрут весит приоритет своей цели / её число подлётов.
+        # ⚠️ без весов — прежнее `.mean`, а не `W @`: иначе округление сдвинет выбор, и эталон уйдёт
+        if traj_w is None:                                # все маршруты равны
+            avg = lambda X: X.mean(axis=0)                # noqa: E731 — среднее по маршрутам, (C,)
+        else:                                             # вклад маршрута — его вес
+            W = np.asarray(traj_w, float) / float(np.sum(traj_w))   # веса маршрутов, сумма 1
+            avg = lambda X: W @ X                         # noqa: E731 — взвешенное среднее, (C,)
+        grp = None if groups is None or traj_w is None else np.asarray(groups, int)   # цель маршрута или None
+        done = set()                                      # группы, набравшие свой уровень
 
         covsum = H.sum(axis=0).astype(float)              # маршрутов на кандидата (третичный ключ)
         # ⚠️ СТАРТУЕМ НЕ С НУЛЯ, ЕСЛИ ДАТЧИКИ ДРУГИХ ТИПОВ УЖЕ СТОЯТ. Их покрытие —
@@ -207,7 +219,7 @@ class CoverageCache:
 
         def phi_now():
             """F текущего набора — основной критерий в среднем по маршрутам. Отдаёт: float."""
-            return float((a1 * cur_min / k + a2 * cur_pop / Lseg).mean())
+            return float(avg(a1 * cur_min / k + a2 * cur_pop / Lseg))
 
         def note_bound(primary):
             """Учесть границу на этом шаге. Вход: основной прирост кандидатов (C,). Отдаёт: ничего."""
@@ -227,6 +239,16 @@ class CoverageCache:
             cur_min = np.minimum(n_vec, k).astype(float)
             cur_pop = _popcount(mask_vec).astype(float)
             cur_cov = np.minimum(cur_cov + Fc[:, c], 1.0)
+
+        def close_groups():
+            """Группа набрала уровень — её маршруты больше не весят (цель защищена). Отдаёт: ничего."""
+            if grp is None or goals is None:              # групп нет — выбывать некому
+                return
+            for g in set(grp.tolist()) - done:
+                rows = grp == g                           # маршруты этой группы
+                if float((n_vec[rows] >= k).mean()) >= float(goals[g]) - 1e-12:   # уровень набран
+                    W[rows] = 0.0                         # — вклада больше нет, веса не пересчитываем
+                    done.add(g)
 
         def exclude_near(idx, sep):
             if sep > 0:
@@ -255,17 +277,19 @@ class CoverageCache:
             if 0 <= i < self.C:
                 exclude_near(i, max(anchor_sep, min_sep))
 
+        stopped = False                                    # остановлен ли правилом прироста (13.1 Д9)
+        close_groups()                                     # закреплённые могли уже набрать уровень
         while len(chosen) < min(N, self.C):
             new_min = np.minimum(n_vec[:, None] + H, k)
             gain_n = (new_min - cur_min[:, None]) / k
             new_pop = _popcount(mask_vec[:, None] | M)
             gain_m = (new_pop - cur_pop[:, None]) / Lseg
-            primary = (a1 * gain_n + a2 * gain_m).mean(axis=0)        # (C,)
+            primary = avg(a1 * gain_n + a2 * gain_m)                  # (C,)
             note_bound(primary)                                       # граница OPT на этом шаге
 
             # вторичный критерий: прирост покрытой доли маршрутов (с усечением 1)
             new_cov = np.minimum(cur_cov[:, None] + Fc, 1.0)
-            gain_cov = (new_cov - cur_cov[:, None]).mean(axis=0)      # (C,)
+            gain_cov = avg(new_cov - cur_cov[:, None])                # (C,)
 
             # лексикографика: основной критерий → вторичный → третичный (резерв кратности)
             secondary = SPREAD_EPS * gain_cov
@@ -280,20 +304,34 @@ class CoverageCache:
             else:
                 score = covsum                             # хоть сколько-то маршрутов
             score = np.where(avail, score, -np.inf)
+            # ⚠️ стоп — по доле маршрутов, засечённых ≥ k, а не по ключу выбора: после насыщения жадный уходит
+            # на вторичный ключ и ставит «туда же» (план 13.1 Д9: 10 ПВН у цели, насыщение уже на 7). Смотрятся
+            # ВСЕ кандидаты, а не выбранный: иначе в общем жадном по целям насыщенная цель глушила бы соседнюю
+            if stop_gain is not None and len(chosen) >= stop_min:   # минимум поставлен — считаем прирост
+                have = n_vec >= k                          # маршруты, уже засечённые k раз
+                gain_k = avg((n_vec[:, None] + H >= k) & ~have[:, None])   # прирост доли с кратностью k, (C,)
+                if np.isfinite(score).any() and not np.isfinite(score[gain_k >= stop_gain]).any():   # пользы нет
+                    stopped = True                         # насыщение — отчёт скажет «прирост < …»
+                    break                                  # — остальное не здесь
+                score = np.where(gain_k >= stop_gain, score, -np.inf)   # ставить только полезные
             c = int(np.argmax(score))
             if not np.isfinite(score[c]) or score[c] <= 0.0:
                 break                                      # полезных позиций не осталось
             take(c)
             exclude_near(c, min_sep)                       # датчики не ближе min_sep друг к другу
+            close_groups()
 
         # граница и после последнего шага: к концу набор полнее, и она обычно самая тесная
         last = (a1 * (np.minimum(n_vec[:, None] + H, k) - cur_min[:, None]) / k
-                + a2 * (_popcount(mask_vec[:, None] | M) - cur_pop[:, None]) / Lseg).mean(axis=0)   # приросты
+                + a2 * (_popcount(mask_vec[:, None] | M) - cur_pop[:, None]) / Lseg)   # приросты
+        last = avg(last)                                   # в среднем по маршрутам, (C,)
         note_bound(last)
         f_s = phi_now()                                    # F итогового набора
         room = ub[0] - f0                                  # сколько вообще можно было добавить
-        self.last_bound = dict(F=f_s, F0=f0, UB=ub[0],
+        self.last_bound = dict(F=f_s, F0=f0, UB=ub[0], stopped=stopped,
                                ratio=((f_s - f0) / room if room > 1e-12 else 1.0))   # не хуже этой доли от OPT
+        self.last_idx = list(chosen)                       # номера выбранных кандидатов — чей датчик (13.1 Д9)
+        self.last_done = set(done)                         # группы, набравшие уровень
         return self.cand[chosen] if chosen else np.empty((0, 2), float)
 
 

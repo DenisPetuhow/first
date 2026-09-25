@@ -22,7 +22,11 @@ _COLS = (
     ("Приоритет", "weight", 90, True),
     ("Сектора", "sectors", 70, True),      # галочка: компас «анализа» у этой цели
     ("Зона ПВН", "zone", 118, False),      # по застройке · задана вручную · укажите район (В13.21)
+    ("Район", "show_area", 60, True),      # галочка: показать район защиты цели на карте (Д5)
 )
+# подсказки заголовков-галочек: обе — только показ, на расчёт не влияют (заказчик 24.09.2026, Д5)
+_TIPS = {"sectors": "Компас 12 направлений из «Анализа» у этой цели — только показ, на расчёт не влияет.",
+         "show_area": "Район защиты цели на карте: заданный вручную или найденный по застройке — только показ."}
 ROW_HEIGHT = 26          # высота строки, px — тёмная тема сплющивает ячейки
 
 
@@ -33,13 +37,14 @@ class TargetsDialog(QtWidgets.QDialog):
     защиты цели (В13.21). `limit` — сколько целей всего, шт."""
 
     def __init__(self, parent, rows, on_place, on_weight, on_move, on_clear, limit,
-                 on_sectors=None, on_area=None, on_area_clear=None):
+                 on_sectors=None, on_area=None, on_area_clear=None, on_show_area=None):
         super().__init__(parent)
         self.setWindowTitle("Объекты защиты")
         self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
         self._rows, self._on_place = rows, on_place
         self._on_weight, self._on_move, self._on_clear = on_weight, on_move, on_clear
         self._on_sectors = on_sectors or (lambda i, on: "")   # галочка «Сектора» у цели
+        self._on_show_area = on_show_area or (lambda i, on: "")   # галочка «Район» у цели (Д5)
         self._on_area = on_area or (lambda i: None)           # «Район защиты…» — чертить мышью
         self._on_area_clear = on_area_clear or (lambda i: None)   # «Снять район»
         self._quiet = False                          # таблицу заполняет программа
@@ -71,6 +76,9 @@ class TargetsDialog(QtWidgets.QDialog):
 
         self.table = QtWidgets.QTableWidget(0, len(_COLS), self)
         self.table.setHorizontalHeaderLabels([c[0] for c in _COLS])
+        for j, (_t, key, _w, _e) in enumerate(_COLS):   # подсказки галочек — только показ
+            if key in _TIPS:
+                self.table.horizontalHeaderItem(j).setToolTip(_TIPS[key])
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.table.verticalHeader().setVisible(False)
         for i, (_t, _k, width, _e) in enumerate(_COLS):
@@ -137,12 +145,11 @@ class TargetsDialog(QtWidgets.QDialog):
         self.table.insertRow(i)
         for j, (_t, key, _w, editable) in enumerate(_COLS):
             val = r.get(key)
-            if key == "sectors":                     # галочка, а не текст
+            if key in _TIPS:                         # галочка, а не текст
                 item = QtWidgets.QTableWidgetItem("")
                 item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable)
                 item.setCheckState(QtCore.Qt.Checked if val else QtCore.Qt.Unchecked)
-                item.setToolTip("Показывать у этой цели компас секторов (галочка «Сектора» "
-                                "в группе «пролёт БПЛА»).")
+                item.setToolTip(_TIPS[key])
                 self.table.setItem(i, j, item)
                 continue
             if key in ("n", "zone"):
@@ -169,6 +176,8 @@ class TargetsDialog(QtWidgets.QDialog):
         try:
             if key == "sectors":                     # галочку компаса переключили
                 note = self._on_sectors(i, item.checkState() == QtCore.Qt.Checked)
+            elif key == "show_area":                 # галочку района переключили
+                note = self._on_show_area(i, item.checkState() == QtCore.Qt.Checked)
             elif key == "weight":
                 note = self._on_weight(i, float(item.text().strip().replace(",", ".")))
             else:                                    # широта или долгота — нужны обе

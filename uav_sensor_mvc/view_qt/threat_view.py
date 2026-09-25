@@ -204,6 +204,16 @@ THREAT_COLORS = {
     # и формой значка, поэтому цвет здесь не единственный признак.
     "sensor_t2":   "#2563eb",           # тип 2 — синий
     "sensor_t3":   "#e11d74",           # тип 3 — малиновый
+    "sensor_plain": "#10b981",          # «Обычный» (план 13.1, Д1) — зелёный: не спутать с МОГ и ПВН
+    # РАЙОН ЗАЩИТЫ ЦЕЛИ (план 13.1, Д5) — тёмно-зелёный со штриховкой: красный путался с запретами
+    "target_area": "#15803d",
+    # ПОСТРОЙКИ ПО ЯЧЕЙКАМ (план 13.1, Д2): число — от светло-жёлтого к бурому, этажность — от голубого
+    # к тёмно-синему; обе шкалы не похожи на весовую (turbo), чтобы не читать их как вес
+    "bld_lo": "#fde68a", "bld_hi": "#7c2d12",
+    # СЛАГАЕМЫЕ КАРТЫ МЕСТА (план 13.1, Д3) — в окне типа: из чего сложена разрешённая карта
+    "zp_settled": "#f59e0b", "zp_buildings": "#b45309", "zp_strip": "#94a3b8", "zp_forest": "#15803d",
+    "zp_wetland": "#0891b2", "zp_rough": "#a16207", "zp_nopass": "#dc2626",
+    "flr_lo": "#bfdbfe", "flr_hi": "#1e3a8a",
     "sensor_fix":  "#ffffff",           # обводка датчика, чьё место подобрал алгоритм
     # ⚠️ ЧЁРНАЯ ОБВОДКА — «МЕСТО ВЫБРАЛ ЧЕЛОВЕК» (клик, строка таблицы, файл). Требование
     # заказчика 05.09.2026. Это ВТОРОЙ признак, независимый от формы значка: форма
@@ -308,6 +318,52 @@ RELIEF_MAX_ALPHA = 165                     # предел непрозрачно
 THREAT_URBAN_RGBA = (255, 93, 108, 120)   # город — красный (исключён из пролёта)
 THREAT_WATER_RGBA = (58, 160, 255, 150)   # вода — синий (запрет установки датчика)
 _TYPE_COLOR_KEYS = {1: "sensor", 2: "sensor_t2", 3: "sensor_t3", 4: "sensor_big"}   # цвет номера без паспорта
+
+
+def _mask_edges(mask, ox, oy, h):
+    """Край маски ячеек — отрезки между ячейкой зоны и соседней вне её. Вход: маска (ny,nx), угол км, шаг км.
+    Отдаёт: (xs, ys) — пары точек, км (для `connect="pairs"`)."""
+    m = np.pad(np.asarray(mask, bool), 1)            # поле с каймой: край карты — тоже край зоны
+    xs, ys = [], []                                  # концы отрезков, км
+    iy, ix = np.nonzero(m[1:, 1:-1] != m[:-1, 1:-1])   # горизонтальные: между строками iy-1 и iy
+    for y, x in zip(iy, ix):
+        xs += [ox + x * h, ox + (x + 1) * h]
+        ys += [oy + y * h, oy + y * h]
+    iy, ix = np.nonzero(m[1:-1, 1:] != m[1:-1, :-1])   # вертикальные: между столбцами ix-1 и ix
+    for y, x in zip(iy, ix):
+        xs += [ox + x * h, ox + x * h]
+        ys += [oy + y * h, oy + (y + 1) * h]
+    return xs, ys
+
+
+def _in_mask(mask, ox, oy, h, X, Y):
+    """Точки внутри маски ячеек. Вход: маска, угол км, шаг км, координаты км (массивы). Отдаёт: bool-массив."""
+    ix = np.floor((np.asarray(X) - ox) / h).astype(int)   # столбец
+    iy = np.floor((np.asarray(Y) - oy) / h).astype(int)   # строка
+    ok = (ix >= 0) & (iy >= 0) & (ix < mask.shape[1]) & (iy < mask.shape[0])   # внутри сетки
+    out = np.zeros(ix.shape, bool)
+    out[ok] = mask[iy[ok], ix[ok]]
+    return out
+
+
+def _hatch(inside, box, n=14):
+    """Штриховка области диагоналями под 45° (Д5). Вход: inside(X, Y) → bool, рамка (x0, x1, y0, y1) км,
+    линий на поперечник. Отдаёт: (xs, ys) — пары концов отрезков внутри области, км."""
+    x0, x1, y0, y1 = box
+    step = max(0.25, max(x1 - x0, y1 - y0) / n)      # шаг штриха, км: не мельче 0.25 км
+    X = np.arange(x0, x1 + step / 8, step / 8)       # точки вдоль линии, км
+    xs, ys = [], []
+    for c in np.arange(y0 - x1, y1 - x0 + step, step):   # линии y = x + c
+        Y = X + c                                    # их точки, км
+        on = inside(X, Y) & (Y >= y0) & (Y <= y1)    # внутри области
+        if not on.any():                             # линия мимо
+            continue
+        d = np.diff(np.r_[0, on.astype(int), 0])     # начала (+1) и концы (−1) участков
+        for a, b in zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0] - 1):
+            if b > a:                                # участок длиннее точки
+                xs += [X[a], X[b]]
+                ys += [Y[a], Y[b]]
+    return xs, ys
 
 
 def type_color(tid):
@@ -513,6 +569,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.on_target_move = lambda i, lon, lat: ""  # координаты из таблицы
         self.on_targets_clear = lambda: None        # «Очистить»
         self.on_target_sectors = lambda i, on: ""   # галочка «Сектора» у цели
+        self.on_target_show_area = lambda i, on: ""   # галочка «Район» у цели (Д5)
         self.on_target_area = lambda i, area: None  # район защиты цели начерчен (В13.21)
         self.on_target_area_clear = lambda i: None  # снять район защиты цели
         self.on_set_sector = lambda x, y: None      # задан сектор появления БПЛА
@@ -650,6 +707,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                 on_move=lambda i, lon, lat: self.on_target_move(i, lon, lat),
                 on_clear=lambda: self.on_targets_clear(), limit=THREAT_TARGETS_MAX,
                 on_sectors=lambda i, on: self.on_target_sectors(i, on),
+                on_show_area=lambda i, on: self.on_target_show_area(i, on),
                 on_area=self._target_area_from_window,               # район защиты (В13.21)
                 on_area_clear=lambda i: self.on_target_area_clear(i))
         self._targets_dlg.refresh()
@@ -747,17 +805,38 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if shape is not None:              # выбрали форму
             self.begin_target_area(i, shape)
 
-    def render_target_areas(self, areas):
-        """Контуры районов защиты, заданных человеком. Вход: список районов (см. `Target.area`), км."""
-        xs, ys = [], []                    # контуры через разрыв NaN, км
-        for a in areas:
-            if a[0] == "circle":           # круг
-                cx, cy = self._circle_xy(a[1], a[2], a[3])
-            else:                          # прямоугольник по двум углам
-                cx, cy = [a[1], a[3], a[3], a[1], a[1]], [a[2], a[2], a[4], a[4], a[2]]
-            xs += list(cx) + [np.nan]
-            ys += list(cy) + [np.nan]
-        self.target_area_item.setData(xs, ys, connect="finite")
+    def render_target_areas(self, zones):
+        """Районы защиты целей (Д5): контур и штриховка. Вход: `target_zone_views` — dict(area=…) — район человека,
+        dict(mask, ox, oy, h) — зона по застройке, км. Контур и штрих — отрезками в км: не плывут при масштабе."""
+        cx, cy, hx, hy = [], [], [], []    # контур и штрих — пары точек, км
+        for z in zones:
+            if "area" in z:                # район человека — фигура
+                a = z["area"]                # ("rect"|"circle", …), км
+                if a[0] == "circle":       # круг: контур ломаной, внутри — по расстоянию
+                    px, py = self._circle_xy(a[1], a[2], a[3])
+                    inside = (lambda X, Y, a=a: np.hypot(X - a[1], Y - a[2]) <= a[3])   # внутри круга
+                    box = (a[1] - a[3], a[1] + a[3], a[2] - a[3], a[2] + a[3])
+                else:                      # прямоугольник по двум углам
+                    px, py = [a[1], a[3], a[3], a[1], a[1]], [a[2], a[2], a[4], a[4], a[2]]
+                    x0, x1, y0, y1 = min(a[1], a[3]), max(a[1], a[3]), min(a[2], a[4]), max(a[2], a[4])
+                    inside = (lambda X, Y, b=(x0, x1, y0, y1): (X >= b[0]) & (X <= b[1]) & (Y >= b[2]) & (Y <= b[3]))  # в рамке
+                    box = (x0, x1, y0, y1)
+                for j in range(len(px) - 1):   # ломаная — парами точек
+                    cx += [px[j], px[j + 1]]
+                    cy += [py[j], py[j + 1]]
+            else:                          # зона по застройке — край ячеек маски
+                m, ox, oy, h = z["mask"], z["ox"], z["oy"], z["h"]
+                ex, ey = _mask_edges(m, ox, oy, h)
+                cx += ex
+                cy += ey
+                iy, ix = np.nonzero(m)     # ячейки зоны
+                box = (ox + ix.min() * h, ox + (ix.max() + 1) * h, oy + iy.min() * h, oy + (iy.max() + 1) * h)
+                inside = (lambda X, Y, m=m, ox=ox, oy=oy, h=h: _in_mask(m, ox, oy, h, X, Y))   # в ячейках зоны
+            sx, sy = _hatch(inside, box)
+            hx += sx
+            hy += sy
+        self.target_area_item.setData(cx, cy, connect="pairs")
+        self.target_hatch_item.setData(hx, hy, connect="pairs")
 
     # ══════════════════════════════════════════════════════════════════════════
     # ОКНО «СЕКТОР НАЛЁТА» И РЕЖИМ ЗАДАНИЯ СЕКТОРА КЛИКАМИ (план 11, 11.6)
@@ -1000,8 +1079,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         if double:                         # двойной клик — новая точка
             self._drop_entry_handle()
             if self.on_entry_add(x, y):    # модель приняла
-                self.set_title("Точка старта добавлена (%.1f, %.1f км). «Применить» — "
-                               "пересчёт маршрутов." % (x, y))
+                self.set_title("Точка старта добавлена (%.1f, %.1f км). «Расставить датчики» — "
+                               "зона пролёта и маршруты заново." % (x, y))
             else:                          # клик за районом
                 self.set_title("Точка старта ставится только внутри района.")
             return
@@ -1046,8 +1125,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         x1, y1 = float(p.x()), float(p.y())            # куда отпустили, км
         if self.on_entry_move(row["x_km"], row["y_km"], x1, y1):   # модель приняла
             self._entry_pick = dict(row, x_km=x1, y_km=y1, manual=True)
-            self.set_title("Точка старта перенесена — теперь она задана вручную. «Применить» — "
-                           "пересчёт маршрутов.")
+            self.set_title("Точка старта перенесена — теперь она задана вручную. «Расставить датчики» — "
+                           "зона пролёта и маршруты заново.")
         else:                              # за районом — вернуть метку
             h.setPos(row["x_km"], row["y_km"])
             self.set_title("Точку старта нельзя вынести за район — возвращена на место.")
@@ -1060,7 +1139,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             return
         self.on_entry_delete(row["x_km"], row["y_km"])
         self._drop_entry_handle()
-        self.set_title("Точка старта убрана. «Применить» — пересчёт маршрутов.")
+        self.set_title("Точка старта убрана. «Расставить датчики» — зона пролёта и маршруты заново.")
 
     def _show_click_coords(self, ev):
         """Координаты точки клика — в строку под картой (план 8, задача 8.3).
@@ -2259,6 +2338,7 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
             dlg.on_saved = self._types_saved
             dlg.on_task = lambda t, r, k: self.on_type_task(t, r, k)
             dlg.on_show_zone = lambda t: self.on_type_zone(t)
+            dlg.set_part_colors({k: THREAT_COLORS["zp_" + k] for k, _t in dlg.PARTS})   # цвета слагаемых (Д3)
             self._types_dlg = dlg
         self._types_dlg.open_on(tid)
         self._types_dlg.show(); self._types_dlg.raise_()
@@ -2728,8 +2808,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         self.btn_place = QtWidgets.QPushButton("Расставить датчики")
         self.btn_place.setToolTip(
-            "Разместить датчики обоих типов: малые — по выборке маршрутов, большие — "
-            "кольцевым щитом вокруг цели. На воду не ставятся.")
+            "Разместить датчики: малые — по выборке маршрутов, большие — кольцом у цели. Если цель, "
+            "сектор или запас хода менялись — сперва заново зона пролёта и выборка.")
         self._tint(self.btn_place, THEME["ok"])
         self.btn_place.clicked.connect(lambda: self.on_place())
         row_place = QtWidgets.QHBoxLayout(); row_place.setSpacing(6)
@@ -2893,7 +2973,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
 
         b1 = QtWidgets.QHBoxLayout()
         self.btn_apply = QtWidgets.QPushButton("Применить")
-        self.btn_apply.setToolTip("Применить параметры (N/R/k/шаг) и пересчитать.")
+        self.btn_apply.setToolTip("Принять параметры и изменения. Датчики не переставляет: зона пролёта, "
+                                  "маршруты и расстановка — по «Расставить датчики».")
         self.btn_reset = QtWidgets.QPushButton("Сброс")
         self.btn_reset.setToolTip("Убрать датчики и заданную цель (карта остаётся).")
         # ОЧИСТИТЬ — вернуться к состоянию ДО МОДЕЛИРОВАНИЯ (заказчик 05.09.2026).
@@ -2980,6 +3061,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
              "Что рельеф СДЕЛАЛ с весом: синим укрытия (вес вырос), красным возвышенности "
              "(вес упал), чёрным — где коридор снят как «очень высокая гора». "
              "Работает, только когда рельеф добавлен в вес."),
+            ("chk_bld_count", "Постройки: число в ячейке", False,
+             "Сколько построек в ячейке 500 м — на чём стоит карта места ПВН. Светлее — меньше, бурее — "
+             "больше; шкала логарифмическая — от 1 до наибольшего на участке. В вес не идёт — только показ."),
+            ("chk_bld_floors", "Постройки: средняя этажность", False,
+             "Средняя этажность построек ячейки. Без тега в OSM — оценка по типу: высокий дом 2, прочие 1 "
+             "(датчики/ТИП_ПВН §4). Ячейка с одним сараем и квартал из 50 домов оба дают «1» — смотреть "
+             "вместе с числом. В вес не идёт — только показ."),
         )),
         ("пролёт БПЛА", (
             ("chk_routes", "Зона пролёта", False,
@@ -3110,6 +3198,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         "chk_cross":     ("crossing_scatter",),
         "chk_threat":    ("threat_img", "cbar"),
         "chk_relief_k":  ("relief_k_img",),
+        "chk_bld_count": ("bld_count_img",),
+        "chk_bld_floors": ("bld_floors_img",),
         "chk_routes":    ("route_area_img", "route_item"),
         "chk_iter":      ("route_iter_item", "route_cur_item"),
         "chk_iter_heat": ("iter_heat_img",),
@@ -3218,12 +3308,14 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         rules = dict(
             chk_threat="grid", chk_layers="grid", chk_water="grid", chk_cross="grid",
             chk_routes="grid", chk_cand="grid", chk_iter="grid", chk_iter_gen="grid",
-            chk_relief="dem", chk_relief_k="relief", chk_iter_heat="iter")
+            chk_relief="dem", chk_relief_k="relief", chk_iter_heat="iter",
+            chk_bld_count="bld", chk_bld_floors="bld")
         hints = dict(
             grid="Сначала «Построить карту».",
             dem="Нет данных о высотах — карта высот не загружена.",
             relief="Сначала «Добавить рельеф» — тогда видно, что он сделал с весом.",
-            iter="Сначала «Пуск», «Шаг» или «Пакетно» — маршрутов ещё нет.")
+            iter="Сначала «Пуск», «Шаг» или «Пакетно» — маршрутов ещё нет.",
+            bld="Построек нет: у участка нет файла мест — tools/pack_area.py --only sensors.")
         for attr, key in rules.items():
             chk = getattr(self, attr, None)
             if chk is None:
@@ -3307,6 +3399,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.pi.addItem(self.relief_img)
         self.relief_k_img = pg.ImageItem(); self.relief_k_img.setOpts(axisOrder="row-major")
         self.relief_k_img.setZValue(-8.5); self.relief_k_img.setOpacity(0.75)
+        # ПОСТРОЙКИ ПО ЯЧЕЙКАМ (Д2) — над весовой картой, под рельефом приоритета
+        self.bld_count_img = pg.ImageItem(); self.bld_count_img.setOpts(axisOrder="row-major")
+        self.bld_count_img.setZValue(-8.4); self.bld_count_img.setVisible(False)
+        self.bld_floors_img = pg.ImageItem(); self.bld_floors_img.setOpts(axisOrder="row-major")
+        self.bld_floors_img.setZValue(-8.3); self.bld_floors_img.setVisible(False)
+        self.pi.addItem(self.bld_count_img)
+        self.pi.addItem(self.bld_floors_img)
         self.relief_k_img.setVisible(False)
         self.pi.addItem(self.relief_k_img)
         # весовая карта (тепловой слой)
@@ -3377,6 +3476,10 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.type_zone_img = pg.ImageItem(); self.type_zone_img.setOpts(axisOrder="row-major")
         self.type_zone_img.setZValue(-5.5); self.type_zone_img.setVisible(False)
         self.pi.addItem(self.type_zone_img)
+        # СЛАГАЕМЫЕ КАРТЫ МЕСТА (Д3) — под самой картой: видно, почему ячейка разрешена или нет
+        self.type_parts_img = pg.ImageItem(); self.type_parts_img.setOpts(axisOrder="row-major")
+        self.type_parts_img.setZValue(-5.6); self.type_parts_img.setVisible(False)
+        self.pi.addItem(self.type_parts_img)
         self.type_zone_pts = pg.ScatterPlotItem(size=4, symbol="o", pen=None)   # места типа
         self.type_zone_pts.setZValue(4); self.pi.addItem(self.type_zone_pts)
         # линии-примеры маршрутов поверх фона-огибающей: бирюзовый, но ПОЛУПРОЗРАЧНЫЙ —
@@ -3419,10 +3522,13 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                                            pen=pg.mkPen(_qcolor(THEME["accent"]),
                                                         width=2.5, dash=[10, 5]))
         self.area_draw_item.setZValue(7)
-        # РАЙОНЫ ЗАЩИТЫ ЦЕЛЕЙ, заданные человеком (В13.21) — пунктир цвета креста цели
-        self.target_area_item = self.pi.plot([], [], antialias=True, connect="finite",
-                                             pen=pg.mkPen(_qcolor(THEME["warn"]), width=2.0, dash=[6, 4]))
+        # РАЙОНЫ ЗАЩИТЫ ЦЕЛЕЙ (В13.21; Д5 — тёмно-зелёный контур и штриховка, свой и по застройке)
+        self.target_area_item = self.pi.plot([], [], antialias=True, connect="pairs",
+                                             pen=pg.mkPen(_qcolor(THREAT_COLORS["target_area"]), width=2.2))
         self.target_area_item.setZValue(6.5)
+        self.target_hatch_item = self.pi.plot([], [], antialias=True, connect="pairs",   # штриховка района
+                                              pen=pg.mkPen(_qcolor(THREAT_COLORS["target_area"], 150), width=1.0))
+        self.target_hatch_item.setZValue(6.4)
         self.pi.addItem(self.zone_draw_pts)
         # ЛИНЕЙКА «Расстояние» (задача 8.9, довесок 06.09.2026) — поверх всего (Z = 8):
         # служебный инструмент, должен быть виден на фоне любых слоёв и зон.
@@ -3589,6 +3695,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
                     show_sector_stats=self.chk_sector_stats.isChecked(),
                     show_relief=self.chk_relief.isChecked(),
                     show_relief_k=self.chk_relief_k.isChecked(),
+                    show_bld_count=self.chk_bld_count.isChecked(),
+                    show_bld_floors=self.chk_bld_floors.isChecked(),
                     show_zones=self.chk_zones.isChecked(),
                     show_entries=self.chk_entries.isChecked(),
                     show_sector_lines=self.chk_sector_lines.isChecked(),
@@ -4386,6 +4494,37 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.relief_legend.setVisible(True)
         self.reposition_legends()       # прижать к правому верхнему углу текущего вида
 
+    def render_buildings(self, zc, extent, toggles):
+        """Постройки по ячейкам (план 13.1, Д2): число и средняя этажность — цветом ячейки, пустые прозрачны.
+        Вход: сводка `sensor_cells` или None, охват (x0, x1, y0, y1) км, галки. Шкала — до максимума участка."""
+        for key, field, img, lo, hi, chk in (
+                ("show_bld_count", "count", self.bld_count_img, "bld_lo", "bld_hi", self.chk_bld_count),
+                ("show_bld_floors", "mean_floors", self.bld_floors_img, "flr_lo", "flr_hi", self.chk_bld_floors)):
+            if not toggles.get(key) or zc is None or extent is None:   # галка снята или данных нет
+                img.setVisible(False)
+                continue
+            v = np.asarray(zc[field], float)         # число или этажность по ячейкам
+            has = np.isfinite(v) & (v > 0)           # ячейки с постройками
+            top = float(np.nanmax(v[has])) if has.any() else 1.0   # максимум участка — верх шкалы
+            # ⚠️ число — по логарифму: на `arh` медиана пара домов при максимуме 180, линейно всё бледное
+            if field == "count":                     # 1 → светлый, максимум → тёмный, логарифмом
+                t = np.log(np.maximum(v, 1.0)) / max(np.log(top), 1e-6)
+            else:                                    # этажность — линейно от 1 до максимума
+                t = (v - 1.0) / max(top - 1.0, 1e-6)
+            t = np.clip(t, 0.0, 1.0)                 # доля шкалы 0…1
+            c0 = np.array(_qcolor(THREAT_COLORS[lo]).getRgb()[:3], float)   # начало шкалы, RGB
+            c1 = np.array(_qcolor(THREAT_COLORS[hi]).getRgb()[:3], float)   # конец шкалы, RGB
+            rgba = np.zeros(v.shape + (4,), np.ubyte)   # картинка слоя, цвет и прозрачность
+            rgba[..., :3] = (c0 + (c1 - c0) * np.nan_to_num(t)[..., None]).astype(np.ubyte)
+            rgba[..., 3] = np.where(has, 210, 0).astype(np.ubyte)
+            img.setImage(rgba, autoLevels=False)
+            x0, x1, y0, y1 = extent
+            img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+            img.setVisible(True)
+            base = next(tip for _t, items in self.LAYER_GROUPS for a, _l, _on, tip in items   # родная подсказка
+                        if a == ("chk_bld_count" if field == "count" else "chk_bld_floors"))
+            chk.setToolTip(base + " Сейчас шкала 1…%g." % round(top, 1))
+
     def set_relief_button(self, active, enabled):
         """Состояние кнопки рельефа: подпись «Добавить/Убрать», подсветка и доступность
         (нет файла высот — нажимать нечего)."""
@@ -4414,9 +4553,22 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.water_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
         self.water_img.setVisible(True)
 
-    def show_type_zone(self, mask=None, extent=None, tid=None, pts=None):
-        """Показать карту места типа и его места (план 13, 13.3). Вход: маска (ny,nx), охват (x0,x1,y0,y1)
-        км, номер типа (цвет), места (M,2) км; маска None — спрятать. Отдаёт: ничего."""
+    def show_type_zone(self, mask=None, extent=None, tid=None, pts=None, parts=None):
+        """Показать карту места типа и его места (13.3), под ней — отмеченные в окне слагаемые (Д3). Вход: маска
+        (ny,nx), охват (x0,x1,y0,y1) км, номер типа (цвет), места (M,2) км, слагаемые dict или None; маска None — спрятать."""
+        dlg = getattr(self, "_types_dlg", None)    # окно типа — какие слои отмечены
+        shown = dlg.shown_parts() if (dlg is not None and parts) else []   # ключи слагаемых по порядку
+        if mask is None or not shown:              # слоёв не показывать
+            self.type_parts_img.setVisible(False)
+        else:                                      # слои — снизу вверх в порядке окна
+            prgba = np.zeros(np.asarray(mask).shape + (4,), np.ubyte)   # картинка слагаемых
+            for key in shown:
+                qp = QtGui.QColor(THREAT_COLORS["zp_" + key])   # цвет слоя
+                prgba[np.asarray(parts[key], bool)] = (qp.red(), qp.green(), qp.blue(), 120)
+            self.type_parts_img.setImage(prgba, autoLevels=False)
+            x0, x1, y0, y1 = extent
+            self.type_parts_img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+            self.type_parts_img.setVisible(True)
         if mask is None:                           # спрятать
             self.type_zone_img.setVisible(False)
             self.type_zone_pts.setData([], [])

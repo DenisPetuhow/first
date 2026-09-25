@@ -127,7 +127,7 @@ class SensorsWindow(QtWidgets.QDialog):
         grid.addWidget(QtWidgets.QLabel("Позиции датчиков:"), 0, 0)
         grid.addWidget(self.rb_calc, 0, 1)
         grid.addWidget(self.rb_manual, 0, 2)
-        self.rb_k_same = QtWidgets.QRadioButton("общая кратность")
+        self.rb_k_same = QtWidgets.QRadioButton("одна на все типы")   # слово «общая» занято (план 13.1 §Д9.4)
         self.rb_k_same.setToolTip("Одна k на всех: засечки считают все типы вместе, число из строки "
                                   "первого типа подставляется во все.")
         self.rb_k_own = QtWidgets.QRadioButton("у каждого своя")
@@ -136,7 +136,7 @@ class SensorsWindow(QtWidgets.QDialog):
         for rb in (self.rb_k_same, self.rb_k_own):
             self._grp_k.addButton(rb)
             rb.toggled.connect(self._k_mode_changed)
-        grid.addWidget(QtWidgets.QLabel("Кратность засечки:"), 1, 0)
+        grid.addWidget(QtWidgets.QLabel("Кратность по району:"), 1, 0)   # не путать с кратностью защиты цели
         grid.addWidget(self.rb_k_same, 1, 1)
         grid.addWidget(self.rb_k_own, 1, 2)
         self.chk_spread = QtWidgets.QCheckBox("распределённое размещение")

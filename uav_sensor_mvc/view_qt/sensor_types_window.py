@@ -28,20 +28,28 @@ FIELDS = (
     ("zone_buf_km", "Полоса у застройки, км", "float", True),
     ("strip_km", "Полоса в лесу у дорог и построек, км", "float", True),
     ("targets", "Ставить у объектов защиты", "bool", True),
-    ("tgt_share", "Доля от вместимости зоны цели", "float", True),
-    ("tgt_gamma", "Сила приоритета γ", "float", True),
     ("tgt_min", "Минимум у цели, шт.", "int", True),
+    ("tgt_gain_pct", "Порог прироста у цели, %", "float", True),
+    ("tgt_level_pct", "Уровень защиты цели, %", "float", True),
     ("tgt_cap_one", "Потолок при одной цели, доля N", "float", True),
     ("tgt_cap_all", "Потолок на все цели, доля N", "float", True),
-    ("tgt_k", "Кратность цели", "int", True),
+    ("tgt_gap_r", "Отступ от цели, доля R", "float", True),
+    ("tgt_k", "Кратность защиты цели", "int", True),
     ("bonus_height", "Бонус высоте крыши", "float", True),
     ("bonus_city", "Бонус крупному пункту", "float", True),
 )
+
+# поля с галкой «от k»: число считается от кратности защиты цели и меняется вместе с ней (заказчик 25.09.2026)
+AUTO = {"tgt_gain_pct": catalog.auto_gain_pct, "tgt_level_pct": catalog.auto_level_pct}
 
 
 class SensorTypesWindow(QtWidgets.QDialog):
     """Справочник типов датчиков. Вход: родитель, Params, цвет типа по номеру.
     Колбэки: `on_saved()` — справочник записан, `on_task(номер, R, k)` — числа моста 1–4, `on_show_zone(номер|None)`."""
+    # слагаемые карты места (Д3): ключ `sensor_zones.allowed_parts` и подпись; порядок — снизу вверх на карте
+    PARTS = (("forest", "лес"), ("wetland", "болота"), ("rough", "прочие неудобья"), ("nopass", "непроходимо (город)"),
+             ("settled", "застройка"), ("buildings", "постройки ± полоса"), ("strip", "полоса у дорог и построек"))
+
 
     def __init__(self, parent, params, color_of):
         super().__init__(parent)
@@ -55,6 +63,9 @@ class SensorTypesWindow(QtWidgets.QDialog):
         self._w = {}                                 # поле паспорта -> виджет формы
         self._color = ""                             # цвет в форме: ключ палитры или «#rrggbb»
         self._touched = set()                        # номера, чья форма открывалась — их числа в задание
+        self._auto = {}                              # поле -> галка «от k» (порог и уровень у цели)
+        self._editing = False                        # идёт правка паспорта (кнопка «Редактировать», Д1)
+        self._snap = None                            # справочник и открытые формы до правки — для «Отмена»
         self.on_saved = lambda: None
         self.on_task = lambda tid, r_km, k: None
         self.on_show_zone = lambda tid: None
@@ -84,26 +95,60 @@ class SensorTypesWindow(QtWidgets.QDialog):
             else:
                 w = QtWidgets.QLineEdit()
             self._w[field] = w
-            form.addRow(title + ":", w)
+            if field in AUTO:                        # порог и уровень у цели — поле и галка «от k»
+                cb = QtWidgets.QCheckBox("от k")     # галка: число считает программа
+                cb.setToolTip("Считать от кратности защиты цели: порог 1 · 3 · 4 · 5 %, уровень 99 · 92 · 89.3 · "
+                              "86.7 %. Снять — вписать своё число.")
+                cb.toggled.connect(lambda _on: self._refresh_auto())
+                self._auto[field] = cb
+                box = QtWidgets.QHBoxLayout()        # поле и галка в строку
+                box.addWidget(w, 1)
+                box.addWidget(cb)
+                form.addRow(title + ":", box)
+            else:
+                form.addRow(title + ":", w)
+            if field == "k":                         # под k — с каким числом считают на самом деле
+                self.lbl_k = QtWidgets.QLabel("")    # «общая / своя / паспорт»
+                self.lbl_k.setWordWrap(True)
+                self.lbl_k.setStyleSheet("color:#8a93a6;")
+                form.addRow("", self.lbl_k)
+        self._w["tgt_k"].textChanged.connect(lambda _t: self._refresh_auto())   # k правят — числа за ней
         self.chk_zone = QtWidgets.QCheckBox("показать разрешённую карту")
         self.chk_zone.setToolTip("Ячейки, где тип можно ставить, и его места — на карте.")
         self.chk_zone.toggled.connect(self._zone_toggled)
         form.addRow(self.chk_zone)
+        # СЛАГАЕМЫЕ КАРТЫ (Д3): из каких слоёв она сложена — каждый своим цветом, под итоговой картой
+        self._parts = {}                             # ключ слоя -> галка
+        grid = QtWidgets.QGridLayout()               # по две галки в строке
+        for n, (key, title) in enumerate(self.PARTS):
+            cb = QtWidgets.QCheckBox(title)          # галка слоя
+            cb.toggled.connect(lambda _on: self._zone_toggled(self.chk_zone.isChecked()))
+            self._parts[key] = cb
+            grid.addWidget(cb, n // 2, n % 2)
+        form.addRow(grid)
+        note = QtWidgets.QLabel("без контура — открытая местность (поле, луг, вырубка): в OSM её не рисуют")
+        note.setStyleSheet("color:#8a93a6;")
+        form.addRow(note)
         top.addLayout(form, 1)
         col.addLayout(top)
         self.lbl_state = QtWidgets.QLabel("")       # итог действий
         self.lbl_state.setWordWrap(True)
         col.addWidget(self.lbl_state)
         row = QtWidgets.QHBoxLayout()                # кнопки
+        self._btn = {}                               # подпись -> кнопка: доступность зависит от правки
         for title, slot, tip in (
-                ("Вернуть исходные", self._reset, "Встроенный справочник: МОГ, ПВН, большой."),
+                ("Редактировать", self._edit, "Открыть паспорт для правки; до этого поля только для чтения."),
+                ("Вернуть исходные", self._reset, "Встроенный справочник: МОГ, ПВН, большой, обычный."),
                 ("Сохранить", self._save, "Проверить числа и записать справочник участка."),
+                ("Отмена", self._cancel, "Вернуть паспорта, как были до «Редактировать»."),
                 ("Закрыть", self.hide, "Закрыть без записи несохранённых правок.")):
             b = QtWidgets.QPushButton(title)         # кнопка окна
             b.setToolTip(tip)
             b.clicked.connect(slot)
             row.addWidget(b)
+            self._btn[title] = b
         col.addLayout(row)
+        self._set_editable(False)
         self.setMinimumWidth(620)
 
     def _fill_list(self, keep=None):
@@ -122,6 +167,7 @@ class SensorTypesWindow(QtWidgets.QDialog):
         self._types = catalog.load()
         self._touched = set()                        # правок ещё не было
         self._fill_list(keep=int(tid) if tid is not None else None)
+        self._set_editable(False)                    # открыли — смотрим, правка по кнопке
 
     def _task_values(self, t):
         """Числа R и k для формы: у номеров 1–4 — задание (Params), у прочих — паспорт. Вход: паспорт."""
@@ -132,7 +178,8 @@ class SensorTypesWindow(QtWidgets.QDialog):
 
     def _select(self, row):
         """Выбрана строка списка: прежний паспорт — из формы в справочник, новый — в форму."""
-        if 0 <= self._cur < len(self._types):        # была открыта другая строка
+        # ⚠️ только в правке: просмотренный номер 1–4 иначе попал бы в `_touched` и переписал задание
+        if 0 <= self._cur < len(self._types) and self._editing:   # правили другую строку
             self._types[self._cur] = self._from_form(self._types[self._cur])
         self._cur = row
         if not 0 <= row < len(self._types):          # список пуст
@@ -156,6 +203,12 @@ class SensorTypesWindow(QtWidgets.QDialog):
             else:
                 w.setText(str(val) if kind == "text" else "%g" % float(val))
         self._w["KIND"].setEnabled(t.type_id not in TYPE_IDS)   # у моста класс задан номером
+        for field, cb in self._auto.items():         # 0 в паспорте — «от k»
+            cb.blockSignals(True)
+            cb.setChecked(float(getattr(t, field)) <= 0)
+            cb.blockSignals(False)
+        self._refresh_auto()
+        self.lbl_k.setText(self._k_note(t, k))
         self._zone_changed(t.zone)
         if self.chk_zone.isChecked():                # карта показана — показать для нового
             self.on_show_zone(t.type_id)
@@ -166,6 +219,68 @@ class SensorTypesWindow(QtWidgets.QDialog):
         for field, _title, _kind, pvn in FIELDS:
             if pvn:
                 self._w[field].setEnabled(on)
+        for cb in self._auto.values():               # галки «от k» — вместе со своими полями
+            cb.setEnabled(on)
+        self._set_editable(self._editing)            # поверх правила места — режим правки
+
+    def _k_note(self, t, k):
+        """С каким k считают и откуда оно (Д1). Вход: паспорт, k формы. Отдаёт: строку под полем k."""
+        if bool(getattr(self._params, "threat_k_same", True)):   # «одна на все типы» в окне «Датчики»
+            return ("считается с k = %d — одна на все типы (окно «Датчики»); число паспорта не действует"
+                    % int(getattr(self._params, "threat_k", k)))
+        if t.type_id in TYPE_IDS:                    # номер моста — поле задания
+            return "считается с k = %d — своя, поле задания (окно «Датчики»); правка здесь пишет туда" % int(k)
+        return "считается с k = %d — из этого паспорта" % int(t.k)
+
+    def _set_editable(self, on):
+        """Режим правки (Д1): без него паспорт только для чтения. Вход: bool. Поля ПВН — ещё и по правилу места."""
+        self._editing = bool(on)
+        rule = self._w["zone"].currentText() != "везде"   # у типа правило места — поля ПВН живые
+        mid = self._types[self._cur].type_id if 0 <= self._cur < len(self._types) else None   # номер в форме
+        for field, _title, kind, pvn in FIELDS:
+            w = self._w[field]                       # поле формы
+            live = (not pvn) or rule                 # поле открыто правилом места
+            if isinstance(w, QtWidgets.QLineEdit):   # текст — только для чтения, но выделяется и копируется
+                w.setReadOnly(not on or (field in self._auto and self._auto[field].isChecked()))
+                w.setEnabled(live)
+            elif field == "KIND":                    # у моста класс задан номером
+                w.setEnabled(on and mid not in TYPE_IDS)
+            else:                                    # галки, списки, кнопка цвета
+                w.setEnabled(on and live)
+        for cb in self._auto.values():
+            cb.setEnabled(on and rule)
+        self.lst.setEnabled(not on)                  # при правке тип не сменить — сперва «Сохранить» или «Отмена»
+        if getattr(self, "_btn", None):              # кнопки уже созданы
+            self._btn["Редактировать"].setEnabled(not on)
+            for title in ("Вернуть исходные", "Сохранить", "Отмена"):
+                self._btn[title].setEnabled(on)
+
+    def _edit(self):
+        """«Редактировать»: запомнить справочник и открытые формы для «Отмена», открыть поля."""
+        self._snap = (list(self._types), set(self._touched))
+        self._set_editable(True)
+        self.lbl_state.setText("Правка: «Сохранить» — записать, «Отмена» — вернуть как было.")
+
+    def _cancel(self):
+        """«Отмена»: паспорта и признак «форма открывалась» — как до «Редактировать» (иначе номер 1–4 ушёл бы в задание)."""
+        if self._snap is not None:                   # правка начиналась
+            self._types, self._touched = list(self._snap[0]), set(self._snap[1])
+        row = self._cur                              # строка в форме
+        self._cur = -1                               # форму в справочник НЕ переносить
+        self._set_editable(False)
+        self._select(row)
+        self.lbl_state.setText("Правка отменена.")
+
+    def _refresh_auto(self):
+        """Порог и уровень с галкой «от k» — пересчитать по кратности защиты в форме; без галки — править самому."""
+        try:
+            k = int(float(self._w["tgt_k"].text().replace(",", ".")))   # кратность защиты из формы
+        except ValueError:                           # поле правят — пока не число
+            return
+        for field, cb in self._auto.items():
+            self._w[field].setReadOnly(cb.isChecked() or not self._editing)
+            if cb.isChecked():                       # от кратности — число считает программа
+                self._w[field].setText("%g" % round(AUTO[field](k), 1))
 
     def _from_form(self, t):
         """Паспорт из формы. Вход: прежний паспорт (номер и умолчания). Отдаёт: новый паспорт."""
@@ -174,6 +289,9 @@ class SensorTypesWindow(QtWidgets.QDialog):
         for field, _title, kind, _pvn in FIELDS:
             w = self._w[field]                       # поле формы
             if field == "KIND":
+                continue
+            if field in self._auto and self._auto[field].isChecked():   # «от k» — в паспорт 0
+                vals[field] = 0.0
                 continue
             if kind == "bool":
                 vals[field] = w.isChecked()
@@ -203,6 +321,15 @@ class SensorTypesWindow(QtWidgets.QDialog):
         if col.isValid():                            # выбрали
             self._color = col.name()
             self._w["color"].setStyleSheet("background:%s; border:1px solid #888;" % self._color)
+
+    def shown_parts(self):
+        """Отмеченные слагаемые карты места (Д3). Отдаёт: список ключей в порядке показа."""
+        return [k for k, _t in self.PARTS if self._parts[k].isChecked()]
+
+    def set_part_colors(self, colors):
+        """Подписи галок слоёв — цветом слоя на карте (Д3). Вход: dict ключ -> «#rrggbb»."""
+        for key, cb in self._parts.items():
+            cb.setStyleSheet("QCheckBox { color: %s; }" % colors.get(key, "#cccccc"))
 
     def _zone_toggled(self, on):
         """Галка «показать разрешённую карту»: карте — номер типа в форме или None."""
@@ -235,4 +362,6 @@ class SensorTypesWindow(QtWidgets.QDialog):
             if t.type_id in TYPE_IDS and t.type_id in self._touched:   # номер моста, правился в форме
                 self.on_task(t.type_id, float(t.r_km), int(t.k))
         self.lbl_state.setText("Записано типов: %d · файл: %s" % (len(self._types), catalog.FILE_NAME))
+        self._set_editable(False)                    # записано — снова только чтение
+        self._snap = None
         self.on_saved()

@@ -25,6 +25,7 @@ MODEL · Справочник типов датчиков (план 13, зада
 """
 import io
 import json
+import math
 import os
 from dataclasses import dataclass
 
@@ -33,6 +34,8 @@ ZONES = ("везде", "застройка")     # правила места: «
 LEGACY_IDS = (1, 2, 3, 4)          # номера, чьи N, R, k живут в полях Params (мост)
 BIG_ID = 4                         # номер большого типа — за ним поля threat_N_big / threat_R_big
 FIRST_FREE_ID = 5                  # с него нумеруются новые типы
+PLAIN_ID = 5                       # «Обычный» (план 13.1, Д1) — первый номер справочника после моста
+VERSION = 2                        # версия встроенного справочника: 2 — появился «Обычный» (25.09.2026)
 
 
 @dataclass(frozen=True)
@@ -50,12 +53,13 @@ class SensorType:
     strip_km: float = 0.0          # полоса у дорог и построек, где лес и болота разрешены, км
     static: bool = False           # режим нового датчика по умолчанию: True — статический (В13.4)
     targets: bool = False          # ставится ли у объектов защиты до общего прохода (13.18)
-    tgt_share: float = 0.5         # доля от вместимости зоны цели: «сколько помещается — пополам»
-    tgt_gamma: float = 0.5         # сила приоритета γ в множителе 1 + γ·(p − p̄)/p̄
-    tgt_min: int = 3               # минимум у цели, шт. — если столько помещается
-    tgt_cap_one: float = 0.5       # потолок при одной цели, доля от N
-    tgt_cap_all: float = 0.7       # потолок на все цели вместе, доля от N
-    tgt_k: int = 1                 # кратность цели — критерий этапа целей
+    tgt_min: int = 3               # минимум у цели, шт. — если помещается; сильнее прироста и потолка (13.1 Д9)
+    tgt_gain_pct: float = 0.0      # порог прироста подлёта у цели, %; 0 — от кратности: 1 · 3 · 4 · 5 … (13.1 Д9)
+    tgt_level_pct: float = 0.0     # уровень защиты — доля подлёта ≥ k, %; 0 — от кратности: 100 · 90 · 80 …
+    tgt_cap_one: float = 0.5       # потолок при одной цели, доля N — бюджет этапа целей
+    tgt_cap_all: float = 0.7       # потолок на все цели вместе, доля N
+    tgt_gap_r: float = 0.5         # отступ от цели, доля радиуса: R/2 (В13.26)
+    tgt_k: int = 1                 # кратность защиты цели — критерий этапа целей
     bonus_height: float = 0.0      # бонус высоте крыши (13.7), доля от лучшего прироста первого шага
     bonus_city: float = 0.0        # бонус размеру пункта (13.7), та же доля
 
@@ -68,12 +72,13 @@ class SensorType:
         ("k", 1, 20, "кратность"),
         ("zone_buf_km", 0.0, 20.0, "полоса у застройки, км"),
         ("strip_km", 0.0, 20.0, "полоса в лесу, км"),
-        ("tgt_share", 0.0, 1.0, "доля от вместимости"),
-        ("tgt_gamma", 0.0, 5.0, "сила приоритета"),
         ("tgt_min", 0, 100, "минимум у цели"),
+        ("tgt_gain_pct", 0.0, 100.0, "порог прироста у цели, %"),
+        ("tgt_level_pct", 0.0, 100.0, "уровень защиты цели, %"),
         ("tgt_cap_one", 0.0, 1.0, "потолок одной цели"),
         ("tgt_cap_all", 0.0, 1.0, "потолок всех целей"),
-        ("tgt_k", 1, 20, "кратность цели"),
+        ("tgt_gap_r", 0.0, 10.0, "отступ от цели, доля R"),
+        ("tgt_k", 1, 20, "кратность защиты цели"),
         ("bonus_height", 0.0, 5.0, "бонус высоте"),
         ("bonus_city", 0.0, 5.0, "бонус крупному пункту"),
     )
@@ -122,11 +127,12 @@ _KEYS = (
     ("полоса_в_лесу_км", "strip_km", float),
     ("статический", "static", bool),
     ("у_объектов_защиты", "targets", bool),
-    ("доля_вместимости", "tgt_share", float),
-    ("сила_приоритета", "tgt_gamma", float),
     ("минимум_у_цели", "tgt_min", int),
+    ("порог_у_цели_проц", "tgt_gain_pct", float),
+    ("уровень_защиты_проц", "tgt_level_pct", float),
     ("потолок_одна_цель", "tgt_cap_one", float),
     ("потолок_все_цели", "tgt_cap_all", float),
+    ("отступ_от_цели_доля_R", "tgt_gap_r", float),
     ("кратность_цели", "tgt_k", int),
     ("бонус_высоте", "bonus_height", float),
     ("бонус_крупному_пункту", "bonus_city", float),
@@ -147,7 +153,30 @@ def defaults():
                   zone="застройка", zone_buf_km=0.5, strip_km=0.5, targets=True,
                   bonus_height=0.1, bonus_city=0.0),
             Big(type_id=BIG_ID, name="Большой", r_km=15.0, k=3, color="sensor_big",
-                static=True)]
+                static=True),
+            plain()]
+
+
+def plain(type_id=PLAIN_ID):
+    """«Обычный» — пока копия МОГ (R 1 км, k 3, везде): у МОГ будет своя механика (план 13.1, Д1).
+    Вход: номер. Отдаёт: Small. Число в задании — `threat_N_types`, по умолчанию 0: эталон не трогает."""
+    return Small(type_id=int(type_id), name="Обычный", r_km=1.0, k=3, color="sensor_plain")
+
+
+def auto_gain_pct(k):
+    """Порог прироста у цели от кратности защиты, %: 1 при k 1, 3 при k 2, дальше ×(1 + 1/k) — 4 · 5 · 6 …
+    Вход: k. Отдаёт: float. Правило заказчика 24–25.09.2026 (план 13.1 §Д9.4г)."""
+    k = max(1, int(k))                               # кратность защиты цели
+    return 1.0 if k == 1 else float(k + 1)           # 3 · ∏(1 + 1/j), j = 3…k = k + 1
+
+
+def auto_level_pct(k):
+    """Уровень защиты цели от k, %: 99 при k 1, 92 при k 2, дальше недобор 8 растёт ×(1 + 1/k) — 89.3 · 86.7 ·
+    84 …, не ниже гарантии жадного 1 − 1/e ≈ 63 %. Вход: k. Отдаёт: float."""
+    k = max(1, int(k))                               # кратность защиты цели
+    if k == 1:                                       # одна засечка — почти весь подлёт
+        return 99.0
+    return max(100.0 - 8.0 * (k + 1) / 3.0, 100.0 * (1.0 - math.exp(-1.0)))   # недобор 8 · ∏(1 + 1/j)
 
 
 def path():
@@ -219,10 +248,16 @@ def load():
         return list(hit[1])
     try:
         with io.open(fp, encoding="utf-8") as f:
-            rows = json.load(f).get("типы")
+            data = json.load(f)                      # весь файл: типы и версия
+        rows, ver = data.get("типы"), int(data.get("версия", 1))
     except Exception:                                # повреждён, нет прав —
-        rows = None                                  # начинаем со встроенных
+        rows, ver = None, VERSION                    # начинаем со встроенных
     out = _parse(rows) if isinstance(rows, list) else []
+    # ⚠️ ДОПИСАТЬ НОВОЕ ИЗ ВСТРОЕННОГО — ПО ВЕРСИИ ФАЙЛА, а не «номера нет»: удалённый человеком тип иначе
+    # возвращался бы при каждом чтении. Номер 5 занят своим типом — «Обычный» берёт свободный
+    if out and ver < 2 and not any(t.name == "Обычный" for t in out):   # справочник до «Обычного»
+        used = {t.type_id for t in out}              # занятые номера
+        out.append(plain(PLAIN_ID if PLAIN_ID not in used else next_id(out)))
     out = out or defaults()                          # пустой список равен отсутствию файла
     _cache[fp] = (mtime, list(out))
     return out
@@ -231,7 +266,7 @@ def load():
 def save(types):
     """Записать справочник. Вход: список типов. Отдаёт: True — записан, False — не вышло."""
     fp = path()                                      # файл справочника участка
-    data = {"типы": [to_row(t) for t in types]}      # то, что уйдёт в файл
+    data = {"версия": VERSION, "типы": [to_row(t) for t in types]}   # то, что уйдёт в файл
     try:
         os.makedirs(os.path.dirname(fp), exist_ok=True)
         with io.open(fp, "w", encoding="utf-8") as f:

@@ -1629,7 +1629,7 @@ def main():
     v.set_title = lambda t: (titles20.append(t), _set_title0(t))[-1]
     _wait_async()
     v.set_title = _set_title0
-    check(any("Целей: 2" in t for t in titles20), "цели применились сами: зона по всем целям",
+    check(any("Целей: 2" in t for t in titles20), "цели применились сами: карта по всем целям",
           " | ".join(t[:40] for t in titles20))
     tx, _ty = v.target_scatter.getData()
     check(tx is not None and len(tx) == 2 and len(v._target_labels) == 2,
@@ -1792,9 +1792,12 @@ def main():
         _n_t = len(_specs(p))                             # типов задания, шт.
         check(w.types.rowCount() == _n_t, "мини-таблица: строка на тип", "%d строк" % w.types.rowCount())
         check(isinstance(w.types.cellWidget(0, 2), _QtW.QPushButton), "в строке — образец цвета")
+        _old22 = {t.type_id for t in _cat.load()}         # номера до «Добавить тип»
+        _want22 = _cat.next_id(_cat.load())               # первый свободный (≥ 5; №5 — «Обычный», Д1)
         w._add_type()
-        _new = [t.type_id for t in _cat.load() if t.type_id >= _cat.FIRST_FREE_ID]   # новые номера
-        check(_new == [_cat.FIRST_FREE_ID], "«Добавить тип» заводит номер с 5", str(_new))
+        _new = [t.type_id for t in _cat.load() if t.type_id not in _old22]   # новые номера
+        check(_new == [_want22] and _want22 >= _cat.FIRST_FREE_ID, "«Добавить тип» заводит первый свободный номер ≥ 5",
+              str(_new))
         _tid = _new[0] if _new else _cat.FIRST_FREE_ID   # номер нового типа
         check(w.types.rowCount() == _n_t + 1 and _tid in w._edits_more, "новый тип — строкой таблицы")
         check(v._types_dlg is not None and v._types_dlg.isVisible(), "и сразу открыто окно его паспорта")
@@ -1834,10 +1837,39 @@ def main():
         td = v._types_dlg                                 # окно паспорта
         check(td._types[td._cur].type_id == 2 and td._w["zone"].currentText() == "застройка",
               "окно открыто на ПВН, место — застройка", td._w["zone"].currentText())
-        check(td._w["tgt_share"].isEnabled() and not td._w["KIND"].isEnabled(),
+        check(td._w["tgt_gain_pct"].isEnabled() and not td._w["KIND"].isEnabled(),
               "поля ПВН открыты, класс номера моста закрыт")
+        # Д1 (план 13.1): «Обычный» в справочнике; паспорт только для чтения до «Редактировать»; «Отмена» — как было
+        _ids22 = [t.type_id for t in td._types]           # номера в окне
+        _r0 = td._w["r_km"].text()                         # радиус ПВН до правки
+        _ro = td._w["r_km"].isReadOnly() and not td._btn["Сохранить"].isEnabled() and td.lst.isEnabled()   # только чтение до правки
+        td._edit()
+        _rw = not td._w["r_km"].isReadOnly() and td._btn["Сохранить"].isEnabled() and not td.lst.isEnabled()   # правка открыта, список заперт
+        td._w["r_km"].setText("0.9")
+        td._cancel()
+        check(5 in _ids22 and _ro and _rw and td._w["r_km"].text() == _r0 and not td._editing
+              and "одна на все типы" in td.lbl_k.text(),
+              "Д1: «Обычный» есть; правка по «Редактировать», «Отмена» вернула; под k — откуда число",
+              "номера %s · R %s · %s" % (_ids22, td._w["r_km"].text(), td.lbl_k.text()[:40]))
+        # ГАЛКА «ОТ k» (заказчик 25.09.2026): порог и уровень у цели идут за кратностью защиты; без галки — своё
+        td._auto["tgt_gain_pct"].setChecked(True)
+        td._auto["tgt_level_pct"].setChecked(True)
+        td._w["tgt_k"].setText("3")
+        _g3, _l3 = td._w["tgt_gain_pct"].text(), td._w["tgt_level_pct"].text()   # от k 3
+        td._w["tgt_k"].setText("2")
+        _g2, _l2 = td._w["tgt_gain_pct"].text(), td._w["tgt_level_pct"].text()   # от k 2
+        _st_auto = td._from_form(td._types[td._cur])                          # паспорт с галками
+        td._auto["tgt_level_pct"].setChecked(False)
+        td._w["tgt_level_pct"].setText("75")
+        _st_own = td._from_form(td._types[td._cur])                           # своё значение уровня
+        check((_g3, _l3, _g2, _l2) == ("4", "89.3", "3", "92") and _st_auto.tgt_level_pct == 0
+              and _st_own.tgt_level_pct == 75 and td._w["tgt_gain_pct"].isReadOnly(),
+              "порог и уровень «от k» пересчитываются с кратностью, своё — без галки",
+              "k3: %s / %s · k2: %s / %s" % (_g3, _l3, _g2, _l2))
+        td._auto["tgt_level_pct"].setChecked(True)
+        td._w["tgt_k"].setText("1")                       # вернуть кратность защиты по умолчанию
         td._select(0)
-        check(not td._w["tgt_share"].isEnabled(), "у типа «везде» поля ПВН закрыты")
+        check(not td._w["tgt_gain_pct"].isEnabled(), "у типа «везде» поля ПВН закрыты")
         # ⚠️ МОСТ: правка R типа 1 — в Params; открытый, но не тронутый ПВН своего k2 не теряет
         p.threat_k_same, p.threat_k2 = True, 4
         td._w["r_km"].setText("1.7")
@@ -1857,6 +1889,17 @@ def main():
         _npts = len(v.type_zone_pts.getData()[0] if v.type_zone_pts.getData()[0] is not None else [])   # мест, шт.
         check(v.type_zone_img.isVisible() and _npts > 0, "карта места ПВН и его места на карте",
               "мест %d" % _npts)
+        # Д3: слагаемые карты — по галкам окна типа, своим цветом под картой
+        _p_before = v.type_parts_img.isVisible()          # слоёв не отмечено — картинки нет
+        td._parts["wetland"].setChecked(True)
+        td._parts["forest"].setChecked(True)
+        c.on_type_zone(2)
+        _pimg = v.type_parts_img.image                    # картинка слагаемых, RGBA
+        check(not _p_before and v.type_parts_img.isVisible() and _pimg is not None and (_pimg[..., 3] > 0).any()
+              and td.shown_parts() == ["forest", "wetland"],
+              "Д3: слои карты места — по галкам окна типа", str(td.shown_parts()))
+        td._parts["wetland"].setChecked(False)
+        td._parts["forest"].setChecked(False)
         c.on_type_zone(1)
         check(not v.type_zone_img.isVisible(), "у типа «везде» карты места нет")
         c.on_type_zone(None)
@@ -1901,7 +1944,32 @@ def main():
               and v._area_shape == _shape0, "район принят, переключатель района расчёта цел",
               str(m.targets.items[0].area[0]))
         _xs23 = v.target_area_item.getData()[0]           # контур района на карте, км
-        check(_xs23 is not None and len(_xs23) >= 5, "контур района защиты на карте")
+        _hs23 = v.target_hatch_item.getData()[0]          # штриховка района, км
+        check(_xs23 is not None and len(_xs23) >= 5 and _hs23 is not None and len(_hs23) >= 2,
+              "контур района защиты и штриховка на карте (Д5)", "штрихов %d" % (len(_hs23) // 2 if _hs23 is not None else 0))
+        # Д5: цель в застройке — показан контур зоны по застройке; галка «Район» снята — ничего
+        import time as _time23                            # замер: зона цели для показа
+        _by, _bx = np.nonzero(m.sensor_cells()["count"] >= 5)   # ячейки с постройками
+        _bpts = [(_g23.ox + (bx + 0.5) * _g23.h, _g23.oy + (by + 0.5) * _g23.h) for by, bx in zip(_by, _bx)]   # км
+        _bpt = next((q for q in _bpts if m.in_area(*q)), m.target_only_km())   # застройка внутри района
+        m.add_target(*_bpt)                               # вторая цель — в застройке
+        _t23 = _time23.time()                            # начало замера, с
+        _zv23 = m.target_zone_views()                     # районы для показа
+        _dt23 = _time23.time() - _t23                     # первый расчёт, с
+        v.render_target_areas(_zv23)
+        _d23 = v.target_area_item.getData()[0]            # контур с зоной по застройке, км
+        _n_auto = 0 if _d23 is None else len(_d23)        # его точек
+        m.set_target_show_area(1, False)
+        m.set_target_show_area(0, False)
+        v.render_target_areas(m.target_zone_views())
+        _d23 = v.target_area_item.getData()[0]            # контур без галок, км
+        _n_off = 0 if _d23 is None else len(_d23)         # его точек
+        check(any("mask" in z for z in _zv23) and _n_auto > len(_xs23) and _n_off == 0,
+              "Д5: зона по застройке — контуром; галка «Район» снята — района нет",
+              "зон %d, точек %d → %d, первый расчёт %.1f с" % (len(_zv23), _n_auto, _n_off, _dt23))
+        m.set_target_show_area(0, True)
+        m.targets.items = m.targets.items[:1]             # дальше — одна цель в лесу, как было
+        v.render_target_areas(m.target_zone_views())
         v._open_targets_window()
         _td = v._targets_dlg                              # окно «Объекты защиты»
         check(_td.table.item(0, _zcol).text() == "задана вручную", "в таблице целей — «задана вручную»")
@@ -1919,6 +1987,48 @@ def main():
         m.targets.items, p.threat_N2, v.ask_target_area = _keep23
         v._area_target = None
 
+    print("\n24. «ПРИМЕНИТЬ» ПРИНИМАЕТ, «РАССТАВИТЬ ДАТЧИКИ» СЧИТАЕТ ЗОНУ И ВЫБОРКУ (25.09.2026)")
+    # ЧТО ЛОВИТ: «Применить» сам пересчитывал маршруты и переставлял датчики (замечание заказчика 25.09.2026)
+    _keep24 = list(m.targets.items)                       # цели до раздела — вернуть
+    try:
+        c.on_place()
+        _wait_async()
+        _kinds24 = []                                     # фоновые задачи, запущенные «Применить»
+        _ra24 = c._run_async                              # настоящий запуск — вернуть
+        c._run_async = lambda kind, fn: (_kinds24.append(kind), _ra24(kind, fn))[-1]
+        _n24 = len(m.sensors)                             # датчиков стоит, шт.
+        c.on_apply()                                      # датчики стоят — прежде кнопка их переставляла
+        _wait_async()
+        _B24 = m.target_only_km()                         # цель, км
+        c.on_set_target(_B24[0] + 2.0, _B24[1] + 1.0)     # обстановка сменилась
+        c.on_apply()                                      # прежде — маршруты и расстановка
+        _wait_async()
+        c._run_async = _ra24
+        check(_n24 > 0 and not _kinds24 and c._pending_recalc and "Расставить датчики" in _title(),
+              "«Применить» ничего не пересчитывает, пересчёт ждёт «Расставить датчики»",
+              "датчиков было %d · задачи %s · ждёт %s" % (_n24, _kinds24, c._pending_recalc))
+        c.on_place()
+        _wait_async()
+        check(not c._pending_recalc and m.route_area is not None and len(m.sensors) > 0,
+              "«Расставить датчики» — зона пролёта заново и расстановка", "датчиков %d" % len(m.sensors))
+    finally:                                              # цель раздела не должна пережить его
+        m.targets.items = _keep24
+
+    print("\n25. «ПОКАЗ»: ПОСТРОЙКИ ПО ЯЧЕЙКАМ — ЧИСЛО И СРЕДНЯЯ ЭТАЖНОСТЬ (план 13.1, Д2)")
+    v.chk_bld_count.setChecked(True)
+    v.chk_bld_floors.setChecked(True)
+    c._render_all()
+    _zc25 = m.sensor_cells()                              # постройки по ячейкам
+    _img25 = v.bld_count_img.image                        # картинка числа, RGBA
+    _n25 = int((_img25[..., 3] > 0).sum()) if _img25 is not None else 0   # закрашено ячеек
+    check(v.chk_bld_count.isEnabled() and v.bld_count_img.isVisible() and v.bld_floors_img.isVisible()
+          and _n25 == int((_zc25["count"] > 0).sum()) and _n25 > 0,
+          "постройки: число и этажность — картинками, закрашены ячейки с постройками", "ячеек %d" % _n25)
+    v.chk_bld_count.setChecked(False)
+    v.chk_bld_floors.setChecked(False)
+    c._render_all()
+    check(not v.bld_count_img.isVisible() and not v.bld_floors_img.isVisible(), "галки сняты — картинок нет")
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
@@ -1928,7 +2038,7 @@ def main():
          "полнота слоёв, район радиусом, окно сектора, точки старта, справочник "
          "типов БПЛА, условия моделирования, таблица точек входа, широкая карта, "
          "объекты защиты, анализ по целям, анализ размещения по режимам, окна «Датчики» и "
-         "«Тип датчика», район защиты цели в лесу — в норме.")
+         "«Тип датчика», район защиты цели в лесу, «Применить» без расстановки — в норме.")
     return 0
 
 

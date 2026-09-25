@@ -80,7 +80,7 @@ class ThreatController:
         # Снимок состояния ПЕРЕД моделированием — к нему возвращает кнопка «Очистить».
         # None — моделирование ещё не запускали, возвращаться некуда.
         self._pre_iter = None
-        # цель/сектор заданы кликом, но маршруты ещё не пересчитаны: ждём «Применить»
+        # обстановка менялась (цель, сектор, запас хода), выборка устарела: ждём «Расставить датчики»
         self._pending_recalc = False
         view.set_callbacks(
             on_build=self.on_build, on_relief=self.on_relief,
@@ -95,6 +95,7 @@ class ThreatController:
             on_targets_done=self.on_targets_done, on_target_weight=self.on_target_weight,
             on_target_move=self.on_target_move, on_targets_clear=self.on_targets_clear,
             on_target_sectors=self.on_target_sectors,
+            on_target_show_area=self.on_target_show_area,
             on_analysis_choices=self._analysis_choices,   # цели в окне «Анализ» (23.09.2026)
             on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
             on_iter_spread=self.on_iter_spread, on_iter_spend=self.on_iter_spend,
@@ -667,7 +668,8 @@ class ThreatController:
             return
         pts = self.model.type_candidates(spec, mask)   # места типа, км
         g = self.model.grid                          # сетка карты: охват и шаг ячейки, км
-        self.view.show_type_zone(mask, g.extent_km(), int(tid), pts)
+        parts = self.model.allowed_parts(spec)       # слагаемые карты (Д3) — какие показать, решает окно
+        self.view.show_type_zone(mask, g.extent_km(), int(tid), pts, parts=parts)
         self.view.set_title("Тип №%d «%s»: разрешено %.0f км², мест %d"
                             % (int(tid), spec.name, float(mask.sum()) * g.h * g.h, len(pts)))
 
@@ -695,22 +697,14 @@ class ThreatController:
         # только надпись, а область, линии и датчики оставались от прежних значений —
         # подхватывалось лишь после «Сбросить» или «Расставить».
         if self.model.grid is not None:
-            if self.view.get_toggles().get("show_iter") and self.model.iter_routes:
-                self._run_async("iter", self.model.iterate_routes)
-            else:
-                # ⚠️ ВЫБОРКА СИНИХ ЛИНИЙ ЗДЕСЬ БОЛЬШЕ НЕ СТРОИТСЯ (решение заказчика
-                # 21.09.2026). Она самая дорогая часть — замер на `arh`: 148 с на 250 линий,
-                # потому что половина попыток не укладывается в запас хода. «Применить»
-                # нажимают часто и подряд, и каждый раз ждать минуты незачем: зону пролёта
-                # пересчитываем сразу (она дешёвая), а линии — по кнопке или по галочке.
-                self.model.routes = []
-                self._pending_recalc = True          # ждём кнопку, как после клика по цели
-                self._run_async("envelope", self.model._refresh_envelope)
-        else:
-            self._render_all()
+            # ⚠️ ЗОНА ПРОЛЁТА, ВЫБОРКА И РАССТАНОВКА — ПО «РАССТАВИТЬ ДАТЧИКИ» (заказчик 25.09.2026). Прежде
+            # зона считалась здесь сразу, итерации — тоже; синие линии не строятся с 21.09.2026 (148 с на 250)
+            self.model.routes = []                   # линии — по прежним параметрам
+            self.model.route_area = None             # прежнюю зону не показывать: она уже неверна
+            self._pending_recalc = True              # «Расставить датчики» посчитает заново
+        self._render_all()
         self.view.set_title(
-            "Входные данные применены: зона пролёта пересчитана. Синие линии выборки — "
-            "по кнопке «Рассчитать позиции» или галочкой «Маршруты»."
+            "Входные данные применены. Зона пролёта, маршруты и датчики — по «Расставить датчики»."
             + (" Разрыв изменён." if gap_changed else ""))
 
     def _render_sensors(self, empty=False):
@@ -1037,13 +1031,14 @@ class ThreatController:
             self.view.refresh_sector_window()             # сектор отсчитывается от первой цели
             n = len(self.model.targets)                   # поставлено целей, шт.
             self.view.set_title(
-                ("Целей: %d — зона пролёта пересчитана по всем. " % n if n
+                ("Целей: %d — карта пересобрана. " % n if n
                  else "Цели убраны — расчёт к цели по умолчанию. ")
-                + "«Применить» — синие линии; цель каждого маршрута разыгрывается.")
+                + "Зона пролёта, маршруты и датчики — по «Расставить датчики».")
             self._ask_target_areas()                      # цель в лесу — «укажите район защиты»
         elif kind == "place":
             self._render_all()
             self.view.refresh_sensor_table(self._sensor_rows())   # таблица окна
+            self.view.refresh_route_viewer()             # выборку могли пересчитать заново
             me = self.model.metrics()
             # В ручном режиме кнопка ничего не переставляла — она посчитала показатели
             # заданной расстановки. Об этом и пишем, иначе слово «расставлено» вводило бы
@@ -1103,12 +1098,16 @@ class ThreatController:
         self.model.build()
         self.model.candidates = self.model.candidate_positions()
 
-    def _work_place(self):
+    def _work_place(self, fresh=False, iters=False):
+        """Расстановка в фоне. Вход: обстановка менялась — зону пролёта и выборку заново; заново — итерациями."""
         # ВЫБОРКА СЧИТАЕТСЯ ЗДЕСЬ, ЕСЛИ ЕЁ ЕЩЁ НЕТ. Датчики ставятся по маршрутам
         # (`_sample_for_sensors`): до итераций — по «всем возможным», после — по
         # накопленным пролётам. Раз маршруты больше не считаются при построении карты
         # (04.09.2026), первым их спрашивает тот, кому они нужны.
-        if not self.model.iter_routes and not self.model.routes:
+        # ⚠️ ЗОНА ПРОЛЁТА — внутри `plan_routes` / `iter_reset`: с 25.09.2026 её строит эта кнопка, не «Применить»
+        if fresh and iters:                              # обстановка менялась, идут итерации — их заново
+            self.model.iterate_routes()
+        elif fresh or (not self.model.iter_routes and not self.model.routes):   # линий нет или устарели
             self.model.plan_routes()
         self.model.place_sensors()
 
@@ -1215,14 +1214,14 @@ class ThreatController:
 
     def on_targets_done(self):
         """Цели поставлены или поправлены — «применяется само» (заказчик): карта со свободными
-        зонами целей и зона пролёта считаются в фоне; синие линии — по «Применить»."""
+        зонами целей — в фоне; зона пролёта, маршруты и датчики — по «Расставить датчики» (25.09.2026)."""
         self._pending_recalc = True
         if self.model.grid is None:                       # карты нет — только сброс
             self.model.apply_targets()
             self._render_after_input("Целей: %d. " % len(self.model.targets))
             self.view.refresh_targets_window()
             return
-        self._run_async("targets", self.model.apply_targets)
+        self._run_async("targets", lambda: self.model.apply_targets(envelope=False))
 
     def on_target_weight(self, i, w):
         """Приоритет из таблицы. Отдаёт: '' — принят, иначе причина (сумма больше 1).
@@ -1263,7 +1262,7 @@ class ThreatController:
             self.view.refresh_targets_window("⚠️ Цель №%d: %s." % (int(i) + 1, why))
             self._ask_target_areas(i)                     # спросить снова — есть «Позже»
             return
-        self.view.render_target_areas(self.model.target_areas())
+        self.view.render_target_areas(self.model.target_zone_views())
         note = "Цель №%d: район защиты задан — мест для ПВН %d." % (int(i) + 1, n)   # итог
         self.view.set_title(note + " Датчики — по «Расставить датчики».")
         self.view.refresh_targets_window(note)
@@ -1272,7 +1271,7 @@ class ThreatController:
     def on_target_area_clear(self, i):
         """«Снять район» в окне целей: зона цели — снова по массиву застройки. Вход: номер с нуля."""
         self.model.clear_target_area(i)
-        self.view.render_target_areas(self.model.target_areas())
+        self.view.render_target_areas(self.model.target_zone_views())
         self.view.refresh_targets_window()
 
     # ---- условия моделирования: тип БПЛА и точка старта (план 12, задача 12.2) ----
@@ -1457,13 +1456,13 @@ class ThreatController:
         return True
 
     def _entry_changed(self, msg):
-        """После правки точек старта: пересчёт маршрутов — по «Применить», как после сектора."""
+        """После правки точек старта: пересчёт — по «Расставить датчики», как после сектора."""
         self._pending_recalc = True
         self._render_after_input(msg)
         self.view.refresh_sector_window()
 
     def _render_after_input(self, msg):
-        """Показать заданное (цель, сектор, точки входа) и напомнить про «Применить».
+        """Показать заданное (цель, сектор, точки входа) и напомнить про «Расставить датчики».
 
         Сам расчёт здесь НЕ запускается: модель уже сбросила маршруты и датчики — они
         построены по прежней обстановке, показывать их дальше было бы враньём."""
@@ -1473,7 +1472,7 @@ class ThreatController:
         if self.model.grid is None:
             self.view.set_title(msg + "Нажмите «Построить карту».")
         else:
-            self.view.set_title(msg + "Нажмите «Применить» — пересчёт маршрутов.")
+            self.view.set_title(msg + "«Расставить датчики» — зона пролёта, маршруты и датчики заново.")
 
     # ---- сброс: убрать датчики и заданную цель (карта остаётся) ----
     def on_reset(self):
@@ -1516,8 +1515,16 @@ class ThreatController:
             self._full_metrics()
 
     def on_place(self):
+        """«Расставить датчики»: обстановка менялась — сперва зона пролёта и выборка, потом расстановка."""
+        if self._busy:                                   # фоновый расчёт идёт — флаг не терять
+            self.view.flash_title("Идёт расчёт — подождите…")
+            return
+        fresh = bool(self._pending_recalc and self.model.grid is not None)   # выборка устарела
+        iters = fresh and bool(self.view.get_toggles().get("show_iter"))    # обновлять итерациями
+        if fresh:                                        # пересчёт берёт эта кнопка
+            self._pending_recalc = False
         # place_sensors сам построит карту, если её ещё нет (в фоновом потоке)
-        self._run_async("place", self._work_place)
+        self._run_async("place", lambda: self._work_place(fresh, iters))
 
     # ---- параметры / режим ----
     def on_apply(self):
@@ -1537,24 +1544,16 @@ class ThreatController:
         before = float(self.model.p.threat_cand_step_km)
         if abs(self.model.sync_cand_step() - before) > 1e-9:
             self.view.set_param_values(self.model.p)     # показать пересчитанный шаг
-        # ОТЛОЖЕННЫЙ ПЕРЕСЧЁТ: цель и/или сектор задавали кликом, и маршруты ждут именно
-        # этой кнопки. Считается ОДИН раз по итоговой обстановке, даже если правок было
-        # несколько подряд. Датчики после этого расставит `_on_task_done`.
-        if self._pending_recalc and self.model.grid is not None:
-            self._pending_recalc = False
-            if self.view.get_toggles().get("show_iter"):
-                self._run_async("iter", self.model.iterate_routes)
-            else:
-                self._run_async("routes", self.model.plan_routes)
-            return
-        if self.model.grid is None:
+        # ⚠️ «ПРИМЕНИТЬ» ТОЛЬКО ПРИНИМАЕТ ИЗМЕНЕНИЯ (заказчик 25.09.2026): зону пролёта, выборку и расстановку
+        # считает «Расставить датчики». Прежде кнопка пересчитывала маршруты и сама переставляла датчики
+        if self.model.grid is None:                      # карты нет — построить её (датчики не ставит)
             self.on_build()
-        elif len(self.model.sensors):
-            self.on_place()
-        else:                                   # карта есть, датчиков нет — лишь пересетка
-            self.model.candidates = self.model.candidate_positions()
-            self._render_all()
-            self._full_metrics()
+            return
+        self.model.candidates = self.model.candidate_positions()   # сетка кандидатов — под новый шаг
+        self._render_all()
+        self._full_metrics()
+        self.view.set_title("Изменения применены. " + ("Обстановка менялась — " if self._pending_recalc else "")
+                            + "зона пролёта, маршруты и датчики — по «Расставить датчики».")
 
     def on_mode(self, key):
         self.model.p.mode = key
@@ -1596,14 +1595,16 @@ class ThreatController:
         t = self.view.get_toggles()
         g = self.model.grid
         # какие слои вообще есть — чтобы галка не стояла над пустотой (см. set_layer_enabled)
+        zc = self.model.sensor_cells() if g is not None else None   # постройки по ячейкам (Д2)
         self.view.set_layer_enabled(
             grid=g is not None,
             dem=g is not None and g.relief_height() is not None,
             relief=g is not None and g.relief_k() is not None,
-            iter=bool(self.model.iter_routes))
+            iter=bool(self.model.iter_routes),
+            bld=zc is not None and bool(np.asarray(zc["count"]).any()))
         entry, target = self.model.entry_target_km()
         self.view.render_entry_target(entry, self.model.target_points_km())   # все цели (план 13)
-        self.view.render_target_areas(self.model.target_areas())   # районы защиты человека (В13.21)
+        self.view.render_target_areas(self.model.target_zone_views())   # районы защиты человека (В13.21)
         self.view.render_uav_start(self.model.uav_start_km)   # старт БПЛА (12.2), может быть None
         self.view.refresh_conditions_button()                 # сектор или цель могли смениться
         # сектор появления рисуется здесь же: иначе он пропадал бы при любой перерисовке
@@ -1623,6 +1624,7 @@ class ThreatController:
             self.view.render_threat(None, None, t)
             self.view.render_relief(None, None, t)
             self.view.render_relief_priority(None, None, None, t)
+            self.view.render_buildings(None, None, t)
             self.view.render_exclusions(None, None, None, t)
             self.view.render_layers({}, [], t, built_mask=None, extent=None)
             self.view.render_candidates(None, t)
@@ -1659,6 +1661,7 @@ class ThreatController:
         else:
             self.view.render_relief(None, None, t)
         self.view.render_relief_priority(g.relief_k(), g.relief_cut(), extent, t)
+        self.view.render_buildings(zc, extent, t)             # постройки по ячейкам (Д2)
         self.view.render_threat(g.weight, extent, t, outside=g.outside_mask())   # за кругом — прозрачно
         self.view.render_exclusions(g.water_mask(), g.urban_mask(), extent, t)
         self.view.render_layers(self.model.layers,
@@ -1696,6 +1699,12 @@ class ThreatController:
         self.view.render_sector_compass(
             [(m.sector_stats(i), t) for i, t in enumerate(m.targets.points_km())
              if m.targets.items[i].sectors])
+
+    def on_target_show_area(self, i, on):
+        """Галочка «Район» у цели в таблице окна (Д5): перерисовать районы защиты. Отдаёт: ''."""
+        self.model.set_target_show_area(i, on)
+        self.view.render_target_areas(self.model.target_zone_views())
+        return ""
 
     def on_target_sectors(self, i, on):
         """Галочка «Сектора» у цели в таблице окна: перерисовать компасы. Отдаёт: ''."""
@@ -1859,15 +1868,30 @@ class ThreatController:
         # ОЦЕНКА ЗАЗОРА (план 13, 13.8): доля от лучшего на ТЕХ ЖЕ местах — после запрета места
         # это «лучшее в застройке», а не «лучшее вообще»; подпись обязана это говорить
         for t, ratio in sorted((me.get("gap") or {}).items()):
-            out.append(f"  тип {t} · не хуже {100 * ratio:.0f} % от лучшего на тех же местах")
-        # ЭТАП ЦЕЛЕЙ (план 13, 13.18): у каждой цели — поставлено из вместимости её зоны; зоны нет —
-        # цель в лесу, район защиты задаёт человек (В13.21)
+            from model.sensors import sensor_types
+            spec = next((s for s in sensor_types(self.model.p) if s.type_id == t), None)   # тип задания
+            limited = spec is not None and self.model.allowed_mask(spec) is not None   # у типа карта места
+            out.append(f"  тип {t} · не хуже {100 * ratio:.0f} % от лучшего на "
+                       + ("разрешённых местах; от лучшего вообще — в «Анализе»" if limited else "тех же местах"))
+        # ЭТАП ЦЕЛЕЙ (план 13, 13.18; число по насыщению — 13.1 Д9): у каждой цели — поставлено, доля
+        # подлёта с кратностью защиты и почему столько; зоны нет — цель в лесу, район задаёт человек (В13.21)
         for t, rep in sorted((me.get("targets_stage") or {}).items()):
-            parts = " · ".join(f"№{i + 1}: {r['placed']} из {r['capacity']}"   # по целям
-                               + ("" if r["zone"] else " — зоны нет, укажите район защиты")
-                               + (" (район вручную)" if r.get("manual") else "")
-                               for i, r in enumerate(rep))
-            out.append(f"  тип {t} · у целей: {parts}")
+            n_type = (by.get(t) or {}).get("n", 0)   # поставлено этого типа всего
+            put = sum(r["placed"] for r in rep)      # из них у целей
+            r0 = rep[0] if rep else {}                # общие числа этапа — одинаковы у всех целей
+            out.append(f"  тип {t} · у целей {put} из {n_type} (потолок целей {r0.get('budget', '—')}; "
+                       f"порог прироста {r0.get('gain_pct', 0):g} %, уровень защиты {r0.get('level_pct', 0):.0f} %)")
+            for i, r in enumerate(rep):
+                out.append(f"    цель №{i + 1}: " + (
+                    f"{r['placed']} шт., подлёт с кратностью защиты {r.get('k', 1)} — "
+                    f"{100 * r.get('share', 0.0):.1f} %, стоп: {r.get('why') or '—'} "
+                    f"(вместимость {r['capacity']})" if r["zone"] else "зоны нет, укажите район защиты")
+                    + (" (район вручную)" if r.get("manual") else ""))
+        # РУБЕЖ ОБНАРУЖЕНИЯ (13.1 Д9): где маршрут к цели засечён впервые — всеми малыми; 0 — не засечён
+        lines = me.get("targets_line") or []         # по целям: медиана и худшие 10 %, км
+        if lines:                                    # датчики стоят, выборка есть
+            out.append("  рубеж первой засечки, км от цели (медиана · худшие 10 %): " + " · ".join(
+                f"№{i + 1}: {r['med']:.1f} · {r['p10']:.1f}" for i, r in enumerate(lines)))
         # ⚠️ ДВЕ РАЗНЫЕ СТРОКИ. «Задано человеком» — сколько позиций он назвал сам;
         # «из них статических» — сколько из них не сдвинется и при итерациях. До
         # итераций стоят все заданные, при итерациях динамические уезжают, и разница
@@ -1968,8 +1992,14 @@ class ThreatController:
                        bt.get("detect_k_frac", 0) * 100, bt["mean_hits"], cov,
                        (" · простаивает: %d" % bt["idle"]) if bt.get("idle") else ""))
             lines.append("</ul>")
+        if target is not None:                         # одна цель — её защита (план 13.1, Д10)
+            lines.append(self._protection_html(int(target)))
+        elif not multi and len(m.target_points_km()) == 1:   # цель одна — защита в общем разборе
+            lines.append(self._protection_html(0))
         if target is None and multi:                   # сводка по целям — только в обобщённом
             lines.append(self._analysis_by_target_html())
+        if target is None:                             # зазор до оптимума — про расстановку целиком (Д4)
+            lines.append(self._gap_html(me))
         cardinal = {0: " (север)", 90: " (восток)", 180: " (юг)", 270: " (запад)"}
         lines.append("<h3>ПО НАПРАВЛЕНИЯМ (компас от %s, шаг 30°, по заходу маршрута, "
                      "не по старту)</h3><ul>"
@@ -2004,6 +2034,71 @@ class ThreatController:
                        "%s — %d (%.0f%%), средняя кратность %.1f</li>"
                        % (i + 1, n, round(d["det1"] * n), d["det1"] * 100, k_lab,
                           round(d["detk"] * n), d["detk"] * 100, d["mean_hits"]))
+            pr = m.target_protection(i)                # защита объекта (Д10) или None
+            if pr and pr.get("zone") and pr.get("n"):  # у цели есть этап ПВН и подлёт
+                out.append("<li style=\"list-style:none\">&nbsp;&nbsp;защита: ПВН %d, подлёт &ge;%d — %.0f%% "
+                           "(уровень %.0f%%)%s</li>" % ((pr.get("stage") or {}).get("placed", 0), pr["k"],
+                                                         100 * pr["share"], pr["level"], self._need_text(pr, short=True)))
+        out.append("</ul>")
+        return "".join(out)
+
+    def _gap_html(self, me):
+        """Раздел «ЗАЗОР ДО ОПТИМУМА» окна «Анализ» (план 13.1, Д4): на разрешённых местах и от лучшего вообще.
+        Вход: показатели расстановки. Отдаёт: HTML; оценок нет — пусто."""
+        gap = me.get("gap") or {}                      # на разрешённых (тех же) местах
+        if not gap:                                    # расстановки по маршрутам не было
+            return ""
+        allg = self.model.gap_all()                    # от лучшего вообще — по запросу, дорого
+        out = ["<h3>ЗАЗОР ДО ОПТИМУМА (граница Минью)</h3><ul>"]
+        for t, ratio in sorted(gap.items()):
+            if t in allg:                              # у типа карта места — две величины
+                out.append("<li>тип %d: не хуже %.0f%% от лучшего <b>на разрешённых местах</b> · %.0f%% <b>от лучшего "
+                           "вообще</b> (без запрета мест, по итоговому набору)</li>" % (t, 100 * ratio, 100 * allg[t]))
+            else:                                      # тип «везде» — величины совпадают
+                out.append("<li>тип %d: не хуже %.0f%% от лучшего (места не ограничены — величина одна)</li>"
+                           % (t, 100 * ratio))
+        out.append("</ul><p style=\"color:#8a93a6\">Это нижняя граница, а не точная доля: настоящий результат "
+                   "обычно ближе к лучшему. Разбор — датчики/ЗАЗОР_И_МАТРОИД §5.</p>")
+        return "".join(out)
+
+    def _need_text(self, pr, short=False):
+        """«Сколько ПВН добавить» до уровней (Д10). Вход: итог `target_protection`, короткая ли строка.
+        Отдаёт: текст; уровень набран — пусто."""
+        parts = []                                     # по уровням
+        for lv, need in sorted((pr.get("need") or {}).items()):
+            if need == 0:                              # уже набран
+                continue
+            parts.append("до %.0f%% — ещё %d ПВН" % (100 * lv, need) if need is not None
+                         else "до %.0f%% не дотянуть: максимум %.1f%%" % (100 * lv, 100 * pr["best"]))
+        if not parts:                                  # всё набрано
+            return ""
+        return (" · " if short else "") + (" · ".join(parts[:1] if short else parts))
+
+    def _protection_html(self, i):
+        """Раздел «ЗАЩИТА ОБЪЕКТА» окна «Анализ» (план 13.1, Д9–Д10): подлёт с кратностью защиты, рубеж,
+        почему кратность мала и сколько ПВН добавить. Вход: номер цели с нуля. Отдаёт: HTML; нет этапа — пусто."""
+        pr = self.model.target_protection(i)           # защита объекта или None
+        if not pr:                                     # нет типа у целей — раздела нет
+            return ""
+        k, st = pr["k"], pr.get("stage") or {}         # кратность защиты; итог этапа целей
+        out = ["<h3>ЗАЩИТА ОБЪЕКТА — ЦЕЛЬ №%d (подлёт в зоне цели, кратность защиты %d)</h3><ul>" % (i + 1, k)]
+        if not pr["zone"]:                             # цель в лесу, района нет
+            return out[0] + "<li>зоны нет — укажите район защиты</li></ul>"
+        n = int(pr["n"])                               # подлётов к цели
+        out.append("<li>ПВН у цели: %d (минимум %d), остановка: %s · порог прироста %g%%, уровень защиты %.0f%%</li>"
+                   % (st.get("placed", 0), st.get("n_min", 0), st.get("why") or "—", pr["gain"], pr["level"]))
+        out.append("<li>подлёт %d маршрутов: засечён &ge;1 — %d (%.0f%%), &ge;%d — %d (%.0f%%)</li>"
+                   % (n, round(pr["share1"] * n), 100 * pr["share1"], k, round(pr["share"] * n), 100 * pr["share"]))
+        out.append("<li>рубеж первой засечки (все малые датчики): медиана %.1f км, худшие 10%% — %.1f км от цели</li>"
+                   % (pr["line_med"], pr["line_p10"]))
+        if n and pr["share"] < pr["level"] / 100.0 - 1e-9:   # уровень не набран — почему и сколько добавить
+            miss = n - round(pr["share"] * n)          # подлётов без кратности защиты
+            rest = max(0, miss - pr["lack_places"] - pr["lack_sep"])   # им просто не хватает ПВН
+            out.append('<li style="color:#ff5555"><b>почему кратность мала</b> (%d подлётов без &ge;%d): мест в '
+                       'радиусе R меньше %d — %d, мешает разнос — %d, не хватает ПВН — %d</li>'
+                       % (miss, k, k, pr["lack_places"], pr["lack_sep"], rest))
+            out.append('<li style="color:#ff5555"><b>сколько добавить у цели:</b> %s (с разносом встаёт ещё %d)</li>'
+                       % (self._need_text(pr) or "—", pr["room"]))
         out.append("</ul>")
         return "".join(out)
 

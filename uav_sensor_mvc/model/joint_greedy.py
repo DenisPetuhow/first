@@ -94,6 +94,22 @@ class _Kind:
         return dict(F=f_s, F0=self.f0, UB=self.ub, ratio=((f_s - self.f0) / room if room > 1e-12 else 1.0))
 
 
+def top_gain(cache, n, mask, weights, top):
+    """Сумма `top` лучших приростов F по кандидатам кэша на покрытии S (граница Минью, план 13.1 Д4). Вход:
+    кэш, засечек у маршрута (T,), покрытые сегменты (T,) uint32, веса (a1, a2), сколько складывать. Отдаёт: float."""
+    a1, a2 = weights
+    H = np.asarray(cache._hit, np.int64)             # засекает ли кандидат маршрут: маршрут × кандидат
+    if H.size == 0 or top <= 0:                      # кандидатов или квоты нет
+        return 0.0
+    M = np.asarray(cache._mask, np.uint32)           # покрытые сегменты: маршрут × кандидат
+    k, L = int(cache.k), int(cache.L_seg)            # кратность, сегментов в маршруте
+    gn = (np.minimum(n[:, None] + H, k) - np.minimum(n, k)[:, None]) / k   # прирост кратности
+    gm = (_popcount(mask[:, None] | M) - _popcount(mask)[:, None]) / L      # прирост сегментов
+    g = (a1 * gn + a2 * gm).mean(axis=0)             # прирост F у каждого кандидата
+    top = min(int(top), len(g))                      # сколько лучших реально есть
+    return float(np.maximum(np.partition(g, -top)[-top:], 0.0).sum())
+
+
 def _take(kinds, t, c, joint):
     """Поставить кандидата `c` типа `t` и обновить покрытие. Вход: типы, номер типа, номер кандидата,
     общее ли покрытие. ⚠️ При общем покрытии засечки считаются МАТРИЦЕЙ поставившего типа — его радиусом."""

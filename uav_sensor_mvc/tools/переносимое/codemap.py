@@ -226,6 +226,9 @@ def build(root):
     # --- разложить модули по частям ---
     parts, cur, cur_len, cur_mods = [], [], 0, []
     empty, small = [], []
+    # ⚠️ порог — на ВЕСЬ файл, как его меряет docmap: шапка части (≈8 строк) идёт сверх тела —
+    # без запаса часть вышла в 1 505 строк при пороге 1 500 (25.09.2026)
+    reserve = len(HEAD.splitlines()) + 10            # высота шапки части с запасом, строк
     for nlines, name, _c, _f, items, anchors, err in stat:
         if not items and not err:
             empty.append(name)
@@ -234,7 +237,7 @@ def build(root):
             small.append((name, nlines, [it[2].split("(")[0] for it in items]))
             continue
         block = module_block(root, name, items, anchors, err, pub)
-        if cur and cur_len + len(block) > PART_MAX_LINES:
+        if cur and cur_len + len(block) > PART_MAX_LINES - reserve:   # часть с шапкой не влезет
             parts.append((cur, cur_mods)); cur, cur_len, cur_mods = [], 0, []
         # СМЕЩЕНИЕ раздела внутри части: блок начинается с пустой строки, заголовок
         # «## имя» — вторая. Высота шапки части прибавится ниже.
