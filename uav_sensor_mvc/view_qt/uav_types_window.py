@@ -73,6 +73,8 @@ class UavTypesDialog(QtWidgets.QDialog):
         self.setMinimumWidth(sum(c[2] for c in _COLS) + 60)
         self.adjustSize()
 
+        self.table.horizontalHeader().setStyleSheet("color: #000000; background: #eeeeee;")
+
     def _fill(self, types):
         """Показать список в таблице. Вход: список типов. Отдаёт: ничего."""
         self.table.setRowCount(0)

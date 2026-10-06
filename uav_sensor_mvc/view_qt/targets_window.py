@@ -37,7 +37,7 @@ class TargetsDialog(QtWidgets.QDialog):
     защиты цели (В13.21). `limit` — сколько целей всего, шт."""
 
     def __init__(self, parent, rows, on_place, on_weight, on_move, on_clear, limit,
-                 on_sectors=None, on_area=None, on_area_clear=None, on_show_area=None):
+                 on_sectors=None, on_area=None, on_area_clear=None, on_show_area=None, on_edit=None):
         super().__init__(parent)
         self.setWindowTitle("Объекты защиты")
         self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
@@ -47,6 +47,7 @@ class TargetsDialog(QtWidgets.QDialog):
         self._on_show_area = on_show_area or (lambda i, on: "")   # галочка «Район» у цели (Д5)
         self._on_area = on_area or (lambda i: None)           # «Район защиты…» — чертить мышью
         self._on_area_clear = on_area_clear or (lambda i: None)   # «Снять район»
+        self._on_edit = on_edit or (lambda i: None)           # «Изменить цели»: крестик и район мышью
         self._quiet = False                          # таблицу заполняет программа
         col = QtWidgets.QVBoxLayout(self)
 
@@ -77,7 +78,7 @@ class TargetsDialog(QtWidgets.QDialog):
         self.table = QtWidgets.QTableWidget(0, len(_COLS), self)
         self.table.setHorizontalHeaderLabels([c[0] for c in _COLS])
         for j, (_t, key, _w, _e) in enumerate(_COLS):   # подсказки галочек — только показ
-            if key in _TIPS:
+            if key in _TIPS:                         # у колонки-галочки — подсказка в заголовке
                 self.table.horizontalHeaderItem(j).setToolTip(_TIPS[key])
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.table.verticalHeader().setVisible(False)
@@ -102,6 +103,13 @@ class TargetsDialog(QtWidgets.QDialog):
         self.btn_area_clear = QtWidgets.QPushButton("Снять район")
         self.btn_area_clear.setToolTip("Зона выбранной цели — снова по массиву застройки.")
         self.btn_area_clear.clicked.connect(lambda: self._with_row(self._on_area_clear))
+        # ИЗМЕНИТЬ ЦЕЛИ (заказчик 29.09.2026): перенести крестик и начертить район мышью, без вопросов о форме
+        self.btn_edit = QtWidgets.QPushButton("Изменить цели")
+        self.btn_edit.setToolTip("Окна спрячутся. Щелчок у крестика — выбрать цель и тащить; щелчок в стороне — угол "
+                                 "района защиты, второй — противоположный, колёсико — принять. Правая кнопка — выход.")
+        self.btn_edit.clicked.connect(lambda: self._on_edit(self.table.currentRow() if self.table.currentRow() >= 0
+                                                            else None))   # выбранная строка — сразу с меткой
+        row.addWidget(self.btn_edit)
         row.addWidget(self.btn_area)
         row.addWidget(self.btn_area_clear)
         btn_close = QtWidgets.QPushButton("Закрыть")
@@ -152,7 +160,7 @@ class TargetsDialog(QtWidgets.QDialog):
                 item.setToolTip(_TIPS[key])
                 self.table.setItem(i, j, item)
                 continue
-            if key in ("n", "zone"):
+            if key in ("n", "zone"):                 # номер и зона — текстом как есть
                 text = str(val if val is not None else "")
             elif key in ("lat", "lon"):
                 text = "%.5f" % val
@@ -194,7 +202,7 @@ class TargetsDialog(QtWidgets.QDialog):
         self.refresh()
 
     def _with_row(self, fn):
-        """Кнопка района: позвать колбэк с номером выбранной цели. Вход: колбэк f(номер с нуля)."""
+        """Кнопка района: позвать колбэк с номером выбранной цели. Вход: колбэк f(номер с нуля). Отдаёт: ничего."""
         i = self.table.currentRow()                  # выбранная строка
         if i < 0:                                    # не выбрана
             self.refresh("⚠️ Выберите цель в таблице.")

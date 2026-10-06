@@ -167,8 +167,9 @@ def main(argv=None):
     # ⚠️ считаются РАБОТАЮЩИЕ: в справочнике ещё «Обычный» №5 (Д1) с N 0 — он в расчёт не идёт
     check(len([s for s in sensor_types(p) if s.active]) == 3,
           "работающих типов стало три", "N2 = %d" % p.threat_N2)
-    check(abs(min_small_radius(p) - min(p.threat_R, p.threat_R2)) < 1e-9,
-          "шаг сетки считается по НАИМЕНЬШЕМУ радиусу", "%g км" % min_small_radius(p))
+    # ⚠️ во встроенном справочнике МОГ и ПВН оба с картой места (план 13.3): общей сеткой не ставится никто — шаг по R типа 1
+    check(abs(min_small_radius(p) - p.threat_R) < 1e-9,
+          "шаг общей сетки — по типам «везде»; МОГ и ПВН со своей картой его не дробят", "%g км" % min_small_radius(p))
     m.place_sensors()
     check(len(m.sensors) == n1 + p.threat_N2, "датчиков стало ровно на тип 2 больше",
           "%d = %d + %d" % (len(m.sensors), n1, p.threat_N2))
@@ -411,7 +412,7 @@ def main(argv=None):
         print("   файла %s нет — числа по участку пропущены" % os.path.basename(sz.layers_path()))
     else:
         cnt = zc["count"]                                        # построек в ячейке
-        iy, ix = np.nonzero(cnt > 0)
+        iy, ix = np.nonzero(cnt > 0)                             # ячейки с постройками: строки, столбцы
         xy = zc["top_xy"][iy, ix]                                # самые высокие постройки, км
         own = ((xy[:, 0] >= m.grid.ox + ix * m.grid.h)             # постройка в своей ячейке & (xy[:, 0] < m.grid.ox + (ix + 1) * m.grid.h)
                & (xy[:, 1] >= m.grid.oy + iy * m.grid.h) & (xy[:, 1] < m.grid.oy + (iy + 1) * m.grid.h))
@@ -424,7 +425,8 @@ def main(argv=None):
     # ---- 4з. карта места типа: ПВН только в застройке (план 13, задача 13.4) ----
     print("\n4з. КАРТА МЕСТА ТИПА: ПВН ТОЛЬКО В ЗАСТРОЙКЕ (план 13, 13.4)")
     specs = {s.type_id: s for s in sensor_types(p)}              # типы задания по номеру
-    check(m.allowed_mask(specs[1]) is None, "МОГ ставится везде — прежний расчёт, карты нет")
+    check(m.allowed_mask(specs[1]) is not None and m.allowed_mask(specs[5]) is None,
+          "МОГ — доезд по дорогам (план 13.3), тип «везде» — прежний расчёт, карты нет")
     zmap = m.allowed_mask(specs[2])                              # карта места ПВН
     if zmap is None or not zmap.any():                           # без построек карта пуста
         print("   карта ПВН пуста (нет файла мест датчиков?) — проверки расстановки пропущены")
@@ -433,9 +435,14 @@ def main(argv=None):
               "%.1f км²" % (zmap.sum() * m.grid.h ** 2))
         # Д3 (план 13.1): слагаемые по отдельности — итог обязан быть той же картой; болота — свой слой
         parts = m.allowed_parts(specs[2])                        # слагаемые карты места ПВН
-        check(np.array_equal(parts["result"], zmap) and not (parts["result"] & parts["nopass"]).any(),
-              "слагаемые карты места: итог — та же карта, в непроходимом мест нет",
-              "болота %d, неудобья %d ячеек" % (int(parts["wetland"].sum()), int(parts["rough"].sum())))
+        # ⚠️ в непроходимом места есть, но только в R от проходимого: с крыши у края города видно маршрут (29.09.2026)
+        from model.threat_grid import _dilate as _dl4z           # noqa: E402
+        _nr = max(0, int(round(float(specs[2].r_km) / m.grid.h)))   # R в ячейках
+        _edge = _dl4z(~parts["nopass"], _nr) if _nr else ~parts["nopass"]   # проходимое ± R
+        check(np.array_equal(parts["result"], zmap) and not (parts["result"] & ~_edge).any(),
+              "слагаемые карты места: итог — та же карта, в непроходимом — только в R от проходимого",
+              "болота %d, неудобья %d, у края запрета %d ячеек" % (int(parts["wetland"].sum()), int(parts["rough"].sum()),
+                                                                  int((parts["result"] & parts["nopass"]).sum())))
         # ⚠️ одиночный ПВН при N1 = 0 раньше шёл путём «один тип» и вставал НОЛЬ раз
         keep_n = (p.threat_N, p.threat_N2, p.threat_R2)          # вернуть после опыта
         p.threat_N, p.threat_N2, p.threat_R2 = 0, 6, 0.5
@@ -450,7 +457,7 @@ def main(argv=None):
               "%s из %s" % places if places else "нет")
         # ---- 4и. своя сетка типа (13.5): на крыше самой высокой постройки либо в центре ячейки ----
         print("\n4и. СВОЯ СЕТКА ТИПА: ПВН НА КРЫШЕ ИЛИ В ЦЕНТРЕ ЯЧЕЙКИ (план 13, 13.5)")
-        g, zc = m.grid, m.sensor_cells()
+        g, zc = m.grid, m.sensor_cells()                         # сетка и постройки по ячейкам
         S = np.asarray(m.sensors, float)                         # позиции ПВН, км
         ix = np.floor((S[:, 0] - g.ox) / g.h).astype(int)        # их ячейки: столбцы
         iy = np.floor((S[:, 1] - g.oy) / g.h).astype(int)        # и строки
@@ -476,13 +483,13 @@ def main(argv=None):
     few = m._sample_for_sensors()[:40]                           # маршрутов в малой задаче
     cand_all = np.asarray(m.candidates, float)                   # общая сетка кандидатов
     big = CoverageCache(cand_all, p.threat_R, p.L_seg, p.threat_k)   # кэш всей сетки — отобрать лучших
-    for r in few:
+    for r in few:                                                # строка кэша на маршрут
         big.add_trajectory(r)
     # каждый 5-й из 60 лучших: 12 самых «густых» подряд насыщают критерий тремя датчиками, и
     # проверка выходит вырожденной (F = OPT = граница); вразнобой граница строго выше — замер 0.54 < 0.63
     top = np.argsort(-big.routes_covered_by_candidate())[0:60:5]   # 12 кандидатов вразнобой по рейтингу
     small = CoverageCache(cand_all[top], p.threat_R, p.L_seg, p.threat_k)   # задача, решаемая перебором
-    for r in few:
+    for r in few:                                                # строка кэша на маршрут
         small.add_trajectory(r)
     small.greedy(3, w)
     b = small.last_bound                                         # F жадного, граница, доля
@@ -515,7 +522,7 @@ def main(argv=None):
     # ⚠️ без разноса и при своей k типы друг другу не мешают — очерёдность не решает НИЧЕГО (замер §13.6.5)
     p.threat_k_same, p.threat_spread_types = False, False
     runs = {}                                                    # правило -> (позиции, типы)
-    for rule in RULES:
+    for rule in RULES:                                           # каждое правило очереди — свой проход
         p.threat_type_order = rule
         m.place_sensors()
         runs[rule] = (np.round(np.asarray(m.sensors, float), 6), np.asarray(m.sensors_type, int).copy())
@@ -537,13 +544,25 @@ def main(argv=None):
     print("\n4м. ПВН У ОБЪЕКТОВ ЗАЩИТЫ: ЭТАП ЦЕЛЕЙ (план 13, 13.18)")
     from model import target_stage as tsg                        # noqa: E402
     pvn_st = st.by_id(2, st.defaults())                          # паспорт ПВН: правила у целей
-    # МИНИМУМЫ (план 13.1, Д9): min(3, вместимость) по убыванию приоритета, пока хватает N — отложены заранее
-    table = [([39, 23, 21], [0.5, 0.3, 0.2], 20, [3, 3, 3]), ([39, 23, 21], [0.2, 0.3, 0.5], 7, [1, 3, 3]),
-             ([39, 2], [0.5, 0.5], 20, [3, 2]), ([39], [1.0], 2, [2])]
-    got_tab = [tsg.floors(c, pr, n, pvn_st) for c, pr, n, _w in table]   # минимумы по правилу
-    check(all(g == w for g, (_c, _p, _n, w) in zip(got_tab, table)),
-          "минимум у целей — по приоритету, пока хватает N",
+    # ДОЛИ ПО ПРИОРИТЕТУ (заказчик 30.09.2026): бюджет λ·p, не больше потребности, не меньше наименьшего; нужно
+    # младшей мало — излишек старшей («10 + 3»), 90/5/5 — всё сверх наименьших старшей, а не «3 3 3 → 10 3 3»;
+    # не хватает на наименьшее — по k каждой, остаток по приоритету (было 3 / 2 / 0)
+    table = [(14, [0.5, 0.5], [14, 3], [3, 3], 2, [11, 3]), (14, [1, 1, 1], [20, 20, 20], [3, 3, 3], 1, [5, 5, 4]),
+             (14, [0.9, 0.05, 0.05], [12, 8, 8], [3, 3, 3], 2, [8, 3, 3]),
+             (14, [0.5, 0.3, 0.2], [14, 7, 5], [3, 3, 3], 2, [7, 4, 3]),
+             (5, [0.5, 0.3, 0.2], [4, 2, 2], [3, 2, 2], 1, [3, 1, 1]), (5, [0.5, 0.3, 0.2], [14, 7, 5], [3, 3, 3], 2, [3, 2, 0]),
+             (20, [0.5, 0.5], [4, 2], [3, 2], 1, [4, 2])]
+    got_tab = [tsg.allot(b, pr, w, lo, kk) for b, pr, w, lo, kk, _o in table]   # доли по правилу
+    check(all(g == o for g, (*_x, o) in zip(got_tab, table)),
+          "доли целей — по приоритету, до потребности; излишек младших — старшей",
           " · ".join("/".join(map(str, g)) for g in got_tab))
+    # ПОТРЕБНОСТЬ: уровень достижим — до него; нет — пока до потолка кривой остаётся ≥ k порогов (при k 3 первые ПВН
+    # дают 0 · 0 · 6 %, стоп по шагу обнулял бы потребность)
+    nd = [tsg.need([0.49, 0.76, 0.86, 0.96, 0.98], 0.95, 0.01, 1),
+          tsg.need([0, .25, .33, .45, .57, .65, .69, .72, .76, .79, .81, .83, .84, .86, .87, .89, .89, .91], 0.95, 0.03, 2),
+          tsg.need([0, 0, .06, .07, .17, .25, .30, .37, .40, .44, .48, .50, .53, .55, .58, .59, .60], 0.95, 0.04, 3)]
+    check([(n, r) for n, r, _t in nd] == [(4, True), (14, False), (12, False)],
+          "потребность: до уровня, иначе до остатка < k порогов", " · ".join("%d%s" % (n, "" if r else "*") for n, r, _t in nd))
     # ПОРОГ И УРОВЕНЬ ОТ КРАТНОСТИ (заказчик 24–25.09.2026): порог 1 · 3 · 4 · 5 %, уровень 99 · 92 · 89.3 · 86.7 %
     import dataclasses                                           # noqa: E402
     thr_lvl = [(tsg.gain_pct(dataclasses.replace(pvn_st, tgt_k=kk)), tsg.level_pct(dataclasses.replace(pvn_st, tgt_k=kk)))  # %
@@ -568,7 +587,7 @@ def main(argv=None):
     # при малом N минимум 3 сильнее потолка (было: 5 ПВН → у цели 2, §Д9.4б); потолок — бюджет целей
     keep_t = (p.threat_N2, p.threat_R2)                          # вернуть после опыта
     got_n = {}                                                   # квота ПВН -> (у цели, доля подлёта, почему)
-    for n2 in (20, 5):
+    for n2 in (20, 5):                                           # квота ПВН: хватает и не хватает
         p.threat_N2, p.threat_R2 = n2, 0.5
         m.place_sensors()
         rep_t = m.metrics().get("targets_stage", {}).get(2, [])  # отчёт этапа по целям
@@ -588,8 +607,11 @@ def main(argv=None):
                   "Д10: защита объекта согласована с этапом, «сколько добавить» растёт с уровнем",
                   "подлёт ≥k %.1f %%, ещё ПВН %s" % (100 * pr.get("share", 0), need))
     put20, share20, why20 = got_n[20]                            # квота 20: стоп по насыщению
-    check(len(m.target_points_km()) == 1 and 3 <= put20 <= 10 and why20.split()[0] in ("прирост", "уровень")
-          and share20 >= 0.9, "одна цель, 20 ПВН: у цели по насыщению, не больше потолка 10",
+    # ⚠️ «мест с подлётом нет» (журнал 349) — тоже насыщение, а не потолок: выборка без зерна изредка кончает места
+    # раньше уровня (1 прогон из 3, 29.09.2026)
+    check(len(m.target_points_km()) == 1 and 3 <= put20 <= 10
+          and why20.split()[0] in ("уровень", "мест", "насыщение:", "доля") and share20 >= 0.9,
+          "одна цель, 20 ПВН: у цели по насыщению, не больше потолка 10",
           "у цели %d из 20, подлёт %.1f %%, стоп: %s" % (put20, 100 * share20, why20))
     check(got_n[5][0] == 3, "5 ПВН: минимум 3 у цели сильнее потолка (50 % × 5 = 2)",
           "у цели %d из 5, стоп: %s" % (got_n[5][0], got_n[5][2]))
@@ -625,14 +647,14 @@ def main(argv=None):
           "%d и %d" % (n_rect, n_circ))
     keep_o = (list(m.targets.items), p.threat_N2, p.threat_R2)   # вернуть после опыта
     p.threat_N2, p.threat_R2 = 6, 0.5
-    from model.sensor_zones import settled_mask                  # noqa: E402
     from model.threat_grid import _dilate, _label8               # noqa: E402
-    # ⚠️ разметка массивов — ОДИН раз, как в `target_zone`: перебор точек через неё шёл бы минутами
-    lab4, _n4 = _label8(_dilate(settled_mask(g4) | (m.sensor_cells()["count"] > 0), 1))   # массивы застройки
+    # ⚠️ разметка массивов — ОДИН раз и из того же, что `target_zone` (`zone_base`, без буфера города и штрафа
+    # деревень): перебор точек через неё шёл бы минутами
+    lab4, _n4 = _label8(_dilate(tsg.zone_base(g4, m.sensor_cells()), 1))   # массивы застройки
     free = np.argwhere(lab4 == 0)                                # ячейки вне массивов (строка, столбец)
     centers = [(g4.ox + (c + 0.5) * g4.h, g4.oy + (r + 0.5) * g4.h) for r, c in free[len(free) // 2:]]   # км
     forest = next(((x, y) for x, y in centers if m.in_area(x, y)), None)   # точка в лесу внутри района, км
-    if forest is None:
+    if forest is None:                                           # точки вне застройки в районе нет
         print("   точки вне застройки в районе нет — раздел пропущен")
     else:
         m.targets.items = []
@@ -648,7 +670,7 @@ def main(argv=None):
         near = ok_c[np.argmin(np.hypot(g4.ox + (ok_c[:, 1] + 0.5) * g4.h - fx, g4.oy + (ok_c[:, 0] + 0.5) * g4.h - fy))]   # ближайшая к цели ячейка
         nx_, ny_ = g4.ox + (near[1] + 0.5) * g4.h, g4.oy + (near[0] + 0.5) * g4.h   # её центр, км
         box = ("rect", min(fx, nx_) - 2, min(fy, ny_) - 2, max(fx, nx_) + 2, max(fy, ny_) + 2)   # район, км
-        why1, n1 = m.set_target_area(0, box)
+        why1, n1 = m.set_target_area(0, box)                     # причина отказа и мест ПВН в районе
         check(not why1 and n1 > 0 and not m.target_needs_area(0)
               and m.target_table_rows()[0]["zone"] == "задана вручную",
               "район до ближайшего места ПВН принят, зона — вручную",
@@ -662,6 +684,52 @@ def main(argv=None):
         check(m.targets.items[0].area is None, "перенос цели снимает её район")
     m.targets.items, p.threat_N2, p.threat_R2 = keep_o
     m.place_sensors()
+
+    # ---- 4п. доезд МОГ по дорогам (план 13.3) ----
+    print("\n4п. ДОЕЗД МОГ ПО ДОРОГАМ: ДЕЙКСТРА, РЕКИ И БОЛОТА ± ОТСТУП (план 13.3)")
+    from model import road_access as ra                          # noqa: E402
+
+    class _Grid4p:
+        """Сетка-макет 5 × 12 ячеек по 0.5 км: только то, что читает `road_access`."""
+        ny, nx, h, ox, oy = 5, 12, 0.5, 0.0, 0.0                 # строк, столбцов, ячейка км, начало км
+        _present = {"road_local": np.zeros((5, 12), bool), "river": np.zeros((5, 12), bool)}   # дорога и река
+
+    g4p = _Grid4p()                                              # сетка-макет
+    g4p._present["road_local"][2, :8] = True                     # дорога по строке 2, разрыв в столбце 8
+    g4p._present["road_local"][2, 9:] = True                     # — кусок за разрывом
+    g4p._present["road_local"][3, 1] = g4p._present["road_local"][4, 2] = True   # съезд вниз по диагонали
+    g4p._present["river"][:, 3] = True                           # река поперёк, дорога идёт по мосту
+    d4p = ra.road_distance(ra.road_cells(g4p), [(2, 0)], 0.5)    # км по дорогам от начала дороги
+    check(d4p[2, 7] == 3.5 and np.isinf(d4p[2, 9]) and abs(d4p[4, 2] - 2 ** 0.5) < 1e-12,
+          "Дейкстра: 7 ячеек — 3.5 км, за разрывом не доехать, две диагонали — 2·0.5·√2 км",
+          "%.2f · %s · %.4f км" % (d4p[2, 7], d4p[2, 9], d4p[4, 2]))
+    st4p = st.Small(type_id=1, name="МОГ", zone="дорога", wet_buf_km=0.5)   # паспорт МОГ
+    pa4p = ra.access_parts(g4p, {}, st4p, np.ones((5, 12), bool), 0.0, [(0.25, 1.25)])   # слагаемые, цель у начала
+    check(pa4p["reach"][2, 3] and pa4p["result"][2, 5] and not pa4p["result"][2, 3:5].any()
+          and not pa4p["reach"][2, 10],
+          "мост проезжаем, стоять у реки ± 0.5 км нельзя, за разрывом дороги мест нет",
+          "мест %d ячеек" % int(pa4p["result"].sum()))
+    lim4p = ra.access_parts(g4p, {}, st.Small(zone="дорога", drive_km=1.0), np.ones((5, 12), bool), 0.0,
+                            [(0.25, 1.25)])                      # то же с пределом выезда 1 км
+    check(int(lim4p["reach"].sum()) == 4, "дальность по дорогам 1 км — доезжает только ближнее",
+          "%d ячеек" % int(lim4p["reach"].sum()))
+    n4p = ra.place_nodes(g4p, 1.0, pa4p["result"])               # места блоками 2 × 2 ячейки
+    check(len(n4p) > 0 and bool(sz.cells_of(g4p, n4p, pa4p["result"]).all()),
+          "места блоками: каждое — в разрешённой ячейке", "%d мест" % len(n4p))
+    mog4p = m.allowed_parts(specs[1])                            # слагаемые карты МОГ на участке
+    if mog4p is None or not mog4p["result"].any():               # дорог нет — проверять нечего
+        print("   карта МОГ пуста — проверки на участке пропущены")
+    else:
+        c4p = m.type_candidates(specs[1], mog4p["result"])       # места МОГ, км
+        ic = np.floor((c4p - [m.grid.ox, m.grid.oy]) / m.grid.h).astype(int)   # их ячейки: столбец, строка
+        check(not mog4p["ban"][ic[:, 1], ic[:, 0]].any() and mog4p["reach"][ic[:, 1], ic[:, 0]].all(),
+              "места МОГ: все доезжают, ни одного у рек и болот ± отступ",
+              "мест %d, доезжает %.0f %% дорог" % (len(c4p), 100 * mog4p["reach"].sum() / mog4p["roads"].sum()))
+        m.place_sensors()
+        s4p = np.asarray(m.sensors, float)[np.asarray(m.sensors_type, int) == 1]   # поставленные МОГ, км
+        is4p = np.floor((s4p - [m.grid.ox, m.grid.oy]) / m.grid.h).astype(int)     # их ячейки
+        check(len(s4p) > 0 and mog4p["result"][is4p[:, 1], is4p[:, 0]].all(),
+              "расстановка: каждый МОГ — на разрешённой карте", "МОГ %d" % len(s4p))
 
     # ---- 5. рельеф: несколько включений подряд ----
     print("\n5. РЕЛЬЕФ")

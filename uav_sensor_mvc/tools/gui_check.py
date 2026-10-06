@@ -71,7 +71,7 @@ def main():
     print("1. РАМКИ")
     check(v.area_max_item.isVisible(), "чёрная рамка области видна всегда")
     check(v.bbox_item.isVisible() == m.area_ready,
-          "синяя рамка показана ровно когда район задан")
+          "красная рамка показана ровно когда район задан")
 
     print("\n2. ОСИ (ноль в углу района или области)")
     if m.area_ready:
@@ -101,7 +101,7 @@ def main():
     check("Область:" in lbl and "тайлы:" in lbl, "в окне есть блок области и папки тайлов",
           lbl.split("<br>")[0][:60])
     v._input_dlg.hide()
-    check(not v.bbox_item.isVisible(), "синяя рамка убрана вместе с районом")
+    check(not v.bbox_item.isVisible(), "красная рамка убрана вместе с районом")
     v.set_area_ready(True, m.area_size_km(), m.bbox_km)
     check(len([w for w in v._panel_widgets() if not w.isEnabled()]) < 5,
           "после задания района панель ожила")
@@ -335,7 +335,7 @@ def main():
     check(hasattr(v._input_dlg, "btn_sensors") and "threat_N" not in v._input_dlg._edits,
           "в «Исходных данных» датчиков нет — только кнопка «Датчики…»")
     v._input_dlg.on_open_sensors()
-    w = v._sensors_dlg
+    w = v._sensors_dlg                                    # окно «Датчики»
     check(w is not None and w.isVisible(), "кнопка открывает окно «Датчики»")
     # номера 1–3: N, R, k; у номера 4 — N и R (кратность больших не участвует)
     check(len(w._edits) == 11, "поля номеров 1–4 на месте", "%d полей" % len(w._edits))
@@ -1257,7 +1257,7 @@ def main():
           "R = %.2f км" % (circ[2] if circ else float("nan")))
     xs_b, _ = v.bbox_item.getData()
     check(xs_b is not None and len(xs_b) > 100 and v.btn_area.text().startswith("Радиус"),
-          "синяя рамка — окружность, кнопка — «Радиус …»", v.btn_area.text())
+          "красная рамка — окружность, кнопка — «Радиус …»", v.btn_area.text())
     check(tuple(float(q) for q in m.target_only_km()) == (circ[0], circ[1]) if circ else False,
           "цель — центр круга")
     m.build(); c._render_all()
@@ -1299,9 +1299,11 @@ def main():
           "правая кнопка — выход из режима и закрытие окна сектора")
 
     n_before = len(m.entry_points)
-    v.btn_entry.click()
-    check(v._edit_entry and not v.btn_target.isEnabled(),
-          "«Точки старта» включают режим и гасят панель")
+    # ⚠️ кнопка «Точки старта» переехала с панели в окно сектора (заказчик 30.09.2026)
+    v._open_sector_window()
+    sd.btn_edit.click()
+    check(v._edit_entry and not v.btn_target.isEnabled() and not hasattr(v, "btn_entry"),
+          "«Редактировать точки» окна сектора включает режим и гасит панель; на панели кнопки нет")
     px, py = cx - 8.0, cy + 6.0
     v._on_scene_click(_Ev(px, py, double=True))
     check(len(m.manual_entries) == 1 and len(m.entry_points) == n_before + 1,
@@ -1325,6 +1327,32 @@ def main():
     v._on_scene_click(_Ev(cx, cy, button=Qt.RightButton))
     check(not v._edit_entry and v.btn_target.isEnabled() and v.vb.menuEnabled(),
           "правая кнопка — выход, панель ожила")
+    # ОКНО СЕКТОРА: «Добавить точки» и «Редактировать точки» (заказчик 30.09.2026)
+    v._open_sector_window()
+    sd.btn_auto.click()                                   # сектор заново: точки сектора есть
+    sd.btn_add.click()
+    _add_on = v._edit_entry and v._entry_add and "Добавляю" in sd.btn_add.text()   # режим и подпись окна
+    v._on_scene_click(_Ev(px, py))                        # одиночный щелчок
+    check(_add_on and len(m.manual_entries) == 1, "«Добавить точки» в окне сектора: одиночный щелчок ставит точку",
+          "ручных %d" % len(m.manual_entries))
+    sd.btn_edit.click()
+    check(v._edit_entry and not v._entry_add and "Правлю" in sd.btn_edit.text(),
+          "«Редактировать точки»: подрежим сменён, режим не вышел")
+    sx, sy = m.sector_points()[0]                         # точка сектора, км
+    v._on_scene_click(_Ev(sx + 0.02, sy))
+    v._entry_handle.setPos(sx + 2.0, sy + 1.0); v._entry_handle_moved()
+    wx2, _ = v.entries_scatter.getData()                  # белые точки на карте
+    mx2, _ = v.entries_manual_scatter.getData()           # розовые точки на карте
+    check(len(m.moved_entries) == 1 and len(m.manual_entries) == 1 and len(mx2) == 1
+          and any(abs(float(x) - (sx + 2.0)) < 1e-6 for x in wx2),
+          "перенесённая точка сектора остаётся белой («розовые не надо»)")
+    c.on_sector_params(m.sector_half_deg(), m.sector_entries_n())   # переотбор сектора
+    d_old = min(float(np.hypot(qx - sx, qy - sy)) for qx, qy in m._sector_pts)   # до прежнего места, км
+    check(d_old > m.grid.h and len(m.moved_entries) == 1
+          and float(np.hypot(m.moved_entries[0][0] - sx - 2.0, m.moved_entries[0][1] - sy - 1.0)) < 1e-6,
+          "переотбор: перенесённая стоит, на её прежнее место белая не встаёт", "%.2f км" % d_old)
+    sd.btn_edit.click()
+    check(not v._edit_entry and "Редактировать" in sd.btn_edit.text(), "повторное нажатие — выход из режима")
     m.add_manual_entry(px, py)
     c.on_reset()
     check(not m.manual_entries and m.sector_kind is None, "«Сброс» убирает сектор и точки старта")
@@ -1688,6 +1716,8 @@ def main():
     # СЕКТОРА У КАЖДОЙ ЦЕЛИ (заказчик 23.09.2026) — компас по её маршрутам
     m.add_target(_B21[0] - 12, _B21[1] + 6)
     m.add_target(_B21[0] + 12, _B21[1] - 6)
+    m.set_target_sectors(0, True)                         # галка «Сектора» у новой цели снята (29.09.2026)
+    m.set_target_sectors(1, True)
     m.apply_targets()
     m.iter_batch()
     c._work_place()
@@ -1719,6 +1749,54 @@ def main():
           "в окне выбор: обобщённый + по цели", _ad.combo.itemText(1))
     _ad.combo.setCurrentIndex(2)
     check("ЦЕЛЬ №2" in _ad.text.toPlainText(), "выбор цели показывает её отчёт")
+    # НАГРУЗКА НА СРЕДСТВА (план 13.4): кнопка «Анализа» → окно; «Все средства» — 4 столбца, тип — 3; выгрузка в Word
+    from model.sensor_load import ORDERS as _ld_orders, sort_rows as _sort_ld
+    from PyQt5 import QtWidgets as _QtW_ld
+    _ad.btn_load.click()
+    _ld = v._load_dlg                                    # окно «Нагрузка на средства»
+    _lrows = _ld._snap.get("rows", [])                   # строки снимка модели
+
+    def _nums():
+        """Номера по списку в строках таблицы окна. Отдаёт: список int сверху вниз."""
+        return [int(_ld.table.item(i, 0).text()) for i in range(_ld.table.rowCount())]
+
+    check(_ld.isVisible() and _ld.table.columnCount() == 4 and len(_lrows) > 0
+          and _nums() == [r["n"] for r in _sort_ld(_lrows)],
+          "«Рассчитать нагрузку»: окно, все средства — 4 столбца, малые по убыванию, большие в конце",
+          "%d средств" % len(_lrows))
+    _ld.combo_type.setCurrentIndex(1)
+    _tid = _ld.combo_type.currentData()                  # выбранный тип
+    check(_ld.table.columnCount() == 3 and sorted(_nums()) == sorted(r["n"] for r in _lrows if r["type_id"] == _tid),
+          "выбор типа — 3 столбца, только его средства", _ld.combo_type.currentText())
+    _ld.combo_order.setCurrentIndex([k for k, _t in _ld_orders].index("number"))
+    check(_nums() == sorted(_nums()), "порядок «№ по списку» — по возрастанию номера")
+    import tempfile
+    _docx = os.path.join(tempfile.gettempdir(), "gui_check_нагрузка.docx")   # куда выгрузить
+    _keep_fd = _QtW_ld.QFileDialog.getSaveFileName       # вернуть после опыта
+    _QtW_ld.QFileDialog.getSaveFileName = lambda *a, **k: (_docx, "")
+    try:
+        _ld._export()
+    finally:                                             # подмена не должна пережить раздел
+        _QtW_ld.QFileDialog.getSaveFileName = _keep_fd
+    from docx import Document as _Doc
+    _wt = _Doc(_docx).tables[0]                          # таблица в Word
+    check(len(_wt.rows) == _ld.table.rowCount() + 1 and _wt.rows[0].cells[0].text == "№ по списку"
+          and _wt.rows[1].cells[0].text == _ld.table.item(0, 0).text(),
+          "«Выгрузить в Word» — таблица как на экране", "%d строк" % (len(_wt.rows) - 1))
+    # по цели и подсветка на карте (этап 2 плана 13.4)
+    check(_ld.combo_target.count() == 3 and _ld.combo_target.isEnabled(), "выбор цели: «Все цели» + две цели",
+          _ld.combo_target.itemText(2))
+    _ld.combo_target.setCurrentIndex(2)
+    check(_ld._snap.get("target") == 1 and _ld._snap.get("n_routes") == len(m.routes_by_target()[1])
+          and "цели №2" in _ld.lbl_info.text(), "цель №2 — нагрузка по её маршрутам", "%d маршрутов" % _ld._snap["n_routes"])
+    _ld.table.selectRow(0)
+    _pk = _ld._shown[0]                                  # средство первой строки
+    _mk = [it for it in v._load_pick_items if hasattr(it, "points")]   # крест подсветки
+    check(len(v._load_pick_items) == 2 and len(_mk) == 1
+          and abs(_mk[0].points()[0].pos().x() - _pk["x_km"]) < 1e-9 and abs(_mk[0].points()[0].pos().y() - _pk["y_km"]) < 1e-9,
+          "строка таблицы подсвечивает своё средство на карте", "№%d" % _pk["n"])
+    _ld.close()
+    check(not v._load_pick_items, "окно закрыли — подсветка снята")
     _ad.close()
 
     # АНАЛИЗ РАЗМЕЩЕНИЯ В РЕЖИМАХ (заказчик: «работает не совсем корректно, точки
@@ -1869,7 +1947,8 @@ def main():
         td._auto["tgt_level_pct"].setChecked(True)
         td._w["tgt_k"].setText("1")                       # вернуть кратность защиты по умолчанию
         td._select(0)
-        check(not td._w["tgt_gain_pct"].isEnabled(), "у типа «везде» поля ПВН закрыты")
+        check(not td._w["tgt_gain_pct"].isEnabled() and td._w["wet_buf_km"].isEnabled(),
+              "у МОГ поля ПВН закрыты, отступ от рек и болот открыт (план 13.3)")
         # ⚠️ МОСТ: правка R типа 1 — в Params; открытый, но не тронутый ПВН своего k2 не теряет
         p.threat_k_same, p.threat_k2 = True, 4
         td._w["r_km"].setText("1.7")
@@ -1891,36 +1970,73 @@ def main():
               "мест %d" % _npts)
         # Д3: слагаемые карты — по галкам окна типа, своим цветом под картой
         _p_before = v.type_parts_img.isVisible()          # слоёв не отмечено — картинки нет
+        td._select(1)                                     # ПВН в форме: галки его правила «застройка» (план 13.3)
         td._parts["wetland"].setChecked(True)
         td._parts["forest"].setChecked(True)
+        td._parts["settled"].setChecked(True)
         c.on_type_zone(2)
         _pimg = v.type_parts_img.image                    # картинка слагаемых, RGBA
+        _cf, _cw = v.type_vec_items.get("c_forest"), v.type_vec_items.get("c_wetland")   # контуры леса и болот
+        _cn = sum(len(i.getData()[0]) for i in (_cf, _cw) if i is not None and i.isVisible() and i.getData()[0] is not None)
         check(not _p_before and v.type_parts_img.isVisible() and _pimg is not None and (_pimg[..., 3] > 0).any()
-              and td.shown_parts() == ["forest", "wetland"],
-              "Д3: слои карты места — по галкам окна типа", str(td.shown_parts()))
+              and td.shown_parts() == ["forest", "wetland", "settled"] and _cn > 0,
+              "Д3 + 13.5.5: застройка — клетками, лес и болота — контуром полигонов OSM", "точек контуров %d" % _cn)
         td._parts["wetland"].setChecked(False)
         td._parts["forest"].setChecked(False)
+        td._parts["settled"].setChecked(False)
+        # ПЛАН 13.3: у МОГ — слои своего правила «дорога» и векторные слои линиями поверх карты
+        td._select(0)                                     # МОГ — первый в справочнике
+        _mog_f = (td._w["zone"].currentText() == "дорога" and not td._w["zone_buf_km"].isEnabled()
+                  and "ban" in td._parts and "forest" not in td._parts)   # поля и галки своего правила
+        td._parts["ban"].setChecked(True)
+        td._vecs["road_local"].setChecked(True)
         c.on_type_zone(1)
-        check(not v.type_zone_img.isVisible(), "у типа «везде» карты места нет")
+        _vx = v.type_vec_items.get("road_local")          # линия местных дорог на карте
+        _vn = len(_vx.getData()[0]) if _vx is not None and _vx.getData()[0] is not None else 0   # точек линии
+        check(_mog_f and td.shown_parts() == ["ban"] and td.shown_vectors() == ["road_local"]
+              and v.type_zone_img.isVisible() and v.type_parts_img.isVisible() and _vn > 0 and _vx.isVisible(),
+              "13.3: МОГ — поля и слои правила «дорога», векторные слои линиями", "точек дорог %d" % _vn)
+        td._parts["ban"].setChecked(False)
+        td._vecs["road_local"].setChecked(False)
+        # 13.5.5: ЛЭП, просеки, ж/д — для сверки; пути доезда от целей — ломаными со стрелками
+        for _k in ("power", "cutline", "railway", "reach_lines"):   # новые векторные слои МОГ
+            td._vecs[_k].setChecked(True)
+        c.on_type_zone(1)
+        _rl = v.type_vec_items.get("reach_lines")         # пути доезда и стрелки на карте
+        _rn = len(_rl.getData()[0]) if _rl is not None and _rl.getData()[0] is not None else 0   # точек
+        _arr = len(v._type_vectors.get("reach_lines", [])) # ломаных вместе с наконечниками
+        check(_rn > 0 and _rl.isVisible() and all(v.type_vec_items.get(k) is not None for k in ("power", "cutline", "railway")),
+              "13.5.5: МОГ — ЛЭП, просеки, ж/д и пути доезда со стрелками", "точек путей %d, ломаных %d" % (_rn, _arr))
+        for _k in ("power", "cutline", "railway", "reach_lines"):   # снять
+            td._vecs[_k].setChecked(False)
+        c.on_type_zone(5)
+        check(not v.type_zone_img.isVisible() and not any(i.isVisible() for i in v.type_vec_items.values()),
+              "у типа «везде» («Обычный») карты места и векторов нет")
         c.on_type_zone(None)
         check(not v.type_zone_img.isVisible(), "и прячется по None")
     finally:                                              # подмены не должны пережить раздел
         (_QtW.QMessageBox.warning, _QtW.QMessageBox.question, _QtW.QColorDialog.getColor, _cat.path) = _keep
-        for _n22, _v22 in _p_keep.items():
+        for _n22, _v22 in _p_keep.items():                # вернуть поля задания
             setattr(p, _n22, _v22)
         m.sync_cand_step()
 
     print("\n23. РАЙОН ЗАЩИТЫ ЦЕЛИ В ЛЕСУ: ОКНО, РИСОВАНИЕ, ТАБЛИЦА (план 13, 13.18, В13.21)")
     # ⚠️ Окно вопроса модальное — без экрана ждало бы вечно: подменяется ответом «прямоугольник»
-    from model.sensor_zones import settled_mask as _sm23
+    from model.target_stage import zone_base as _zb23   # из чего массив цели — как в `target_zone`
     from model.threat_grid import _dilate as _dl23, _label8 as _lb23
     from view_qt.targets_window import _COLS as _tcols
     _g23 = m.grid                                         # сетка карты
-    _lab23, _n23 = _lb23(_dl23(_sm23(_g23) | (m.sensor_cells()["count"] > 0), 1))   # массивы застройки
+    _lab23, _n23 = _lb23(_dl23(_zb23(_g23, m.sensor_cells()), 1))   # массивы застройки
     _free23 = np.argwhere(_lab23 == 0)                    # ячейки вне массивов (строка, столбец)
-    _fx, _fy = next(((_g23.ox + (cc + 0.5) * _g23.h, _g23.oy + (rr + 0.5) * _g23.h)   # точка в лесу, км
-                     for rr, cc in _free23[len(_free23) // 2:]
-                     if m.in_area(_g23.ox + (cc + 0.5) * _g23.h, _g23.oy + (rr + 0.5) * _g23.h)), (None, None))
+    _bc23 = np.argwhere(m.sensor_cells()["count"] > 0)    # ячейки с постройками (строка, столбец)
+    # ⚠️ точка в лесу — БЛИЖАЙШАЯ к постройкам вне массива, не ближе 3 ячеек: район ±6 км обязан задеть места ПВН
+    # (29.09.2026: без «доп. зоны» массивы ужались, и середина списка ушла в глухой лес — в районе 0 мест)
+    _fc23 = np.array([rc for rc in _free23[::7]           # каждая 7-я — хватает, и матрица расстояний мала
+                      if m.in_area(_g23.ox + (rc[1] + 0.5) * _g23.h, _g23.oy + (rc[0] + 0.5) * _g23.h)])
+    _d23 = np.min(np.hypot(_fc23[:, None, 0] - _bc23[None, :, 0], _fc23[:, None, 1] - _bc23[None, :, 1]),
+                  axis=1)                                 # до ближайшей постройки, ячеек
+    _rr23, _cc23 = _fc23[int(np.argmin(np.where(_d23 >= 3, _d23, np.inf)))]   # ближайшая не ближе 1.5 км
+    _fx, _fy = _g23.ox + (_cc23 + 0.5) * _g23.h, _g23.oy + (_rr23 + 0.5) * _g23.h   # точка в лесу, км
     _zcol = [k for _t, k, _w, _e in _tcols].index("zone")   # колонка «Зона ПВН»
     _keep23 = (list(m.targets.items), p.threat_N2, v.ask_target_area)   # вернуть в конце
     _asked = []                                           # у каких целей спрашивали район
@@ -1953,6 +2069,7 @@ def main():
         _bpts = [(_g23.ox + (bx + 0.5) * _g23.h, _g23.oy + (by + 0.5) * _g23.h) for by, bx in zip(_by, _bx)]   # км
         _bpt = next((q for q in _bpts if m.in_area(*q)), m.target_only_km())   # застройка внутри района
         m.add_target(*_bpt)                               # вторая цель — в застройке
+        m.set_target_show_area(1, True)                   # галка «Район» по умолчанию снята (29.09.2026)
         _t23 = _time23.time()                            # начало замера, с
         _zv23 = m.target_zone_views()                     # районы для показа
         _dt23 = _time23.time() - _t23                     # первый расчёт, с
@@ -1987,7 +2104,76 @@ def main():
         m.targets.items, p.threat_N2, v.ask_target_area = _keep23
         v._area_target = None
 
-    print("\n24. «ПРИМЕНИТЬ» ПРИНИМАЕТ, «РАССТАВИТЬ ДАТЧИКИ» СЧИТАЕТ ЗОНУ И ВЫБОРКУ (25.09.2026)")
+    print("\n23а. «ИЗМЕНИТЬ ЦЕЛИ», ГАЛКИ ЦЕЛИ СНЯТЫ, ГРУППА ПОКАЗА В ОКНЕ ТИПА (заказчик 29.09.2026)")
+    # ЧТО ЛОВИТ: крестик не переносится мышью, район не чертится без вопроса о форме, после района режим
+    # закрывается; галки «Секторы» и «Район» включены у новой цели; места нельзя спрятать отдельно от карты
+    from model.targets import Target as _T23a
+    _t0 = _T23a(0.0, 0.0)                                 # новая цель
+    check(not _t0.sectors and not _t0.show_area, "у новой цели галки «Секторы» и «Район» сняты")
+    _keep23a = (list(m.targets.items), p.threat_N2)       # вернуть в конце
+    try:
+        p.threat_N2 = 5
+        m.targets.items = []
+        m.add_target(*_bpt)                               # цель в застройке, км
+        c.on_targets_done()
+        _wait_async()
+        v.begin_edit_targets(0)
+        check(v.editing_targets() and v._tgt_pick == 0 and v._tgt_handle is not None,
+              "«Изменить цели» — режим с меткой на выбранной цели")
+        _x0, _y0 = m.targets.items[0].x_km, m.targets.items[0].y_km   # где стояла, км
+        v._tgt_handle.setPos(_x0 + 0.5, _y0)              # метку утащили на 0.5 км восточнее
+        v._target_handle_moved()
+        _wait_async()
+        check(abs(m.targets.items[0].x_km - (_x0 + 0.5)) < 1e-3 and abs(m.targets.items[0].y_km - _y0) < 1e-3,
+              "метку отпустили — цель перенесена", "%.2f → %.2f км" % (_x0, m.targets.items[0].x_km))
+
+        class _Ev23a:
+            """Щелчок левой кнопкой в точке (x, y) км — для `_edit_targets_click`."""
+
+            def __init__(self, x, y):
+                self._sp = v.vb.mapViewToScene(QPointF(x, y))   # точка сцены
+
+            def button(self):
+                """Отдаёт: левую кнопку."""
+                return Qt.LeftButton
+
+            def scenePos(self):
+                """Отдаёт: точку сцены."""
+                return self._sp
+
+            def accept(self):
+                """Событие принято — делать нечего. Отдаёт: ничего."""
+
+        _xa, _ya = m.targets.items[0].x_km, m.targets.items[0].y_km   # цель после переноса, км
+        _far = 25.0 * v._km_per_pixel() + 1.0            # «в стороне» — дальше допуска выбора, км
+        v._edit_targets_click(_Ev23a(_xa - _far, _ya - _far))
+        check(v._area_mode and v._area_target == 0 and len(v._area_pts) == 1,
+              "щелчок в стороне при выбранной цели — первый угол её района")
+        v._area_pts.append((_xa + _far, _ya + _far))
+        v._end_area(True)
+        check(m.targets.items[0].area is not None and m.targets.items[0].show_area and v.editing_targets(),
+              "колёсико — район задан, галка «Район» включилась, режим продолжается",
+              "район %.1f × %.1f км" % (2 * _far, 2 * _far))
+        v._end_edit_targets()
+        check(not v.editing_targets() and v._tgt_handle is None, "выход — метка снята, режим закрыт")
+    finally:                                              # подмены не должны пережить раздел
+        v._end_edit_targets()
+        m.targets.items, p.threat_N2 = _keep23a
+    _td23a = getattr(v, "_types_dlg", None)               # окно типа, если открывали
+    if _td23a is not None:                                # галки группы показа
+        _td23a._show["places"].setChecked(False)
+        c.on_type_zone(2)
+        _np23a = v.type_zone_pts.getData()[0]             # показанные места
+        _pl_off = _np23a is None or len(_np23a) == 0      # мест не видно
+        _td23a._show["result"].setChecked(False)
+        c.on_type_zone(2)
+        _map_off = not v.type_zone_img.isVisible()        # карты не видно
+        _td23a._show["places"].setChecked(True)
+        _td23a._show["result"].setChecked(True)
+        c.on_type_zone(None)
+        check(_pl_off and _map_off, "группа показа: места и карта прячутся каждая своей галкой")
+
+    print("\n24.«ПРИМЕНИТЬ» ПРИНИМАЕТ, «РАССТАВИТЬ ДАТЧИКИ» СЧИТАЕТ ЗОНУ И ВЫБОРКУ (25.09.2026)")
     # ЧТО ЛОВИТ: «Применить» сам пересчитывал маршруты и переставлял датчики (замечание заказчика 25.09.2026)
     _keep24 = list(m.targets.items)                       # цели до раздела — вернуть
     try:
@@ -2028,6 +2214,188 @@ def main():
     v.chk_bld_floors.setChecked(False)
     c._render_all()
     check(not v.bld_count_img.isVisible() and not v.bld_floors_img.isVisible(), "галки сняты — картинок нет")
+
+    # ---- 26. план 13.5: шкала градаций, прозрачность групп, Ctrl + колесо ----
+    # ЧТО ЛОВИТ: шкала в раскладке ужимала карту («0.97»); показ не последнего включённого слоя; ползунок «датчики и
+    # подписи», не гасящий видимого; прозрачность, слетающая при перерисовке; Ctrl + колесо, меняющее уровень тайлов
+    print("\n26. ПЛАН 13.5: ШКАЛА ГРАДАЦИЙ, ПРОЗРАЧНОСТЬ ГРУПП, CTRL + КОЛЕСО")
+    lg = v.grad_legend                                     # плашка шкалы поверх карты
+    for _ch in (v.chk_threat, v.chk_bld_count, v.chk_bld_floors, v.chk_iter_heat):   # всё с градацией — снять
+        _ch.setChecked(False)
+    c._render_all(); app.processEvents()
+    _w0 = v.vb.width()                                     # ширина вида карты без шкалы, px
+    check(lg.isHidden(), "градаций на карте нет — шкалы нет")
+    _keys = []                                             # чья шкала после каждого шага
+    for _ch in (v.chk_threat, v.chk_bld_count, v.chk_bld_floors):   # включаем по очереди
+        _ch.setChecked(True); c._render_all(); app.processEvents()
+        _keys.append(lg.key)
+    v.chk_bld_floors.setChecked(False); c._render_all(); app.processEvents(); _keys.append(lg.key)
+    v.chk_bld_count.setChecked(False); c._render_all(); app.processEvents(); _keys.append(lg.key)
+    check(_keys == ["threat", "bld_count", "bld_floors", "bld_count", "threat"],
+          "шкала — последнего включённого; сняли — возвращается предыдущий", " → ".join(map(str, _keys)))
+    check(abs(v.vb.width() - _w0) < 0.5 and not lg.isHidden(), "шкала видна, а карта не ужалась (была колонка справа)",
+          "вид %.0f → %.0f px" % (_w0, v.vb.width()))
+    check(lg.x() + lg.width() <= v.plot.width() and lg.y() >= v._mode_bar.y() + v._mode_bar.height(),
+          "шкала — справа сверху под плашкой режимов", "x %d, y %d" % (lg.x(), lg.y()))
+    v.chk_bld_count.setChecked(True); c._render_all(); app.processEvents()
+    _rows = v._grad_rows("bld_count")                      # строки шкалы числа построек
+    _top26 = int(np.nanmax(m.sensor_cells()["count"]))     # построек в самой плотной ячейке
+    check(len(_rows) == v.SCALE_ROWS and _rows[0][1] == "%d" % _top26 and _rows[-1][1] == "1",
+          "шкала построек — от максимума участка до 1", "%s … %s" % (_rows[0][1], _rows[-1][1]))
+    v.chk_bld_count.setChecked(False); c._render_all()
+    # ПРОЗРАЧНОСТЬ ГРУПП: каждый ползунок гасит свои элементы; у «датчиков» — и после перерисовки
+    if not len(m.sensors):                                 # датчиков нет — поставить
+        m.place_sensors()
+    c._render_sensors(); app.processEvents()
+    _sld = v._opacity_sliders.get("chk_sensors")           # ползунок группы «датчики и подписи»
+    _ok_all = all(v._opacity_items([a]) for a in ("chk_zones", "chk_entries", "chk_sector_lines", "chk_legend"))
+    check(_sld is not None and _ok_all, "ползунок у группы «датчики и подписи» знает её элементы",
+          "ползунков %d" % len(v._opacity_sliders))
+    if _sld is not None:                                   # притушить вдвое
+        _sld.setValue(50); app.processEvents()
+        _op = [it.opacity() / getattr(it, "_base_op", 1.0) for it in v._sensor_items]   # доля от родной
+        c._render_sensors(); app.processEvents()           # датчики пересозданы
+        _op2 = [it.opacity() / getattr(it, "_base_op", 1.0) for it in v._sensor_items]
+        check(_op and all(abs(o - 0.5) < 1e-6 for o in _op + _op2),
+              "датчики притушены вдвое — и после перерисовки", "элементов %d → %d" % (len(_op), len(_op2)))
+        _sld.setValue(100)
+    _all_ok = []                                           # каждый ползунок: элементы его группы на 30 %
+    for _first, _s in v._opacity_sliders.items():          # ползунки всех групп
+        _s.setValue(30); app.processEvents()
+        _items = v._opacity_items([_first])                # элементы первой галки группы
+        _all_ok.append(bool(_items) and all(abs(it.opacity() - 0.3 * it._base_op) < 1e-6 for it in _items))
+        _s.setValue(100)
+    check(all(_all_ok), "все ползунки прозрачности работают", "групп %d" % len(_all_ok))
+    # CTRL + КОЛЕСО: шаг ×1.25 без смены уровня тайлов; отпустили Ctrl — вид на ближайшем уровне
+
+    class _Wheel:
+        """Событие колеса для проверки: прокрутка от себя, с Ctrl или без."""
+        def __init__(self, ctrl):
+            self._ctrl = ctrl                              # держат ли Ctrl
+        def delta(self):
+            """Щелчок колеса от себя — приблизить. Отдаёт: 120."""
+            return 120
+        def modifiers(self):
+            """Клавиши-модификаторы. Отдаёт: Ctrl или ничего."""
+            return Qt.ControlModifier if self._ctrl else Qt.NoModifier
+        def pos(self):
+            """Курсор — в середине вида. Отдаёт: точка, px."""
+            return QPointF(v.vb.width() / 2.0, v.vb.height() / 2.0)
+        def accept(self):
+            """Событие принято. Отдаёт: ничего."""
+
+    _span = lambda: float(np.diff(v.vb.viewRange()[0])[0])   # noqa: E731 — охват вида по X, км
+    v.frame_bbox(); app.processEvents()                    # весь район: до предела приближения далеко
+    _s0 = _span(); v.vb.wheelEvent(_Wheel(False)); _s1 = _span()
+    _z0 = getattr(getattr(v, "_tiles", None), "_cur_z", None)   # уровень тайлов до Ctrl
+    v.vb.wheelEvent(_Wheel(True))
+    _frames = 0                                            # кадров анимации до конца (13.5.6)
+    while v.vb._free_timer.isActive():                     # прогнать кадры таймера синхронно
+        v.vb._free_tick(); _frames += 1
+    _s2 = _span()
+    _held = getattr(getattr(v, "_tiles", None), "hold_z", "нет тайлов")   # заморожен ли уровень
+    check(abs(_s1 / _s0 - 0.5) < 1e-3 and abs(_s2 / _s1 - 0.8) < 1e-3 and v._ctrl_timer.isActive(),
+          "колесо — уровень тайлов (×2), с Ctrl — плавно (×1.25)", "%.3f · %.3f" % (_s1 / _s0, _s2 / _s1))
+    check(_frames >= 5, "Ctrl + колесо — анимацией, а не скачком", "кадров %d" % _frames)
+    v._ctrl_poll()                                         # без экрана Ctrl не держат — «отпустили»
+    while v.vb._free_timer.isActive():                     # возврат на уровень — тоже анимацией
+        v.vb._free_tick()
+    _s3 = _span()
+    import view_qt.geomap as _gm                           # noqa: E402 — формула ширины уровня
+    _kpd = _gm._km_per_deg_lon(v._geo_lat0)                # км на градус долготы
+    _lv = [(v._map_px() / 256.0) / 2.0 ** z * 360.0 * _kpd for z in range(_gm.ZOOM_MIN, _gm.ZOOM_MAX + 1)]   # охваты уровней
+    check(not v._ctrl_timer.isActive() and min(abs(_s3 / w - 1) for w in _lv) < 1e-3
+          and getattr(getattr(v, "_tiles", None), "hold_z", None) is None,
+          "Ctrl отпустили — вид на ближайшем уровне тайлов, заморозка снята",
+          "уровень до Ctrl %s, заморожен %s, охват %.1f км" % (_z0, _held, _s3))
+
+    # РУКА ПРИ ПЕРЕТАСКИВАНИИ (13.5.7): начало — сжатая рука, конец — прежний курсор
+    import pyqtgraph as _pg                                # noqa: E402
+    from PyQt5.QtWidgets import QApplication as _QA       # noqa: E402
+
+    class _Drag:
+        """Перетаскивание левой кнопкой для проверки: начало или конец."""
+        def __init__(self, start):
+            self._s = start                                # начало ли
+        def button(self):
+            """Кнопка мыши. Отдаёт: левая."""
+            return Qt.LeftButton
+        def isStart(self):
+            """Начало перетаскивания. Отдаёт: bool."""
+            return self._s
+        def isFinish(self):
+            """Конец перетаскивания. Отдаёт: bool."""
+            return not self._s
+
+    _orig = _pg.ViewBox.mouseDragEvent                     # само перетаскивание вида — не нужно
+    _pg.ViewBox.mouseDragEvent = lambda self, ev, axis=None: None   # noqa: E731
+    v.vb.mouseDragEvent(_Drag(True))
+    _c1 = _QA.overrideCursor()                             # курсор во время перетаскивания
+    v.vb.mouseDragEvent(_Drag(False))
+    _pg.ViewBox.mouseDragEvent = _orig
+    check(_c1 is not None and _c1.shape() == Qt.ClosedHandCursor and _QA.overrideCursor() is None,
+          "перетаскивание — курсор «рука», отпустили — прежний")
+
+    # ---- 27. план 13.5: «Пуск» и «Пакетно» в фоновом потоке, линии дописываются (13.5.11) ----
+    # ЧТО ЛОВИТ: поток меняет выборку (зерно то же — маршруты обязаны совпасть до бита); датчики не пересчитываются;
+    # накопленные линии перерисовываются целиком; «Пакетно» ставит датчики в главном потоке
+    print("\n27. ПЛАН 13.5: «ПУСК» И «ПАКЕТНО» В ФОНОВОМ ПОТОКЕ (13.5.11)")
+    import time as _tm                                     # noqa: E402
+    _rng0 = np.random.default_rng                          # розыгрыш с зерном — чтобы сравнить выборки
+
+    def _seeded(*_a, **_k):
+        """Генератор с закреплённым зерном. Отдаёт: numpy Generator."""
+        return _rng0(4242)
+
+    v.ed_iter_T.setText("12"); m.p.threat_iter_routes = 12
+    # ⚠️ ТО ЖЕ СОСТОЯНИЕ, ЧТО У «ПУСКА»: он включает галку итераций, и перерисовка обновляет зону пролёта — эталон
+    # без неё расходился с «Пуском» не из-за потока (отдельный прогон окна: 12 из 12 совпали)
+    v.set_iter_checked(True); c._render_all(); app.processEvents()
+    def _clear_hist():
+        """История стартов (пауза точек входа) — с чистого листа: `iter_reset` её НЕ сбрасывает (находка 13.5.11,
+        В13.5.5) — без этого два прогона подряд даже в главном потоке расходятся с первого маршрута. Отдаёт: ничего."""
+        for _c in m._ctxs:                                 # контексты целей
+            for _k in ("_recent_entries", "_recent_ok_entries"):   # история стартов — общая на все цели
+                if _k in _c:                               # контекст с точками входа
+                    del _c[_k][:]
+
+    np.random.default_rng = _seeded
+    _clear_hist()
+    m.iter_reset()
+    _at = 0                                                # при скольких маршрутах эталон пересчитал датчики
+    # ⚠️ ЭТАЛОН — СТАРЫЙ «ПУСК» ЦЕЛИКОМ: розыгрыш И расстановка каждые 5 маршрутов в главном потоке. Без расстановки
+    # эталон в этом состоянии (несколько целей) расходится и со старым «Пуском» — расстановка трогает контексты целей
+    while m.iter_iteration < m.iter_target_count():       # маршрут за маршрутом, как таймер прежде
+        if m.iter_step() is not None and len(m.iter_routes) - _at >= 5:   # пора пересчитать датчики
+            m.place_sensors(); _at = len(m.iter_routes)
+    _ref = [np.array(r, float) for r in m.iter_routes]     # маршруты эталона, км
+    c._speed = 400                                        # анимация — маршрут за кадр, чтобы не ждать
+    _clear_hist()
+    c.on_iter_play()                                       # «Пуск»: поток строит, анимация показывает
+    _started = c._worker is not None                       # поток запущен
+    _t0, _pe = _tm.time(), 0.0                             # начало и самый долгий проход цикла событий, с
+    while (c._anim_running or c._worker is not None) and _tm.time() - _t0 < 300:   # до конца «Пуска»
+        _a = _tm.time(); app.processEvents(); _pe = max(_pe, _tm.time() - _a)
+        _tm.sleep(0.005)
+    np.random.default_rng = _rng0
+    _got = [np.array(r, float) for r in m.iter_routes]     # маршруты «Пуска»
+    _same = len(_got) == len(_ref) and all(a.shape == b.shape and np.array_equal(a, b) for a, b in zip(_got, _ref))
+    check(_started and _same, "«Пуск» в потоке — та же выборка, что в главном (зерно то же)",
+          "маршрутов %d и %d" % (len(_got), len(_ref)))
+    check(c._sensors_at == len(_got) and len(m.sensors) > 0 and c._worker is None and not c._busy,
+          "датчики пересчитаны по всей выборке, поток закончил, кнопки свободны",
+          "датчиков %d, по %d маршрутам; дольше всего главный поток занят %.2f с" % (len(m.sensors), c._sensors_at, _pe))
+    check(len(v._acc_routes) == len(_got) and len(v._acc_items) == -(-len(_got) // v.ACC_CHUNK),
+          "накопленные линии — кусками, дописыванием", "кусков %d" % len(v._acc_items))
+    c.on_iter_batch()                                      # «Пакетно»: выборка и расстановка в фоне
+    _t0, _pe2 = _tm.time(), 0.0                            # начало и самый долгий проход цикла событий, с
+    while c._busy and _tm.time() - _t0 < 300:              # пока фон считает
+        _a = _tm.time(); app.processEvents(); _pe2 = max(_pe2, _tm.time() - _a)
+        _tm.sleep(0.005)
+    app.processEvents()
+    check(not c._busy and c._sensors_at == len(m.iter_routes) and len(m.sensors) > 0,
+          "«Пакетно»: расстановка в фоне, главный поток только рисует",
+          "маршрутов %d, датчиков %d, главный занят до %.2f с" % (len(m.iter_routes), len(m.sensors), _pe2))
 
     print("\n" + LINE)
     if _fails:

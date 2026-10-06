@@ -26,10 +26,11 @@ VIEW (Qt) · ПОДЛОЖКА ПОШТУЧНЫМИ ТАЙЛАМИ (план 10, 
 не спорить с нашими слоями, и полупрозрачная картинка на тёмном фоне приложения ушла бы в
 грязно-тёмное вместо светло-бледного (см. `basemap_mixin._fade_basemap`).
 """
+import math
 from collections import OrderedDict
 
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtGui
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from . import geomap as gm
 
@@ -85,11 +86,73 @@ class SteppedViewBox(pg.ViewBox):
     бы назад (замечание заказчика «после 10 прокруток дёргается»). Поэтому шаг колеса и
     делается равным уровню — ровно так же ведут себя слиппи-карты в браузере."""
 
+    FREE_STEP = 1.25                               # Ctrl + колесо: охват за щелчок (120 единиц прокрутки), 13.5.3
+    FREE_SHARE = 0.25                              # доля оставшегося пути масштаба за кадр анимации (13.5.6)
+    free_zoom_cb = None                            # вид: «крутят с Ctrl» — заморозить уровень тайлов
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        # ПЛАВНЫЙ МАСШТАБ (13.5.6, заказчик: «как PNG, а не дёрганье»): щелчок не прыгает, а копит множитель охвата,
+        # и таймер «доезжает» до него кадрами по 16 мс — каждый кадр четверть оставшегося пути в логарифме
+        self._free_left = 1.0                      # сколько ещё умножить охват, множитель; 1 — доехали
+        self._free_at = None                       # точка, которая стоит на месте (под курсором), км
+        self._free_done = None                     # что сделать, когда доехали (снять заморозку тайлов)
+        self._free_timer = QtCore.QTimer()         # кадры плавного масштаба
+        self._free_timer.setInterval(16)           # мс — ~60 кадров в секунду
+        self._free_timer.timeout.connect(self._free_tick)
+        self._hand = False                         # курсор-рука включён на время перетаскивания (13.5.7)
+
+    def zoom_smooth(self, factor, at, done=None):
+        """Плавно умножить охват вида (13.5.6). Вход: множитель (< 1 — приблизить), неподвижная точка (x, y) км,
+        что сделать по окончании. Отдаёт: ничего."""
+        self._free_left *= float(factor)           # щелчки подряд складываются в один путь
+        self._free_at = pg.Point(at)
+        self._free_done = done
+        if not self._free_timer.isActive():        # анимация ещё не идёт — запустить
+            self._free_timer.start()
+
+    def _free_tick(self):
+        """Кадр плавного масштаба: часть оставшегося пути. Вход: нет. Отдаёт: ничего."""
+        left = self._free_left                     # остаток пути, множитель охвата
+        # ⚠️ шаг — в ЛОГАРИФМЕ: ×0.8 и ×1.25 — одинаковые по ощущению шаги, а доля разности их бы исказила
+        step = left if abs(math.log(left)) < 0.002 else left ** self.FREE_SHARE   # множитель охвата за кадр
+        self._free_left = left / step
+        (x0, x1), (y0, y1) = self.viewRange()
+        ny0, ny1 = self._zoom_axis(y0, y1, self._free_at.y(), step)   # Y — к той же точке
+        set_span_x(self, self._zoom_axis(x0, x1, self._free_at.x(), step), y_center=(ny0 + ny1) * 0.5)
+        if self._free_left == 1.0:                 # доехали
+            self._free_timer.stop()
+            done, self._free_done = self._free_done, None   # обработчик — один раз
+            if done is not None:                   # было что сделать по окончании
+                done()
+
+    def mouseDragEvent(self, ev, axis=None):
+        """Перетаскивание вида: на время — курсор «рука» (13.5.7). Вход: событие pyqtgraph. Отдаёт: ничего."""
+        if ev.button() == QtCore.Qt.LeftButton:    # тянут вид левой кнопкой
+            if ev.isStart() and not self._hand:    # начали тянуть — рука сжата
+                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.ClosedHandCursor)
+                self._hand = True
+            if ev.isFinish() and self._hand:       # отпустили — прежний курсор
+                QtWidgets.QApplication.restoreOverrideCursor()
+                self._hand = False
+        super().mouseDragEvent(ev, axis)
+
     def wheelEvent(self, ev, axis=None):
         d = ev.delta() if hasattr(ev, "delta") else ev.angleDelta().y()
         if not d:                                  # горизонтальная прокрутка или пустое событие
             return                                 # масштаб не трогаем
-        factor = 0.5 if d > 0 else 2.0             # от себя — приблизить: охват вдвое меньше
+        # ⚠️ С CTRL — ПЛАВНО, «КАК КАРТИНКУ» (заказчик 02.10.2026): уровень тайлов вид замораживает, картинка тянется;
+        # Ctrl отпустили — вид сам встанет на ближайший уровень (`ThreatMapView._ctrl_poll`)
+        free = bool(ev.modifiers() & QtCore.Qt.ControlModifier)   # крутят с Ctrl
+        if free:                                   # плавный масштаб анимацией (13.5.6)
+            if self.free_zoom_cb is not None:      # вид слушает — пусть заморозит тайлы
+                self.free_zoom_cb()
+            at = pg.functions.invertQTransform(self.childGroup.transform()).map(ev.pos())   # точка под курсором, км
+            # множитель — по величине прокрутки: тачпад шлёт мелкие порции, и масштаб идёт с пальцем, а не рывками
+            self.zoom_smooth(self.FREE_STEP ** (-d / 120.0), (at.x(), at.y()))
+            ev.accept()
+            return
+        factor = 0.5 if d > 0 else 2.0             # обычное колесо — ровно уровень тайлов: от себя — вдвое меньше
         # точка под курсором остаётся на месте — как при обычном зуме pyqtgraph
         center = pg.Point(pg.functions.invertQTransform(
             self.childGroup.transform()).map(ev.pos()))
@@ -186,6 +249,7 @@ class TileLayer(QtCore.QObject):
         # вместо 42. Картинка тайла не устаревает: устаревает только надобность в ней.
         self._need = set()
         self._cur_z = None                     # зум, на котором сейчас показываем
+        self.hold_z = None                     # замороженный уровень (Ctrl + колесо, 13.5.3); None — по виду
         self._visible = True
 
         self._pool = QtCore.QThreadPool.globalInstance()
@@ -205,6 +269,10 @@ class TileLayer(QtCore.QObject):
             return None                            # считать нечего — ждём следующего вызова
         layer = self._get_layer()
         z = gm.pick_zoom_for_box(kx0, kx1, ky0, ky1, width_px, self._lon0, self._lat0)
+        # ⚠️ ЗАМОРОЗКА НЕ ДАЛЬШЕ ДВУХ УРОВНЕЙ: отдалив вид с замороженным крупным уровнем, пришлось бы грузить тайлов
+        # в 4^k раз больше — на трёх уровнях это тысячи картинок разом
+        if self.hold_z is not None and abs(z - self.hold_z) <= 2:   # Ctrl + колесо — уровень прежний
+            z = self.hold_z
         x0, x1, y0, y1 = gm.tiles_for_box(kx0, kx1, ky0, ky1, z, self._lon0, self._lat0)
         # ⚠️ ПОЛЕ В ОДИН ТАЙЛ ВОКРУГ ОКНА: при панораме следующий тайл уже загружен, и
         # край экрана не догоняет мышь пустотой. Стоит это ровно одного ряда тайлов.

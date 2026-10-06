@@ -63,14 +63,15 @@ def file_name(layers_file):
 
 
 def layers_path():
-    """Полный путь файла мест датчиков активного участка (папка участка, откат в корень кэша)."""
+    """Полный путь файла мест датчиков активного участка (папка участка, откат в корень кэша). Отдаёт: строку."""
     from config import THREAT_LAYERS_FILE
     from model.threat_grid import area_file
     return area_file(file_name(THREAT_LAYERS_FILE))
 
 
 def _levels(value):
-    """Этажность из тега `building:levels`: «2», «2;3», «1,5» → 2.0, 2.0, 1.5. Отдаёт: float или NaN."""
+    """Этажность из тега `building:levels`: «2», «2;3», «1,5» → 2.0, 2.0, 1.5. Вход: значение тега.
+    Отдаёт: float или NaN."""
     try:
         head = str(value).replace(",", ".").split(";")[0].strip().split()[0]   # первое число строки
         lev = float(head)                            # этажей
@@ -82,9 +83,9 @@ def _levels(value):
 def kind_class(kind):
     """Класс типа здания. Вход: значение тега `building`. Отдаёт: 2 высокий, 0 низкий, 1 не ясно."""
     k = str(kind or "").strip().lower()              # тег без регистра и пробелов
-    if k in TALL_KINDS:
-        return 2
-    return 0 if k in LOW_KINDS else 1
+    if k in TALL_KINDS:                              # тип обычно не ниже двух этажей
+        return 2                                     # — высокий
+    return 0 if k in LOW_KINDS else 1                # одноэтажный тип — 0, неизвестный — 1
 
 
 def _buildings(osm, lon0, lat0, clip):
@@ -99,7 +100,7 @@ def _buildings(osm, lon0, lat0, clip):
         cen = b.geometry.centroid                    # центры пятен
         area_deg = np.asarray(b.geometry.area, float)   # площадь в квадратных градусах
     lon, lat = np.asarray(cen.x, float), np.asarray(cen.y, float)   # центры, градусы
-    x, y = lonlat_to_km(lon, lat, lon0, lat0)
+    x, y = lonlat_to_km(lon, lat, lon0, lat0)        # центры построек от якоря, км
     x, y = np.asarray(x, float), np.asarray(y, float)   # центры, км
     km_lon = KM_PER_DEG_LON_EQ * np.cos(np.radians(lat))   # км в градусе долготы на широте постройки
     area_m2 = area_deg * km_lon * KM_PER_DEG_LAT * 1e6    # площадь пятна, м²
@@ -109,7 +110,7 @@ def _buildings(osm, lon0, lat0, clip):
     cls = np.ones(len(b))                            # класс типа; 1 — «не ясно»
     if "building" in b.columns:                      # тип указан
         cls = np.array([kind_class(v) for v in b["building"]], float)       # класс по тегу
-    x0, x1, y0, y1 = clip
+    x0, x1, y0, y1 = clip                            # рамка участка с запасом, км
     keep = np.isfinite(x) & np.isfinite(y) & (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)   # в рамке
     return np.column_stack([x, y, lev, cls, np.nan_to_num(area_m2)])[keep].astype(np.float32)
 
@@ -123,18 +124,18 @@ def _polygons(osm, flt, lon0, lat0, clip):
             custom_filter=flt, filter_type="keep", keep_nodes=False, keep_ways=True, keep_relations=True)
     except Exception:                                # фильтр ничего не нашёл
         return []
-    x0, x1, y0, y1 = clip
+    x0, x1, y0, y1 = clip                            # рамка участка с запасом, км
     out = []
-    for geom in ([] if gdf is None else gdf.geometry):
-        if geom is None or geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):
+    for geom in ([] if gdf is None else gdf.geometry):   # каждый объект с нужными тегами
+        if geom is None or geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):   # не площадь
             continue                                 # линия или точка — не площадь
         simple = geom.simplify(SIMPLIFY_DEG, preserve_topology=False)   # контур с допуском ~50 м
-        if simple.is_empty or simple.geom_type not in ("Polygon", "MultiPolygon"):
+        if simple.is_empty or simple.geom_type not in ("Polygon", "MultiPolygon"):   # упрощение его съело
             continue                                 # полигон мельче допуска выродился
-        for ring in _geom_to_kms(simple, lon0, lat0):
+        for ring in _geom_to_kms(simple, lon0, lat0):   # внешние кольца, км
             if len(ring) < 3:                        # не кольцо
                 continue
-            if ring[:, 0].max() < x0 or ring[:, 0].min() > x1 or ring[:, 1].max() < y0 or ring[:, 1].min() > y1:
+            if ring[:, 0].max() < x0 or ring[:, 0].min() > x1 or ring[:, 1].max() < y0 or ring[:, 1].min() > y1:   # вне рамки
                 continue                             # целиком за рамкой
             out.append(ring.astype(np.float32))
     return out
@@ -145,18 +146,18 @@ def sensor_layers_from_osm(pbf_path, lon0, lat0, bbox_lonlat):
     Отдаёт: dict слой -> список массивов, как у `threat_grid.layers_from_osm`."""
     from pyrosm import OSM
     from model.threat_grid import OSM_CLIP_MARGIN_KM, _clip_box_km
-    lo, la, ho, ha = bbox_lonlat
+    lo, la, ho, ha = bbox_lonlat                     # рамка участка: долгота, широта углов, градусы
     # complete_relations — как у слоёв веса: лес часто размечен мультиполигоном, и без членов за
     # рамкой крупный массив на краю участка пришёл бы с дырой
     osm = OSM(pbf_path, bounding_box=[lo, la, ho, ha], complete_relations=True)
     clip = _clip_box_km(lon0, lat0, (lo, la, ho, ha), OSM_CLIP_MARGIN_KM)   # участок + запас, км
     out = {}
     pts = _buildings(osm, lon0, lat0, clip)          # постройки (N, 5)
-    if len(pts):
+    if len(pts):                                     # постройки есть — в файл
         out[BUILDING_LAYER] = [pts]
-    for layer, flt in ((FOREST_LAYER, FOREST_FILTER), (WETLAND_LAYER, WETLAND_FILTER), (ROUGH_LAYER, ROUGH_FILTER)):
+    for layer, flt in ((FOREST_LAYER, FOREST_FILTER), (WETLAND_LAYER, WETLAND_FILTER), (ROUGH_LAYER, ROUGH_FILTER)):   # слои-площади
         polys = _polygons(osm, flt, lon0, lat0, clip)   # кольца слоя
-        if polys:
+        if polys:                                    # слой не пуст — в файл; пустого слоя в файле нет
             out[layer] = polys
     return out
 
@@ -197,7 +198,7 @@ def building_rank(pts):
 def cell_buildings(grid, pts):
     """Постройки по ячейкам сетки. Вход: ThreatGrid, массив (N, 5). Отдаёт: dict — `count` (ny,nx) int32,
     `top_xy` (ny,nx,2) км, `top_floors`, `mean_floors` (ny,nx) — средняя этажность (Д2), `top_known` bool; нет — NaN."""
-    ny, nx = grid.ny, grid.nx
+    ny, nx = grid.ny, grid.nx                        # размер сетки: строк, столбцов
     count = np.zeros((ny, nx), np.int32)             # построек в ячейке
     top_xy = np.full((ny, nx, 2), np.nan)            # самая высокая постройка ячейки, км
     top_floors = np.full((ny, nx), np.nan)           # её этажей (оценка)
@@ -235,7 +236,7 @@ def polygon_mask(grid, polys):
     Отдаёт: (ny, nx) bool. Проверка — только по ячейкам габарита каждого кольца, как у застройки."""
     from model.threat_grid import _points_in_polygon
     out = np.zeros((grid.ny, grid.nx), bool)
-    for ring in polys:
+    for ring in polys:                               # каждое кольцо — по ячейкам своего габарита
         P = np.asarray(ring, float)                  # вершины кольца, км
         if P.ndim != 2 or len(P) < 3:                # не кольцо
             continue
@@ -247,7 +248,7 @@ def polygon_mask(grid, polys):
             continue
         cx = grid.ox + (np.arange(ix0, ix1 + 1) + 0.5) * grid.h   # центры столбцов габарита, км
         cy = grid.oy + (np.arange(iy0, iy1 + 1) + 0.5) * grid.h   # центры строк габарита, км
-        gx, gy = np.meshgrid(cx, cy)
+        gx, gy = np.meshgrid(cx, cy)                 # центры ячеек габарита, км
         out[iy0:iy1 + 1, ix0:ix1 + 1] |= _points_in_polygon(gx.ravel(), gy.ravel(), P).reshape(gy.shape)
     return out
 
@@ -265,17 +266,20 @@ def settled_mask(grid):
     return out
 
 
-def allowed_mask(grid, zc, st, passable):
+def allowed_mask(grid, zc, st, passable, r_km=0.0, targets=None):
     """Карта места типа (план 13, 13.4). Вход: ThreatGrid, сводка `cells`, паспорт типа, проходимость
-    (ny,nx) bool. Отдаёт: (ny,nx) bool; None — ограничения нет (место «везде», прежний расчёт до бита)."""
-    parts = allowed_parts(grid, zc, st, passable)    # слагаемые карты — из них же и итог (Д3)
+    (ny,nx) bool, радиус типа км, цели [(x,y)] км. Отдаёт: (ny,nx) bool; None — места «везде», прежний расчёт до бита."""
+    parts = allowed_parts(grid, zc, st, passable, r_km, targets)   # слагаемые карты — из них же и итог (Д3)
     return None if parts is None else parts["result"]
 
 
-def allowed_parts(grid, zc, st, passable):
+def allowed_parts(grid, zc, st, passable, r_km=0.0, targets=None):
     """Слагаемые карты места (план 13.1, Д3) — для показа по отдельности; `result` — сама карта. Вход: как у
     `allowed_mask`. Отдаёт: dict (ny,nx) bool — settled, buildings, strip, forest, wetland, rough, nopass, result."""
     from model.threat_grid import _dilate
+    if st is not None and st.zone == "дорога":       # МОГ — доезд по дорогам от целей (план 13.3)
+        from model.road_access import access_parts
+        return access_parts(grid, zc, st, passable, r_km, targets or [])
     if st is None or st.zone != "застройка":         # тип ставится везде
         return None                                  # — фильтровать нечего
     nb = max(0, int(round(float(st.zone_buf_km) / grid.h)))   # полоса у построек, ячеек
@@ -283,7 +287,7 @@ def allowed_parts(grid, zc, st, passable):
     settled = settled_mask(grid)                     # застройка — с пунктами в свободных зонах
     bcell = zc["count"] > 0                          # ячейки с постройками
     roads = np.zeros_like(bcell)                     # ячейки с дорогами и ЖД
-    for name in ROAD_LAYERS:
+    for name in ROAD_LAYERS:                         # дороги и ЖД — все виды
         if name in grid._present:                    # слой есть на карте
             roads |= grid._present[name]
     # ⚠️ полоса — только у ПОСТРОЕК, а не у всей застройки: так снят замер §0.4в (карта N2, 473 км²)
@@ -293,10 +297,14 @@ def allowed_parts(grid, zc, st, passable):
     wet = zc.get("wetland", np.zeros_like(bcell))    # болота; старая сводка — их нет отдельно
     # лес, болота и неудобья запрещены, кроме полосы у дорог и построек: в них 158 ячеек с домами
     cover_ok = ~(zc["forest"] | wet | zc["rough"]) | strip
-    # ⚠️ ∩ проходимость: в городе пролёт запрещён, и ПВН там не увидит ни одного маршрута
+    # ⚠️ ∩ ПРОХОДИМОСТЬ ± R: в глубине города пролёт запрещён, и ПВН там не увидит ни одного маршрута, но с крыши
+    # у края видно на R — маршрут, огибающий город. Без «± R» разрешённое обрывалось на границе запрета (29.09.2026:
+    # юг Плесецка при цели у Мирного — застройка 27 ячеек, разрешено 0)
     pas = np.asarray(passable, bool)                 # куда БПЛА может лететь
+    nr = max(0, int(round(float(r_km or 0.0) / grid.h)))   # на сколько ячеек видно с места, R
+    seen = _dilate(pas, nr) if nr > 0 else pas       # проходимое и ячейки не дальше R от него
     return dict(settled=settled, buildings=near, strip=strip, forest=zc["forest"], wetland=wet,
-                rough=zc["rough"], nopass=~pas, result=built & cover_ok & pas)
+                rough=zc["rough"], nopass=~pas, result=built & cover_ok & seen)
 
 
 def cells_of(grid, pts, mask):
@@ -315,10 +323,10 @@ def type_nodes(grid, step_km, mask, zc):
     """Своя сетка типа (план 13, 13.5): узлы шагом `step_km` в разрешённых ячейках без построек, а в
     ячейке с постройками — одна точка, самая высокая постройка. Вход: ThreatGrid, шаг км, маска
     (ny,nx), сводка `cells`. Отдаёт: (точки (M,2) км, крыша ли (M,) bool) — сперва крыши, затем узлы."""
-    x0, x1, y0, y1 = grid.extent_km()
+    x0, x1, y0, y1 = grid.extent_km()                # охват сетки, км
     xs = np.arange(x0 + 0.5 * step_km, x1, step_km)   # столбцы узлов, км
     ys = np.arange(y0 + 0.5 * step_km, y1, step_km)   # строки узлов, км
-    gx, gy = np.meshgrid(xs, ys)
+    gx, gy = np.meshgrid(xs, ys)                     # узлы сеткой, км
     nodes = np.column_stack([gx.ravel(), gy.ravel()])  # все узлы района
     mask = np.asarray(mask, bool)                    # карта места типа по ячейкам
     built = mask & (zc["count"] > 0)                 # разрешённые ячейки с постройками
@@ -357,4 +365,39 @@ def cells(grid, layers):
     out["forest"] = polygon_mask(grid, layers.get(FOREST_LAYER, []))
     out["rough"] = polygon_mask(grid, layers.get(ROUGH_LAYER, []))
     out["wetland"] = polygon_mask(grid, layers.get(WETLAND_LAYER, []))   # старый файл — пусто, болота в `rough`
+    return out
+
+
+_DISSOLVED = {}                                      # (файл, его время, слой, порог, допуск) -> кольца слитого контура, км
+
+
+def dissolved_rings(layer, min_km2=0.05, tol_km=0.02):
+    """Контур слоя-площади одним целым (план 13.5, 13.5.12): полигоны слиты — швы между соседними кусками OSM пропадают.
+    Вход: имя слоя файла мест, наименьшая площадь куска км², допуск упрощения км. Отдаёт: список колец (M,2) км."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    fp = layers_path()                               # файл мест участка
+    key = (fp, os.path.getmtime(fp) if os.path.exists(fp) else 0.0, layer, min_km2, tol_km)   # ключ: файл не правили
+    if key in _DISSOLVED:                            # уже сливали — дорогое не повторять (12 тыс. колец — секунды)
+        return _DISSOLVED[key]
+    polys = []                                       # куски слоя полигонами
+    for r in load().get(layer, []):                  # внешние кольца файла мест
+        if len(r) < 3:                               # не кольцо
+            continue
+        p = Polygon(np.asarray(r, float)[:, :2])     # кусок полигоном, км
+        if not p.is_valid:                           # упрощение при извлечении дало самопересечение
+            p = p.buffer(0)                          # — починить
+        if not p.is_empty:                           # кусок не выродился
+            polys.append(p)
+    out = []                                         # кольца слитого контура
+    if polys:                                        # есть что сливать
+        # ⚠️ СЛИЯНИЕ, А НЕ РИСОВАНИЕ КУСКОВ: лес OSM нарезан на тысячи соседних полигонов (у 8 685 из 12 297 колец меньше
+        # 10 вершин), и общие края рисовались линиями внутри массива — «много лишних линий» (заказчик 02.10.2026)
+        u = unary_union(polys).simplify(tol_km)      # одно целое без внутренних швов, упрощённое
+        for part in getattr(u, "geoms", [u]):        # острова слитого слоя
+            if part.geom_type != "Polygon" or part.area < min_km2:   # мелочь — на карте не читается
+                continue
+            out.append(np.asarray(part.exterior.coords, float))
+            out += [np.asarray(h.coords, float) for h in part.interiors if Polygon(h).area >= min_km2]   # поляны
+    _DISSOLVED[key] = out
     return out

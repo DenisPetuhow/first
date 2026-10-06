@@ -550,7 +550,7 @@ class ThreatGrid:
         # буфером и зона штрафа деревень. В вес не идёт; считается заново, только если зоны задели пункты
         settle = self._built_cells | self._urban | (self._village_penalty != 0)   # застройка, как в §0.3а
         if (self._free & (city_all | village_all)).any():   # свободная зона вырезала часть пунктов
-            v_all, _info = self._village_size_filter(village_all, village_skip_factor, village_townlike_med)
+            v_all, _info = self._village_size_filter(village_all, village_skip_factor, village_townlike_med)   # деревни без вырезов
             pen_all = (self._village_field(v_all, village_core, village_edge, r_min_km, r_max_km)   # штраф
                        if v_all.any() else np.zeros_like(self._village_penalty))   # без вырезов
             settle = settle | (_dilate(city_all, r) if r > 0 else city_all) | (pen_all != 0)   # + пункты целиком
@@ -2215,6 +2215,8 @@ class ThreatModel:
         # из точек сектора и точек, заданных человеком, и руками не присваивается.
         self.entry_points = []         # итоговые точки входа, список (x, y) км
         self._sector_pts = []          # отобранные сектором, (x, y) км — пересчитываются
+        self._sector_taken = []        # места сектора, откуда человек увёл точку, (x, y) км — переотбор их не занимает
+        self.moved_entries = []        # точки сектора, перенесённые человеком, (x, y) км — белые, переотбор их не трогает
         # ТОЧКИ СТАРТА, ЗАДАННЫЕ ЧЕЛОВЕКОМ (кнопка «Точки старта») — входные данные, как датчики
         # человека: переживают пересчёт сектора, смену цели и пересборку карты
         self.manual_entries = []       # (x, y) км
@@ -2337,6 +2339,8 @@ class ThreatModel:
         self.sector_point_km = None
         self.sector_kind = None
         self._sector_pts = []
+        self._sector_taken = []
+        self.moved_entries = []
         # точки старта человека — тоже: в чужом районе их километры бессмысленны (план 11, Р10)
         self.manual_entries = []
         self.entry_points = []
@@ -2402,6 +2406,8 @@ class ThreatModel:
         self.sector_point_km = None
         self.sector_kind = None
         self._sector_pts = []
+        self._sector_taken = []
+        self.moved_entries = []
         self.manual_entries = []
         self.entry_points = []
         self.area_circle = None
@@ -3290,6 +3296,31 @@ class ThreatModel:
                                  x_km=float(pts[i, 0]), y_km=float(pts[i, 1])))
         return rows
 
+    def sensor_load(self, target=None):
+        """Нагрузка на средства (план 13.4): доля маршрутов выборки через каждое средство, малые и большие.
+        Вход: None — все цели, номер с нуля — маршруты к этой цели. Отдаёт: dict(rows, n_routes, source, names, target)."""
+        from . import sensor_load
+        from .sensors import sensor_types
+        sample = self._sample_for_sensors()          # та же выборка, что у расстановки и «Анализа», все цели
+        src = ("iter" if sample is self.iter_routes else
+               "loaded" if sample is self.loaded_routes else "zone")   # откуда выборка — подпись в окне
+        parts = self.routes_by_target(sample) if target is not None else []   # выборка по целям
+        if target is not None and 0 <= int(target) < len(parts):   # одна цель — её маршруты, доля от них
+            sample = parts[int(target)]
+        else:                                        # все цели или номера такой цели уже нет
+            target = None
+        table = self.sensors_table()                 # номера по списку: малые по типам (внутри — порядок выбора), затем большие
+        names = {s.type_id: s.name for s in sensor_types(self.p)}   # номер типа -> название
+        out = dict(rows=[], n_routes=len(sample or []), source=src, names=names, target=target)
+        if not table or not sample:                  # мерить нечем или нечего
+            return out
+        r_big = float(getattr(self.p, "threat_R_big", 0.0) or 0.0)   # радиус больших, км
+        # ⚠️ радиусы — в порядке `sensors_table`: сперва малые (`_sensor_radii` в порядке `self.sensors`), потом большие
+        radii = np.r_[self._sensor_radii(), np.full(len(self.sensors_big), r_big)]   # км
+        pts = np.array([[t["x_km"], t["y_km"]] for t in table], float)   # средства, км
+        out["rows"] = sensor_load.load_rows(table, sensor_load.seen_matrix(sample, pts, radii), radii)
+        return out
+
     def add_manual_sensor(self, type_id, static, x_km, y_km):
         """Добавить датчик, заданный человеком (клик по карте, строка таблицы, файл).
 
@@ -3725,7 +3756,6 @@ class ThreatModel:
 
         Работает одинаково ДО и ПОСЛЕ итераций: до них выборка — «все возможные пути»
         (`plan_routes`), после — накопленные пролёты (`_sample_for_sensors`)."""
-        from .optimization import CoverageCache
         from config import MODES
         if len(cand) == 0 or not routes:
             return np.empty((0, 2), float)
@@ -3785,15 +3815,14 @@ class ThreatModel:
         # читает число и радиус типа 1, и одиночный тип 2 (ПВН) вставал там ноль раз
         lone_first = (len(types) == 1 and types[0].type_id == 1
                       and self.allowed_mask(types[0]) is None)   # работает один тип 1, место «везде»
-        if not lone_first or any(m.type_id != 4 for m in self.manual_locked()):
-            return self._place_multi_type(cand, routes, types)
+        if not lone_first or any(m.type_id != 4 for m in self.manual_locked()):   # типов больше или есть закреплённые
+            return self._place_multi_type(cand, routes, types)   # — общий проход по типам
         # ⚠️ ОДИН РАБОТАЮЩИЙ ТИП И НИ ОДНОГО ЗАКРЕПЛЁННОГО ДАТЧИКА — ПРЕЖНИЙ КОД БЕЗ
         # ЕДИНОГО ИЗМЕНЕНИЯ. Обычный случай обязан считаться ровно как раньше, иначе
         # контрольный прогон перестанет что-либо доказывать: расхождение с эталоном
         # нельзя будет отличить от настоящей поломки.
-        cache = CoverageCache(cand, R, self.p.L_seg, self.p.threat_k)
-        for r in routes:
-            cache.add_trajectory(r)
+        # строки кэша — нарастающим итогом (шаг 9): при «Пуске» досчитываются только новые маршруты
+        cache = self._row_cache({"lone"}, "lone", cand, R, routes, np.empty((0, 2)), self.p.threat_k)
         # ЯКОРЯ ВЫКЛЮЧЕНЫ (проба по решению заказчика 29.08.2026). Раньше принудительно
         # ставились два: у входа и у цели, каждый в 0.45·R внутрь коридора, и из кандидатов
         # в круге 0.7·R брался накрывающий больше всего маршрутов. При пяти точках входа
@@ -3836,7 +3865,6 @@ class ThreatModel:
         # ⚠️ КЭШ У КАЖДОГО ТИПА СВОЙ: `CoverageCache` строится под ОДИН радиус; общий — только выбор
         from . import sensor_zones
         from .joint_greedy import joint_greedy
-        from .optimization import CoverageCache
         from config import MODES, THREAT_SPREAD_PAIR
         weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
         # галка «распределять между типами» снимает ТОЛЬКО разнос разных типов; внутри типа он всегда
@@ -3868,6 +3896,7 @@ class ThreatModel:
             # расстановкой (правило заказчика 05.09.2026).
             st = self.manual_locked(spec.type_id)
             anchors = []
+            base = c                                 # постоянные кандидаты типа — их строки копятся (шаг 9), км
             if st:
                 extra = np.array([[m.x_km, m.y_km] for m in st], float)
                 anchors = list(range(len(c), len(c) + len(extra)))
@@ -3878,28 +3907,30 @@ class ThreatModel:
                     and not manual_mode):        # доля у целей есть, места выбирает алгоритм
                 # ⚠️ квота целей — N минус закреплённые человеком: потолка от N больше нет (13.1 Д9)
                 tpos = self._target_stage(spec, zone, routes, weights, int(spec.n) - len(anchors))   # ПВН у целей, км
-                if len(tpos):
+                if len(tpos):                        # у целей встали — в проход закреплёнными
                     anchors += list(range(len(c), len(c) + len(tpos)))
                     c = np.vstack([c, tpos])
             if len(c) == 0:
                 continue
-            cache = CoverageCache(c, R, self.p.L_seg, int(spec.k))   # кэш покрытия типа
-            for r in routes:
-                cache.add_trajectory(r)
+            # кэш покрытия типа: строки постоянных кандидатов — из хранилища, закреплённые и позиции у целей (они
+            # меняются от расстановки к расстановке) — отдельными столбцами (оптимизация, шаг 9)
+            cache = self._row_cache({s.type_id for s in types}, spec.type_id, base, R, routes, c[len(base):],
+                                    int(spec.k))
             # бонус места (13.7): высота крыши и размер пункта — только у типа с правилом места
             bonus = (sensor_zones.bonus_vector(self.grid, self.sensor_cells(), c, spec.passport)
                      if zone is not None else None)  # None — выбор прежний
             kinds.append((spec, anchors, cache, bonus))
-        if not kinds:
+        if not kinds:                                # ставить некому
             self.sensors_type = np.empty(0, int)
-            return np.empty((0, 2), float)
+            return np.empty((0, 2), float)           # — датчиков нет
         radii = [float(kd[0].r_km) for kd in kinds]   # радиусы типов, км
         sep_min = [max(0.1, float(self.p.threat_min_sep_frac)) * r for r in radii]   # нижний разнос, км
         seps = [max(1.6 * r, lo) for r, lo in zip(radii, sep_min)]   # желаемый разнос 1.6·R, км
         quotas = [int(kd[0].n) for kd in kinds]   # сколько ставить каждого типа
         # Разнос: желаемый 1.6·R; тип не набрал квоту — его разнос ослабляется ×0.85 до 0.75·R,
         # и проход повторяется целиком (так же, как прежде у одного типа)
-        while True:
+        while True:                                  # проход; недобрал тип — разнос мягче и заново
+            # номера выбранных по типам и оценки зазора прохода
             picks, bounds = joint_greedy([kd[2] for kd in kinds], quotas, weights, seps,
                                          [kd[1] for kd in kinds],
                                          pair=(THREAT_SPREAD_PAIR if spread else 0.0), joint=k_joint,
@@ -3907,15 +3938,15 @@ class ThreatModel:
                                          bonuses=[kd[3] for kd in kinds])
             short = [i for i in range(len(kinds))   # типы, не набравшие квоту при этом разносе
                      if len(picks[i]) < quotas[i] and seps[i] > sep_min[i]]   # недобравшие типы
-            if not short:
-                break
-            for i in short:
+            if not short:                            # все набрали квоту
+                break                                # — проход окончательный
+            for i in short:                          # недобравшим — разнос мягче
                 seps[i] = max(sep_min[i], seps[i] * 0.85)
-        out_xy, out_tid = [], []
+        out_xy, out_tid = [], []                     # позиции по типам, км, и номера их типов
         # ⚠️ В ТАБЛИЦЕ — ПО ТИПАМ В ПОРЯДКЕ НОМЕРОВ, как в окне, а не в порядке шагов прохода
         for (spec, _a, cache, _b), idx, bd in zip(kinds, picks, bounds):
             self.gap_bounds[spec.type_id] = bd
-            if not idx:
+            if not idx:                              # тип не поставил ни одного
                 continue
             out_xy.append(cache.cand[idx])
             out_tid.append(np.full(len(idx), spec.type_id, int))
@@ -4113,6 +4144,7 @@ class ThreatModel:
             iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(int), 0, g.ny - 1)
             dens[np.unique(iy * g.nx + ix)] += 1.0        # клетка учитывается раз на маршрут
         mx = dens.max()
+        self.route_density_top = float(mx)           # маршрутов в самой частой клетке — верх шкалы показа (13.5.1)
         return (dens / mx if mx > 0 else dens).reshape(g.ny, g.nx)
 
     def _sensor_radii(self):
@@ -4167,7 +4199,7 @@ class ThreatModel:
         from .target_stage import first_line
         lines = []                                     # по целям: медиана и худшие 10 %, км
         if len(self.sensors) and sample:               # есть чем и кого ловить
-            for pt, part in zip(self.target_points_km(), self.routes_by_target(sample)):
+            for pt, part in zip(self.target_points_km(), self.routes_by_target(sample)):   # цель и её маршруты
                 d = first_line(part, pt, self.sensors, rad) if part else np.zeros(0)   # км по маршрутам
                 lines.append(dict(n=len(d), med=float(np.median(d)) if len(d) else 0.0,
                                   p10=float(np.percentile(d, 10)) if len(d) else 0.0))
@@ -4306,6 +4338,7 @@ class ThreatModel:
         weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])   # веса жадного
         levels = sorted({0.9, 0.95, base["level"] / 100.0})   # уровни для «сколько добавить»
         base.update(ts.protection(tails, own, pos, R, base["k"], 1.6 * R, self.p.L_seg, weights, levels))
+        # рубеж первой засечки по маршрутам к цели, км; маршрутов или датчиков нет — пусто
         d = ts.first_line(part, pt, self.sensors, self._sensor_radii()) if part and len(self.sensors) else np.zeros(0)
         base.update(line_med=float(np.median(d)) if len(d) else 0.0,   # рубеж первой засечки, км
                     line_p10=float(np.percentile(d, 10)) if len(d) else 0.0)
@@ -4432,7 +4465,7 @@ class ThreatModel:
         # СЕКТОР ОТСЧИТЫВАЕТСЯ ОТ ЦЕЛИ: сменилась цель — сместился и он, точки входа
         # пересчитываются по той же точке клика (или заново по 360° у авто-сектора)
         if self.sector_kind is not None:
-            self._sector_pts = self.compute_entry_points()
+            self._sector_pts = self._pick_sector()
             self._compose_entries()                 # ручные точки старта остаются на месте
         self.sync_auto_L_max()
 
@@ -4536,6 +4569,7 @@ class ThreatModel:
             return ("в указанном районе нет разрешённых мест: 0 из %d ячеек района"
                     % int(area_mask(self.grid, area).sum())), 0
         self.targets.set_area(i, area)
+        self.targets.items[int(i)].show_area = True  # район только что начертили — показать его, галка «Район»
         return "", n
 
     def clear_target_area(self, i):
@@ -4547,7 +4581,8 @@ class ThreatModel:
         return [t.area for t in self.targets.items if t.area is not None]
 
     def set_target_show_area(self, i, on):
-        """Галка «Район» у цели (план 13.1, Д5): показывать ли её район защиты. Отдаёт: True — цель есть."""
+        """Галка «Район» у цели (план 13.1, Д5): показывать ли её район защиты. Вход: номер с нуля, галка.
+        Отдаёт: True — цель есть."""
         if not 0 <= int(i) < len(self.targets):      # номера нет
             return False
         self.targets.items[int(i)].show_area = bool(on)
@@ -4562,7 +4597,7 @@ class ThreatModel:
         g = self.grid                                # сетка карты
         if getattr(self, "_zv_grid", None) is not g:   # сетка новая — прежние маски не годятся
             self._zv_grid, self._zv_cache = g, {}
-        for t in self.targets.items:
+        for t in self.targets.items:                 # каждая цель — её район или зона по застройке
             if not t.show_area:                      # галка «Район» снята
                 continue
             if t.area is not None:                   # район задал человек — он и есть
@@ -4629,11 +4664,21 @@ class ThreatModel:
         if getattr(self, "_allowed_grid", None) is not self.grid:   # сетка новая — карты устарели
             self._allowed_grid, self._allowed = self.grid, {}       # сетка и её карты по правилу
         gap, slack = self._route_gap_km(), self._route_slack_km()   # разрыв и запас проходимости, км
-        key = (st.zone, float(st.zone_buf_km), float(st.strip_km), gap, slack)   # правило места
+        tg = self._access_targets(st)                # откуда едет МОГ; у прочих правил — пусто
+        key = (st.zone, float(st.zone_buf_km), float(st.strip_km), float(st.wet_buf_km), float(st.drive_km),
+               tuple(tg), gap, slack, float(spec.r_km))   # правило места, цели и R
         if key not in self._allowed:                 # такой карты ещё не считали
             pas = passable_mask(self.grid, gap, slack)   # куда БПЛА вообще может лететь
-            self._allowed[key] = sensor_zones.allowed_mask(self.grid, self.sensor_cells(), st, pas)
+            self._allowed[key] = sensor_zones.allowed_mask(self.grid, self.sensor_cells(), st, pas, float(spec.r_km),
+                                                           list(tg))
         return self._allowed[key]
+
+    def _access_targets(self, st):
+        """Цели, от которых едет тип с правилом «дорога» (план 13.3). Вход: паспорт. Отдаёт: список (x, y) км,
+        округлённых до метра, — ключ кэша карты; у прочих правил — пустой: их карта от целей не зависит."""
+        if st.zone != "дорога":                      # карта от целей не зависит
+            return []                                # — кэш по целям не дробить
+        return [(round(float(x), 3), round(float(y), 3)) for x, y in self.target_points_km()]
 
     def gap_all(self):
         """Зазор «от лучшего вообще» (план 13.1, Д4): у типа с картой места — граница Минью по его своей сетке БЕЗ
@@ -4658,29 +4703,29 @@ class ThreatModel:
 
         def cover(ids):
             """Покрытие набора S: засечки и сегменты. Вход: номера типов в наборе. Отдаёт: (n, mask)."""
-            n, mask = np.zeros(len(routes), np.int64), np.zeros(len(routes), np.uint32)
-            for t in ids:
+            n, mask = np.zeros(len(routes), np.int64), np.zeros(len(routes), np.uint32)   # засечки и сегменты маршрутов
+            for t in ids:                            # типы набора
                 pos = self.sensors[tids == t]        # датчики типа, км
                 if not len(pos) or t not in specs:   # типа нет в наборе
                     continue
-                c = CoverageCache(pos, float(specs[t].r_km), self.p.L_seg, int(specs[t].k))
-                for r in routes:
+                c = CoverageCache(pos, float(specs[t].r_km), self.p.L_seg, int(specs[t].k))   # кэш датчиков типа
+                for r in routes:                     # строка кэша на маршрут
                     c.add_trajectory(r)
                 n = n + np.asarray(c._hit, np.int64).sum(axis=1)
                 mask = mask | np.bitwise_or.reduce(np.asarray(c._mask, np.uint32), axis=1)   # сегменты под наблюдением
             return n, mask
 
-        for t, bd in bounds.items():
+        for t, bd in bounds.items():                 # типы с оценкой зазора прохода
             spec = specs.get(t)                      # тип задания
             zone = self.allowed_mask(spec) if spec is not None else None   # карта места
             if not bd or zone is None:               # тип «везде» — величины совпадают
                 continue
             n, mask = cover(sorted(set(tids.tolist())) if joint else [t])   # покрытие итогового набора
             extra = {}                               # лучшие приросты: на карте и без неё
-            for key, z in (("zone", zone), ("all", np.ones_like(zone, bool))):
+            for key, z in (("zone", zone), ("all", np.ones_like(zone, bool))):   # на карте места и без неё
                 cand = self.type_candidates(spec, z)   # своя сетка типа — на карте или по всей зоне пролёта
                 cache = CoverageCache(cand, float(spec.r_km), self.p.L_seg, int(spec.k))   # кэш покрытия
-                for r in routes:
+                for r in routes:                     # строка кэша на маршрут
                     cache.add_trajectory(r)
                 extra[key] = top_gain(cache, n, mask, weights, int(spec.n))
                 del cache                            # кэш без карты — десятки МБ, не держать
@@ -4701,7 +4746,20 @@ class ThreatModel:
         from . import sensor_zones
         from .threat_routes import passable_mask
         pas = passable_mask(self.grid, self._route_gap_km(), self._route_slack_km())   # куда БПЛА может лететь
-        return sensor_zones.allowed_parts(self.grid, self.sensor_cells(), st, pas)
+        return sensor_zones.allowed_parts(self.grid, self.sensor_cells(), st, pas, float(spec.r_km),
+                                          self._access_targets(st))
+
+    def _row_cache(self, keep, key, cand, R, routes, extra, k):
+        """Кэш покрытия через хранилище строк (оптимизация, шаг 9): кандидаты те же — считаются только новые маршруты.
+        Вход: ключи живых хранилищ, ключ (номер типа | "lone"), кандидаты (C,2) км, радиус км, выборка, доп. кандидаты
+        (E,2) км, кратность. Отдаёт: CoverageCache на кандидатах + доп."""
+        from .optimization import RowStore
+        stores = {kk: v for kk, v in (getattr(self, "_row_stores", None) or {}).items() if kk in keep}   # без выбывших
+        store = stores.get(key)                      # строки этого типа
+        if store is None or not store.fits(cand, R, self.p.L_seg):   # кандидаты или радиус сменились — заново
+            store = stores[key] = RowStore(cand, R, self.p.L_seg)
+        self._row_stores = stores                    # ключ -> RowStore; живут между расстановками
+        return store.cache(routes, extra, k)
 
     def _target_stage(self, spec, zone, routes, weights, n_left):
         """Этап целей для типа с долей у объектов защиты (план 13, 13.18) — `target_stage.stage`.
@@ -4718,6 +4776,7 @@ class ThreatModel:
         targets = ([(t.x_km, t.y_km, float(t.weight)) for t in items] if items   # (x, y, приоритет)
                    else [tuple(self.target_only_km()) + (1.0,)])   # нет их — цель по умолчанию
         areas = [t.area for t in items] if items else [None]   # районы защиты человека (В13.21)
+        # позиции у целей, км, и отчёт по целям
         pos, rep = target_stage.stage(self.grid, zc, zone, places, targets, self.routes_by_target(routes),
                                       spec.passport, max(0, int(n_left)), float(spec.r_km), self.p.L_seg, weights,
                                       areas=areas)
@@ -4728,14 +4787,20 @@ class ThreatModel:
         """Своя сетка типа с правилом места (план 13, 13.5): шаг R/2 внутри карты, в ячейке с постройками —
         самая высокая постройка. Вход: SensorSpec, карта (ny,nx). Отдаёт: (M,2) км с отсечками общей
         сетки — круг района, вода (1.1), зона пролёта (1.2)."""
+        from .road_access import place_nodes
         from .sensor_zones import cells_of, type_nodes
         # ⚠️ не мельче ЯЧЕЙКИ КАРТЫ: карта поячеечная, и узлы 0.25 км у ПВН новых мест не дают, а
         # уводят его с крыш — замер: на постройке 6 из 20 против 10 при узле в центре ячейки
         step = max(self.grid.h, 0.5 * float(spec.r_km))   # шаг своей сетки, км
-        c, roof = type_nodes(self.grid, step, zone, self.sensor_cells())   # кандидаты типа, км; крыша ли
+        st = getattr(spec, "passport", None)         # паспорт типа
+        if st is not None and st.zone == "дорога":   # МОГ — места блоками по дорогам, крыш нет (план 13.3 §2.3)
+            c = place_nodes(self.grid, step, zone)   # кандидаты типа, км
+            roof = np.zeros(len(c), bool)            # вода режет все места
+        else:                                        # ПВН — крыши и узлы
+            c, roof = type_nodes(self.grid, step, zone, self.sensor_cells())   # кандидаты типа, км; крыша ли
         c = self._places_filter(c, roof)             # круг района, вода
         area = self.route_area                       # зона пролёта, как у общей сетки
-        if area is not None and len(c):
+        if area is not None and len(c):              # зона пролёта есть — отсечь кандидатов вне её
             keep = cells_of(self.grid, c, area)      # кандидат там, куда БПЛА долетает
             if keep.any():                           # пустая зона — не терять кандидатов
                 c = c[keep]
@@ -4877,6 +4942,7 @@ class ThreatModel:
         Пересчитывает точки входа и сбрасывает всё, что от входа зависит."""
         self.sector_point_km = (float(x_km), float(y_km))
         self.sector_kind = "click"
+        self._sector_taken, self.moved_entries = [], []   # новый сектор — прежние перенос и «увёл отсюда» не про него
         return self._apply_sector()
 
     def set_sector_auto(self):
@@ -4885,6 +4951,7 @@ class ThreatModel:
         Отдаёт: итоговые точки входа, список (x, y) км."""
         self.sector_point_km = None                 # оси нет — сектор круговой
         self.sector_kind = "auto"
+        self._sector_taken, self.moved_entries = [], []   # новый сектор — прежние перенос и «увёл отсюда» не про него
         return self._apply_sector()
 
     def set_sector_params(self, half_deg, n_entries):
@@ -4899,7 +4966,7 @@ class ThreatModel:
     def _apply_sector(self):
         """Переотобрать точки сектора, собрать итоговый список и сбросить зависящее от входа.
         Отдаёт: итоговые точки входа, список (x, y) км."""
-        self._sector_pts = self.compute_entry_points()
+        self._sector_pts = self._pick_sector()
         self._compose_entries()
         self._reset_after_entry_change()
         if self.grid is not None and self.entry_points:
@@ -4914,16 +4981,29 @@ class ThreatModel:
         self.sector_point_km = None
         self.sector_kind = None
         self._sector_pts = []
+        self._sector_taken = []
+        self.moved_entries = []
         self._compose_entries()
         self._reset_after_entry_change()
         return True
+
+    def _pick_sector(self):
+        """Отбор точек сектора без мест, откуда человек увёл точку (перенос делает её ручной).
+        Отдаёт: список (x, y) км."""
+        pts = self.compute_entry_points()            # отбор с нуля — прежние места те же
+        # ⚠️ без этого переотбор (раствор, число точек, цель) ставил белую точку РОВНО на место перенесённой:
+        # точка удваивалась — 5 → 6, до прежнего места 0.00 км (замер 30.09.2026)
+        near = max(self.ENTRY_PICK_KM, self.grid.h if self.grid is not None else 0.0)   # допуск «то же место», км
+        return [q for q in pts if all(np.hypot(q[0] - x, q[1] - y) > near for x, y in self._sector_taken)]
 
     # ---- ТОЧКИ СТАРТА, ЗАДАННЫЕ ЧЕЛОВЕКОМ (план 11, 11.6, кнопка «Точки старта») ----
     ENTRY_PICK_KM = 0.05      # допуск поиска точки по координатам, км (точки мышью не ближе)
 
     def _compose_entries(self):
-        """Собрать ИТОГОВЫЕ точки входа: сначала отобранные сектором, затем заданные человеком."""
+        """Собрать ИТОГОВЫЕ точки входа: отобранные сектором, перенесённые человеком, добавленные человеком.
+        Отдаёт: ничего — список в `entry_points`."""
         self.entry_points = ([(float(x), float(y)) for x, y in self._sector_pts]
+                             + [(float(x), float(y)) for x, y in self.moved_entries]
                              + [(float(x), float(y)) for x, y in self.manual_entries])
         # ⚠️ РУЧНЫЕ ЗАПАСЫ ПРИВЯЗАНЫ К НОМЕРУ ТОЧКИ, а список только что пересобран: точки
         # другие, и старые правки относились бы не к тем (план 12, 12.5)
@@ -4938,10 +5018,11 @@ class ThreatModel:
             self.build()
 
     def _find_entry(self, x_km, y_km):
-        """Где лежит точка входа: ("sector" | "manual", индекс) либо (None, -1).
-        Ищем ПО КООРДИНАТЕ, а не по номеру строки: номер меняется от любой правки."""
+        """Где лежит точка входа — ПО КООРДИНАТЕ, а не по номеру (номер меняется от любой правки). Вход: x, y км.
+        Отдаёт: ("sector" | "moved" | "manual", индекс) либо (None, -1)."""
         best = (None, -1, self.ENTRY_PICK_KM)
-        for kind, pts in (("sector", self._sector_pts), ("manual", self.manual_entries)):
+        for kind, pts in (("sector", self._sector_pts), ("moved", self.moved_entries),
+                          ("manual", self.manual_entries)):   # три вида точек: сектор, перенесённые, добавленные
             for i, (px, py) in enumerate(pts):
                 d = float(np.hypot(px - float(x_km), py - float(y_km)))   # до точки, км
                 if d <= best[2]:                    # ближе прежней находки
@@ -4958,27 +5039,31 @@ class ThreatModel:
         return True
 
     def move_entry(self, x0_km, y0_km, x1_km, y1_km):
-        """Перенести точку входа из (x0, y0) в (x1, y1) км. Точка сектора при переносе
-        становится заданной человеком — иначе пересчёт сектора вернул бы её на место
-        (как у перенесённого датчика). Отдаёт: True, если точка найдена и перенесена."""
+        """Перенести точку входа из (x0, y0) в (x1, y1) км. Вход: старая и новая координата, км.
+        Отдаёт: True, если точка найдена и перенесена; вне района — False."""
         kind, i = self._find_entry(x0_km, y0_km)
         if kind is None or not bool(self.in_area(float(x1_km), float(y1_km))):   # нет точки или вне района
             return False
+        new = (float(x1_km), float(y1_km))          # новое место, км
+        # ⚠️ перенесённая точка сектора остаётся БЕЛОЙ (заказчик 30.09.2026: «розовые не надо»), но в свой список:
+        # переотбор её не сдвинет, а её прежнее место (`_sector_taken`) не займёт — иначе там вставала белая копия
         if kind == "sector":                        # точка сектора
-            self._sector_pts.pop(i)                 # — уходит из сектора в ручные
-            self.manual_entries.append((float(x1_km), float(y1_km)))
-        else:                                       # ручная — просто новые координаты
-            self.manual_entries[i] = (float(x1_km), float(y1_km))
+            self._sector_taken.append(self._sector_pts.pop(i))   # — место помним
+            self.moved_entries.append(new)
+        elif kind == "moved":                       # уже перенесённая — новые координаты
+            self.moved_entries[i] = new
+        else:                                       # добавленная человеком — новые координаты
+            self.manual_entries[i] = new
         self._entry_changed()
         return True
 
     def remove_entry(self, x_km, y_km):
-        """Убрать точку входа по координате (сектора — до его пересчёта, ручную — насовсем).
+        """Убрать точку входа по координате (сектора — до его пересчёта, перенесённую и добавленную — насовсем).
         Отдаёт: True, если точка найдена."""
         kind, i = self._find_entry(x_km, y_km)
         if kind is None:                            # в этом месте точки нет
             return False
-        (self._sector_pts if kind == "sector" else self.manual_entries).pop(i)
+        {"sector": self._sector_pts, "moved": self.moved_entries, "manual": self.manual_entries}[kind].pop(i)
         self._entry_changed()
         return True
 
@@ -4992,12 +5077,13 @@ class ThreatModel:
         return True
 
     def sector_points(self):
-        """Точки входа, отобранные сектором (без заданных человеком), список (x, y) км."""
-        return list(self._sector_pts)
+        """Точки сектора — рисуются белыми: отобранные и перенесённые человеком (без добавленных).
+        Отдаёт: список (x, y) км."""
+        return list(self._sector_pts) + list(self.moved_entries)
 
     def entry_rows(self):
-        """Точки входа для выбора мышью: список dict(n, x_km, y_km, manual)."""
-        n_sec = len(self._sector_pts)
+        """Точки входа для выбора мышью. Отдаёт: список dict(n, x_km, y_km, manual) — manual у добавленных человеком."""
+        n_sec = len(self._sector_pts) + len(self.moved_entries)   # белых точек — сектор и перенесённые
         return [dict(n=i + 1, x_km=float(x), y_km=float(y), manual=(i >= n_sec))
                 for i, (x, y) in enumerate(self.entry_points)]
 

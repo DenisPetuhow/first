@@ -6,6 +6,9 @@ VIEW (Qt) · Окно «Сектор налёта» (план 11, задача 1
 точки сразу переотбираются), «Построить сектор» (все 360°, лучшая точка на каждые 10°),
 «Задать сектор» (режим на карте: щелчок по краю района; правая кнопка — выход из режима и
 закрытие этого окна) и «Убрать сектор». Работает и в прямоугольном районе, и в круглом.
+«Редактировать точки» и «Добавить точки» (заказчик 30.09.2026) — режим точек входа мышью, как «Править
+датчики»: выбрать, перенести, удалить или ставить щелчком. Точки сектора белые и после переноса; розовые —
+только добавленные человеком. Прежняя кнопка «Точки старта» панели переехала сюда.
 
 ⚠️ НОВЫЙ МЕХАНИЗМ — СВОЙ ФАЙЛ (правило проекта, CLAUDE.md), тем же приёмом, что
 `analysis_window.py` и `route_viewer.py`: окно ничего не считает и модель не знает — оно
@@ -21,7 +24,8 @@ class SectorDialog(QtWidgets.QDialog):
 
     APPLY_DELAY_MS = 500      # пауза после последнего изменения поля до применения, мс
 
-    def __init__(self, parent, on_params, on_auto, on_click_mode, on_clear, on_data=None):
+    def __init__(self, parent, on_params, on_auto, on_click_mode, on_clear, on_data=None, on_entry_edit=None,
+                 on_entry_add=None):
         super().__init__(parent)
         self.setWindowTitle("Сектор налёта")
         self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
@@ -80,11 +84,31 @@ class SectorDialog(QtWidgets.QDialog):
             "этого окна.")
         self.btn_click.clicked.connect(on_click_mode)
         self.btn_clear = QtWidgets.QPushButton("Убрать сектор")
-        self.btn_clear.setToolTip("Убрать сектор. Точки старта, поставленные вручную, останутся.")
+        self.btn_clear.setToolTip("Убрать сектор вместе с перенесёнными точками. Добавленные вручную точки останутся.")
         self.btn_clear.clicked.connect(on_clear)
         col.addWidget(self.btn_auto)
         col.addWidget(self.btn_click)
         col.addWidget(self.btn_clear)
+        # ТОЧКИ ВХОДА МЫШЬЮ (заказчик 30.09.2026) — как «Править датчики»: режим на карте; перенесённая точка
+        # остаётся белой («розовые не надо»), розовые — только добавленные
+        self.btn_edit = QtWidgets.QPushButton("Редактировать точки")
+        self.btn_edit.setToolTip(
+            "Режим на карте: щелчок — выбрать точку входа, тащить — перенести, DELETE — удалить, "
+            "двойной клик — добавить.\n"
+            "Перенесённая точка остаётся белой; переотбор сектора её не сдвинет и на прежнее место не встанет.\n"
+            "Правая кнопка мыши или Esc — выход.")
+        self.btn_edit.clicked.connect(on_entry_edit or (lambda: None))
+        self.btn_add = QtWidgets.QPushButton("Добавить точки")
+        self.btn_add.setToolTip(
+            "Режим на карте: каждый щелчок внутри района — новая точка входа (розовая).\n"
+            "Правая кнопка мыши или Esc — выход.")
+        self.btn_add.clicked.connect(on_entry_add or (lambda: None))
+        row = QtWidgets.QHBoxLayout()                # две кнопки точек входа в строку
+        row.addWidget(self.btn_edit)
+        row.addWidget(self.btn_add)
+        for b, cb in ((self.btn_edit, on_entry_edit), (self.btn_add, on_entry_add)):   # кнопка и её колбэк
+            b.setVisible(cb is not None)             # без колбэка кнопке нечего делать
+        col.addLayout(row)
         # ⚠️ ТАБЛИЦА ЖИВЁТ ЗДЕСЬ, А НЕ В ОКНЕ УСЛОВИЙ (уточнение заказчика 20.09.2026):
         # точки входа отбирает сектор, значит и данные по ним смотрят рядом с ним
         self.btn_data = QtWidgets.QPushButton("Показать данные")
@@ -116,9 +140,9 @@ class SectorDialog(QtWidgets.QDialog):
         """Пауза прошла — отдать раствор (как полураствор) и число точек контроллеру."""
         self._on_params(0.5 * float(self.spin_angle.value()), int(self.spin_n.value()))
 
-    def set_state(self, half_deg, n_entries, kind, n_points, n_manual, click_mode):
-        """Показать текущее состояние. Вход: полураствор °, заказано точек шт., вид сектора
-        (None / "click" / "auto"), отобрано точек шт., ручных точек шт., включён ли режим кликов."""
+    def set_state(self, half_deg, n_entries, kind, n_points, n_manual, click_mode, entry_mode=None):
+        """Показать текущее состояние. Вход: полураствор °, заказано точек шт., вид сектора (None / "click" / "auto"),
+        отобрано шт., ручных шт., режим кликов bool, режим точек мышью (None / "edit" / "add"). Отдаёт: ничего."""
         self._quiet = True
         try:
             self.spin_angle.setValue(int(round(2.0 * float(half_deg))))
@@ -128,9 +152,18 @@ class SectorDialog(QtWidgets.QDialog):
         what = {None: "сектор не задан", "click": "сектор задан кликом",
                 "auto": "сектор по всем 360°"}.get(kind, str(kind))
         text = "%s · точек сектора: %d" % (what, n_points)
-        if n_manual:                                 # есть точки старта человека
-            text += " · заданных вручную: %d" % n_manual
+        if n_manual:                                 # есть точки, добавленные человеком
+            text += " · добавленных вручную: %d" % n_manual
+        from .threat_view import THREAT_COLORS      # палитра вкладки 3 — одна на всё (правило проекта)
+        text += ("<br>белые — сектор (и перенесённые), <span style='color:%s'>розовые</span> — добавленные вручную"
+                 % THREAT_COLORS["entry_manual"])
         if click_mode:                               # идёт режим кликов по карте
             text += "<br><b>Режим задания: щёлкните край района; правая кнопка — выход.</b>"
+        if entry_mode == "edit":                     # правка точек мышью
+            text += "<br><b>Правка: щелчок — выбрать, тащить — перенести, DELETE — удалить; правая кнопка — выход.</b>"
+        elif entry_mode == "add":                    # добавление точек мышью
+            text += "<br><b>Добавление: щелчок внутри района — новая точка; правая кнопка — выход.</b>"
         self.lbl_state.setText(text)
         self.btn_click.setText("Щёлкайте край района…" if click_mode else "Задать сектор кликом")
+        self.btn_edit.setText("Правлю… (ещё раз — выход)" if entry_mode == "edit" else "Редактировать точки")
+        self.btn_add.setText("Добавляю… (ещё раз — выход)" if entry_mode == "add" else "Добавить точки")

@@ -136,6 +136,63 @@ def main(argv=None):
     check(sum(d["n"] for d in by2.values()) == me2.get("n_sensors", 0),
           "сумма по типам сходится и с заданными позициями")
 
+    print("\n5. НАГРУЗКА НА СРЕДСТВО (план 13.4)")
+    import numpy as np                                            # noqa: E402
+    from model.sensor_load import seen_matrix, sort_rows          # noqa: E402
+    keep5 = (np.array(m.sensors, copy=True), np.array(m.sensors_big, copy=True))   # расстановка до расчёта
+    sample5 = m._sample_for_sensors()                             # единая выборка
+    det5 = m._detection(sample5)                                  # засечка «Анализа» на ней же
+    ld = m.sensor_load()                                          # нагрузка на средства
+    rows5, table5 = ld["rows"], m.sensors_table()                 # строки нагрузки и список средств
+    check(len(rows5) == len(m.sensors) + len(m.sensors_big) and [r["n"] for r in rows5] == [t["n"] for t in table5],
+          "строка на каждое средство, номера — из списка средств", "%d строк, маршрутов %d" % (len(rows5), ld["n_routes"]))
+    check(all(0.0 <= r["load_pct"] <= 100.0 and r["routes"] <= ld["n_routes"] for r in rows5),
+          "нагрузка в пределах 0…100 %")
+    small5 = [r for r in rows5 if not r["big"]]                   # малые средства
+    s5 = sum(r["routes"] for r in small5)                         # Σ маршрутов через малые
+    check(abs(s5 - det5["mean_hits"] * det5["n"]) < 1e-6,
+          "Σ маршрутов через малые = средняя кратность × M (тождество)",
+          "%d = %.3f × %d" % (s5, det5["mean_hits"], det5["n"]))
+    seen5 = seen_matrix(sample5, m.sensors, m._sensor_radii())   # маршрут × малое средство
+    tids5 = np.asarray(m.sensors_type, int)                       # тип каждого малого
+    ok_u = all(abs(float(seen5[:, tids5 == t].any(axis=1).mean()) - d["detect_frac"]) < 1e-12
+               for t, d in det5["by_type"].items())                # объединение по типу = засечка типа
+    check(ok_u, "объединение маршрутов по типу = доля засечки типа в «Анализе»")
+    df5 = sort_rows(rows5)                                        # порядок по умолчанию
+    check(all((a["big"], -a["load_pct"], a["n"]) <= (b["big"], -b["load_pct"], b["n"]) for a, b in zip(df5, df5[1:]))
+          and all(r["big"] for r in df5[len(small5):]),
+          "по умолчанию: малые по убыванию нагрузки, большие в конце")
+    check(np.array_equal(keep5[0], m.sensors) and np.array_equal(keep5[1], m.sensors_big)
+          and m._detection(sample5)["mean_hits"] == det5["mean_hits"],
+          "расчёт нагрузки расстановку и показатели не меняет")
+    rad5 = np.r_[m._sensor_radii(), np.full(len(m.sensors_big), float(getattr(m.p, "threat_R_big", 0.0) or 0.0))]   # км
+    check(all(r["x_km"] == t["x_km"] and r["y_km"] == t["y_km"] for r, t in zip(rows5, table5))
+          and np.allclose([r["r_km"] for r in rows5], rad5),
+          "у строки — место и радиус средства (подсветка на карте)")
+    # по цели (этап 2 плана 13.4): маршруты делятся между целями без остатка — Σ по целям = вся выборка у каждого средства;
+    # вторая цель — на время, у конца последнего маршрута, чтобы деление было не пустым
+    keep_t5 = list(m.targets.items)                               # цели до проверки — вернуть в конце
+    end5 = np.asarray(sample5[-1], float)[-1] if sample5 else None   # конец последнего маршрута, км
+    why5 = "цель не добавлялась"                                  # почему второй цели нет
+    if end5 is not None and len(m.targets) < 2:                   # цель одна — завести вторую у конца маршрута
+        if not len(m.targets):                                    # стоит цель по умолчанию — поставить её явно первой
+            m.add_target(*[float(v) for v in m.target_only_km()])
+        why5 = m.add_target(float(end5[0]), float(end5[1])) or "вторая цель у конца маршрута"
+    try:
+        parts5 = [m.sensor_load(i) for i in range(len(m.target_points_km()))]   # нагрузка по каждой цели
+        sum5 = {}                                                 # номер средства -> Σ маршрутов по целям
+        for p5 in parts5:                                         # цель — её снимок
+            for r in p5["rows"]:                                  # средство в снимке цели
+                sum5[r["n"]] = sum5.get(r["n"], 0) + r["routes"]
+        check(sum(p5["n_routes"] for p5 in parts5) == ld["n_routes"]
+              and all(sum5.get(r["n"], 0) == r["routes"] for r in rows5) and all(p5["target"] == i for i, p5 in enumerate(parts5)),
+              "по целям: Σ маршрутов и Σ через каждое средство = вся выборка",
+              "целей %d, маршрутов %s (%s)" % (len(parts5), " + ".join(str(p5["n_routes"]) for p5 in parts5), why5))
+        far5 = m.sensor_load(99)                                  # номера такой цели нет
+        check(far5["target"] is None and far5["n_routes"] == ld["n_routes"], "чужой номер цели — вся выборка")
+    finally:
+        m.targets.items = keep_t5
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))

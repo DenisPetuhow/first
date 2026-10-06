@@ -47,13 +47,15 @@ class _Kind:
     def __init__(self, cache, n, sep, anchors, cover, bonus=None):
         self.cand = cache.cand                       # кандидаты типа, км
         self.R = float(cache.R)                      # радиус типа, км
-        self.H = np.asarray(cache._hit, np.int64)    # засекает ли кандидат маршрут: маршрут × кандидат
+        # ⚠️ матрицы — в том виде, в каком хранятся (13.1 Д6): uint8 и float32 дают те же суммы, что копии int64 / float64
+        self.H = np.asarray(cache._hit, np.uint8)    # засекает ли кандидат маршрут: маршрут × кандидат
         self.M = np.asarray(cache._mask, np.uint32)  # покрытые сегменты: маршрут × кандидат
-        self.Fc = np.asarray(cache._cov, np.float64)  # доля пути в зоне: маршрут × кандидат
-        self.covsum = self.H.sum(axis=0).astype(float)   # маршрутов на кандидата — третичный ключ
+        self.Fc = np.asarray(cache._cov, np.float32)  # доля пути в зоне: маршрут × кандидат
+        self.covsum = self.H.sum(axis=0, dtype=np.int64).astype(float)   # маршрутов на кандидата — третичный ключ
         self.k, self.L = int(cache.k), int(cache.L_seg)  # кратность типа, сегментов в маршруте
         self.n_quota = int(n)                        # сколько поставить, с закреплёнными
         self.sep = float(sep)                        # разнос внутри типа, км
+        # закреплённые человеком номера кандидатов; номера вне сетки отброшены
         self.anchors = [int(a) for a in (anchors or []) if 0 <= int(a) < len(self.cand)]
         self.cover = cover                           # состояние покрытия (общее или своё)
         self.avail = np.ones(len(self.cand), bool)   # кандидат ещё можно выбрать
@@ -64,23 +66,38 @@ class _Kind:
         self.scale = None                            # масштаб бонуса — лучший прирост первого шага
 
     def phi(self, a1, a2):
-        """F типа на текущем покрытии — основной критерий в среднем по маршрутам. Отдаёт: float."""
-        c = self.cover
+        """F типа на текущем покрытии — основной критерий в среднем по маршрутам. Вход: веса a1, a2. Отдаёт: float."""
+        c = self.cover                               # покрытие маршрутов: засечки, сегменты, доля пути
         return float((a1 * np.minimum(c.n, self.k) / self.k + a2 * _popcount(c.mask) / self.L).mean())
 
     def gains(self, a1, a2):
-        """Приросты всех кандидатов на текущем покрытии. Отдаёт: (основной, доля пути) — оба (C,)."""
-        c = self.cover
-        gn = (np.minimum(c.n[:, None] + self.H, self.k)   # прирост кратности с потолком k
-              - np.minimum(c.n, self.k)[:, None]) / self.k
-        gm = (_popcount(c.mask[:, None] | self.M)          # прирост покрытых сегментов
-              - _popcount(c.mask)[:, None]) / self.L
-        primary = (a1 * gn + a2 * gm).mean(axis=0)   # кратность и равномерность
-        gcov = (np.minimum(c.cov[:, None] + self.Fc, 1.0) - c.cov[:, None]).mean(axis=0)   # доля пути
-        return primary, gcov
+        """Основной прирост всех кандидатов на текущем покрытии — кратность и равномерность. Вход: веса a1, a2.
+        Отдаёт: (C,) — прирост F в среднем по маршрутам. ⚠️ на месте, без копий (13.1 Д6); порядок действий прежний."""
+        c = self.cover                               # покрытие маршрутов: засечки, сегменты, доля пути
+        t = c.n[:, None] + self.H                    # засечек с кандидатом, int64
+        np.minimum(t, self.k, out=t)                 # потолок k
+        t -= np.minimum(c.n, self.k)[:, None]        # прирост кратности, целый
+        gn = t / self.k                              # в долях k, float64
+        del t
+        p = _popcount(c.mask[:, None] | self.M)      # покрытых сегментов с кандидатом
+        p -= _popcount(c.mask)[:, None]              # прирост сегментов, целый
+        gm = p / self.L                              # в долях сегментов
+        del p
+        gn *= a1; gm *= a2; gn += gm                 # a1·Δn + a2·Δm
+        return gn.mean(axis=0)
+
+    def cov_gains(self):
+        """Прирост доли пути под наблюдением (усечение 1) у всех кандидатов — второй ключ. Вход: нет — `self.cover`.
+        Отдаёт: (C,). ⚠️ только после насыщения основного: прежде считался на каждом шаге впустую (13.1 Д6)."""
+        c = self.cover                               # покрытие маршрутов: засечки, сегменты, доля пути
+        g = c.cov[:, None] + self.Fc                 # доля с кандидатом, (T, C); float64 + float32 — те же числа
+        np.minimum(g, 1.0, out=g)                    # больше всего пути не накрыть
+        g -= c.cov[:, None]                          # прирост доли
+        return g.mean(axis=0)
 
     def note_bound(self, primary, a1, a2):
-        """Граница Минью на этом шаге (как в `CoverageCache.greedy`, 13.8). Вход: основной прирост."""
+        """Граница Минью на этом шаге (как в `CoverageCache.greedy`, 13.8). Вход: основной прирост (C,), веса a1, a2.
+        Отдаёт: ничего — копит наименьшую границу в `self.ub`."""
         top = min(self.n_quota, len(primary))        # сколько лучших приростов складывать
         if top <= 0:                                 # квоты нет — оценивать нечего
             return
@@ -88,7 +105,7 @@ class _Kind:
         self.ub = min(self.ub, self.phi(a1, a2) + float(np.maximum(best, 0.0).sum()))
 
     def bound(self, a1, a2):
-        """Оценка зазора прохода, как `CoverageCache.last_bound`. Отдаёт: dict(F, F0, UB, ratio)."""
+        """Оценка зазора прохода, как `CoverageCache.last_bound`. Вход: веса a1, a2. Отдаёт: dict(F, F0, UB, ratio)."""
         f_s = self.phi(a1, a2)                       # F итогового набора
         room = self.ub - self.f0                     # сколько вообще можно было добавить
         return dict(F=f_s, F0=self.f0, UB=self.ub, ratio=((f_s - self.f0) / room if room > 1e-12 else 1.0))
@@ -97,8 +114,8 @@ class _Kind:
 def top_gain(cache, n, mask, weights, top):
     """Сумма `top` лучших приростов F по кандидатам кэша на покрытии S (граница Минью, план 13.1 Д4). Вход:
     кэш, засечек у маршрута (T,), покрытые сегменты (T,) uint32, веса (a1, a2), сколько складывать. Отдаёт: float."""
-    a1, a2 = weights
-    H = np.asarray(cache._hit, np.int64)             # засекает ли кандидат маршрут: маршрут × кандидат
+    a1, a2 = weights                                 # вес кратности, вес равномерности
+    H = np.asarray(cache._hit, np.uint8)             # засекает ли кандидат маршрут: маршрут × кандидат (Д6 — без копии)
     if H.size == 0 or top <= 0:                      # кандидатов или квоты нет
         return 0.0
     M = np.asarray(cache._mask, np.uint32)           # покрытые сегменты: маршрут × кандидат
@@ -112,7 +129,8 @@ def top_gain(cache, n, mask, weights, top):
 
 def _take(kinds, t, c, joint):
     """Поставить кандидата `c` типа `t` и обновить покрытие. Вход: типы, номер типа, номер кандидата,
-    общее ли покрытие. ⚠️ При общем покрытии засечки считаются МАТРИЦЕЙ поставившего типа — его радиусом."""
+    общее ли покрытие. Отдаёт: ничего — меняет `chosen`, `avail` и покрытие типа.
+    ⚠️ При общем покрытии засечки считаются МАТРИЦЕЙ поставившего типа — его радиусом."""
     kd = kinds[t]                                    # тип, который ставит
     kd.chosen.append(c)
     kd.avail[c] = False
@@ -131,12 +149,12 @@ def _exclude(kinds, t, c, pair):
         kd.avail[np.linalg.norm(kd.cand - xy, axis=1) < kd.sep] = False
     if pair <= 0:                                    # галка «распределять между типами» снята
         return
-    for u, other in enumerate(kinds):
-        if u == t:
-            continue
+    for u, other in enumerate(kinds):                # остальные типы — разнос от поставленного
+        if u == t:                                   # сам тип
+            continue                                 # — его разнос `sep`, выше
         block = np.linalg.norm(other.cand - xy, axis=1) < pair * (kd.R + other.R)   # слишком близко
         # ⚠️ как в прежнем проходе: если разнос закрыл бы типу ВСЕ места — не терять тип совсем
-        if (other.avail & ~block).any():
+        if (other.avail & ~block).any():             # после разноса у типа места остаются — разносим
             other.avail &= ~block
 
 
@@ -144,43 +162,44 @@ def joint_greedy(caches, quotas, weights, seps, anchors, pair=0.0, joint=True, r
     """Общий жадный по типам. Вход: кэши типов (без `placed`), квоты, веса (a1, a2), разнос внутри типа,
     закреплённые номера, доля пары (0 — нет), общее ли покрытие, правило (RULES), бонусы мест по типам
     (None — нет; 13.7). Отдаёт: (номера выбранных по типам, оценки зазора по типам)."""
-    a1, a2 = weights
+    a1, a2 = weights                                 # вес кратности, вес равномерности
     T = caches[0].n_traj if caches else 0            # маршрутов в выборке — у всех кэшей одна
     shared = _Cover(T)                               # общее покрытие («одна на всех»)
     bonuses = bonuses or [None] * len(caches)        # бонусы мест по типам
     kinds = [_Kind(cache, n, s, anc, shared if joint else _Cover(T), bn)   # типы прохода
              for cache, n, s, anc, bn in zip(caches, quotas, seps, anchors, bonuses)]
-    for kd in kinds:
+    for kd in kinds:                                 # F до прохода — от него считается доля зазора
         kd.f0 = kd.phi(a1, a2)
     # ЗАКРЕПЛЁННЫЕ ЧЕЛОВЕКОМ — сперва все, потом разнос от них: поставил два рядом — оба остаются
-    for t, kd in enumerate(kinds):
-        for a in kd.anchors:
-            if a not in kd.chosen:
+    for t, kd in enumerate(kinds):                   # каждый тип
+        for a in kd.anchors:                         # — его закреплённые
+            if a not in kd.chosen:                   # номер повторён — ставим один раз
                 _take(kinds, t, a, joint)
-    for t, kd in enumerate(kinds):
-        for a in kd.anchors:
+    for t, kd in enumerate(kinds):                   # разнос — когда закреплённые уже стоят все
+        for a in kd.anchors:                         # от каждого закреплённого
             _exclude(kinds, t, a, pair)
     turn = 0                                         # чей ход при «по кругу»
-    while True:
+    while True:                                      # шаг: каждый тип предлагает лучшее место, ставится одно
         offers = []                                  # (уровень, счёт, стеснённость, тип, кандидат)
-        for t, kd in enumerate(kinds):
+        for t, kd in enumerate(kinds):               # предложение каждого типа
             if len(kd.chosen) >= min(kd.n_quota, len(kd.cand)):   # квота типа исчерпана
                 continue
-            primary, gcov = kd.gains(a1, a2)
+            primary = kd.gains(a1, a2)               # основной прирост кандидатов типа
             if not joint:                            # своё покрытие — граница по типу на каждом шаге
                 kd.note_bound(primary, a1, a2)
-            secondary = SPREAD_EPS * gcov            # второй ключ — с тем же весом, что у одного типа
             if primary.max() > 1e-9:                 # кратность ещё растёт
-                level, score = 0, primary
+                level, score = 0, primary            # уровень ключа 0 — основной; счёт — прирост
                 if kd.bonus is not None:             # модульный бонус места (13.7) — только на этом уровне
                     kd.scale = float(primary.max()) if kd.scale is None else kd.scale
                     score = primary + kd.scale * kd.bonus   # прирост плюс бонус места
-            elif secondary.max() > 1e-12:            # насыщена — равномерность пути
-                level, score = 1, secondary
-            else:                                    # насыщено и это — резерв кратности
-                level, score = 2, kd.covsum
+            else:                                    # насыщена — второй ключ, с тем же весом, что у одного типа
+                secondary = SPREAD_EPS * kd.cov_gains()   # равномерность пути
+                if secondary.max() > 1e-12:          # доля пути ещё растёт
+                    level, score = 1, secondary      # уровень 1 — доля пути
+                else:                                # насыщено и это — резерв кратности
+                    level, score = 2, kd.covsum      # уровень 2 — сколько маршрутов накрывает
             s = np.where(kd.avail, score, -np.inf)   # только доступные места
-            c = int(np.argmax(s))
+            c = int(np.argmax(s))                    # лучшее место типа
             if not np.isfinite(s[c]) or s[c] <= 0.0:   # полезных мест у типа не осталось
                 continue
             tight = (kd.n_quota - len(kd.chosen)) / max(1, int(kd.avail.sum()))   # осталось / доступно
@@ -195,7 +214,7 @@ def joint_greedy(caches, quotas, weights, seps, anchors, pair=0.0, joint=True, r
             turn = (t + 1) % len(kinds)              # следующий ход — следующему типу
         elif rule == "tight":                        # самый стеснённый ходит первым всегда
             _lev, _s, _tg, t, c = max(offers, key=lambda o: (-o[0], o[2], o[1], -o[3]))
-        else:
+        else:                                        # «gain» — по приросту (В13.22)
             level = min(o[0] for o in offers)        # уровень критерия: основной важнее
             top = max(o[1] for o in offers if o[0] == level)   # лучший прирост этого уровня
             # равные приросты — ходит самый стеснённый; при равенстве и в этом — меньший номер типа
@@ -208,17 +227,17 @@ def joint_greedy(caches, quotas, weights, seps, anchors, pair=0.0, joint=True, r
         return picks, []
     if not joint:                                    # покрытие у каждого своё — граница по типу
         for kd in kinds:                             # и после последнего шага — обычно самая тесная
-            kd.note_bound(kd.gains(a1, a2)[0], a1, a2)
+            kd.note_bound(kd.gains(a1, a2), a1, a2)
         return picks, [kd.bound(a1, a2) for kd in kinds]
     # ⚠️ ПОКРЫТИЕ ОБЩЕЕ — граница ОДНА на весь проход: OPT ≤ F(S) + Σ по типам N_t лучших приростов
     # типа (квоты — матроид разбиения). Граница «по типу» здесь неверна: чужие датчики, поставленные
     # после последнего хода типа, подняли бы F выше неё
     f_s = kinds[0].phi(a1, a2)                       # F общего набора (k у всех одна)
     extra = 0.0                                      # сумма лучших приростов по типам
-    for kd in kinds:
-        g = kd.gains(a1, a2)[0]                      # приросты типа на итоговом покрытии
+    for kd in kinds:                                 # по типам — N_t лучших приростов каждого
+        g = kd.gains(a1, a2)                         # приросты типа на итоговом покрытии
         top = min(kd.n_quota, len(g))                # сколько лучших складывать
-        if top > 0:
+        if top > 0:                                  # квота есть — складываем её лучшие приросты
             extra += float(np.maximum(np.partition(g, -top)[-top:], 0.0).sum())
     f0 = kinds[0].f0                                 # F до прохода
     room = f_s + extra - f0                          # сколько вообще можно было добавить

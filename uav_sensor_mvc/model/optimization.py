@@ -135,39 +135,53 @@ class CoverageCache:
         self._pre_mask.append(mask)
         self._pre_cov.append(min(cov, 1.0))
 
-    def add_trajectory(self, traj):
+    def add_trajectory(self, traj, block=1 << 19):
+        """Строка кэша по маршруту: засечка, сегменты, доля пути у каждого кандидата. Вход: точки маршрута (P, 2)
+        км; block — пар «точка × кандидат» в куске (13.1 Д6). Отдаёт: ничего — строка дописывается в _hit, _mask, _cov."""
         self._add_placed_row(np.asarray(traj, float))
         if self.C == 0:
             self._hit.append(np.zeros(0, np.uint8))
             self._mask.append(np.zeros(0, np.uint32))
             self._cov.append(np.zeros(0, np.float32))
             return
-        diff = traj[:, None, :] - self.cand[None, :, :]
-        d = np.linalg.norm(diff, axis=2)                  # (n_points, C)
-        within = d <= self.R
-        self._hit.append(within.any(axis=0).astype(np.uint8))
-        self._cov.append(within.mean(axis=0).astype(np.float32))
-        mask_row = np.zeros(self.C, np.uint32)
-        idx = np.array_split(np.arange(len(traj)), self.L_seg)
-        for j, ix in enumerate(idx):
-            if len(ix):
-                seg_hit = within[ix].any(axis=0)
-                mask_row |= (seg_hit.astype(np.uint32) << np.uint32(j))
+        # ⚠️ КУСКАМИ ПО КАНДИДАТАМ: матрица расстояний целиком стоила ~48 байт на пару (разность, её копия и квадраты
+        # в `norm`), до 620 МБ на маршрут при малом радиусе. √(dx² + dy²) — ровно то, что `norm` считает по оси из
+        # двух чисел (одно сложение), поэтому эталон до бита; `hypot` — функция C-библиотеки, совпадает лишь по замеру
+        hit = np.empty(self.C, np.uint8)                  # засекает ли кандидат маршрут
+        cov = np.empty(self.C, np.float32)                # доля точек маршрута в зоне кандидата
+        mask_row = np.zeros(self.C, np.uint32)            # покрытые сегменты, битами
+        idx = np.array_split(np.arange(len(traj)), self.L_seg)   # номера точек по L_seg равным сегментам
+        step = max(1, int(block) // max(1, len(traj)))   # кандидатов в куске
+        for a in range(0, self.C, step):                  # куски кандидатов: в куске не больше block пар
+            b = min(a + step, self.C)                     # конец куска
+            d = traj[:, 0, None] - self.cand[None, a:b, 0]    # dx, потом расстояние, (точек, кусок), км
+            dy = traj[:, 1, None] - self.cand[None, a:b, 1]   # dy, км
+            d *= d; dy *= dy; d += dy                      # dx² + dy²
+            np.sqrt(d, out=d)                              # расстояние точка — кандидат, км
+            within = d <= self.R                          # точка в зоне кандидата, (точек, кусок)
+            hit[a:b] = within.any(axis=0)                 # хоть одна точка в зоне — засёк
+            cov[a:b] = within.mean(axis=0)                # доля точек маршрута в зоне
+            for j, ix in enumerate(idx):                  # сегменты маршрута: бит j — сегмент задет
+                if len(ix):                               # в сегменте есть точки (маршрут короче L_seg — нет)
+                    seg_hit = within[ix].any(axis=0)      # сегмент j задет кандидатом
+                    mask_row[a:b] |= (seg_hit.astype(np.uint32) << np.uint32(j))
+        self._hit.append(hit)
+        self._cov.append(cov)
         self._mask.append(mask_row)
 
     def routes_covered_by_candidate(self):
         """Сколько маршрутов выборки засекает КАЖДЫЙ кандидат — вектор (C,).
         Нужен для выбора «якорных» датчиков у входа и цели (вкладка 3): среди ближних
         кандидатов берётся тот, что накрывает больше всего маршрутов."""
-        if not self._hit:
+        if len(self._hit) == 0:                        # строк нет; `not` не годится — строки бывают матрицей (шаг 9)
             return np.zeros(self.C, np.int64)
-        return np.asarray(self._hit, dtype=np.int64).sum(axis=0)
+        return np.asarray(self._hit, dtype=np.uint8).sum(axis=0, dtype=np.int64)   # int64 — без копии в int64
 
     def greedy(self, N, weights, anchors=None, anchor_sep=0.0, min_sep=0.0, bonus=None, stop_gain=None, stop_min=0,
                traj_w=None, groups=None, goals=None):
-        """Жадный выбор до min(N, C) позиций; ключи по очереди: кратность и равномерность → доля пути → маршрутов.
-        Вход: N, веса (a1, a2), закреплённые номера и разнос км, разнос км, бонус (C,) | None (13.7); 13.1 Д9 — стоп по
-        приросту доли с кратностью k и минимум до него, веса маршрутов (T,), группа маршрута (T,) и уровень группы 0…1."""
+        """Жадный выбор до min(N, C) позиций; ключи: кратность и равномерность → доля пути → маршрутов. Вход: N, веса
+        (a1, a2), закреплённые номера и их разнос км, разнос км, бонус (C,) | None (13.7), стоп по приросту доли и минимум
+        до него, веса маршрутов (T,), группа маршрута (T,), уровни групп 0…1 (13.1 Д9). Отдаёт: позиции (n, 2), км."""
         # ⚠️ ТРЕТИЙ КЛЮЧ «сколько маршрутов накрывает кандидат» (резерв кратности) — не украшение: без него
         # при насыщении двух первых счёт нулевой у всех, `argmax` брал ПЕРВОГО по порядку, и датчики уходили
         # в угол карты (4 из 12 не ловили ни одного пролёта). Нулевой и он — расстановка прекращается.
@@ -179,9 +193,11 @@ class CoverageCache:
         if T == 0 or self.C == 0 or N <= 0:
             return np.empty((0, 2), float)
         a1, a2 = weights
-        H = np.asarray(self._hit, dtype=np.int64)         # (T, C)
-        M = np.asarray(self._mask, dtype=np.uint32)       # (T, C)
-        Fc = np.asarray(self._cov, dtype=np.float64)      # (T, C)
+        # ⚠️ матрицы — в том виде, в каком хранятся (13.1 Д6): копии в int64 / float64 стоили +20 байт на пару, а
+        # int64 + uint8 и float64 + float32 дают те же числа — эталон до бита
+        H = np.asarray(self._hit, dtype=np.uint8)         # (T, C) засекает ли
+        M = np.asarray(self._mask, dtype=np.uint32)       # (T, C) покрытые сегменты
+        Fc = np.asarray(self._cov, dtype=np.float32)      # (T, C) доля пути в зоне
         k, Lseg = self.k, self.L_seg
         # ВЕСА МАРШРУТОВ (13.1 Д9): у этапа целей маршрут весит приоритет своей цели / её число подлётов.
         # ⚠️ без весов — прежнее `.mean`, а не `W @`: иначе округление сдвинет выбор, и эталон уйдёт
@@ -193,7 +209,7 @@ class CoverageCache:
         grp = None if groups is None or traj_w is None else np.asarray(groups, int)   # цель маршрута или None
         done = set()                                      # группы, набравшие свой уровень
 
-        covsum = H.sum(axis=0).astype(float)              # маршрутов на кандидата (третичный ключ)
+        covsum = H.sum(axis=0, dtype=np.int64).astype(float)   # маршрутов на кандидата (третичный ключ)
         # ⚠️ СТАРТУЕМ НЕ С НУЛЯ, ЕСЛИ ДАТЧИКИ ДРУГИХ ТИПОВ УЖЕ СТОЯТ. Их покрытие —
         # часть решения, и жадный прирост обязан считаться поверх него: иначе тип 2
         # «не видит» кратности, набранной типом 1, и ставит датчики в уже закрытые места.
@@ -240,11 +256,36 @@ class CoverageCache:
             cur_pop = _popcount(mask_vec).astype(float)
             cur_cov = np.minimum(cur_cov + Fc[:, c], 1.0)
 
+        def gain_rows(late=False):
+            """Прирост основного критерия у пар маршрут × кандидат, на месте (13.1 Д6). Вход: late — порядок границы
+            после цикла (a1·Δ)/k, иначе шага a1·(Δ/k): ⚠️ округление разное, эталон до бита. Отдаёт: (T, C) float64."""
+            t = n_vec[:, None] + H                         # засечек с кандидатом, int64
+            np.minimum(t, k, out=t)                        # не больше k
+            g = t - cur_min[:, None]                       # прирост кратности, float64
+            del t
+            p = _popcount(mask_vec[:, None] | M)           # покрытых сегментов с кандидатом, int64
+            gm = p - cur_pop[:, None]                      # прирост сегментов, float64
+            del p
+            if late:                                       # граница после цикла — сперва вес, потом деление
+                g *= a1; g /= k; gm *= a2; gm /= Lseg
+            else:                                          # шаг цикла — сперва деление, потом вес
+                g /= k; g *= a1; gm /= Lseg; gm *= a2
+            g += gm                                        # a1·Δn/k + a2·Δm/L
+            return g
+
+        def cov_rows():
+            """Прирост доли пути под наблюдением (усечение 1) у пар маршрут × кандидат, на месте. Вход: нет — текущее
+            покрытие `cur_cov`. Отдаёт: (T, C) float64."""
+            g = cur_cov[:, None] + Fc                      # доля с кандидатом; float64 + float32 — те же числа, что с копией
+            np.minimum(g, 1.0, out=g)                      # больше всего пути не накрыть
+            g -= cur_cov[:, None]                          # прирост доли
+            return g
+
         def close_groups():
             """Группа набрала уровень — её маршруты больше не весят (цель защищена). Отдаёт: ничего."""
             if grp is None or goals is None:              # групп нет — выбывать некому
                 return
-            for g in set(grp.tolist()) - done:
+            for g in set(grp.tolist()) - done:             # группы, ещё не набравшие уровень
                 rows = grp == g                           # маршруты этой группы
                 if float((n_vec[rows] >= k).mean()) >= float(goals[g]) - 1e-12:   # уровень набран
                     W[rows] = 0.0                         # — вклада больше нет, веса не пересчитываем
@@ -280,29 +321,20 @@ class CoverageCache:
         stopped = False                                    # остановлен ли правилом прироста (13.1 Д9)
         close_groups()                                     # закреплённые могли уже набрать уровень
         while len(chosen) < min(N, self.C):
-            new_min = np.minimum(n_vec[:, None] + H, k)
-            gain_n = (new_min - cur_min[:, None]) / k
-            new_pop = _popcount(mask_vec[:, None] | M)
-            gain_m = (new_pop - cur_pop[:, None]) / Lseg
-            primary = avg(a1 * gain_n + a2 * gain_m)                  # (C,)
+            primary = avg(gain_rows())                                # основной прирост кандидатов, (C,)
             note_bound(primary)                                       # граница OPT на этом шаге
 
-            # вторичный критерий: прирост покрытой доли маршрутов (с усечением 1)
-            new_cov = np.minimum(cur_cov[:, None] + Fc, 1.0)
-            gain_cov = avg(new_cov - cur_cov[:, None])                # (C,)
-
             # лексикографика: основной критерий → вторичный → третичный (резерв кратности)
-            secondary = SPREAD_EPS * gain_cov
             if primary.max() > 1e-9:
                 score = primary
                 if bonus is not None:                      # модульный бонус места (13.7) — только
                     if scale[0] is None:                   # на первом уровне, пока кратность растёт
                         scale[0] = float(primary.max())    # масштаб — лучший прирост первого шага
                     score = primary + scale[0] * np.asarray(bonus, float)   # прирост плюс бонус места
-            elif secondary.max() > 1e-12:
-                score = secondary
-            else:
-                score = covsum                             # хоть сколько-то маршрутов
+            else:                                          # основной насыщен — вторичный: доля пути (с усечением 1)
+                # ⚠️ считается только здесь: прежде — на каждом шаге и впустую, пока основной растёт (13.1 Д6)
+                secondary = SPREAD_EPS * avg(cov_rows())                  # (C,)
+                score = secondary if secondary.max() > 1e-12 else covsum   # иначе — хоть сколько-то маршрутов
             score = np.where(avail, score, -np.inf)
             # ⚠️ стоп — по доле маршрутов, засечённых ≥ k, а не по ключу выбора: после насыщения жадный уходит
             # на вторичный ключ и ставит «туда же» (план 13.1 Д9: 10 ПВН у цели, насыщение уже на 7). Смотрятся
@@ -322,9 +354,7 @@ class CoverageCache:
             close_groups()
 
         # граница и после последнего шага: к концу набор полнее, и она обычно самая тесная
-        last = (a1 * (np.minimum(n_vec[:, None] + H, k) - cur_min[:, None]) / k
-                + a2 * (_popcount(mask_vec[:, None] | M) - cur_pop[:, None]) / Lseg)   # приросты
-        last = avg(last)                                   # в среднем по маршрутам, (C,)
+        last = avg(gain_rows(late=True))                   # приросты в среднем по маршрутам, (C,)
         note_bound(last)
         f_s = phi_now()                                    # F итогового набора
         room = ub[0] - f0                                  # сколько вообще можно было добавить
@@ -396,3 +426,56 @@ class CoverageCache:
                 d = np.linalg.norm(self.cand - self.cand[c], axis=1)
                 avail[d < min_sep] = False
         return self.cand[chosen] if chosen else np.empty((0, 2), float)
+
+
+# ----------------------------------------------------------------------
+# Строки кэша нарастающим итогом (оптимизация, шаг 9)
+# ----------------------------------------------------------------------
+class RowStore:
+    """Строки кэша покрытия нарастающим итогом: выборка при итерациях растёт с хвоста, и строки старых маршрутов по
+    тем же кандидатам не пересчитываются. Вход: постоянные кандидаты (C,2) км, радиус км, сегментов. Разбор —
+    теория/код/ОПТИМИЗАЦИЯ_В_КОДЕ §9."""
+
+    def __init__(self, cand, R, L_seg):
+        self.base = CoverageCache(cand, R, L_seg, 1)   # строки по постоянным кандидатам; k строкам не нужен
+        self.routes = []                               # маршруты, чьи строки уже есть, — ссылки, по порядку
+        self.added = 0                                 # сколько строк досчитано в последнем `cache` — для замера
+
+    def fits(self, cand, R, L_seg):
+        """Те же ли кандидаты, радиус и сегменты. Вход: (C,2) км, км, шт. Отдаёт: bool."""
+        c = np.asarray(cand, float)                    # кандидаты запроса, км
+        b = self.base                                  # хранимое
+        return (b.R == float(R) and b.L_seg == int(L_seg) and c.shape == b.cand.shape
+                and bool(np.array_equal(c, b.cand)))
+
+    def cache(self, routes, extra, k):
+        """Кэш на кандидатах + `extra` по выборке: общее начало выборки — из памяти, новые маршруты и столбцы `extra`
+        — счётом. Вход: маршруты, доп. кандидаты (E,2) км, кратность. Отдаёт: CoverageCache (строки — матрицами)."""
+        b = self.base                                  # хранимые строки
+        n = len(self.routes)                           # маршрутов в памяти
+        # ⚠️ ВЫБОРКА РОСЛА С ХВОСТА — ТЕ ЖЕ ОБЪЕКТЫ по порядку (`is`, не сравнение чисел): новую выборку, сброс
+        # итераций, загруженную историю строки прежней не описывают — тогда всё заново
+        if n > len(routes) or any(a is not r for a, r in zip(self.routes, routes)):   # выборку сменили
+            b = self.base = CoverageCache(b.cand, b.R, b.L_seg, 1)
+            self.routes, n = [], 0
+        for r in routes[n:]:                           # новые маршруты — строки счётом
+            b.add_trajectory(r)
+        self.routes = list(routes)
+        self.added = len(routes) - n
+        T = len(routes)                                # маршрутов всего
+        extra = np.asarray(extra, float).reshape(-1, 2)   # закреплённые и позиции у целей, км
+        full = CoverageCache(np.vstack([b.cand, extra]), b.R, b.L_seg, k)   # кэш запроса
+        H = np.asarray(b._hit, np.uint8).reshape(T, -1)      # засечки, (T, C)
+        M = np.asarray(b._mask, np.uint32).reshape(T, -1)    # сегменты, (T, C)
+        F = np.asarray(b._cov, np.float32).reshape(T, -1)    # доля пути, (T, C)
+        if len(extra):                                 # столбцы доп. кандидатов — счётом по всей выборке
+            ex = CoverageCache(extra, b.R, b.L_seg, k)   # их строки
+            for r in routes:                           # строка на маршрут
+                ex.add_trajectory(r)
+            # ⚠️ столбец считается независимо от соседей (расстояние, `any`, `mean` по точкам), поэтому склейка даёт
+            # ровно те числа, что один кэш на всех кандидатах, — эталон до бита
+            H = np.hstack([H, np.asarray(ex._hit, np.uint8).reshape(T, -1)])
+            M = np.hstack([M, np.asarray(ex._mask, np.uint32).reshape(T, -1)])
+            F = np.hstack([F, np.asarray(ex._cov, np.float32).reshape(T, -1)])
+        full._hit, full._mask, full._cov = H, M, F     # готовые матрицы: `greedy`, `joint_greedy` берут их без копии
+        return full

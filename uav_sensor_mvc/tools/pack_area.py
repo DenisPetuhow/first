@@ -352,13 +352,13 @@ def pack_sensors(folder, rec):
     if not pbfs:                                     # исходников нет
         raise SystemExit("места датчиков: в папке и в %s нет .pbf" % PARTS_DIR)
     pts, out, seen = [], {}, {}                      # постройки всех частей; кольца; отпечатки колец
-    for p in pbfs:
+    for p in pbfs:                                   # каждая часть экстракта
         t0 = time.time()                             # начало разбора части
         got = sensor_layers_from_osm(p, lon0, lat0, rec["bbox"])   # слои этого .pbf
         pts += got.pop(BUILDING_LAYER, [])
-        for name, rings in got.items():
+        for name, rings in got.items():              # слои-площади части
             keys = seen.setdefault(name, set())      # отпечатки колец слоя
-            for r in rings:
+            for r in rings:                          # кольцо — если такого ещё не было
                 k = _key(r)                          # отпечаток кольца
                 if k in keys:                        # то же кольцо из соседней полосы
                     continue                         # — второй раз не кладём

@@ -30,7 +30,7 @@ import os
 from dataclasses import dataclass
 
 FILE_NAME = "типы_датчиков.json"   # имя справочника в папке участка
-ZONES = ("везде", "застройка")     # правила места: «застройка» — карта ПВН (13.4)
+ZONES = ("везде", "застройка", "дорога")   # правила места: «застройка» — карта ПВН (13.4), «дорога» — доезд МОГ (13.3)
 LEGACY_IDS = (1, 2, 3, 4)          # номера, чьи N, R, k живут в полях Params (мост)
 BIG_ID = 4                         # номер большого типа — за ним поля threat_N_big / threat_R_big
 FIRST_FREE_ID = 5                  # с него нумеруются новые типы
@@ -51,9 +51,11 @@ class SensorType:
     zone: str = "везде"            # правило места, одно из ZONES
     zone_buf_km: float = 0.0       # полоса вокруг застройки и построек, км (ПВН — 0.5)
     strip_km: float = 0.0          # полоса у дорог и построек, где лес и болота разрешены, км
-    static: bool = False           # режим нового датчика по умолчанию: True — статический (В13.4)
+    wet_buf_km: float = 0.0        # отступ места от рек и болот, км (МОГ — 0.5; правило «дорога», план 13.3)
+    drive_km: float = 0.0          # дальность выезда по дорогам от объектов защиты, км; 0 — без предела
+    static: bool = False          # режим нового датчика по умолчанию: True — статический (В13.4)
     targets: bool = False          # ставится ли у объектов защиты до общего прохода (13.18)
-    tgt_min: int = 3               # минимум у цели, шт. — если помещается; сильнее прироста и потолка (13.1 Д9)
+    tgt_min: int = 3               # меньше не ставить у цели, шт. (не ниже k); сам минимум — доля по приоритету (30.09)
     tgt_gain_pct: float = 0.0      # порог прироста подлёта у цели, %; 0 — от кратности: 1 · 3 · 4 · 5 … (13.1 Д9)
     tgt_level_pct: float = 0.0     # уровень защиты — доля подлёта ≥ k, %; 0 — от кратности: 100 · 90 · 80 …
     tgt_cap_one: float = 0.5       # потолок при одной цели, доля N — бюджет этапа целей
@@ -72,7 +74,9 @@ class SensorType:
         ("k", 1, 20, "кратность"),
         ("zone_buf_km", 0.0, 20.0, "полоса у застройки, км"),
         ("strip_km", 0.0, 20.0, "полоса в лесу, км"),
-        ("tgt_min", 0, 100, "минимум у цели"),
+        ("wet_buf_km", 0.0, 20.0, "отступ от рек и болот, км"),
+        ("drive_km", 0.0, 1000.0, "дальность по дорогам, км"),
+        ("tgt_min", 0, 100, "меньше не ставить у цели"),
         ("tgt_gain_pct", 0.0, 100.0, "порог прироста у цели, %"),
         ("tgt_level_pct", 0.0, 100.0, "уровень защиты цели, %"),
         ("tgt_cap_one", 0.0, 1.0, "потолок одной цели"),
@@ -92,8 +96,8 @@ class SensorType:
             bad.append("номер %d — ждём от 1" % int(self.type_id))
         if self.zone not in ZONES:                   # чужое правило места расстановка не поймёт
             bad.append("место «%s» — бывает %s" % (self.zone, ", ".join(ZONES)))
-        for field, lo, hi, title in self.LIMITS:
-            val = float(getattr(self, field))
+        for field, lo, hi, title in self.LIMITS:    # числовые поля и их здравые пределы
+            val = float(getattr(self, field))        # значение поля в паспорте
             if not (lo <= val <= hi):                # число вне здравого смысла
                 bad.append("%s: %g — ждём от %g до %g" % (title, val, lo, hi))
         return bad
@@ -125,6 +129,8 @@ _KEYS = (
     ("место", "zone", str),
     ("полоса_у_застройки_км", "zone_buf_km", float),
     ("полоса_в_лесу_км", "strip_km", float),
+    ("отступ_от_рек_и_болот_км", "wet_buf_km", float),
+    ("дальность_по_дорогам_км", "drive_km", float),
     ("статический", "static", bool),
     ("у_объектов_защиты", "targets", bool),
     ("минимум_у_цели", "tgt_min", int),
@@ -146,7 +152,8 @@ _cache = {}                        # путь -> (время правки фай
 def defaults():
     """Встроенный справочник — с чего начинают, когда файла нет. Отдаёт: список типов.
     МОГ и ПВН — умолчания заказчика (21.09.2026), большой — нынешний тип 4."""
-    return [Small(type_id=1, name="МОГ", r_km=1.0, k=3, color="sensor"),
+    # МОГ — доезд по дорогам, реки и болота ± 0.5 км (заказчик 29.09.2026, план 13.3); справочник участка — как записан
+    return [Small(type_id=1, name="МОГ", r_km=1.0, k=3, color="sensor", zone="дорога", wet_buf_km=0.5),
             # бонус высоте 0.1 — наименьший, при котором ПВН на ≥ 2 этажах чаще 3 из 20 (замер 13.7: 3 → 5);
             # бонус городу 0 — его цену выбирает заказчик (В13.23, план 13 §13.7.4)
             Small(type_id=2, name="ПВН", r_km=0.5, k=4, color="sensor_t2",
@@ -158,7 +165,7 @@ def defaults():
 
 
 def plain(type_id=PLAIN_ID):
-    """«Обычный» — пока копия МОГ (R 1 км, k 3, везде): у МОГ будет своя механика (план 13.1, Д1).
+    """«Обычный» — МОГ без правила места (R 1 км, k 3, везде; план 13.1, Д1): у МОГ с 29.09.2026 — доезд по дорогам.
     Вход: номер. Отдаёт: Small. Число в задании — `threat_N_types`, по умолчанию 0: эталон не трогает."""
     return Small(type_id=int(type_id), name="Обычный", r_km=1.0, k=3, color="sensor_plain")
 
@@ -195,8 +202,8 @@ def _val(row, key, default, kind):
         if kind is str:                              # пустая строка — как пропуск
             return str(raw).strip() or default
         return kind(float(raw)) if kind is int else kind(raw)
-    except (TypeError, ValueError):
-        return default
+    except (TypeError, ValueError):                  # не число там, где ждём число
+        return default                               # — умолчание, справочник не губим
 
 
 def to_row(st):
@@ -224,7 +231,7 @@ def _parse(rows):
     """Записи файла — в справочник. Вход: список словарей. Отдаёт: типы без повторов номера.
     Повтор или номер < 1 отбрасывается: номер — ключ, двум типам под ним не жить."""
     out, seen = [], set()                            # типы и занятые номера
-    for r in rows:
+    for r in rows:                                   # записи файла по порядку
         if not isinstance(r, dict):                  # мусор вместо записи
             continue
         st = from_row(r)
@@ -249,7 +256,7 @@ def load():
     try:
         with io.open(fp, encoding="utf-8") as f:
             data = json.load(f)                      # весь файл: типы и версия
-        rows, ver = data.get("типы"), int(data.get("версия", 1))
+        rows, ver = data.get("типы"), int(data.get("версия", 1))   # записи типов и версия файла
     except Exception:                                # повреждён, нет прав —
         rows, ver = None, VERSION                    # начинаем со встроенных
     out = _parse(rows) if isinstance(rows, list) else []
@@ -279,17 +286,17 @@ def save(types):
 
 def by_id(type_id, types=None):
     """Тип по номеру. Вход: номер, список (по умолчанию — из файла). Отдаёт: тип или None."""
-    for st in (load() if types is None else types):
-        if st.type_id == int(type_id):
-            return st
+    for st in (load() if types is None else types):   # типы справочника
+        if st.type_id == int(type_id):               # номер совпал
+            return st                                # — он
     return None
 
 
 def by_name(name, types=None):
     """Тип по названию. Вход: название, список (по умолчанию — из файла). Отдаёт: тип или None."""
-    for st in (load() if types is None else types):
-        if st.name == name:
-            return st
+    for st in (load() if types is None else types):   # типы справочника
+        if st.name == name:                          # название совпало
+            return st                                # — он
     return None
 
 
@@ -298,6 +305,6 @@ def next_id(types):
     Номера 1–4 не выдаются: их числа живут в полях Params, и новый тип их бы унаследовал."""
     used = {int(t.type_id) for t in types}           # занятые номера
     tid = FIRST_FREE_ID                              # кандидат в номера
-    while tid in used:
+    while tid in used:                               # занят — следующий
         tid += 1
     return tid

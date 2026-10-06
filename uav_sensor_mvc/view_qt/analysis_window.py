@@ -29,7 +29,7 @@ class AnalysisDialog(QtWidgets.QDialog):
     (`refresh`), но сам по себе не обновляется — иначе «на момент нажатия» потеряло бы
     смысл. Колбэки: `data(номер цели или None)` → HTML, `choices()` → подписи целей."""
 
-    def __init__(self, parent, data=None, choices=None):
+    def __init__(self, parent, data=None, choices=None, on_load=None):
         super().__init__(parent)
         self.setWindowTitle("Анализ моделирования")
         self.resize(560, 640)
@@ -46,6 +46,13 @@ class AnalysisDialog(QtWidgets.QDialog):
         self.text = QtWidgets.QTextBrowser()
         self.text.setOpenExternalLinks(False)
         col.addWidget(self.text)
+        # НАГРУЗКА НА СРЕДСТВА (план 13.4, заказчик 30.09.2026) — своё окно с таблицей по типу и общей
+        self.btn_load = QtWidgets.QPushButton("Рассчитать нагрузку")
+        self.btn_load.setToolTip("Доля маршрутов выборки, прошедших через каждое средство: таблица по типу или по всем "
+                                 "средствам, по убыванию нагрузки; выгрузка в Word.")
+        self.btn_load.clicked.connect(on_load or (lambda: None))
+        self.btn_load.setVisible(on_load is not None)   # без колбэка кнопке нечего делать
+        col.addWidget(self.btn_load)
         btn_close = QtWidgets.QPushButton("Закрыть")
         btn_close.clicked.connect(self.close)
         col.addWidget(btn_close)
