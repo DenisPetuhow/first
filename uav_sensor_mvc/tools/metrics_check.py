@@ -32,9 +32,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+
 from config import Params, THREAT_AREA                     # noqa: E402
-from model.threat_grid import ThreatModel                  # noqa: E402
-from model.sensors import sensor_types                     # noqa: E402
+from model.threat.threat_grid import ThreatModel                  # noqa: E402
+from model.placement.sensors import sensor_types                     # noqa: E402
 
 LINE = "=" * 70
 _fails = []
@@ -138,7 +140,7 @@ def main(argv=None):
 
     print("\n5. НАГРУЗКА НА СРЕДСТВО (план 13.4)")
     import numpy as np                                            # noqa: E402
-    from model.sensor_load import seen_matrix, sort_rows          # noqa: E402
+    from model.placement.sensor_load import seen_matrix, sort_rows          # noqa: E402
     keep5 = (np.array(m.sensors, copy=True), np.array(m.sensors_big, copy=True))   # расстановка до расчёта
     sample5 = m._sample_for_sensors()                             # единая выборка
     det5 = m._detection(sample5)                                  # засечка «Анализа» на ней же

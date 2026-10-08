@@ -71,6 +71,9 @@ ROOT = _find_root()
 
 def _run(cmd):
     # Запустить git и отдать вывод. Вход: список аргументов. Отдаёт: строку ("" — не вышло).
+    if cmd and cmd[0] == "git":                       # git — без экранирования кириллицы в путях
+        # ⚠️ по умолчанию git выдаёт "tools/\320\277…" (core.quotepath): путь не находится на диске (журнал 367)
+        cmd = ["git", "-c", "core.quotepath=off"] + list(cmd[1:])
     try:
         return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                               encoding="utf-8", errors="replace").stdout
@@ -91,17 +94,37 @@ def _abs(base_dir, rel):
     return os.path.join(base_dir, rel.strip().replace("/", os.sep))
 
 
+def _paths_only(line):
+    # Строка без путей и полных имён: `src/model/a.py` → `a.py`, `model.threat.grid` → `grid`.
+    # Вход: строка кода. Отдаёт: строку для сравнения «было — стало».
+    line = re.sub(r"(?:[\w.-]+/)+", "", line)          # префиксы папок
+    return re.sub(r"\b(?:\w+\.)+(\w+)", r"\1", line)  # составные имена — до последней части
+
+
 def changed_lines(base):
     # Какие строки каких .py изменились относительно base, плюс новые файлы целиком.
     # Вход: коммит/ветка. Отдаёт: {абсолютный путь: множество номеров строк}.
     out = _run(["git", "diff", "--unified=0", base, "--", "*.py"])
     base_dir = repo_root()                            # от него отсчитаны пути в диффе
     files, cur = {}, None
+    rem, add, newno = [], [], 0                       # куска: удалённые строки, (номер, добавленная), счётчик
+
+    def flush():
+        # ПРАВКА ТОЛЬКО ПУТЕЙ — не новый код (журнал 364: перенос в src/ менял `model/x.py` в старых пояснениях).
+        # Вход: ничего (куски rem/add). Отдаёт: ничего — снимает такие строки с проверки.
+        if cur and rem and len(rem) == len(add):      # строки куска парные — сравниваем попарно
+            for old, (no, new) in zip(rem, add):      # пара «было — стало»
+                if _paths_only(old) == _paths_only(new):   # отличаются лишь путями и полными именами
+                    files[cur].discard(no)
+        rem.clear(); add.clear()
+
     for line in out.splitlines():
         if line.startswith("+++ b/"):                 # начался новый файл диффа
+            flush()
             cur = _abs(base_dir, line[6:])            # — дальше его куски
             files.setdefault(cur, set())
         elif line.startswith("@@") and cur:
+            flush()
             # формат куска: @@ -старое +новое,сколько @@
             try:
                 part = line.split("+")[1].split("@@")[0].strip()
@@ -110,6 +133,12 @@ def changed_lines(base):
             except (IndexError, ValueError):          # необычная шапка куска
                 continue                              # — пропускаем, не падаем
             files[cur].update(range(start, start + count))
+            newno = start
+        elif line.startswith("-") and not line.startswith("---"):   # удалённая строка куска
+            rem.append(line[1:])
+        elif line.startswith("+") and not line.startswith("+++"):   # добавленная строка куска
+            add.append((newno, line[1:])); newno += 1
+    flush()
     # ⚠️ НОВЫЙ ФАЙЛ, ЕЩЁ НЕ ДОБАВЛЕННЫЙ В GIT, `git diff` НЕ ВИДИТ — а правило именно про
     # новый код. Берём такие целиком: 20.09.2026 модуль типов БПЛА прошёл проверку
     # вхолостую («файлов с правками 1» при четырёх).

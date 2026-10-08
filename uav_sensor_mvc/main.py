@@ -10,6 +10,11 @@
 Здесь параметры задаются и меняются прямо в интерфейсе (панель справа,
 Enter — пересчёт). Консольных режимов и аргументов командной строки нет.
 """
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))   # код программы — в src/ (журнал 364)
+
 from config import Params
 
 

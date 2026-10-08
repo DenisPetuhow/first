@@ -15,6 +15,8 @@
 import os
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))   # код программы — в src/ (журнал 364)
+
 # ⚠️ ДО `import config`: область и папка тайлов, выбранные в прошлый раз (план 10 §10.5).
 # config читает область при импорте, поэтому переменные окружения нужны раньше него.
 import area_file
@@ -196,9 +198,9 @@ def selftest():
     `threat_layers.npz` и `dem.tif` в корне кэша и после перехода на папки участков
     сообщала бы «НЕТ» о файлах, которые на месте."""
     import importlib.util
-    from model.threat_grid import (geo_cache_root, area_cache_dir, area_file,
+    from model.threat.threat_grid import (geo_cache_root, area_cache_dir, area_file,
                                    dem_files, ThreatModel)
-    from view_qt import geomap as gm
+    from view_qt.maps import geomap as gm
     from config import (Params, THREAT_AREA, THREAT_LAYERS_FILE, THREAT_SOURCE_FILE,
                         THREAT_DEM_FILE, THREAT_BBOX_LONLAT)
 
@@ -275,11 +277,11 @@ def main():
     from pyqtgraph.Qt import QtWidgets, QtGui, QtCore
     from config import SPLASH_SECONDS
     from model import SimulationModel
-    from model.area_start import AreaStartModel
-    from model.threat_grid import ThreatModel
+    from model.tabs12.area_start import AreaStartModel
+    from model.threat.threat_grid import ThreatModel
     from view_qt import SimulationView
-    from view_qt.area_view import AreaStartView
-    from view_qt.threat_view import ThreatMapView
+    from view_qt.tabs.area_view import AreaStartView
+    from view_qt.tabs.threat_view import ThreatMapView
     from controller_qt import QtSimulationController
     from controller_qt.area_controller import AreaStartController
     from controller_qt.threat_controller import ThreatController
@@ -317,7 +319,7 @@ def main():
     m3 = ThreatModel(p3)
     # area_max_km — ЧЁРНАЯ рамка: предел, за которым нет ни векторных данных, ни рельефа.
     # Синяя рамка (район моделирования) появится, когда район зададут (план 8, задача 8.2).
-    from model.geo_frame import bbox_lonlat_to_km as _bb2km
+    from model.threat.geo_frame import bbox_lonlat_to_km as _bb2km
     from config import THREAT_BBOX_LONLAT as _AREA_BBOX, THREAT_VIEW_LONLAT as _VIEW_BBOX
     # view_max_km — рамка ПОКАЗА (план 12, 12.1): докуда видно подложку. Шире чёрной рамки,
     # если в `область.txt` задан ключ «карта»; иначе совпадает с ней, и всё как прежде.

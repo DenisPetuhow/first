@@ -34,6 +34,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))   # папка docs/
 ROOT = os.path.dirname(_HERE)              # корень проекта: docs/ лежит в нём
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+    sys.path.insert(0, os.path.join(ROOT, "src"))   # код программы — в src/ (журнал 364)
 
 PIC_DIR = os.path.join(_HERE, "картинки")   # куда кладём PNG для документа
 
@@ -50,7 +51,7 @@ def _model():
     # района, и картинка растягивается на пустое поле
     sys.path.insert(0, os.path.join(ROOT, "tools"))
     from motion_check import build_scenario
-    from model.threat_routes import build_iter_context
+    from model.threat.threat_routes import build_iter_context
     m, _auto, _lmax = build_scenario()
     entry, target = m.entries_target_km()
     t0 = time.time()                            # засекаем сборку контекста
@@ -167,7 +168,7 @@ def fig_field(m, ctx, out):
 
 def fig_routes(m, ctx, out, n_routes=24, seed=1000):
     """Рисунок 3: зачем нужны via — маршруты, раскрашенные по своей точке обхода."""
-    from model.threat_routes import sample_one_route
+    from model.threat.threat_routes import sample_one_route
     rng = np.random.default_rng(seed)           # зерно закреплено: картинка повторяема
     via_x, via_y = _cells_km(m, ctx["via_cell"])   # точки обхода, км
     L_max = float(m.p.threat_L_max)             # запас хода, км
@@ -213,7 +214,7 @@ def fig_routes(m, ctx, out, n_routes=24, seed=1000):
 
 def fig_cost(m, ctx, t_ctx, out, n_routes=40, seed=1000):
     """Рисунок 4: что считается один раз, что на каждый маршрут и цена наивного пути."""
-    from model.threat_routes import sample_one_route
+    from model.threat.threat_routes import sample_one_route
     rng = np.random.default_rng(seed)           # зерно закреплено
     L_max = float(m.p.threat_L_max)             # запас хода, км
     t0 = time.time()                            # засекаем розыгрыш маршрутов

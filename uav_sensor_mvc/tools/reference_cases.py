@@ -60,9 +60,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+
 from config import Params, THREAT_AREA                     # noqa: E402
-from model.threat_grid import ThreatModel                  # noqa: E402
-from model.sensors import sensor_types                     # noqa: E402
+from model.threat.threat_grid import ThreatModel                  # noqa: E402
+from model.placement.sensors import sensor_types                     # noqa: E402
 
 LINE = "=" * 74
 

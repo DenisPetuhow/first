@@ -49,6 +49,7 @@ def _find_root(markers=("CLAUDE.md", "config.py")):
 ROOT = _find_root()
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+    sys.path.insert(0, os.path.join(ROOT, "src"))   # код программы — в src/ (журнал 364)
 _TOOLS = os.path.join(ROOT, "tools")
 if _TOOLS not in sys.path:
     sys.path.insert(0, _TOOLS)
@@ -68,7 +69,7 @@ def collect(m, level, seed, routes):
     # Набрать маршруты с их повадкой и поясом. Вход: модель, уровень облёта, зерно,
     # число маршрутов. Отдаёт: список (линия (N,2) км, повадка, пояс или −1).
     # ⚠️ Не `run_batch`: метки лежат в `_stats` ПОСЛЕДНЕГО розыгрыша — читать сразу.
-    from model.threat_routes import sample_one_route
+    from model.threat.threat_routes import sample_one_route
     m.p.threat_iter_approach = level
     # ⚠️ ЗЕРНО ПАТЧИМ ВОКРУГ `iter_reset`: он заводит генератор выборки заново, и без
     # подмены картинка не повторилась бы (ловушка уже стоила замера — журнал п. 275).
@@ -126,7 +127,7 @@ def fig_belts(m, level, seed, routes, out):
     """⭐ Облёт цели: маршруты по повадкам, пояса, столбцы «заказано → вышло».
     Вход: модель, уровень облёта, зерно, число маршрутов, путь .png. Отдаёт: None."""
     import config as cfg
-    from model.threat_routes import FINAL_BYPASS_KM
+    from model.threat.threat_routes import FINAL_BYPASS_KM
     levels = ("min", "medium", "max")
     # Столбцы по уровням честны только тогда, когда КАЖДЫЙ уровень набран отдельно: доли
     # заданы внутри уровня, и смешанная выборка показала бы среднее по трём заказам.

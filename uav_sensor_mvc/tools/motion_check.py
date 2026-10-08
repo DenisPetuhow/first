@@ -32,6 +32,7 @@ from concurrent.futures import ProcessPoolExecutor
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+    sys.path.insert(0, os.path.join(ROOT, "src"))   # код программы — в src/ (журнал 364)
 if hasattr(sys.stdout, "reconfigure"):   # вывод в файл идёт в cp1251, и знак «×» ронял прогон
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -139,6 +140,14 @@ ETALON_APPROACH = {
 ETALONS = {"spread": ETALON, "approach": ETALON_APPROACH}   # оси, у которых есть эталон
 
 
+
+def _model_path(mod):
+    """Полное имя модуля модели по короткому (`threat_routes`). Вход: имя. Отдаёт: `model.<подпапка>.<имя>`."""
+    for sub in ("threat", "placement", "tabs12"):         # подпапки модели (журнал 364)
+        if os.path.exists(os.path.join(ROOT, "src", "model", sub, mod + ".py")):   # модуль лежит здесь
+            return "model.%s.%s" % (sub, mod)
+    return "model." + mod
+
 def check_etalon(results, etalon):
     """Сверить средние прогонов с эталоном движения. Вход: {режим: [итоги прогонов]}, эталон оси.
     Отдаёт: число расхождений (печатает строку на каждое)."""
@@ -170,7 +179,7 @@ def build_scenario(extra_km=EXTRA_KM, az_deg=SECTOR_AZ_DEG, centered=True):
     Вход: extra_km — добавка к авто-запасу хода, км; az_deg — азимут сектора, градусы;
     centered — район размером с район по умолчанию, но с центром в цели. Отдаёт: (модель, авто-запас км, запас км)."""
     from config import Params, THREAT_WORK_LONLAT, THREAT_TARGET
-    from model.threat_grid import ThreatModel
+    from model.threat.threat_grid import ThreatModel
     m = ThreatModel(Params())
     m.set_relief(True)                       # как в контрольном прогоне
     # ⚠️ РАЙОН С ЦЕНТРОМ В ЦЕЛИ (задание «центр в Мирном»). В районе по умолчанию Мирный
@@ -218,7 +227,7 @@ def _turns(Q):
 def route_metrics(poly, B, entry_c, grid):
     """Форма одного маршрута. Вход: линия (N,2) км, цель B км, центр входов км, сетка.
     Отдаёт: словарь показателей (км, градусы, доли, флаги 0/1)."""
-    from model.threat_routes import _mean_weight
+    from model.threat.threat_routes import _mean_weight
     P = np.asarray(poly, float)
     Q, s = _resample(P, RESAMPLE_KM)
     out = dict(length=float(np.hypot(*np.diff(P, axis=0).T).sum()),
@@ -307,7 +316,7 @@ def route_metrics(poly, B, entry_c, grid):
 def run_batch(m, T, seed):
     """Набрать T маршрутов тем же порядком, что `iter_batch`, считая попытки.
     Вход: модель, T шт., зерно. Отдаёт: (маршруты, попыток, секунд)."""
-    from model.threat_routes import sample_one_route
+    from model.threat.threat_routes import sample_one_route
     _orig = np.random.default_rng
     np.random.default_rng = lambda *a, **k: _orig(seed)   # воспроизводимый прогон
     try:
@@ -427,7 +436,7 @@ def apply_sets(sets):
     for item in items:
         name, val = item.split("=", 1)
         mod, attr = name.strip().rsplit(".", 1)
-        module = importlib.import_module(mod if mod.startswith(("model.", "config")) else "model." + mod)
+        module = importlib.import_module(mod if mod.startswith(("model.", "config")) else _model_path(mod))   # модуль по имени из --set
         old = getattr(module, attr)
         if isinstance(old, bool):                      # флаг
             new = val.strip() in ("1", "True", "true")

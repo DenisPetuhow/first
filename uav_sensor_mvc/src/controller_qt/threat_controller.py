@@ -1,0 +1,2245 @@
+# -*- coding: utf-8 -*-
+"""
+CONTROLLER (Qt) · Вкладка 3 «Цифровая карта угроз».
+
+Связывает model.threat.threat_grid.ThreatModel (построение весовой карты + расстановка
+датчиков по весам) с view_qt.tabs.threat_view.ThreatMapView (ограниченная карта участка,
+векторные слои, тепловой слой весов, датчики). Анимации нет — карта статична, датчики
+считаются одним проходом (без итераций накопления, как и просил пользователь).
+
+ДОКУМЕНТАЦИЯ (почему так, а не как устроено — это здесь в комментариях):
+  теория/вкладка_3/ВКЛАДКА_3_КАК_РАБОТАЕТ.md — порядок работы кнопок простыми словами
+  теория/правила/ОГРАНИЧЕНИЯ.md — §6 что проверяет контрольный прогон
+
+Карта кода — теория/карта_кода/README.md (генерируется codemap.py).
+"""
+import os
+
+import numpy as np
+from pyqtgraph.Qt import QtCore
+
+from config import (MODE_LABELS, THREAT_LAYERS, THREAT_CELL_M,
+                    THREAT_ITER_MODE_LABELS, THREAT_SENSOR_REFRESH_EVERY)
+
+
+class _TaskSignals(QtCore.QObject):
+    """Мостик «фоновый поток → интерфейс». Qt-объекты из потока трогать нельзя, поэтому
+    результат фоновой задачи возвращается СИГНАЛОМ `done`, который Qt доставляет уже в
+    основной поток. Полезная нагрузка — кортеж (вид_задачи, ошибка|None)."""
+    done = QtCore.pyqtSignal(object)          # (kind, error|None)
+
+
+class _Task(QtCore.QRunnable):
+    """Тяжёлый расчёт (чтение OSM / наложение слоёв / расстановка) в ФОНОВОМ потоке,
+    чтобы интерфейс не подвисал (на реальных данных это секунды). Работает только с
+    моделью (чистый numpy) — Qt из потока не трогает; результат отдаёт сигналом."""
+
+    def __init__(self, kind, work_fn, sig):
+        super().__init__()
+        self._kind = kind; self._work = work_fn; self._sig = sig
+
+    def run(self):
+        err = None
+        try:
+            self._work()
+        except Exception as e:                 # noqa: BLE001 — донесём текст в UI
+            err = e
+        try:
+            self._sig.done.emit((self._kind, err))
+        except RuntimeError:
+            pass                               # окно закрыто во время расчёта
+
+
+class ThreatController:
+    """Связывает МОДЕЛЬ (ThreatModel — чистый numpy) и ПРЕДСТАВЛЕНИЕ (ThreatMapView — Qt).
+
+    Отвечает за: запуск тяжёлых расчётов в фоне (пул потоков, чтобы окно не подвисало),
+    покадровую анимацию итераций (таймер 33 мс, «полёт» БПЛА по маршруту), сбор данных из
+    модели и передачу их во view на отрисовку, обработку действий пользователя (кнопки,
+    чекбоксы, клик «цель», окно входных данных). Логику расчётов сам не содержит — только
+    оркестрирует. Публичные методы `on_*` — обработчики событий интерфейса (их имена
+    говорят сами за себя); тяжёлое считается в `_run_async`, результат приходит в
+    `_on_task_done`."""
+
+    def __init__(self, model, view):
+        self.model = model
+        self.view = view
+        self._pool = QtCore.QThreadPool.globalInstance()
+        self._sig = _TaskSignals()
+        self._sig.done.connect(self._on_task_done)
+        self._busy = False
+        # анимация итераций (как во вкладке 2): таймер прорисовки полёта БПЛА
+        self._anim = QtCore.QTimer()
+        self._anim.setInterval(33)
+        self._anim.timeout.connect(self._anim_tick)
+        self._anim_running = False
+        self._cur_route = None            # маршрут, который сейчас «летит»
+        self._cur_j = 0                   # индекс точки анимации
+        self._speed = 6                   # скорость анимации (точек за кадр)
+        self._sensors_at = 0              # при скольких маршрутах датчики пересчитаны
+        # ПОТОК «ПУСКА» (13.5.11): маршруты и датчики считает `IterWorker`, анимация берёт маршруты из очереди
+        self._worker = None               # поток итераций или None
+        self._route_queue = []            # построенные потоком маршруты, ещё не показанные анимацией
+        self._worker_end = None           # чем поток закончил (done · exhausted · stopped · error) или None
+        # Снимок состояния ПЕРЕД моделированием — к нему возвращает кнопка «Очистить».
+        # None — моделирование ещё не запускали, возвращаться некуда.
+        self._pre_iter = None
+        # обстановка менялась (цель, сектор, запас хода), выборка устарела: ждём «Расставить датчики»
+        self._pending_recalc = False
+        view.set_callbacks(
+            on_build=self.on_build, on_relief=self.on_relief,
+            on_place=self.on_place, on_apply=self.on_apply,
+            on_reset=self.on_reset, on_reset_view=self.on_reset_view,
+            on_clear_iter=self.on_clear_iter,
+            on_mode=self.on_mode, on_toggle=self.on_toggle,
+            on_map_layer=self.on_map_layer, on_map_offline=self.on_map_offline,
+            on_set_target=self.on_set_target, on_choose_data=self.on_choose_data,
+            # план 13, 13.13: объекты защиты — окно и постановка мышью
+            on_targets_rows=self.model.target_table_rows, on_target_add=self.on_target_add,
+            on_targets_done=self.on_targets_done, on_target_weight=self.on_target_weight,
+            on_target_move=self.on_target_move, on_targets_clear=self.on_targets_clear,
+            on_target_sectors=self.on_target_sectors,
+            on_target_show_area=self.on_target_show_area,
+            on_analysis_choices=self._analysis_choices,   # цели в окне «Анализ» (23.09.2026)
+            on_input_apply=self.on_input_apply, on_iter_mode=self.on_iter_mode,
+            on_iter_spread=self.on_iter_spread, on_iter_spend=self.on_iter_spend,
+            on_iter_approach=self.on_iter_approach,
+            on_iter_play=self.on_iter_play, on_iter_step=self.on_iter_step,
+            on_iter_batch=self.on_iter_batch, on_iter_speed=self.on_iter_speed,
+            on_iter_gen_frac=self.on_iter_gen_frac,
+            on_zone_added=self.on_zone_added, on_zone_undo=self.on_zone_undo,
+            on_set_sector=self.on_set_sector, on_clear_sector=self.on_clear_sector,
+            # план 11, 11.6: круглый район, окно «Сектор налёта», точки старта мышью
+            on_set_area_circle=self.on_set_area_circle,
+            on_sector_params=self.on_sector_params, on_sector_auto=self.on_sector_auto,
+            on_sector_state=self._sector_state,
+            on_entry_rows=self.model.entry_rows, on_entry_add=self.on_entry_add,
+            on_entry_move=self.on_entry_move, on_entry_delete=self.on_entry_delete,
+            # план 12, 12.2: условия моделирования — тип БПЛА и точка старта
+            on_set_uav_start=self.on_set_uav_start, on_clear_uav_start=self.on_clear_uav_start,
+            on_uav_type=self.on_uav_type, on_sim_state=self.on_sim_state,
+            on_entry_table_rows=self.model.entry_table_rows,
+            on_set_entry_L_max=self.on_set_entry_L_max,
+            on_uav_speed=self.on_uav_speed,
+            on_sensors_apply=self.on_sensors_apply, on_set_area=self.on_set_area,
+            # план 13, 13.2–13.3: окна «Датчики» и «Тип датчика»
+            on_types_changed=self.on_types_changed, on_type_deleted=self.on_type_deleted,
+            on_type_task=self.on_type_task, on_type_zone=self.on_type_zone,
+            # план 13, В13.21: район защиты цели в лесу
+            on_target_area=self.on_target_area, on_target_area_clear=self.on_target_area_clear,
+            on_clear_area=self.on_clear_area,
+            # датчики, заданные человеком (задача 8.7)
+            on_manual_add=self.on_manual_add, on_manual_remove=self.on_manual_remove,
+            on_manual_edit=self.on_manual_edit, on_clear_sensors=self.on_clear_sensors,
+            on_sensor_delete=self.on_sensor_delete,
+            on_manual_clear=self.on_manual_clear, on_manual_mode=self.on_manual_mode,
+            on_sensor_rows=self._sensor_rows,
+            # «режим анализа» плашки над картой (план 8, задача 8.9, довесок 06.09.2026)
+            on_mode_analysis=self.on_mode_analysis,
+            # история полётов: выгрузка/загрузка (задача 8.6)
+            on_flights_save=self.on_flights_save, on_flights_load=self.on_flights_load,
+            on_flights_clear=self.on_flights_clear,
+            # окно «Посмотреть маршруты» (задача 8.6, довесок 06.09.2026)
+            on_routes_data=self._routes_data_for_viewer,
+            on_route_preview=self.on_route_preview,
+            on_route_preview_reset=self.on_route_preview_reset,
+            # галочка «обобщать одинаковые проходы» загруженной истории (14.09.2026)
+            on_generalize_loaded=self.on_generalize_loaded,
+            on_generalize_state=self._generalize_state_for_viewer,
+            # окно «Анализ моделирования» (план 8, задача 8.9, довесок 06.09.2026)
+            on_analysis_data=self._analysis_html,
+            # нагрузка на средства и её выгрузка в Word (план 13.4)
+            on_sensor_load=self.on_sensor_load, on_load_export=self.on_load_export,
+            # окна рисунков «Аналитики» — карта, нагрузка, направления (06.10.2026)
+            on_report_data=self.on_report_data)
+        # СТАРТ: район не задан — расчётные кнопки закрыты, синей рамки нет
+        view.set_area_ready(model.area_ready,
+                            model.area_size_km() if model.area_ready else None,
+                            model.bbox_km if model.area_ready else None,
+                            model.area_circle)
+        # перерисовка слоёв при смене масштаба/панораме: прореживание считается по
+        # ВИДИМОЙ области, а застройка переключается растр <-> контуры
+        self.view.on_view_changed = self._on_view_changed
+        self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
+        self.model.sync_cand_step(force=True)      # шаг сетки под текущий радиус
+        self.view.set_param_values(self.model.p)
+        self._idle_metrics()
+
+    # ================= ЗАПРЕТНЫЕ ЗОНЫ =================
+    def on_zone_added(self, poly):
+        """Пользователь нарисовал зону: пролёт там запрещён, всё зависящее — пересчитать."""
+        if not self.model.add_no_fly_zone(poly):
+            return
+        self._after_zone_change()
+
+    def on_zone_undo(self):
+        """Убрать последнюю зону."""
+        if not self.model.undo_no_fly_zone():
+            self.view.set_title("Запретных зон нет")
+            return
+        self._after_zone_change()
+
+    def _after_zone_change(self):
+        """Общее для добавления и отмены: пересчёт и ЧЕСТНОЕ сообщение о последствиях.
+
+        Зона могла перекрыть единственный коридор — тогда маршрутов не будет вовсе. Это
+        законный исход, а не поломка, но молчать о нём нельзя: пустая карта выглядит как
+        сбой программы."""
+        self.model.sensors = np.empty((0, 2), float)
+        self._sensors_at = 0
+        info = self.model.no_fly_check()
+        msg = "Запретных зон: %d (%.0f км²)" % (info["zones"], info["area_km2"])
+        if info["blocked_entry"]:
+            msg += " — ⚠ ТОЧКА ВЫЛЕТА внутри зоны"
+        elif info["blocked_target"]:
+            msg += " — ⚠ ЦЕЛЬ внутри зоны"
+        elif info["unreachable"]:
+            msg += " — ⚠ цель НЕДОСТИЖИМА: зона перекрыла коридор, обхода по весам нет"
+        if info["zones"] == 0:
+            msg = "Запретные зоны убраны"
+        self.view.set_title(msg)
+        self._render_all()
+
+    # ================= РЕЛЬЕФ =================
+    def on_relief(self):
+        """Кнопка «Добавить рельеф» / «Убрать рельеф».
+
+        Карта пересобирается целиком (рельеф — последний шаг конвейера весов, досчитать
+        его поверх готовой карты нельзя). Пересборка обнуляет накопленные маршруты,
+        итерации и датчики: они построены по другой карте, смешивать выборки нельзя."""
+        if self._busy:
+            self.view.flash_title("Идёт расчёт — подождите…")
+            return
+        if not self.model.has_dem():
+            # путь называем ПОЛНОСТЬЮ, с папкой участка: файл, положенный не туда,
+            # программа не найдёт, а сообщение «положите dem.tif» это не подскажет
+            from model.threat.threat_grid import area_cache_dir
+            self.view.flash_title("Нет файла высот: положите растр (.tif/.hgt) в "
+                                  f"{area_cache_dir()}")
+            return
+        want = not self.model.relief_on
+        self._anim_stop()
+        self.view.iter_clear_current()
+        self.model.set_relief(want)
+        self.view.set_relief_button(self.model.relief_on, True)
+        # ПОКАЗ ВКЛЮЧАЕТСЯ ВМЕСТЕ С РЕЛЬЕФОМ. Иначе рельеф применялся к весам, а на карте
+        # ничего не менялось — галка показа осталась снятой, и выглядело это как «рельеф
+        # не воспроизводится» (заказчик 04.09.2026). Выключаем — гасим и показ.
+        self.view.set_relief_shown(self.model.relief_on)
+        self._sensors_at = 0
+        self._run_async("build", self.model.build)
+
+    def _on_view_changed(self):
+        """Вид изменился — перерисовать только векторные слои (остальное не зависит
+        от масштаба). Дёшево: слои и так строятся из готовых массивов."""
+        self.view.reposition_legends()      # легенды прижаты к углам вида, а не участка
+        g = self.model.grid
+        if g is None:
+            return
+        t = self.view.get_toggles()
+        # ⚠️ РАНЬШЕ ЗДЕСЬ БЫЛ ВЫХОД ПРИ СНЯТОЙ ГАЛКЕ «векторные слои». Теперь перерисовка
+        # нужна и без слоёв: от масштаба зависят ещё и ПОДПИСИ пунктов (какие показывать и
+        # какие попали в кадр), а они живут по своей галке. Пустой проход дёшев — слои
+        # получают пустые массивы и прячутся.
+        self.view.render_layers(self.model.layers,
+                                self.model.layers.get("bridge_pts", []), t,
+                                built_mask=g._built_cells, extent=g.extent_km())
+
+    # ================= ИТЕРАЦИИ (симуляция как во вкладке 2) =================
+    def _iter_ready(self):
+        if self._busy:
+            self.view.flash_title("Идёт расчёт — подождите…"); return False
+        if self.model.grid is None:
+            self.view.flash_title("Сначала «Построить карту»."); return False
+        return True
+
+    def on_iter_speed(self, v):
+        self._speed = max(1, int(v))
+
+    def _iter_title(self):
+        lab = THREAT_ITER_MODE_LABELS.get(self.model.p.threat_iter_mode,
+                                          self.model.p.threat_iter_mode)
+        T = self.model.iter_target_count()            # число из панели, шт.
+        # без `or ()`: sensors_big — массив numpy, его истинность неопределена
+        big_arr = getattr(self.model, "sensors_big", None)
+        n_big = 0 if big_arr is None else len(big_arr)
+        big = (f" + {n_big}/{getattr(self.model.p, 'threat_N_big', 0)} больших"
+               if getattr(self.model.p, "threat_N_big", 0) else "")
+        return (f"Итерация {len(self.model.iter_routes)}/{T}  |  режим «{lab}»  |  "
+                f"датчиков {len(self.model.sensors)}/{self.model.p.threat_N}{big}  |  "
+                f"L_max={self.model.p.threat_L_max:g} км")
+
+    # ▶ Пуск / ⏸ Пауза — пошаговая анимация с движением БПЛА
+    def on_iter_play(self):
+        if self._anim_running:                            # пауза
+            self._anim_stop(); return
+        if not self._iter_ready():
+            return
+        self.view.set_iter_checked(True)
+        self.model.p.threat_iter_routes = self.view.get_iter_T()
+        if self.model.iter_iteration == 0 or self._iter_finished():
+            self._snapshot_before_iter()                  # чтобы «Очистить» вернуло это
+            if not self.model.iter_reset():
+                self.view.flash_title("Цель недостижима по коридорам (проверьте L_max/цель).")
+                return
+            self._sensors_at = 0                          # выборка начата заново
+            self.view.iter_show_accumulated([])
+        self._start_worker()
+        self._anim_running = True
+        self.view.set_iter_running(True)
+        self._anim.start()
+
+    def _start_worker(self):
+        """Запустить поток «Пуска» (13.5.11в): маршруты и датчики — в фоне. Вход: нет. Отдаёт: ничего."""
+        from config import THREAT_SENSOR_REFRESH_EVERY
+        from .iter_worker import IterWorker
+        self._stop_worker()                               # прежний — дождаться, двух на одну модель нельзя
+        w = IterWorker(self.model, THREAT_SENSOR_REFRESH_EVERY, start_at=self._sensors_at)   # поток итераций
+        q = QtCore.Qt.QueuedConnection                    # сигналы — в главный поток очередью событий Qt
+        w.route_ready.connect(self._route_queue.append, q)
+        w.sensors_ready.connect(self._on_worker_sensors, q)
+        w.ended.connect(self._on_worker_ended, q)
+        self._worker, self._worker_end = w, None
+        self.view.set_busy(True, wait_cursor=False)       # кнопки обстановки — нельзя, окна — можно
+        w.start()
+
+    def _stop_worker(self):
+        """Остановить поток «Пуска» и дождаться его — перед всем, что меняет модель. Вход: нет. Отдаёт: ничего."""
+        w = self._worker                                  # поток итераций
+        if w is None:                                     # не запускали
+            return
+        w.stop()
+        w.wait()                                          # доделает шаг: маршрут ≤ 0.3 с, датчики ≤ 1 с
+        self._worker = None
+        self._route_queue.clear()                         # построенные, но не показанные — уже в выборке модели
+        self.view.iter_show_accumulated(self.model.iter_routes)
+        self.view.set_busy(False)
+
+    def _on_worker_sensors(self, n):
+        """Поток пересчитал датчики — нарисовать и отпустить его. Вход: маршрутов в выборке. Отдаёт: ничего."""
+        self._sensors_at = n
+        self._render_sensors()
+        if self._worker is not None:                      # поток ждёт отрисовки
+            self._worker.drawn()
+
+    def _on_worker_ended(self, why):
+        """Поток закончил — запомнить почему; анимация доиграет очередь и подведёт итог. Вход: причина. Отдаёт: ничего."""
+        self._worker_end = why
+        if why.startswith("error"):                      # упал — сказать
+            self.view.flash_title("Ошибка итераций: %s" % why[7:])
+
+    def _iter_finished(self):
+        # по тому же числу, что и пакет «Пакетно», — числу из панели
+        return self.model.iter_iteration >= self.model.iter_target_count()
+
+    def _maybe_refresh_sensors(self, force=False):
+        """Пересчитать датчики по УЖЕ накопленной выборке пролётов — периодически, а не
+        только в самом конце. Раньше во время итераций датчики стояли неподвижно (те, что
+        были посчитаны по «возможным путям»), и казалось, что модель на выборку не
+        реагирует. Шаг обновления — `THREAT_SENSOR_REFRESH_EVERY` накопленных маршрутов."""
+        n = len(self.model.iter_routes)
+        step = max(1, int(THREAT_SENSOR_REFRESH_EVERY))
+        if n < step:
+            return False
+        if not force and n - self._sensors_at < step:
+            return False
+        self.model.place_sensors()
+        self._sensors_at = n
+        self._render_sensors()
+        return True
+
+    def _anim_stop(self):
+        self._anim.stop()
+        self._anim_running = False
+        self.view.set_iter_running(False)
+        self._stop_worker()                               # пауза — поток доделает шаг и выйдет
+
+    def _anim_tick(self):
+        """Один кадр анимации (таймер 33 мс). Если текущий маршрут «долетел» — берём из
+        модели следующую итерацию и начинаем её; иначе сдвигаем маркер БПЛА вперёд по
+        текущему маршруту. По завершении всех итераций — расставляем датчики и рисуем всё."""
+        # начать новый маршрут, если предыдущий долетел
+        if self._cur_route is None:
+            # ⚠️ МАРШРУТ СТРОИТ ПОТОК (13.5.11в): здесь — только показ; очередь пуста — поток ещё считает, окно свободно
+            if not self._route_queue:                     # показывать нечего
+                why = self._worker_end                    # чем поток закончил; None — ещё считает
+                if why in ("done", "exhausted"):          # закончил, всё показано — итог
+                    self._anim_stop()
+                    self._render_all()
+                    self._full_metrics()
+                    self.view.set_title(self._iter_title() + (" — готово. Датчики по выборке пролётов." if why == "done"
+                                                              else " — выборка исчерпана."))
+                elif why is not None:                     # остановлен или упал
+                    self._anim_stop()
+                return
+            route = self._route_queue.pop(0)              # следующий построенный маршрут
+            if self._worker is not None:                  # место впрок освободилось — поток строит следующий
+                self._worker.consumed()
+            self._cur_route = route
+            self._cur_j = 0
+            self.view.refresh_route_viewer()   # маршрут долетел — виден в списке сразу
+            # «итерационные маршруты» выкл -> на карте только ТЕКУЩИЙ пролёт (не весь веер)
+            show_acc = self.view.get_toggles().get("show_iter")
+            self.view.iter_show_accumulated(self.model.iter_routes if show_acc else [])
+            self.view.iter_setup_flight(route)
+            self.view.set_title(self._iter_title())
+        # двигать БПЛА по текущему маршруту. Шаг ~ пропорционален длине пути, чтобы любой
+        # маршрут пролетался за одинаковое число кадров (иначе длинные — очень медленно).
+        self._cur_j += max(1, int(len(self._cur_route) * self._speed / 120))
+        end = len(self._cur_route) - 1
+        if self._cur_j >= end:
+            self._cur_j = end
+        self.view.iter_update_flight(self._cur_route, self._cur_j)
+        if self._cur_j >= end:                            # долетел -> следующая итерация
+            self._cur_route = None                        # датчики пересчитывает поток (`_on_worker_sensors`)
+            if self.view.get_toggles().get("show_iter_gen"):   # 10 % «на этот момент»
+                self._refresh_generalized()
+
+    # Шаг — одна итерация без анимации (сразу весь маршрут)
+    def on_iter_step(self):
+        if not self._iter_ready():
+            return
+        self._anim_stop()                                 # и поток «Пуска», если шёл
+        self.view.set_iter_checked(True)
+        self.model.p.threat_iter_routes = self.view.get_iter_T()
+        if self.model.iter_iteration == 0:
+            self._snapshot_before_iter()                  # чтобы «Очистить» вернуло это
+            if not self.model.iter_reset():
+                self.view.flash_title("Цель недостижима по коридорам.")
+                return
+            self._sensors_at = 0                          # выборка начата заново
+        route = self.model.iter_step()
+        self.view.iter_show_accumulated(self.model.iter_routes)
+        if route is not None:
+            self.view.iter_update_flight(route, len(route) - 1)   # весь маршрут + БПЛА в цели
+            self.view.refresh_route_viewer()       # маршрут добавлен — виден в списке сразу
+        self._maybe_refresh_sensors()                            # датчики по накопленной выборке
+        self._refresh_generalized()                              # 10 % «на этот момент»
+        self.view.set_title(self._iter_title())
+
+    # Пакетно — все T итераций сразу (в фоне), без анимации
+    def on_iter_batch(self):
+        if not self._iter_ready():
+            return
+        self._anim_stop()
+        self.view.iter_clear_current()
+        self.view.set_iter_checked(True)
+        self.model.p.threat_iter_routes = self.view.get_iter_T()
+        self._sensors_at = 0                             # iter_batch начинает выборку заново
+        self._snapshot_before_iter()
+        # ⚠️ «ПАКЕТНО» ЦЕЛИКОМ В ФОНЕ (13.5.11а): и выборка, и итоговая расстановка — в потоке пула; прежде расстановка
+        # шла в главном по сигналу «готово», и окно замирало ещё на 0.7–5.9 с
+        self._run_async("iter", self._iter_batch_work)
+
+    def _iter_batch_work(self, fn=None):
+        """«Пакетно» в фоне: выборка и итоговая расстановка (13.5.11а). Вход: чем строить выборку (по умолчанию
+        `iter_batch`). Отдаёт: ничего. Окна не трогает."""
+        from config import THREAT_SENSOR_REFRESH_EVERY
+        (fn or self.model.iter_batch)()
+        n = len(self.model.iter_routes)                   # маршрутов в выборке
+        if n >= max(1, int(THREAT_SENSOR_REFRESH_EVERY)):  # есть по чему ставить
+            self.model.place_sensors()
+            self._sensors_at = n
+
+    # ---- «ОЧИСТИТЬ»: назад к состоянию ДО МОДЕЛИРОВАНИЯ (заказчик 05.09.2026) ----
+    def _snapshot_before_iter(self):
+        """Запомнить расстановку и заданные датчики ПЕРЕД запуском итераций.
+
+        ⚠️ Снимок делается сам, а не по кнопке: человек нажимает «Пуск» или «Пакетно», не
+        думая о том, что потом захочет вернуться. Момент — старт выборки, то есть когда
+        `iter_iteration == 0`: повторный запуск поверх уже накопленного снимок НЕ
+        обновляет, иначе «до моделирования» означало бы «до последней добавки».
+
+        Что запоминаем: расстановку со всеми её спутниками (тип, режим, кем поставлен),
+        заданные человеком датчики (их динамические позиции при итерациях меняются) и
+        показатели. Карту, рельеф и район — нет: моделирование их не трогает."""
+        import copy
+        m = self.model
+        if m.iter_iteration and self._pre_iter is not None:
+            return                                    # выборка уже идёт — снимок не трогаем
+        self._pre_iter = dict(
+            sensors=np.array(m.sensors, float, copy=True),
+            sensors_big=np.array(m.sensors_big, float, copy=True),
+            sensors_type=np.array(m.sensors_type, int, copy=True),
+            sensors_static=np.array(m.sensors_static, bool, copy=True),
+            sensors_big_static=np.array(m.sensors_big_static, bool, copy=True),
+            sensors_manual=np.array(m.sensors_manual, bool, copy=True),
+            sensors_big_manual=np.array(m.sensors_big_manual, bool, copy=True),
+            manual=copy.deepcopy(m.manual_sensors),
+            metrics=copy.deepcopy(m.metrics()),
+        )
+
+    def on_clear_iter(self):
+        """Кнопка «Очистить»: убрать итерации и вернуть состояние до моделирования.
+
+        Отличие от «Сброса»: тот обнуляет всё, оставляя район, весовую карту и рельеф.
+        Здесь карта, маршруты «все возможные» и заданные условия остаются — уходит
+        только то, что дало моделирование."""
+        import copy
+        self._anim_stop()                                 # поток «Пуска» — остановить до правки модели
+        m = self.model
+        self._anim_stop()
+        m.iter_routes = []
+        m.iter_iteration = 0
+        self._sensors_at = 0
+        snap = self._pre_iter
+        if snap is not None:
+            m.sensors = np.array(snap["sensors"], float, copy=True)
+            m.sensors_big = np.array(snap["sensors_big"], float, copy=True)
+            m.sensors_type = np.array(snap["sensors_type"], int, copy=True)
+            m.sensors_static = np.array(snap["sensors_static"], bool, copy=True)
+            m.sensors_big_static = np.array(snap["sensors_big_static"], bool, copy=True)
+            m.sensors_manual = np.array(snap["sensors_manual"], bool, copy=True)
+            m.sensors_big_manual = np.array(snap["sensors_big_manual"], bool, copy=True)
+            m.manual_sensors = copy.deepcopy(snap["manual"])
+            m._metrics = copy.deepcopy(snap["metrics"])
+        self.view.iter_show_accumulated([])
+        self.view.iter_clear_current()
+        self.view.set_iter_checked(False)
+        self.view.refresh_sensor_table(self._sensor_rows())
+        self.view.set_manual_count(len(m.manual_sensors))
+        self._render_all()
+        self._full_metrics()
+        self.view.refresh_route_viewer()   # список «своих маршрутов» опустел — обновить
+        self.view.set_title(
+            "Итерации убраны — вернулись к состоянию до моделирования."
+            if snap is not None else
+            "Итерации убраны. Снимка «до моделирования» не было — датчики остались "
+            "теми, что посчитаны сейчас.")
+
+    # ================= ИСТОРИЯ ПОЛЁТОВ: выгрузка/загрузка (задача 8.6) =================
+    def on_flights_save(self, path):
+        """Кнопка «Выгрузить историю полётов». Путь уже выбран диалогом во View —
+        здесь только проверка готовности (заказчик: «если пакетное моделирование не
+        завершилось — предупреждение, что нет данных») и сама запись."""
+        from model.threat import flight_log
+        if not self.model.iterations_complete():
+            self.view.flash_title(
+                "Нет данных: пакет итераций не завершён (%d/%d) — дойдите «Пуск»/"
+                "«Пакетно» до конца."
+                % (len(self.model.iter_routes), self.model.iter_target_count()))
+            return
+        try:
+            n_routes, n_points = flight_log.save_flights(path, self.model)
+        except OSError as ex:
+            self.view.flash_title("Файл не записан: %s" % ex)
+            return
+        msg = "Записано в файл: маршрутов %d, точек %d." % (n_routes, n_points)
+        size_mb = os.path.getsize(path) / (1024.0 * 1024.0)
+        if size_mb > 8.0:                      # план 8 §8.6.4: предупредить про размер
+            msg += "  ⚠ файл %.1f МБ" % size_mb
+        self.view.flash_title(msg)
+
+    def on_flights_load(self, path):
+        """Кнопка «Загрузить историю полёта». Маршруты идут В ОТДЕЛЬНОЕ поле
+        `model.loaded_routes` — НЕ в `iter_routes` (план 8 §8.6.4: иначе счётчик
+        итераций и вся статистика соврут). Участок и якорь НЕ проверяются — координаты
+        в градусах самодостаточны, как и у заданных вручную датчиков."""
+        from model.threat import flight_log
+        try:
+            routes_deg, report = flight_log.load_flights(path)
+        except OSError as ex:
+            self.view.flash_title("Файл не прочитан: %s" % ex)
+            return
+        reason = flight_log.check_compatible(routes_deg, report)
+        if reason:
+            self.view.flash_title("Файл не подходит: %s" % reason)
+            return
+        n = self.model.load_routes_lonlat(routes_deg, report.get("groups"))   # маршрутов в выборке
+        self.model.show_loaded_routes = True
+        self.view.set_loaded_routes_checked(True)
+        msg = "Загружено маршрутов: %d, точек: %d." % (n, report["n_points"])
+        if report["rejected"]:                    # были нечитаемые строки
+            msg += "  Отброшено строк: %d." % len(report["rejected"])
+        if report.get("routes_with_repeats"):     # в файле были одинаковые проходы подряд
+            msg += ("  %d из %d записей в файле состояли из одинаковых проходов — каждый проход "
+                    "загружен отдельным маршрутом, без возвратов в начало. Обобщить до одного "
+                    "прохода на запись — галочка в окне «Посмотреть маршруты»."
+                    % (report["routes_with_repeats"], report["routes_in_file"]))
+        self.view.flash_title(msg)
+        self._render_all()
+        self.view.refresh_route_viewer()   # «Загруженная история» появилась/сменилась
+
+    def on_flights_clear(self):
+        """Кнопка «Удалить выборку» — убирает ТОЛЬКО загруженную историю (заказчик
+        06.09.2026): после этого «Расставить датчики» снова считает по зоне пролёта
+        (или по своим итерациям, если они уже накоплены), как было бы без загрузки.
+        В отличие от «Сброса» — датчики, цель и зоны не трогает."""
+        n = self.model.clear_loaded_routes()
+        self.view.set_loaded_routes_checked(False)
+        self.view.flash_title(
+            "Загруженная история убрана (%d маршрутов)." % n if n else
+            "Загруженной истории и не было.")
+        self._render_all()
+        self.view.refresh_route_viewer()   # «Загруженная история» опустела — обновить
+
+    # ---- окно «Посмотреть маршруты» (задача 8.6, довесок 06.09.2026) ----
+    def _routes_data_for_viewer(self):
+        """Данные для окна просмотра: свои пройденные маршруты и загруженная история,
+        оба в градусах — то же представление, что в файле."""
+        return self.model.routes_lonlat(), self.model.loaded_routes_lonlat()
+
+    def _generalize_state_for_viewer(self):
+        # Состояние галочки «обобщать одинаковые проходы» для окна просмотра.
+        # Вход: ничего. Отдаёт: (обобщать есть что — bool, включена — bool, записей, проходов).
+        records, passes = self.model.loaded_repeat_info()   # записей файла и проходов всего
+        return records < passes, self.model.generalize_loaded, records, passes
+
+    def on_generalize_loaded(self, on):
+        # Галочка «обобщать одинаковые проходы» в окне «Посмотреть маршруты».
+        # Вход: on — bool. Отдаёт: ничего; перерисовывает карту и список окна.
+        n = self.model.set_generalize_loaded(on)     # маршрутов в выборке после переключения
+        records, passes = self.model.loaded_repeat_info()
+        self.view.flash_title(
+            ("Обобщение включено: по одному проходу на запись — %d маршрутов вместо %d."
+             % (n, passes)) if on else
+            ("Обобщение выключено: все проходы — %d маршрутов (записей в файле %d)."
+             % (n, records)))
+        self.view.render_route_preview(None)         # подсветка указывала на старую нумерацию
+        self._render_all()
+        self.view.refresh_route_viewer()
+
+    def on_route_preview(self, is_loaded, index):
+        """Подсветить на карте ОДИН выбранный маршрут (км — тот же фрейм, что у карты).
+        Индекс — по тому же списку, что вернул `_routes_data_for_viewer`."""
+        src = self.model.loaded_routes if is_loaded else self.model.iter_routes
+        if 0 <= index < len(src):
+            self.view.render_route_preview(src[index])
+
+    def on_route_preview_reset(self):
+        self.view.render_route_preview(None)
+
+    # ---- окно «Исходные данные»: применить сразу (не блокирует программу) ----
+    # ⚠️ ОДИН ОБРАБОТЧИК НА ВСЁ ОКНО (задача 8.7). Прежде их было два — «Датчики» и
+    # «Входные данные», каждый со своим окном. Теперь окно одно и отдаёт все поля разом,
+    # а что пересчитывать, решается по тому, ЧТО именно изменилось: правка радиуса
+    # датчика не должна пересчитывать маршруты, а правка разрыва — обязана.
+    ROUTE_KEYS = ("threat_L_max", "threat_L_max_manual", "threat_speed_kmh",
+                  "threat_bank_deg", "threat_turn_interval_km", "threat_max_gap_km",
+                  "threat_corridor_slack_km")
+
+    def on_sensors_apply(self, vals):
+        """Применить поля окна «Исходные данные».
+
+        ⚠️ РАССТАНОВКУ НЕ ЗАПУСКАЕТ (правило заказчика 05.09.2026). «Применить» здесь
+        значит «принять введённые данные», и не более: дальше они учитываются там, где
+        нужны — при добавлении датчика мышью, при расстановке по кнопке основного окна,
+        при расчёте маршрутов. Раньше кнопка сама расставляла датчики, и правка одного
+        радиуса запускала секундный пересчёт, которого никто не просил.
+
+        Исключение — параметры МАРШРУТА (запас хода, разрыв и т. п.): они меняют саму
+        проходимость карты и область залёта, поэтому пересчёт остаётся."""
+        p = self.model.p
+        before = {n: getattr(p, n, None) for n in self.ROUTE_KEYS}
+        r_before = float(getattr(p, "threat_R", 0.0))
+        for n, v in vals.items():
+            setattr(p, n, v)
+        # ⚠️ ЧИСЛО СЕГМЕНТОВ ЗАЖАТО 1…31 (план 12, 12.6): маска накрытых сегментов лежит в
+        # 32-битном числе, по биту на сегмент, и 32 молча сломали бы счёт покрытия
+        if "L_seg" in vals:
+            p.L_seg = int(min(31, max(1, int(p.L_seg))))
+        # ⚠️ РУЧНОЙ ЗАПАС ОТМЕНЯЕТ ЗАПАС ПО ТОЧКАМ (план 12, 12.4): человек ввёл своё число —
+        # значит хочет один предел на все точки, как было до условий моделирования
+        if vals.get("threat_L_max_manual") and self.model.uav_lmax_per_entry:
+            self.model.uav_lmax_per_entry = False
+            self.view.flash_title("Запас хода задан вручную — один на все точки входа.")
+        from model.placement.sensors import sensor_types
+        # ⚠️ ДОВОЛЬНО ЛЮБОГО РАБОТАЮЩЕГО ТИПА (план 13, 13.4): прежде требовался тип 1, и обстановка
+        # «один ПВН» (N1 = 0) не принималась, хотя с 13.4 она считается честно
+        if not any(s.active for s in sensor_types(p)):   # ни у одного типа нет N > 0 и R > 0
+            self.view.flash_title("Нет ни одного работающего типа: нужно N ≥ 1 и радиус > 0.")
+            return
+        # Шаг сетки кандидатов подгоняется под радиус — но только если радиус СМЕНИЛСЯ,
+        # иначе затирали бы значение, которое пользователь только что ввёл в этом окне.
+        if abs(float(p.threat_R) - r_before) > 1e-9:
+            self.model.sync_cand_step()
+        self.view.set_param_values(p)
+        route_changed = any(getattr(p, n, None) != before[n] for n in self.ROUTE_KEYS)
+        if route_changed:
+            # ⚠️ ПРИЗНАК СМЕНЫ РАЗРЫВА СЧИТАЕМ ЗДЕСЬ и передаём готовым: значения уже
+            # проставлены выше, и внутри `on_input_apply` сравнивать было бы не с чем —
+            # «до» и «после» там совпали бы всегда, и сброс маршрутов молча не сработал.
+            self.on_input_apply({}, gap_changed=(
+                getattr(p, "threat_max_gap_km", None) != before["threat_max_gap_km"]))
+            return
+        if self.model.grid is None:
+            self.view.set_title("Исходные данные приняты. Нажмите «Построить карту».")
+            return
+        # Датчики НЕ переставляем — только обновляем показатели и карту под новые числа.
+        self._full_metrics()
+        self._render_all()
+        n = len(self.model.sensors) + len(self.model.sensors_big)
+        self.view.set_title(
+            "Исходные данные приняты." + (
+                " Датчики на карте прежние — нажмите «Расставить датчики», чтобы "
+                "пересчитать их по новым данным." if n else
+                " Нажмите «Расставить датчики»."))
+
+    # ---- окна «Датчики» и «Тип датчика» (план 13, 13.2–13.3) ----
+    def on_types_changed(self):
+        """Справочник типов правили: названия, цвета, правила места — легенда, датчики, окна. Отдаёт: ничего."""
+        self.view.refresh_legend()
+        self._render_sensors()
+        self.view.refresh_sensors_dialog()
+
+    def on_type_deleted(self, tid):
+        """Тип удалён из справочника: его заданные датчики и его число в задании — тоже. Вход: номер. Отдаёт: ничего."""
+        tid = int(tid)                               # номер удалённого типа
+        self.model.manual_sensors = [m for m in self.model.manual_sensors if m.type_id != tid]
+        more = dict(getattr(self.model.p, "threat_N_types", {}) or {})   # число типов справочника
+        more.pop(tid, None)
+        more.pop(str(tid), None)
+        self.model.p.threat_N_types = more
+        self._after_manual_change()
+
+    def on_type_task(self, tid, r_km, k):
+        """Окно типа поправило R и k номера моста 1–4 — это числа задания, поля Params (план 13 §13.1.4).
+        Вход: номер, радиус км, кратность. Отдаёт: ничего."""
+        from model.placement.sensors import _FIELDS
+        p = self.model.p                                  # задание: поля номеров 1–4
+        tid = int(tid)                               # номер типа из окна
+        if tid not in _FIELDS:                      # не номер моста — числа в паспорте, задание не трогаем
+            return
+        _f_n, f_r, f_k = _FIELDS[tid]                     # имена полей Params: радиус и кратность типа
+        r_before = float(getattr(p, f_r, 0.0))       # радиус до правки, км
+        setattr(p, f_r, float(r_km))
+        same = bool(getattr(p, "threat_k_same", True))   # общая кратность
+        # ⚠️ ПРИ ОБЩЕЙ КРАТНОСТИ окно показывает у 2–3 общее threat_k — записать его в threat_k2/k3
+        # значило бы молча стереть их собственную кратность; общее число правится у типа 1
+        if tid == 1:                                 # тип 1 — его поле и есть общее
+            p.threat_k = int(k)
+        elif tid in (2, 3) and not same:             # своя кратность — своё поле
+            setattr(p, f_k, int(k))
+        if abs(float(r_km) - r_before) > 1e-9:       # радиус сменился — шаг сетки под него
+            self.model.sync_cand_step()
+        self.view.set_param_values(p)
+        self.view.refresh_sensors_dialog()
+
+    def on_type_zone(self, tid):
+        """Показать карту места типа и его места (13.3). Вход: номер типа; None — спрятать. Отдаёт: ничего."""
+        from model.placement.sensors import sensor_types
+        if tid is None or self.model.grid is None:   # спрятать или карты ещё нет
+            self.view.show_type_zone(None)
+            return
+        spec = next((s for s in sensor_types(self.model.p) if s.type_id == int(tid)), None)   # тип задания
+        mask = self.model.allowed_mask(spec) if spec is not None else None   # карта места
+        if mask is None:                             # тип ставится везде
+            self.view.show_type_zone(None)
+            self.view.flash_title("Тип №%d ставится везде — ограничений места нет." % int(tid))
+            return
+        pts = self.model.type_candidates(spec, mask)   # места типа, км
+        g = self.model.grid                          # сетка карты: охват и шаг ячейки, км
+        parts = self.model.allowed_parts(spec)       # слагаемые карты (Д3) — какие показать, решает окно
+        from model.placement import road_access, sensor_zones
+        from config import THREAT_REACH_ARROW_KM
+        vectors = None                               # векторные слои — только у правила «дорога» (план 13.3)
+        if spec.passport is not None and spec.passport.zone == "дорога":   # МОГ — дороги, реки, ручьи
+            # ЛЭП, просеки, ж/д — не дороги: МОГ по ним не едет, в окне — для сверки с подложкой (13.5.5)
+            names = road_access.DRIVE_LAYERS + ("river", "stream", "power", "cutline", "railway")   # слои — линиями
+            vectors = {n: self.model.layers.get(n, []) for n in names}   # ломаные слоёв, км
+            # ⚠️ ПУТИ — ПО ВЕКТОРНЫМ ЛИНИЯМ ДОРОГ, а не по клеткам (13.5.9): клеточное дерево шло лесенкой «ёлочкой» мимо
+            # самих дорог (снимок 2026-10-02 214453); карта места по-прежнему клеточная — правило 13.3
+            lines, arrows = road_access.reach_lines(self.model.layers, self.model._access_targets(spec.passport),
+                                                    float(getattr(spec.passport, "drive_km", 0.0) or 0.0),
+                                                    THREAT_REACH_ARROW_KM)   # пути по дорогам и стрелки
+            vectors["reach_lines"] = lines           # пути доезда от целей — ломаными
+            vectors["reach_arrows"] = arrows         # и стрелки по ходу: (x, y, dx, dy) км
+        # КОНТУРЫ ЛЕСА, БОЛОТ, НЕУДОБИЙ — настоящие полигоны OSM из файла мест, а не клетки (13.5.5)
+        # ⚠️ СЛИТЫЕ КОНТУРЫ (13.5.12): куски OSM рисовались каждый своим кольцом — швы внутри массивов леса
+        contours = {key: sensor_zones.dissolved_rings(layer)   # кольца слитого контура, км
+                    for key, layer in (("forest", sensor_zones.FOREST_LAYER), ("wetland", sensor_zones.WETLAND_LAYER),
+                                       ("rough", sensor_zones.ROUGH_LAYER))}
+        self.view.show_type_zone(mask, g.extent_km(), int(tid), pts, parts=parts, vectors=vectors, contours=contours)
+        title = ("Тип №%d «%s»: разрешено %.0f км², мест %d"
+                 % (int(tid), spec.name, float(mask.sum()) * g.h * g.h, len(pts)))   # заголовок карты
+        if parts is not None and "reach" in parts:   # правило «дорога» — ещё доезд
+            dist = parts["dist"][parts["reach"]]     # км по дорогам до доезжаемых ячеек
+            share = 100.0 * parts["reach"].sum() / max(1, parts["roads"].sum())   # доля дорог, куда доезжает, %
+            title += "; доезжает %.0f %% дорог, дальше всего %.0f км" % (share, float(dist.max()) if len(dist) else 0.0)
+        self.view.set_title(title)
+
+    def on_input_apply(self, vals, gap_changed=None):
+        """Пересчёт после правки параметров МАРШРУТА (запас хода, разрыв, скорость…).
+
+        `vals` может быть пустым: значения уже проставлены вызывающим — тогда это просто
+        «пересчитай под новые параметры», а `gap_changed` приходит готовым."""
+        gap_before = getattr(self.model.p, "threat_max_gap_km", None)
+        for n, v in vals.items():
+            setattr(self.model.p, n, v)
+        if gap_changed is None:
+            gap_changed = (getattr(self.model.p, "threat_max_gap_km", None) != gap_before)
+        # РАЗРЫВ меняет саму проходимость: коридоры сшиваются/рвутся, а значит меняются и
+        # область залёта, и набор возможных маршрутов. Всё накопленное построено по старой
+        # проходимости — сбрасываем и считаем заново (контекст выборки модель пересоберёт
+        # сама: разрыв входит в его ключ).
+        if gap_changed:
+            self.model.routes = []
+            self.model.iter_routes = []
+            self.model.iter_iteration = 0
+        # Маршруты, область залёта и датчики зависят от запаса хода и разрыва —
+        # пересчитываем ВСЕГДА, а не только то, что сейчас показано на карте. Раньше
+        # условие смотрело на чекбоксы: при выключенных «маршрутах» правка L_max меняла
+        # только надпись, а область, линии и датчики оставались от прежних значений —
+        # подхватывалось лишь после «Сбросить» или «Расставить».
+        if self.model.grid is not None:
+            # ⚠️ ЗОНА ПРОЛЁТА, ВЫБОРКА И РАССТАНОВКА — ПО «РАССТАВИТЬ ДАТЧИКИ» (заказчик 25.09.2026). Прежде
+            # зона считалась здесь сразу, итерации — тоже; синие линии не строятся с 21.09.2026 (148 с на 250)
+            self.model.routes = []                   # линии — по прежним параметрам
+            self.model.route_area = None             # прежнюю зону не показывать: она уже неверна
+            self._pending_recalc = True              # «Расставить датчики» посчитает заново
+        self._render_all()
+        self.view.set_title(
+            "Входные данные применены. Зона пролёта, маршруты и датчики — по «Расставить датчики»."
+            + (" Разрыв изменён." if gap_changed else ""))
+
+    def _render_sensors(self, empty=False):
+        """Отдать датчики на отрисовку вместе с типами и признаком «закреплён».
+
+        ⚠️ ОДНО МЕСТО НА ВСЕ ВЫЗОВЫ. Раньше вызовов было три, с разными наборами
+        аргументов; теперь у каждого датчика есть ещё тип, признак закрепления и свой
+        радиус, и рассинхрон между вызовами (где-то передали, где-то нет) означал бы,
+        что на карте датчики выглядят по-разному в зависимости от того, что их
+        обновило."""
+        import numpy as _np
+        from model.placement.sensors import sensor_types
+        m, p = self.model, self.model.p
+        if empty:
+            # ⚠️ ДАЖЕ КОГДА РАСЧЁТА НЕТ, поставленные мышью датчики показываем: карта
+            # может быть ещё не построена, а человек уже расставляет — и он должен
+            # видеть, куда попал клик.
+            self.view.render_sensors(
+                _np.empty((0, 2), float), p.threat_R,
+                _np.empty((0, 2), float), p.threat_R_big,
+                pending=[(s.x_km, s.y_km, s.type_id, s.static)
+                         for s in m.manual_sensors])
+            return
+        radii = {s.type_id: s.r_km for s in sensor_types(p)}
+        # ПОСТАВЛЕННЫЕ МЫШЬЮ, НО ЕЩЁ НЕ УЧТЁННЫЕ РАСЧЁТОМ — показываем сразу. Отбираем
+        # тех, кого нет в текущей расстановке: после «Расставить датчики» они уже там, и
+        # рисовать их вторично значило бы удваивать значки.
+        #
+        # ⚠️ ФЛАГ `placed` ЗДЕСЬ ГЛАВНЕЕ РАССТОЯНИЯ. Одной проверки «нет в расстановке»
+        # мало: ДИНАМИЧЕСКИЙ датчик в неё и не попадает — алгоритм ставит его в другом
+        # месте, — и точка клика оставалась на карте навсегда. Со стороны это выглядело
+        # так, будто динамические не двигаются вовсе (замечание заказчика 05.09.2026).
+        # Учтённые расстановкой заявки не рисуем: их место теперь показывает расчёт.
+        placed = list(_np.asarray(m.sensors, float)) + list(_np.asarray(m.sensors_big, float))
+        pending = []
+        for mm in m.manual_sensors:
+            if getattr(mm, "placed", False):
+                continue
+            near = any(abs(pt[0] - mm.x_km) < 1e-3 and abs(pt[1] - mm.y_km) < 1e-3
+                       for pt in placed)
+            if not near:
+                pending.append((mm.x_km, mm.y_km, mm.type_id, mm.static))
+        self.view.render_sensors(
+            m.sensors, p.threat_R, getattr(m, "sensors_big", None),
+            getattr(p, "threat_R_big", 0.0),
+            types=getattr(m, "sensors_type", None),
+            static=getattr(m, "sensors_static", None),
+            big_static=getattr(m, "sensors_big_static", None),
+            manual=getattr(m, "sensors_manual", None),
+            big_manual=getattr(m, "sensors_big_manual", None),
+            type_radii=radii, pending=pending)
+
+    # ================= ДАТЧИКИ, ЗАДАННЫЕ ЧЕЛОВЕКОМ (задача 8.7) =================
+    def on_manual_add(self, type_id, static, lon, lat):
+        """Добавить датчик по координатам (клик по карте, строка таблицы или файл)."""
+        self.model.add_manual_lonlat(type_id, static, lon, lat)
+        self._after_manual_change()
+
+    def on_manual_remove(self, index):
+        """Убрать датчик по номеру строки таблицы.
+
+        ⚠️ НОМЕР СТРОКИ — НЕ НОМЕР В `manual_sensors`. В режиме расчёта таблица
+        показывает результат расстановки, где заданные вручную вперемешку с
+        подобранными: удалять по такому номеру значит удалить не тот датчик. Поэтому
+        строка сперва переводится в позицию, а позиция — в запись."""
+        rows = self._sensor_rows()
+        if not (0 <= int(index) < len(rows)):
+            return
+        r = rows[int(index)]
+        best, best_d = None, 1e-3
+        for i, m in enumerate(self.model.manual_sensors):
+            d = ((m.x_km - r["x_km"]) ** 2 + (m.y_km - r["y_km"]) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = i, d
+        if best is None:
+            self.view.flash_title("Этот датчик поставила программа — его нельзя убрать "
+                                  "из таблицы: измените число датчиков типа.")
+            return
+        self.model.remove_manual_sensor(best)
+        self._after_manual_change()
+
+    def on_manual_edit(self, index, type_id, static, lon, lat):
+        """Изменить датчик строкой таблицы: тип, режим и координаты — одним действием.
+
+        ⚠️ ЗАПИСЬ ПРАВИТСЯ НА МЕСТЕ, а не «удалить и добавить заново». Пара вызовов
+        ломалась о то, что в режиме расчёта таблица показывает РЕЗУЛЬТАТ расстановки:
+        удаление не находило ручной записи и отказывалось работать, а добавление создавало
+        лишний датчик — правка выглядела «не работает» (заказчик 05.09.2026). Заодно
+        сохраняется ПОРЯДОК записей: строка остаётся на своём месте в таблице.
+
+        Строку, которую поставила программа (её нет среди заданных), правка превращает в
+        заданную: человек указал для неё место — значит теперь место выбрал он."""
+        rows = self._sensor_rows()
+        if not (0 <= int(index) < len(rows)):
+            return
+        r = rows[int(index)]
+        rec = self._manual_at(r["x_km"], r["y_km"])
+        if rec is None:
+            rec = self.model.add_manual_lonlat(int(type_id), bool(static), lon, lat)
+        else:
+            self.model.update_manual_lonlat(rec, int(type_id), bool(static), lon, lat)
+        # ⚠️ ДВИГАЕМ И САМУ РАССТАНОВКУ, а не только заявку (заказчик 05.09.2026: «сразу
+        # отобразиться на карте, перерисовать данный датчик»). Без этого на карте
+        # оказывались бы двое: старый — из расчёта, новый — как «только что поставленный».
+        if self.model.move_placed_sensor((r["x_km"], r["y_km"]),
+                                         (rec.x_km, rec.y_km),
+                                         int(type_id), bool(static)):
+            rec.placed = True                 # заявка уже отражена в расстановке
+            self.model._metrics = self.model._evaluate_current()
+        self._after_manual_change()
+
+    def on_sensor_delete(self, lon, lat):
+        """Удалить датчик, выбранный на карте в режиме правки (клавиша Delete).
+
+        ⚠️ ПО КООРДИНАТЕ, А НЕ ПО НОМЕРУ СТРОКИ. Номер меняется при любой правке — после
+        переноса он указывает уже на другой датчик, и удалялся бы не тот. Убираются обе
+        стороны: и заявка человека, и точка в расстановке, — иначе датчик исчезал бы из
+        таблицы, но оставался на карте (или наоборот)."""
+        from model.threat.geo_frame import lonlat_to_km
+        x, y = lonlat_to_km(float(lon), float(lat),
+                            self.model.lon0, self.model.lat0)
+        rec = self._manual_at(x, y, tol=0.05)
+        if rec is not None:
+            self.model.manual_sensors.remove(rec)
+        gone = self.model.remove_placed_sensor(x, y)
+        if gone:
+            self.model._metrics = self.model._evaluate_current()
+        if not gone and rec is None:
+            self.view.flash_title("Датчик не найден — щёлкните точнее по его центру.")
+            return
+        self._after_manual_change()
+
+    def _manual_at(self, x_km, y_km, tol=1e-3):
+        """Заданная человеком запись в этой точке — или None, если её поставил алгоритм."""
+        best, best_d = None, tol
+        for m in self.model.manual_sensors:
+            d = ((m.x_km - x_km) ** 2 + (m.y_km - y_km) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = m, d
+        return best
+
+    def on_manual_clear(self):
+        self.model.clear_manual_sensors()
+        self._after_manual_change()
+
+    def on_clear_sensors(self):
+        """Кнопка «Очистить датчики»: убрать с карты ВСЕ — и подобранные, и заданные.
+
+        Отличие от «Сброса»: цель, сектор, запретные зоны, маршруты и итерации остаются
+        на месте. Убирается только расстановка, чтобы посчитать её заново — например с
+        другими параметрами типов (заказчик 05.09.2026)."""
+        self.model._reset_sensors()
+        self.model.clear_manual_sensors()
+        self.model._metrics = None
+        self._after_manual_change()
+        self.view.set_title("Датчики убраны с карты. Нажмите «Расставить датчики», "
+                            "чтобы расставить заново.")
+
+    def on_manual_mode(self, manual):
+        """Переключение «Рассчитать позиции» ⇄ «Задать позиции»."""
+        self.model.set_manual_mode(manual)            # сбросит снимок анализа размещения
+        self._after_manual_change()
+
+    def on_mode_analysis(self, checked):
+        """Галочка «режим анализа» плашки над картой (план 8, задача 8.9, довесок
+        06.09.2026): во время моделирования расстановка перестаёт пересчитываться —
+        см. `threat_grid.place_sensors` и `config.Params.threat_analysis_static`."""
+        self.model.p.threat_analysis_static = bool(checked)
+
+    def _sensor_rows(self):
+        """Чем заполнять таблицу окна.
+
+        В режиме «Задать позиции» и до расстановки показываем ЗАДАННЫЕ датчики: иначе
+        таблица была бы пуста и человеку некуда было бы добавлять строки. После
+        расстановки в режиме расчёта — её РЕЗУЛЬТАТ (требование заказчика: таблица
+        заполняется в обоих режимах)."""
+        manual = bool(getattr(self.model.p, "threat_manual_mode", False))
+        if not manual and len(self.model.sensors) + len(self.model.sensors_big):
+            return self.model.sensors_table()
+        rows = []
+        for m, (tid, static, lon, lat) in zip(self.model.manual_sensors,
+                                              self.model.manual_lonlat()):
+            rows.append(dict(n=len(rows) + 1, type_id=tid, static=static,
+                             lon=lon, lat=lat, x_km=m.x_km, y_km=m.y_km))
+        return rows
+
+    def _left_to_place(self):
+        """Сколько датчиков алгоритму осталось доставить к заданным человеком.
+
+        Считается ПО ТИПАМ и суммируется: заказ у каждого типа свой, и «20 всего» ничего
+        не сказало бы, если пять из них уже стоят типом 2. Отрицательное значение —
+        заданных больше, чем заказано: лишние в расстановку не попадут."""
+        from model.placement.sensors import sensor_types
+        p = self.model.p
+        left = 0
+        for s in sensor_types(p):
+            if not s.active:
+                continue
+            have = sum(1 for m in self.model.manual_sensors if m.type_id == s.type_id)
+            left += int(s.n) - have
+        return left
+
+    def _after_manual_change(self):
+        """Список заданных датчиков изменился: обновить таблицу и карту.
+
+        ⚠️ В РУЧНОМ РЕЖИМЕ ДАТЧИКИ ПОКАЗЫВАЮТСЯ СРАЗУ. Там расстановка ничего не считает
+        (позиции уже названы), это доли секунды — и человек видит результат клика тут же.
+        В режиме расчёта пересчитывать на каждый клик нельзя: расстановка занимает
+        секунды, а датчики ставят подряд по одному. Поэтому там — подсказка, что нужно
+        нажать «Расставить датчики»."""
+        manual = bool(getattr(self.model.p, "threat_manual_mode", False))
+        if manual and self.model.grid is not None:
+            self.model.place_sensors()
+        self.view.refresh_sensor_table(self._sensor_rows())
+        self.view.set_manual_count(len(self.model.manual_sensors))
+        n = len(self.model.manual_sensors)
+        n_fix = sum(1 for m in self.model.manual_sensors if m.static)
+        out = self.model.manual_outside_area()
+        msg = "Задано датчиков вручную: %d%s%s." % (
+            n, ", статических: %d" % n_fix if n_fix else "",
+            ", ВНЕ РАЙОНА: %d" % out if out else "")
+        # ⚠️ СКОЛЬКО ОСТАЛОСЬ ДОСТАВИТЬ — считаем ДО нажатия кнопки (заказчик
+        # 05.09.2026). Заданные входят в заказанное число, и человек должен видеть,
+        # сколько датчиков алгоритм добавит к его собственным, а не узнавать это постфактум.
+        if not manual and n:
+            left = self._left_to_place()
+            msg += (" Останется доставить: %d." % left if left >= 0 else
+                    " Задано БОЛЬШЕ, чем заказано: лишние %d не поместятся." % -left)
+        if not manual and n and self.model.grid is not None:
+            msg += " Нажмите «Расставить датчики»."
+        self.view.set_title(msg)
+        self._render_all()
+
+    # ---- смена приоритета по весу (max/medium/min/mix) ----
+    def on_iter_mode(self, key):
+        self.model.p.threat_iter_mode = key
+        if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
+                and not self._busy):
+            self._run_async("iter", lambda: self._iter_batch_work(self.model.iterate_routes))
+
+    # ---- смена разброса по карте (center/middle/edge/mix) ----
+    def on_iter_spread(self, key):
+        self.model.p.threat_iter_spread = key
+        if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
+                and not self._busy):
+            self._run_async("iter", lambda: self._iter_batch_work(self.model.iterate_routes))
+
+    # ---- смена уровня облёта цели (min/medium/max/mix) ----
+    def on_iter_approach(self, key):
+        """Панель: новый уровень облёта цели. Вход: ключ THREAT_APPROACH_LABELS.
+        Отдаёт: None; при включённых итерациях пересчитывает выборку в фоне."""
+        self.model.p.threat_iter_approach = key
+        if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
+                and not self._busy):                  # итерации показаны и расчёт свободен
+            self._run_async("iter", lambda: self._iter_batch_work(self.model.iterate_routes))   # — пересчитать выборку
+
+    # ---- смена профиля расхода запаса хода (late/early/even) ----
+    # Влияет только на ИТЕРАЦИИ: «возможные маршруты» строятся веером всех повадок,
+    # чтобы показывать возможности целиком, а не один выбранный сценарий.
+    def on_iter_spend(self, key):
+        self.model.p.threat_spend = key
+        if (self.model.grid is not None and self.view.get_toggles().get("show_iter")
+                and not self._busy):
+            self._run_async("iter", lambda: self._iter_batch_work(self.model.iterate_routes))
+
+    # ---- запуск тяжёлого расчёта в фоне ----
+    def _run_async(self, kind, work_fn):
+        """Запустить тяжёлую функцию модели `work_fn` в ФОНОВОМ потоке (пул QThreadPool),
+        пометив интерфейс «занят». `kind` — метка задачи (build/place/routes/iter), по
+        ней `_on_task_done` решит, что отрисовать. Пока идёт расчёт — новый не запускаем."""
+        if self._busy:
+            self.view.flash_title("Идёт расчёт — подождите…")
+            return
+        if self._worker is not None:                      # шёл «Пуск» — две задачи на одну модель нельзя
+            self._anim_stop()
+        self._busy = True
+        self.view.set_busy(True)
+        titles = {"build": "Строю весовую карту угроз…",
+                  "place": "Расставляю датчики по весам…",
+                  "routes": "Строю маршруты пролёта…",
+                  "envelope": "Пересчитываю зону пролёта…",
+                  "targets": "Применяю цели: карта и зона пролёта по всем целям…",
+                  "iter": "Генерирую маршруты (итерации)…"}
+        self.view.flash_title(titles.get(kind, "Расчёт…"))
+        self.view.process_pending()
+        self._pool.start(_Task(kind, work_fn, self._sig))
+
+    def _on_task_done(self, payload):
+        """Приходит в ОСНОВНОЙ поток по сигналу завершения фоновой задачи. Разбирает метку
+        `kind` и обновляет карту/показатели: build → строить маршруты; place → показать
+        датчики; routes → огибающая+линии; iter → расставить датчики по выборке пролётов."""
+        kind, err = payload
+        self._busy = False
+        self.view.set_busy(False)
+        if err is not None:
+            self.view.flash_title(f"Ошибка: {err}")
+            return
+        if kind == "build":
+            self.view.set_source(self.model.source)
+            # файл высот мог появиться (или исчезнуть) между запусками — сверить кнопку
+            self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
+            self._render_all()
+            self._full_metrics()
+            tg = self.view.get_toggles()
+            if tg.get("show_iter"):                      # идут итерации — их и обновить
+                self._run_async("iter", lambda: self._iter_batch_work(self.model.iterate_routes))
+            else:
+                # ⚠️ МАРШРУТЫ ПОСЛЕ ПОСТРОЕНИЯ НЕ СЧИТАЕМ (правило заказчика 04.09.2026).
+                # Раньше здесь безусловно запускался `plan_routes` — самая тяжёлая часть
+                # конвейера (два поля Дейкстры, огибающая, выборка путей), и она уходила
+                # в работу при каждом построении карты: включили рельеф, сменили слои,
+                # поправили район. А нужна она только для датчиков и итераций, и там
+                # считается сама, если выборки ещё нет (см. `_work_place`, `on_iter_*`).
+                self.view.set_title(
+                    "Карта построена. «Расставить датчики» или «Пуск» — "
+                    "маршруты посчитаются при первом обращении.")
+        elif kind == "envelope":
+            # зона пролёта пересчитана, синие линии ждут кнопки (решение заказчика 21.09.2026)
+            self._render_all()
+            self._full_metrics()
+        elif kind == "targets":
+            # цели применены (план 13): карта пересобрана, зона — объединение по целям
+            self._render_all()
+            self._full_metrics()
+            self.view.refresh_targets_window()
+            self.view.refresh_sector_window()             # сектор отсчитывается от первой цели
+            n = len(self.model.targets)                   # поставлено целей, шт.
+            self.view.set_title(
+                ("Целей: %d — карта пересобрана. " % n if n
+                 else "Цели убраны — расчёт к цели по умолчанию. ")
+                + "Зона пролёта, маршруты и датчики — по «Расставить датчики».")
+            self._ask_target_areas()                      # цель в лесу — «укажите район защиты»
+        elif kind == "place":
+            self._render_all()
+            self.view.refresh_sensor_table(self._sensor_rows())   # таблица окна
+            self.view.refresh_route_viewer()             # выборку могли пересчитать заново
+            me = self.model.metrics()
+            # В ручном режиме кнопка ничего не переставляла — она посчитала показатели
+            # заданной расстановки. Об этом и пишем, иначе слово «расставлено» вводило бы
+            # в заблуждение: позиции задал человек, программа их не выбирала.
+            manual = bool(getattr(self.model.p, "threat_manual_mode", False))
+            # ОТКУДА ВЗЯТА ВЫБОРКА (задача 8.6, заказчик 06.09.2026): если позиции считал
+            # алгоритм по ЗАГРУЖЕННОЙ истории полёта — сказать об этом прямо, а не молчать,
+            # будто расстановка обычная (по своей выборке или зоне пролёта).
+            if manual:
+                head = "Задано датчиков %d (позиции ваши, расчёт по ним)" % me["n_sensors"]
+            elif getattr(self.model, "sensor_source", None) == "loaded":
+                head = ("Датчиков %d (расстановка по ЗАГРУЖЕННОЙ истории маршрутов)"
+                        % me["n_sensors"])
+            else:
+                head = "Датчиков %d" % me["n_sensors"]
+            # ⚠️ БОЛЬШИЕ ПРИ РАВНЫХ ПРИОРИТЕТАХ НЕ СТАВЯТСЯ (ответ заказчика В13.8) — сказать
+            # прямо, иначе заказанные и не появившиеся датчики выглядят как поломка
+            big_note = (" · приоритеты целей равны: большие датчики задаются вручную"
+                        if int(getattr(self.model.p, "threat_N_big", 0) or 0) > 0
+                        and self.model.big_ring_target_km() is None else "")
+            self.view.set_title(
+                f"{head} · засечено пролётов "
+                f"{me.get('detect_k_frac', 0)*100:.0f}% ("
+                f"{'кратность ≥%d' % self.model.p.threat_k if self.model.p.threat_k_same else self._k_label()}) · "
+                f"покрыто веса {me['covered_frac']*100:.0f}% · "
+                f"режим {MODE_LABELS[self.model.p.mode]}{big_note}")
+            self._full_metrics()
+        elif kind == "routes":
+            # Датчики стоят по ЭТОЙ ЖЕ выборке (до итераций — по «возможным маршрутам»,
+            # см. _sample_for_sensors), поэтому после её пересчёта их надо обновить.
+            # Раньше они оставались от прежнего запаса хода: область залёта на карте
+            # выросла, маршруты перестроились, а кольца датчиков висели по-старому —
+            # и подвинуть их можно было только «Расставить» или сбросом.
+            if len(self.model.sensors):
+                self.model.place_sensors()
+                self._sensors_at = len(self.model.iter_routes)
+            self._render_all()
+            self._full_metrics()
+            n, area = self.model.reachable_stats()
+            # Всего маршрутов — астрономически много (~1e107), нарисовать их нельзя; полную
+            # картину даёт ЗАКРАШЕННАЯ ОБЛАСТЬ, а линии — выборка, разложенная по ней широко.
+            total = self.model.count_routes()
+            tot_s = f" · всего путей ≈{total:.1e}" if total > 0 else ""
+            self.view.set_title(
+                f"Мест пролёта (≤L_max): {area:.0f} км² ({n} ячеек){tot_s} · "
+                f"показано {len(self.model.routes)} · L_max={self.model.p.threat_L_max:g} км.")
+        elif kind == "iter":
+            self.view.iter_clear_current()               # пакетно — без летящего маркера
+            self._sensors_at = len(self.model.iter_routes)   # датчики уже пересчитаны в фоне (13.5.11а)
+            self._render_all()
+            self._full_metrics()
+            self.view.refresh_route_viewer()   # пакет добавил маршруты все разом — обновить
+            self.view.set_title(self._iter_title() + " (пакетно). Датчики по выборке пролётов.")
+
+    # ---- построение карты (в фоне) ----
+    def _work_build(self):
+        self.model.build()
+        self.model.candidates = self.model.candidate_positions()
+
+    def _work_place(self, fresh=False, iters=False):
+        """Расстановка в фоне. Вход: обстановка менялась — зону пролёта и выборку заново; заново — итерациями.
+        Отдаёт: ничего."""
+        # ВЫБОРКА СЧИТАЕТСЯ ЗДЕСЬ, ЕСЛИ ЕЁ ЕЩЁ НЕТ. Датчики ставятся по маршрутам
+        # (`_sample_for_sensors`): до итераций — по «всем возможным», после — по
+        # накопленным пролётам. Раз маршруты больше не считаются при построении карты
+        # (04.09.2026), первым их спрашивает тот, кому они нужны.
+        # ⚠️ ЗОНА ПРОЛЁТА — внутри `plan_routes` / `iter_reset`: с 25.09.2026 её строит эта кнопка, не «Применить»
+        if fresh and iters:                              # обстановка менялась, идут итерации — их заново
+            self.model.iterate_routes()
+        elif fresh or (not self.model.iter_routes and not self.model.routes):   # линий нет или устарели
+            self.model.plan_routes()
+        self.model.place_sensors()
+
+    def on_build(self):
+        self._run_async("build", self._work_build)
+
+    # ---- РАБОЧИЙ РАЙОН (план 8, задача 8.2) ----
+    def on_set_area(self, bbox_lonlat):
+        """Задать рабочий район: сетка, веса, маршруты и датчики — только по нему.
+
+        Область ПОКАЗА при этом не меняется: подложка и своя карта видны и за его
+        пределами, туда просто не заходит расчёт. Пересборка тяжёлая (чтение `.osm.pbf`
+        и наложение слоёв — десятки секунд), поэтому идёт в фоновом потоке."""
+        self.model.set_area(bbox_lonlat)
+        self._area_changed()
+
+    def on_set_area_circle(self, cx, cy, r_km):
+        """Задать КРУГЛЫЙ район (план 11, 11.6): центр и радиус в км. Центр — цель; за
+        окружностью вес не считается, пролёт и датчики запрещены. Остальное — как у рамки."""
+        self.model.set_area_circle(cx, cy, r_km)
+        self._area_changed()
+
+    def _area_changed(self):
+        """Район задан (рамкой или кругом): показать его и напомнить про «Построить карту»."""
+        w_km, h_km = self.model.area_size_km()
+        # синяя рамка — по НОВОМУ району: иначе она осталась бы вокруг прежнего
+        self.view.set_area_ready(True, (w_km, h_km), self.model.bbox_km, self.model.area_circle)
+        self.view.refresh_sector_window()      # сектор и точки старта сброшены вместе с районом
+        self.view.refresh_targets_window()     # и объекты защиты (план 13) — они в прежних км
+        # ⚠️ ПРЕДЕЛ РАЙОНА. Дальше ~150 км по широте подложка расходится с векторными
+        # слоями сильнее радиуса малого датчика (план 8 §0.4): тайлы в Меркаторе,
+        # наши слои — в равнопромежуточной проекции, привязка идёт по углам.
+        warn = ""
+        if h_km > 150.0 or w_km > 150.0:
+            warn = (" ⚠️ Район %.0f×%.0f км — больше 150 км: подложка и слои разойдутся, "
+                    "смотрите план 8 §0.4." % (w_km, h_km))
+        # ⚠️ КАРТА НЕ СТРОИТСЯ САМА (правило заказчика 04.09.2026). Район задают, глядя на
+        # местность, и часто поправляют два-три раза подряд; автоматический пересчёт после
+        # каждого движения — это десятки секунд чтения `.osm.pbf` впустую. Считает кнопка
+        # «Построить карту» — как и с выбором цифровых карт (`on_choose_data`).
+        what = ("Район радиусом %.1f км (центр — цель)" % self.model.area_circle[2]
+                if self.model.area_circle is not None else "Район %.1f × %.1f км" % (w_km, h_km))
+        self.view.set_title("%s задан. Нажмите «Построить карту».%s" % (what, warn))
+        self.view.set_source("район задан · карта не построена")
+        self.view.set_metrics([what + ".",
+                               "Нажмите «Построить карту», чтобы наложить слои",
+                               "и посчитать веса."])
+        self._render_all()          # показать новую рамку и убрать старые слои
+
+    def on_clear_area(self):
+        """Убрать рабочий район: всё расчётное обнуляется, остаётся только показ."""
+        self._anim_stop()                      # остановить анимацию полёта, если шла
+        self.view.iter_clear_current()
+        self.view.set_iter_checked(False)
+        self._sensors_at = 0
+        self.model.clear_area()
+        # кнопка рельефа возвращается в исходное «Добавить рельеф»: сам рельеф сброшен
+        self.view.set_relief_button(self.model.relief_on, self.model.has_dem())
+        self.view.set_area_ready(False)
+        self.view.refresh_sector_window()
+        self.view.refresh_targets_window()     # цели убраны вместе с районом (план 13)
+        self.view.set_source("район не задан")
+        self.view.set_metrics(["Район не задан.",
+                               "Очертите его мышью либо загрузите свою карту —",
+                               "её рамка станет районом моделирования."])
+        self._render_all()
+
+    # ---- выбор цифровых карт (источник + слои) из отдельного окна ----
+    def on_choose_data(self, path, enabled):
+        # Окно ТОЛЬКО задаёт выбор; наложение выполняет кнопка «Построить карту»
+        # (как и просил пользователь). enabled — набор слоёв (пустой = без слоёв);
+        # None приходит только программно и означает «все слои».
+        self.model.set_data_source(path)
+        self.model.set_enabled_layers(enabled)
+        src = f"файл: {path}" if path else "авто (кэш → демо)"
+        n = "все" if enabled is None else str(len(enabled))
+        self.view.set_source(f"{src} · слоёв: {n} (нажмите «Построить карту»)")
+        self.view.set_title("Выбор сохранён. Нажмите «Построить карту».")
+
+    # ---- «указать цель» кликом по карте ----
+    def on_set_target(self, x, y):
+        """Клик ТОЛЬКО задаёт цель. Пересчёт — по кнопке «Применить».
+
+        Почему не сразу: цель и сектор задаются подряд («поставил цель — очертил
+        сектор»), и пересчёт после каждого клика шёл дважды, причём первый — по
+        промежуточному состоянию. Теперь оба клика копят изменения, а «Применить»
+        считает один раз по итоговой обстановке."""
+        self.model.set_target(x, y)                       # пересчитает авто-запас хода
+        self._pending_recalc = True
+        self._render_after_input(f"Цель задана: ({x:.0f}, {y:.0f}) км. ")
+        self.view.refresh_sector_window()                 # сектор переотобран от новой цели
+        self.view.refresh_targets_window()                # одна цель вместо всех (план 13)
+
+    # ---- объекты защиты: окно «Указать цель» (план 13, задача 13.13) ----
+    def on_target_add(self, x, y):
+        """Двойной клик в режиме целей. Отдаёт: '' — принята, иначе причина. ⚠️ Карта
+        пересчитывается ОДИН раз — когда постановка закончена (`on_targets_done`)."""
+        if self._busy:                                    # фоновый расчёт читает цели
+            return "идёт расчёт, подождите"
+        why = self.model.add_target(x, y)                 # '' — принята
+        if not why:                                       # показать сразу, не дожидаясь пересчёта
+            self.view.render_entry_target(self.model.entry_km(), self.model.target_points_km())
+        return why
+
+    def on_targets_done(self):
+        """Цели поставлены или поправлены — «применяется само» (заказчик): карта со свободными
+        зонами целей — в фоне; зона пролёта, маршруты и датчики — по «Расставить датчики» (25.09.2026).
+        Отдаёт: ничего."""
+        self._pending_recalc = True
+        if self.model.grid is None:                       # карты нет — только сброс
+            self.model.apply_targets()
+            self._render_after_input("Целей: %d. " % len(self.model.targets))
+            self.view.refresh_targets_window()
+            return
+        self._run_async("targets", lambda: self.model.apply_targets(envelope=False))
+
+    def on_target_weight(self, i, w):
+        """Приоритет из таблицы. Отдаёт: '' — принят, иначе причина (сумма больше 1).
+        Пересчёта не нужно: приоритет влияет лишь на кольцо больших при расстановке."""
+        return self.model.set_target_weight(i, w)
+
+    def on_target_move(self, i, lon, lat):
+        """Координаты цели из таблицы или метки «Изменить цели». Вход: номер с нуля, долгота и широта, градусы.
+        Отдаёт: '' — принято (и применяется), иначе причина отказа."""
+        from model.threat.geo_frame import lonlat_to_km
+        if self._busy:                                    # фоновый расчёт читает цели
+            return "идёт расчёт, подождите"
+        x, y = lonlat_to_km(lon, lat, self.model.lon0, self.model.lat0)   # новое место, км
+        why = self.model.move_target(i, float(x), float(y))   # '' — принято, иначе причина
+        if not why:                                       # цель сдвинута — карта и зона заново
+            self.on_targets_done()
+        return why
+
+    def on_targets_clear(self):
+        """«Очистить» в окне целей: все цели убраны, расчёт — к цели по умолчанию."""
+        self.model.clear_targets()
+        self.on_targets_done()
+
+    # ---- район защиты цели в лесу (план 13, 13.18, В13.21) ----
+    def _ask_target_areas(self, start=0):
+        """Первой цели в лесу без района — окно «укажите район защиты». Вход: с какого номера искать.
+        ⚠️ По одной: следующую спросим, когда начертят эту; «Позже» — больше не спрашивать. Отдаёт: ничего."""
+        for i in range(int(start), len(self.model.targets)):   # цели по порядку — первая в лесу без района
+            if self.model.target_needs_area(i):          # у точки нет массива построек, района нет
+                shape = self.view.ask_target_area(i)      # "rect" | "circle" | "edit" | None — позже
+                if shape == "edit":                       # крестик и район мышью (29.09.2026)
+                    self.view.begin_edit_targets(i)
+                elif shape is not None:                   # человек выбрал форму — чертить
+                    self.view.begin_target_area(i, shape)
+                return
+
+    def on_target_area(self, i, area):
+        """Район защиты начерчен (В13.21): зона цели = район ∩ карта ПВН. Пустая — отказ и вопрос снова.
+        Вход: номер цели с нуля, район ("rect", x0, y0, x1, y1) | ("circle", cx, cy, r) км. Отдаёт: ничего."""
+        why, n = self.model.set_target_area(i, area)     # причина отказа, мест ПВН в зоне
+        if why:                                           # в районе негде ставить
+            self.view.set_title("Район защиты цели №%d не принят: %s." % (int(i) + 1, why))
+            self.view.refresh_targets_window("⚠️ Цель №%d: %s." % (int(i) + 1, why))
+            if not self.view.editing_targets():           # в «Изменить цели» — чертят заново сами
+                self._ask_target_areas(i)                 # спросить снова — есть «Позже»
+            return
+        self.view.render_target_areas(self.model.target_zone_views())
+        note = "Цель №%d: район защиты задан — мест для ПВН %d." % (int(i) + 1, n)   # итог
+        self.view.set_title(note + " Датчики — по «Расставить датчики».")
+        self.view.refresh_targets_window(note)
+        if not self.view.editing_targets():               # ⚠️ в «Изменить цели» окна спрятаны — вопрос сбил бы их возврат
+            self._ask_target_areas(int(i) + 1)            # следующая цель в лесу
+
+    def on_target_area_clear(self, i):
+        """«Снять район» в окне целей: зона цели — снова по массиву застройки. Вход: номер с нуля. Отдаёт: ничего."""
+        self.model.clear_target_area(i)
+        self.view.render_target_areas(self.model.target_zone_views())
+        self.view.refresh_targets_window()
+
+    # ---- условия моделирования: тип БПЛА и точка старта (план 12, задача 12.2) ----
+    def on_set_uav_start(self, x, y):
+        """Клик поставил точку старта БПЛА: запас хода пересчитан по точкам, панель и
+        таблица обновлены сами (правило заказчика 21.09.2026)."""
+        self.model.set_uav_start(x, y)
+        self.view.render_uav_start(self.model.uav_start_km)
+        self._after_uav_start("Старт БПЛА задан: (%.0f, %.0f) км." % (x, y))
+
+    def on_clear_uav_start(self):
+        """«Убрать точку старта»: снять точку и метку, вернуть один общий запас."""
+        self.model.clear_uav_start()
+        self.view.render_uav_start(None)
+        self._after_uav_start("Точка старта БПЛА убрана: запас хода снова общий.")
+
+    def _after_uav_start(self, msg):
+        """Обновить всё, что зависит от точки старта: панель, таблицу точек, окно условий.
+        ⚠️ Само, без «Применить»: среднее в панели иначе показывало бы прежнее число."""
+        per = self.model.entry_L_max_km()              # запасы по точкам, км (или None)
+        if per:                                        # условия действуют
+            msg += " Запас по точкам: %.0f…%.0f км, среднее %.0f км." % (
+                min(per), max(per), sum(per) / len(per))
+        self.view.refresh_sensors_dialog()             # среднее в графе запаса хода
+        self.view.refresh_entries_table()              # таблица точек
+        self.view.refresh_sim_window()
+        self.view.set_title(msg)
+
+    def on_uav_speed(self):
+        """Скорость выбранного типа для линейки, км/ч. Отдаёт: число или None — тип не
+        выбран, и тогда линейка время не показывает (выдуманное хуже пустого)."""
+        uav = self.model.uav_type                     # выбранный тип или None
+        return float(uav.speed_kmh) if uav is not None else None
+
+    def on_set_entry_L_max(self, i, km):
+        """Запас хода одной точки задан в таблице. Вход: номер с нуля, км (None — вернуть
+        расчётный). ⚠️ Маршруты сбрасывать не надо — их пересчитает «Применить»."""
+        if self.model.set_entry_L_max(i, km):
+            self.view.refresh_sensors_dialog()        # среднее в панели изменилось
+
+    def on_uav_type(self, name):
+        """Тип выбран в списке. Вход: название. Отдаёт: ничего — тип кладётся в модель."""
+        from model.threat import uav_types as ut
+        self.model.set_uav_type(ut.by_name(name))
+
+    def on_sim_state(self):
+        """Что показать в окне условий. Отдаёт: словарь (названия типов, выбранное,
+        строка характеристик, строка координат старта)."""
+        from model.threat import uav_types as ut
+        types = ut.load()
+        uav = self.model.uav_type                     # выбранный тип или None
+        if uav is None and types:                     # тип ещё не выбирали
+            uav = types[0]                            # — показываем первый из справочника
+            self.model.set_uav_type(uav)
+        # КНОПКА ОТКРЫТА, КОГДА ЕСТЬ ТОЧКИ ВХОДА: до них и считается остаток хода.
+        # ⚠️ ЦЕЛЬ КЛИКОМ НЕ ТРЕБУЕТСЯ (жалоба заказчика 21.09.2026: «почему не нажимается,
+        # сектор задан»). Цель есть ВСЕГДА — из `область.txt` («Мирный») или как центр
+        # круглого района; `target_km` хранит лишь ТУ, что поставили кликом, и проверять
+        # его значило требовать лишнего щелчка по цели, которая уже на карте.
+        # ⚠️ Смотрим `entry_points` (сектор плюс ручные), а НЕ `entry_points_km()`: тот
+        # никогда не бывает пустым — без сектора он отдаёт демо-точку участка.
+        need = []                                     # чего не хватает, по фразе на нехватку
+        if not self.model.entry_points:               # ни сектора, ни ручных точек
+            need.append("задайте сектор налёта или поставьте точки старта")
+        return {"names": [u.name for u in types],
+                "current": uav.name if uav else "",
+                "type_text": self._uav_type_text(uav),
+                "start_text": self._uav_start_text(),
+                "ready": not need,
+                "why": ("Доступно: точек входа %d." % len(self.model.entry_points)
+                        if not need else "Недоступно: " + ", ".join(need) + ".")}
+
+    def _uav_type_text(self, uav):
+        """Характеристики типа одной строкой. Вход: тип или None. Отдаёт: строку."""
+        if uav is None:                               # справочник пуст
+            return "Тип не выбран — справочник пуст."
+        return ("%s · %s · %.0f км/ч · запас %.0f км · крен %.0f° · высота %.0f м · "
+                "радиус разворота %.2f км" % (uav.name, uav.KIND, uav.speed_kmh,
+                                              uav.L_max_km, uav.bank_deg, uav.alt_m,
+                                              uav.turn_radius_km()))
+
+    def _uav_start_text(self):
+        """Координаты старта и расстояния до точек входа. Отдаёт: строку («» — не задан)."""
+        if self.model.uav_start_km is None:           # точка не поставлена
+            return ""
+        from model.threat.geo_frame import format_deg, km_to_lonlat
+        x, y = self.model.uav_start_km
+        lon, lat = km_to_lonlat(x, y, self.model.lon0, self.model.lat0)
+        dists = self.model.uav_start_dists_km()       # до каждой точки входа, км
+        text = "Старт: %s · X %.1f км, Y %.1f км" % (format_deg(lon, lat), x, y)
+        if dists:                                     # точки входа есть — показать разброс
+            text += ("<br>До точек входа: %d шт., от %.0f до %.0f км, среднее %.0f км"
+                     % (len(dists), min(dists), max(dists), sum(dists) / len(dists)))
+        per = self.model.entry_L_max_km()             # запасы по точкам, км
+        if per:                                       # условия действуют
+            text += ("<br><b>Запас хода по точкам: от %.0f до %.0f км</b> (в панели "
+                     "среднее %.0f км)" % (min(per), max(per), sum(per) / len(per)))
+        return text
+
+    # ---- «задать сектор появления» кликом по краю карты ----
+    def on_set_sector(self, x, y):
+        """Клик задаёт ось «цель → точка»; модель отбирает по весам точки входа.
+        Маршруты пересчитываются по «Применить» — см. `on_set_target`."""
+        if self.model.grid is None:
+            self.view.set_title("Сектор задаётся по построенной карте — «Построить карту».")
+            return
+        pts = self.model.set_sector(x, y)
+        if not pts:
+            self.view.set_title("В сектор не попал ни один край карты — укажите точку "
+                                "на другой стороне.")
+            return
+        self._pending_recalc = True
+        self._render_after_input("Сектор задан: %d точек входа. " % len(pts))
+        self.view.refresh_sector_window()
+
+    def on_clear_sector(self):
+        if not self.model.clear_sector():
+            return
+        self._pending_recalc = True
+        left = len(self.model.manual_entries)          # точки старта человека остаются
+        self._render_after_input("Сектор убран: %s. " % (
+            "остались точки старта, заданные вручную (%d)" % left if left
+            else "точка появления одна"))
+        self.view.refresh_sector_window()
+
+    # ---- ОКНО «СЕКТОР НАЛЁТА» (план 11, 11.6) ----
+    def _sector_state(self):
+        """Что показать в окне сектора: dict(half_deg, entries, kind, n_sector, n_manual)."""
+        m = self.model
+        return dict(half_deg=m.sector_half_deg(), entries=m.sector_entries_n(),
+                    kind=m.sector_kind, n_sector=len(m.sector_points()),
+                    n_manual=len(m.manual_entries))
+
+    def on_sector_params(self, half_deg, n):
+        """Окно сектора: раствор или число точек изменились — применить сразу."""
+        was = self.model.sector_kind                   # был ли сектор до правки
+        self.model.set_sector_params(half_deg, n)
+        self.view.refresh_sector_window()
+        if was is None:                                # сектора нет — только запомнили
+            self.view.set_title("Раствор %.0f°, точек %d — применятся к следующему сектору."
+                                % (2.0 * float(half_deg), int(n)))
+            return
+        self._pending_recalc = True
+        self._render_after_input("Сектор переотобран: раствор %.0f°, точек входа %d. "
+                                 % (2.0 * float(half_deg), len(self.model.sector_points())))
+
+    def on_sector_auto(self):
+        """«Построить сектор»: по всем 360°, лучшая точка на каждые 10°."""
+        if self.model.grid is None:
+            self.view.set_title("Сектор строится по построенной карте — «Построить карту».")
+            return
+        self.model.set_sector_auto()
+        self.view.refresh_sector_window()
+        if not self.model.sector_points():             # край без проходимых ячеек
+            self.view.set_title("На краю района не нашлось точек входа — проверьте карту и цель.")
+            return
+        self._pending_recalc = True
+        self._render_after_input("Сектор по 360° построен: %d приоритетных направлений. "
+                                 % len(self.model.sector_points()))
+
+    # ---- ТОЧКИ СТАРТА МЫШЬЮ (план 11, 11.6) ----
+    def on_entry_add(self, x, y):
+        """Двойной клик в режиме «Точки старта». Отдаёт: True, если точка добавлена."""
+        if not self.model.add_manual_entry(x, y):      # клик за районом
+            return False
+        self._entry_changed("Точка старта добавлена: всего точек %d. "
+                            % len(self.model.entry_points))
+        return True
+
+    def on_entry_move(self, x0, y0, x1, y1):
+        """Точку старта перетащили. Отдаёт: True, если модель перенос приняла."""
+        if not self.model.move_entry(x0, y0, x1, y1):  # за район или точка не найдена
+            return False
+        self._entry_changed("Точка старта перенесена. ")
+        return True
+
+    def on_entry_delete(self, x, y):
+        """DELETE по выбранной точке старта. Отдаёт: True, если точка найдена и убрана."""
+        if not self.model.remove_entry(x, y):
+            return False
+        self._entry_changed("Точка старта убрана: осталось %d. " % len(self.model.entry_points))
+        return True
+
+    def _entry_changed(self, msg):
+        """После правки точек старта: пересчёт — по «Расставить датчики», как после сектора.
+        Вход: строка для заголовка. Отдаёт: ничего."""
+        self._pending_recalc = True
+        self._render_after_input(msg)
+        self.view.refresh_sector_window()
+
+    def _render_after_input(self, msg):
+        """Показать заданное (цель, сектор, точки входа) и напомнить про «Расставить датчики».
+
+        Сам расчёт здесь НЕ запускается: модель уже сбросила маршруты и датчики — они
+        построены по прежней обстановке, показывать их дальше было бы враньём. Отдаёт: ничего."""
+        # `_render_all` сам рисует цель, сектор, точки входа и обновляет |AB| с запасом
+        # хода в окне входных данных — отдельных вызовов здесь не нужно
+        self._render_all()                                # маршруты сброшены — убрать с карты
+        if self.model.grid is None:
+            self.view.set_title(msg + "Нажмите «Построить карту».")
+        else:
+            self.view.set_title(msg + "«Расставить датчики» — зона пролёта, маршруты и датчики заново.")
+
+    # ---- сброс: убрать датчики и заданную цель (карта остаётся) ----
+    def on_reset(self):
+        self._anim_stop()
+        self.view.iter_clear_current()
+        # ЗАПРЕТНЫЕ ЗОНЫ убираются ТОЛЬКО здесь: пересборка карты и добавление рельефа их
+        # сохраняют — они нарисованы пользователем и от местности не зависят.
+        self.model.clear_no_fly_zones()
+        # ⚠️ ДАТЧИКИ СБРАСЫВАЮТСЯ ВСЕ. Здесь обнулялись только малые, и большие
+        # оставались висеть на карте после «Сброса» (замечание заказчика 05.09.2026).
+        # Заодно уходят и поставленные вручную: иначе следующая расстановка вернула бы
+        # их обратно как якоря, и сброс выглядел бы неполным.
+        self.model._reset_sensors()
+        self.model.clear_manual_sensors()
+        self.model.clear_loaded_routes()   # загруженная история полётов — тоже входные данные
+        self.view.set_loaded_routes_checked(False)
+        self.view.render_route_preview(None)   # подсветка маршрута могла указывать в никуда
+        self.model.target_km = None        # у круглого района цель снова в центре (11.6)
+        self.model.clear_sector()          # сектор отсчитывается от цели — уходит вместе с ней
+        self.model.clear_manual_entries()  # свои точки старта — входные данные, как датчики человека
+        self._pending_recalc = False       # считать после сброса нечего
+        self.model.routes = []
+        self.model.iter_routes = []
+        self.model.iter_iteration = 0
+        self.model._iter_ctx = None
+        self.model.route_area = None
+        self.model._metrics = {}
+        self._cur_route = None
+        self._render_all()
+        self.view.refresh_sensor_table([])          # таблица в окне тоже пустеет
+        self.view.refresh_route_viewer()            # оба списка маршрутов опустели
+        self.view.refresh_sector_window()           # сектор и точки старта убраны
+        self.view.refresh_targets_window()          # и объекты защиты (план 13)
+        self.view.set_title("Сброшено: датчики (малые, большие и заданные вручную), "
+                            "цель, сектор, точки старта, зоны и загруженная история полётов убраны. "
+                            "Карта сохранена.")
+        if self.model.grid is None:
+            self._idle_metrics()
+        else:
+            self._full_metrics()
+
+    def on_place(self):
+        """«Расставить датчики»: обстановка менялась — сперва зона пролёта и выборка, потом расстановка.
+        Отдаёт: ничего."""
+        if self._busy:                                   # фоновый расчёт идёт — флаг не терять
+            self.view.flash_title("Идёт расчёт — подождите…")
+            return
+        fresh = bool(self._pending_recalc and self.model.grid is not None)   # выборка устарела
+        iters = fresh and bool(self.view.get_toggles().get("show_iter"))    # обновлять итерациями
+        if fresh:                                        # пересчёт берёт эта кнопка
+            self._pending_recalc = False
+        # place_sensors сам построит карту, если её ещё нет (в фоновом потоке)
+        self._run_async("place", lambda: self._work_place(fresh, iters))
+
+    # ---- параметры / режим ----
+    def on_apply(self):
+        try:
+            vals = self.view.get_param_values()
+        except (ValueError, TypeError):
+            self.view.set_param_values(self.model.p)
+            self.view.flash_title("Ошибка ввода: проверьте числовые поля.")
+            return
+        for n, v in vals.items():
+            setattr(self.model.p, n, v)
+        if self.model.p.threat_N < 1 or self.model.p.threat_R <= 0:
+            self.view.flash_title("N ≥ 1 и R > 0.")
+            return
+        # ШАГ СЕТКИ ДАТЧИКОВ подгоняется под радиус, но только если радиус СМЕНИЛСЯ:
+        # иначе затирали бы значение, которое пользователь только что ввёл руками
+        before = float(self.model.p.threat_cand_step_km)
+        if abs(self.model.sync_cand_step() - before) > 1e-9:
+            self.view.set_param_values(self.model.p)     # показать пересчитанный шаг
+        # ⚠️ «ПРИМЕНИТЬ» ТОЛЬКО ПРИНИМАЕТ ИЗМЕНЕНИЯ (заказчик 25.09.2026): зону пролёта, выборку и расстановку
+        # считает «Расставить датчики». Прежде кнопка пересчитывала маршруты и сама переставляла датчики
+        if self.model.grid is None:                      # карты нет — построить её (датчики не ставит)
+            self.on_build()
+            return
+        self.model.candidates = self.model.candidate_positions()   # сетка кандидатов — под новый шаг
+        self._render_all()
+        self._full_metrics()
+        self.view.set_title("Изменения применены. " + ("Обстановка менялась — " if self._pending_recalc else "")
+                            + "зона пролёта, маршруты и датчики — по «Расставить датчики».")
+
+    def on_mode(self, key):
+        self.model.p.mode = key
+        if len(self.model.sensors):
+            self.on_place()
+
+    def on_toggle(self):
+        t = self.view.get_toggles()
+        # чекбокс «показать загруженную выборку» — модель узнаёт о нём здесь: она сама
+        # решает (в `_sample_for_sensors`), можно ли по нему ставить датчики (задача 8.6)
+        self.model.show_loaded_routes = bool(t.get("show_loaded_routes"))
+        # итерации (веер ИЛИ обобщённая выборка) включили, а их ещё нет -> сгенерировать
+        # в фоне (стохастика, ~1 с). Обобщённая выборка тоже строится из этих маршрутов.
+        if ((t.get("show_iter") or t.get("show_iter_gen")) and self.model.grid is not None
+                and not self.model.iter_routes and not self._busy):
+            self._run_async("iter", lambda: self._iter_batch_work(self.model.iterate_routes))
+            return
+        # маршруты включили, а их ещё нет -> посчитать в фоне (Дейкстра, ~1 с)
+        if (t["show_routes"] and self.model.grid is not None
+                and not self.model.routes and not self._busy):
+            self._run_async("routes", self.model.plan_routes)
+            return
+        self._render_all()
+
+    def on_map_layer(self, key):
+        self.model.p.map_layer3 = key
+
+    def on_map_offline(self, flag):
+        self.model.p.map_offline3 = bool(flag)
+
+    def on_reset_view(self):
+        self.view.frame_bbox()
+
+    # ---- отрисовка ----
+    def _render_all(self):
+        """Собрать текущее состояние модели и целиком перерисовать карту с учётом галочек
+        показа (тепловая карта, слои, огибающая, маршруты, итерации, датчики и т.д.).
+        Единая точка отрисовки — вызывается после любого изменения данных."""
+        t = self.view.get_toggles()
+        g = self.model.grid
+        # какие слои вообще есть — чтобы галка не стояла над пустотой (см. set_layer_enabled)
+        zc = self.model.sensor_cells() if g is not None else None   # постройки по ячейкам (Д2)
+        self.view.set_layer_enabled(
+            grid=g is not None,
+            dem=g is not None and g.relief_height() is not None,
+            relief=g is not None and g.relief_k() is not None,
+            iter=bool(self.model.iter_routes),
+            bld=zc is not None and bool(np.asarray(zc["count"]).any()))
+        entry, target = self.model.entry_target_km()
+        self.view.render_entry_target(entry, self.model.target_points_km())   # все цели (план 13)
+        self.view.render_target_areas(self.model.target_zone_views())   # районы защиты человека (В13.21)
+        self.view.render_uav_start(self.model.uav_start_km)   # старт БПЛА (12.2), может быть None
+        self.view.refresh_conditions_button()                 # сектор или цель могли смениться
+        # сектор появления рисуется здесь же: иначе он пропадал бы при любой перерисовке
+        self.view.render_sector(self.model.sector_edges_km(), self.model.sector_points(), t,
+                                manual_points=self.model.manual_entries)
+        self.view.render_no_fly(self.model.no_fly_zones, t)
+        # |AB| вход->цель (для окна входных данных)
+        ab = float(np.hypot(target[0] - entry[0], target[1] - entry[1]))
+        self.model.p.ab_distance = round(ab, 1)
+        self.view.set_ab_distance(ab)
+        self.view.refresh_input_dialog()                  # окно «Входные данные» — актуальный L_max
+        if g is None:
+            # СЕТКИ НЕТ (район не задан или убран) — карту нужно ОЧИСТИТЬ, а не просто
+            # выйти. Раньше здесь стоял голый `return`, и уже нарисованные весовая карта,
+            # рельеф и векторные слои оставались на экране после снятия района: данных
+            # нет, а картинка есть (замечание заказчика 04.09.2026).
+            self.view.render_threat(None, None, t)
+            self.view.render_relief(None, None, t)
+            self.view.render_relief_priority(None, None, None, t)
+            self.view.render_buildings(None, None, t)
+            self.view.render_exclusions(None, None, None, t)
+            self.view.render_layers({}, [], t, built_mask=None, extent=None)
+            self.view.render_candidates(None, t)
+            self.view.render_routes([], None, None, t)
+            self.view.render_iter_routes([], t)
+            self.view.render_generalized([], t)
+            self.view.render_loaded_routes([], t)
+            self.view.render_iter_heat(None, None, t)
+            self.view.render_crossings(None, t)
+            self._render_sensors(empty=True)
+            self.view.render_sensor_track([], {})
+            self.view.render_sector_compass([])
+            return
+        extent = g.extent_km()
+        # рельеф: карта высот берётся в РОДНОМ разрешении (сетка 500 м для показа груба),
+        # приоритет — с сетки, потому что он показывает ровно то, что ушло в вес
+        # ⚠️ ЧТЕНИЕ РЕЛЬЕФА ЗАЩИЩЕНО try. Растр читается с диска ПРИ ОТРИСОВКЕ, и на
+        # большом файле (у активной области `arh_hh.tif` — 568 МБ, 20908 × 8256) любая
+        # беда — нехватка памяти, битый тайл, срезанный край — валила бы всю перерисовку,
+        # а с ней и окно. Показ высот — не то, ради чего стоит терять карту: при сбое
+        # гасим слой и пишем причину в заголовок (заказчик 04.09.2026: «при выборе
+        # рельефа программа крашится»).
+        if t.get("show_relief"):
+            try:
+                disp = self.model.relief_display()
+                if disp is None:
+                    self.view.render_relief(g.relief_height(), extent, t)
+                else:
+                    self.view.render_relief(disp[0], disp[1], t)
+            except Exception as e:                       # noqa: BLE001 — донесём в UI
+                self.view.render_relief(None, None, t)
+                self.view.flash_title("Не удалось показать высоты: %s: %s"
+                                      % (type(e).__name__, e))
+        else:
+            self.view.render_relief(None, None, t)
+        self.view.render_relief_priority(g.relief_k(), g.relief_cut(), extent, t)
+        self.view.render_buildings(zc, extent, t)             # постройки по ячейкам (Д2)
+        self.view.render_threat(g.weight, extent, t, outside=g.outside_mask())   # за кругом — прозрачно
+        self.view.render_exclusions(g.water_mask(), g.urban_mask(), extent, t)
+        self.view.render_layers(self.model.layers,
+                                self.model.layers.get("bridge_pts", []), t,
+                                built_mask=g._built_cells, extent=extent)
+        if t["show_cand"] and len(self.model.candidates) == 0:
+            self.model.candidates = self.model.candidate_positions()
+        self.view.render_candidates(self.model.candidates, t)
+        self.view.render_routes(self.model.routes, self.model.route_area, extent, t)
+        self.view.render_iter_routes(self.model.iter_routes, t)
+        self.view.render_loaded_routes(self.model.loaded_routes, t)
+        self._refresh_generalized(t)
+        self.view.render_iter_heat(
+            self.model.route_density_field() if t.get("show_iter_heat") else None, extent, t,
+            top=getattr(self.model, "route_density_top", None))   # верх шкалы — маршрутов в самой частой клетке
+        if t.get("show_cross"):
+            self.view.render_crossings(g.crossing_cells_km(), t)
+        else:
+            self.view.render_crossings(None, t)
+        self._render_sensors()
+        self._render_sensor_track(t)
+        self._render_sector_compass(t)
+
+    def _render_sector_compass(self, toggles):
+        """Сектора «анализа моделирования» по направлениям (довесок 06.09.2026): галка
+        в группе «пролёт БПЛА» — считает модель (`sector_stats`), рисует представление."""
+        if not toggles.get("show_sector_stats"):
+            self.view.render_sector_compass([])
+            return
+        m = self.model  # модель — короче в списке ниже
+        if not len(m.targets):                         # целей не ставили — цель по умолчанию
+            self.view.render_sector_compass([(m.sector_stats(), m.target_only_km())])
+            return
+        # ⚠️ КОМПАС У КАЖДОЙ ЦЕЛИ ПО ЕЁ МАРШРУТАМ (заказчик 23.09.2026); галочка «Сектора»
+        # в таблице окна целей гасит лишние. Одна цель — те же числа, что раньше
+        self.view.render_sector_compass(
+            [(m.sector_stats(i), t) for i, t in enumerate(m.targets.points_km())
+             if m.targets.items[i].sectors])
+
+    def on_target_show_area(self, i, on):
+        """Галочка «Район» у цели в таблице окна (Д5): перерисовать районы защиты. Вход: номер с нуля, галка.
+        Отдаёт: ''."""
+        self.model.set_target_show_area(i, on)
+        self.view.render_target_areas(self.model.target_zone_views())
+        return ""
+
+    def on_target_sectors(self, i, on):
+        """Галочка «Сектора» у цели в таблице окна: перерисовать компасы. Отдаёт: ''."""
+        self.model.set_target_sectors(i, on)
+        self._render_sector_compass(self.view.get_toggles())
+        return ""
+
+    def _render_sensor_track(self, toggles):
+        """«Анализ размещения» (задача 8.9) — сравнение ПЕРВОГО построения с ТЕКУЩИМ.
+        Считает модель (`sensor_movement`, венгерское сопоставление по типам); здесь
+        только решаем, показывать ли (галка в панели режимов), и достаём радиусы типов
+        для серых кругов первого построения — те же, что у обычной отрисовки датчиков."""
+        if not toggles.get("show_sensor_track"):
+            self.view.render_sensor_track([], {})
+            return
+        from model.placement.sensors import sensor_types
+        radii = {s.type_id: s.r_km for s in sensor_types(self.model.p)}
+        self.view.render_sensor_track(self.model.sensor_movement(), radii)
+
+    def on_iter_gen_frac(self, frac):
+        """Пользователь сменил долю обобщённой выборки (поле «обобщ. %»). Запоминаем и, если
+        слой включён, сразу перерисовываем."""
+        self.model.p.threat_iter_gen_frac = float(frac)
+        if self.view.get_toggles().get("show_iter_gen"):
+            self._refresh_generalized()
+
+    def _refresh_generalized(self, toggles=None):
+        """Обновить слой ОБОБЩЁННОЙ выборки (доля задаётся полем «обобщ. %», по умолч. 10 %):
+        считаем подмножество в модели только когда чекбокс включён (иначе слой очищается).
+        Долю берём из поля -> меняется без перезапуска. Дёшево — вызываем и по ходу анимации
+        (на завершении каждого пролёта), чтобы доля пересчитывалась «на этот момент»."""
+        t = toggles or self.view.get_toggles()
+        frac = self.view.get_iter_gen_frac()
+        self.model.p.threat_iter_gen_frac = frac
+        gen = self.model.generalized_sample(frac) if t.get("show_iter_gen") else []
+        self.view.render_generalized(gen, t)
+
+    # ---- показатели ----
+    def _idle_metrics(self):
+        kx0, kx1, ky0, ky1 = self.model.bbox_km
+        cell = THREAT_CELL_M / 1000.0
+        nx = int(round((kx1 - kx0) / cell)); ny = int(round((ky1 - ky0) / cell))
+        self.view.set_metrics([
+            "ВКЛАДКА 3 · цифровая карта угроз", "",
+            "Участок (демо-регион):",
+            f"  {kx1-kx0:.0f}×{ky1-ky0:.0f} км",
+            f"  сетка {cell*1000:.0f} м → {nx}×{ny} = {nx*ny} ячеек", "",
+            "1) «Построить карту» — наложение слоёв",
+            "   (реки/дороги/ЛЭП/мосты/…) на сетку;",
+            "2) «Расставить датчики» — по сумме весов",
+            "   (макс. покрытого веса + разнос),",
+            "   без датчиков на воде.", "",
+            "Веса слоёв — в config.THREAT_LAYERS.",
+        ])
+
+    def _relief_lines(self):
+        """Блок показателей по рельефу. Пока рельеф не добавлен — одна строка-подсказка,
+        чтобы было видно, что механизм есть и чем он управляется."""
+        g = self.model.grid
+        if g is None or not self.model.relief_on or g.relief_k() is None:
+            hint = ("нет файла высот" if not self.model.has_dem()
+                    else "выключен · кнопка «Добавить рельеф»")
+            return ["РЕЛЬЕФ", f"  {hint}", ""]
+        k = g.relief_k(); cut = g.relief_cut(); h = g.relief_height()
+        import numpy as _np
+        pos = g.weight > 0
+        up = int((pos & (k > 1.02)).sum()); dn = int((pos & (k < 0.98)).sum())
+        n = max(int(pos.sum()), 1)
+        return [
+            "РЕЛЬЕФ (в весе)",
+            f"  высоты: {_np.nanmin(h):.0f}…{_np.nanmax(h):.0f} м",
+            f"  укрытий: {up} ({100.0*up/n:.0f} %) · "
+            f"открытых: {dn} ({100.0*dn/n:.0f} %)",
+            f"  снято как гора: {int(cut.sum())} ячеек",
+            "",
+        ]
+
+    def _full_metrics(self):
+        me = self.model.metrics()
+        p = self.model.p
+        kx0, kx1, ky0, ky1 = self.model.bbox_km
+        cell = THREAT_CELL_M / 1000.0
+        lines = [
+            "ГЕОМЕТРИЯ",
+            f"  участок {kx1-kx0:.0f}×{ky1-ky0:.0f} км",
+            f"  ячейка {cell*1000:.0f} м",
+            f"  источник: {self.model.source}", "",
+            "МЕСТА ПРОЛЁТА (граф, ≤ L_max)",
+            f"  достижимо: {self.model.reachable_stats()[0]} ячеек "
+            f"= {self.model.reachable_stats()[1]:.0f} км²",
+            f"  линий-примеров: {len(self.model.routes)} · "
+            f"итерац.: {len(self.model.iter_routes)}",
+            f"  запас хода L_max: {p.threat_L_max:g} км", "",
+        ]
+        lines += self._relief_lines()
+        lines += self._resource_lines(p)
+        if me:
+            lines += [
+                f"  кандидатов: {me.get('n_candidates', 0)}", "",
+                "ВЕС КАРТЫ (по слоям)",
+            ]
+            by = me.get("by_layer", {})
+            for name in sorted(by, key=lambda n: -abs(by[n])):
+                lab = THREAT_LAYERS.get(name, {}).get("label", name)
+                lines.append(f"  {lab:<18}{by[name]:+8.0f}")
+            lines += ["", "РАССТАНОВКА"] + self._placement_lines(me)
+            lines += [
+                f"  покрытый вес: {me.get('covered_weight', 0):.0f} / "
+                f"{me.get('total_weight', 0):.0f}",
+                f"  доля покрытия: {me.get('covered_frac', 0)*100:.0f}%",
+                "",
+                f"ЗАСЕЧКА ПРОЛЁТОВ (по {me.get('n_routes_eval', 0)} маршрутам)",
+                f"  засечено ≥1 датчиком: {me.get('detect_frac', 0)*100:.0f}%",
+                f"  засечено {self._k_label()}: {me.get('detect_k_frac', 0)*100:.0f}%",
+                f"  средняя кратность: {me.get('mean_hits', 0):.1f}",
+            ] + self._by_type_lines(me)
+        self.view.set_metrics(lines)
+
+    # ---- отчёт по ТИПАМ датчиков (задача 8.7) ----
+    # ⚠️ ПОЧЕМУ РАЗБИВКА ОБЯЗАТЕЛЬНА. Пока тип был один, «N=10, R=2, k=3» описывало
+    # расстановку целиком. С четырьмя типами те же три числа описывают только первый из
+    # них, а строка «датчиков: 30» не отвечает на главный вопрос — работают ли все типы
+    # или два из них стоят впустую. Общая кратность 16.7 этого тоже не показывает.
+    def _resource_lines(self, p):
+        """Блок РЕСУРС: строка на каждый работающий тип."""
+        from model.placement.sensors import sensor_types, KIND_LABEL
+        out = ["РЕСУРС"]
+        specs = sensor_types(p)
+        total = 0
+        for s in specs:
+            if not s.active:
+                continue
+            total += s.n
+            kind = KIND_LABEL.get(s.kind, s.kind)
+            # у больших кратность в расстановке не участвует (кольцо по углу)
+            k_txt = "" if s.kind == "big" else f"  k={s.k}"
+            out.append(f"  тип {s.type_id} · {kind:<7} N={s.n:<4} R={s.r_km:g} км{k_txt}")
+        if not any(s.active for s in specs):
+            out.append("  типы не заданы: N = 0 у всех")
+        elif len([s for s in specs if s.active]) > 1:
+            out.append(f"  всего заказано: {total}")
+        if bool(getattr(p, "threat_manual_mode", False)):
+            out.append("  режим: ЗАДАННЫЕ ПОЗИЦИИ (алгоритм не подбирает)")
+        else:
+            out.append(f"  режим: {MODE_LABELS[p.mode]}")
+        return out
+
+    def _placement_lines(self, me):
+        """Блок РАССТАНОВКА: сколько поставлено, по типам и сколько закреплено."""
+        by = me.get("by_type") or {}
+        n_small, n_big = me.get("n_sensors", 0), me.get("n_big", 0)
+        out = [f"  датчиков: {n_small + n_big}"
+               + (f"  (малых {n_small} + больших {n_big})" if n_big else "")]
+        if len(by) > 1:
+            parts = " · ".join(f"тип {t}: {by[t]['n']}" for t in sorted(by))
+            out.append(f"  по типам: {parts}")
+        # КАРТА МЕСТА ТИПА (план 13, 13.4): пустая — не ошибка, но видна числом, а не нулём молча
+        for t, (ok, total) in sorted((me.get("zone_places") or {}).items()):
+            out.append(f"  тип {t} · карта места: {ok} из {total} кандидатов"
+                       + ("  ⚠️ мест нет — тип не поставлен" if ok == 0 else ""))
+        # ОЦЕНКА ЗАЗОРА (план 13, 13.8): доля от лучшего на ТЕХ ЖЕ местах — после запрета места
+        # это «лучшее в застройке», а не «лучшее вообще»; подпись обязана это говорить
+        for t, ratio in sorted((me.get("gap") or {}).items()):
+            from model.placement.sensors import sensor_types
+            spec = next((s for s in sensor_types(self.model.p) if s.type_id == t), None)   # тип задания
+            limited = spec is not None and self.model.allowed_mask(spec) is not None   # у типа карта места
+            out.append(f"  тип {t} · не хуже {100 * ratio:.0f} % от лучшего на "
+                       + ("разрешённых местах; от лучшего вообще — в «Анализе»" if limited else "тех же местах"))
+        # ЭТАП ЦЕЛЕЙ (план 13, 13.18; число по насыщению — 13.1 Д9): у каждой цели — поставлено, доля
+        # подлёта с кратностью защиты и почему столько; зоны нет — цель в лесу, район задаёт человек (В13.21)
+        for t, rep in sorted((me.get("targets_stage") or {}).items()):
+            n_type = (by.get(t) or {}).get("n", 0)   # поставлено этого типа всего
+            put = sum(r["placed"] for r in rep)      # из них у целей
+            r0 = rep[0] if rep else {}                # общие числа этапа — одинаковы у всех целей
+            out.append(f"  тип {t} · у целей {put} из {n_type} (потолок целей {r0.get('budget', '—')}; "
+                       f"порог прироста {r0.get('gain_pct', 0):g} %, уровень защиты {r0.get('level_pct', 0):.0f} %)")
+            for i, r in enumerate(rep):                     # строка отчёта на цель
+                # доля по приоритету и потребность (заказчик 30.09.2026): видно, кому сколько положено и нужно
+                out.append(f"    цель №{i + 1}: " + (
+                    f"{r['placed']} шт. (нужно {r.get('want', '—')}, доля по приоритету {r.get('allot', '—')}), "
+                    f"подлёт с кратностью защиты {r.get('k', 1)} — "
+                    f"{100 * r.get('share', 0.0):.1f} %, стоп: {r.get('why') or '—'} "
+                    f"(вместимость {r['capacity']})" if r["zone"] else "зоны нет, укажите район защиты")
+                    + (" (район вручную)" if r.get("manual") else ""))
+        # РУБЕЖ ОБНАРУЖЕНИЯ (13.1 Д9): где маршрут к цели засечён впервые — всеми малыми; 0 — не засечён
+        lines = me.get("targets_line") or []         # по целям: медиана и худшие 10 %, км
+        if lines:                                    # датчики стоят, выборка есть
+            out.append("  рубеж первой засечки, км от цели (медиана · худшие 10 %): " + " · ".join(
+                f"№{i + 1}: {r['med']:.1f} · {r['p10']:.1f}" for i, r in enumerate(lines)))
+        # ⚠️ ДВЕ РАЗНЫЕ СТРОКИ. «Задано человеком» — сколько позиций он назвал сам;
+        # «из них статических» — сколько из них не сдвинется и при итерациях. До
+        # итераций стоят все заданные, при итерациях динамические уезжают, и разница
+        # между строками показывает, что именно сейчас закреплено.
+        n_hand, n_fix = me.get("n_manual", 0), me.get("n_static", 0)
+        if n_hand:
+            out.append(f"  задано человеком: {n_hand}"
+                       + (f"  (из них статических: {n_fix})" if n_fix else ""))
+        elif n_fix:
+            out.append(f"  статических: {n_fix}")
+        return out
+
+    def _by_type_lines(self, me):
+        """Засечка ОТДЕЛЬНО ПО ТИПАМ: свой радиус, своя доля, свои простаивающие.
+
+        `простаивает` — датчики этого типа, не увидевшие ни одного пролёта. Именно этот
+        показатель отвечает, зачем тип вообще стоит на карте: у закреплённых вручную
+        датчиков он законно бывает ненулевым (человек поставил, где считает нужным),
+        у подобранных программой — признак, что типу не хватило места."""
+        by = me.get("by_type") or {}
+        if len(by) < 2:
+            return []
+        out = ["", "ПО ТИПАМ ДАТЧИКОВ (свой радиус и своя кратность)"]
+        for t in sorted(by):
+            d = by[t]
+            out.append(f"  тип {t}: {d['n']} шт. · R={d['r_km']:g} км · k={d.get('k', 0)}")
+            out.append(f"     ловит ≥1: {d['detect_frac']*100:.0f}% · "
+                       f"≥k: {d.get('detect_k_frac', 0)*100:.0f}% · "
+                       f"кратность {d['mean_hits']:.1f} · "
+                       f"покрытие {d.get('covered_frac', 0)*100:.0f}%")
+            if d.get("idle"):
+                out.append(f"     ⚠ простаивает: {d['idle']} (не видят ни одного пролёта)")
+        return out
+
+    # ---- окно «Анализ моделирования» (план 8, задача 8.9, довесок 06.09.2026) ----
+    def _analysis_choices(self):
+        """Подписи целей для выбора в окне «Анализ» («Цель №N — маршрутов M»). Отдаёт:
+        список строк; пусто — цель одна, и выбирать нечего."""
+        m = self.model  # модель
+        if len(m.targets) < 2:                         # цель одна — анализ один
+            return []
+        return ["Цель №%d — маршрутов %d" % (i + 1, len(part))
+                for i, part in enumerate(m.routes_by_target())]
+
+    def _k_label(self, html=False):
+        """Подпись «засечено с кратностью»: «≥k(3)» при «одна на всех», иначе «своей кратностью
+        типа» (В13.13). Вход: html — писать «&ge;». Отдаёт: строку."""
+        if bool(getattr(self.model.p, "threat_k_same", True)):   # кратность одна на всех
+            return ("&ge;k(%d)" if html else "≥k(%d)") % int(self.model.p.threat_k)
+        return "своей кратностью типа"                # у каждого типа своя k
+
+    def on_sensor_load(self, target=None):
+        """Снимок нагрузки на средства для окна (план 13.4). Вход: None — все цели, номер с нуля — одна цель.
+        Отдаёт: dict из `ThreatModel.sensor_load`."""
+        return self.model.sensor_load(target)
+
+    def on_report_data(self, target=None):
+        """Снимок для окон рисунков «Аналитики» (рисунки 5–9, 06.10.2026). Вход: None — все цели, номер с нуля — одна.
+        Отдаёт: dict `report_data` — сетка, маршруты, средства, типы, цели, точки входа, нагрузка, сектора."""
+        from model.threat.report_data import report_data
+        return report_data(self.model, target)
+
+    def on_load_export(self, path, title, info, headers, cells):
+        """«Выгрузить в Word» окна нагрузки. Вход: путь .docx, таблица как на экране. Отдаёт: None или текст ошибки."""
+        from model.placement.sensor_load import write_docx
+        return write_docx(path, title, info, headers, cells)
+
+    def _approach_time_html(self, target=None):
+        """Строка «время подлёта» окна «Анализ»: t = L / v по выборке. Вход: None — все цели, номер — одна.
+        Отдаёт: HTML; маршрутов нет — пустая строка. Скорость — выбранного типа БПЛА, иначе панели (для R_min)."""
+        from model.threat.approach_time import approach_times
+        m = self.model                                 # модель
+        uav = m.uav_type                               # выбранный тип БПЛА или None
+        v = float(uav.speed_kmh) if uav is not None else float(m.p.threat_speed_kmh)   # скорость, км/ч
+        parts = m.routes_by_target()                   # выборка по целям
+        routes = (parts[int(target)] if target is not None and int(target) < len(parts)   # одна цель
+                  else [r for p in parts for r in p])  # все цели
+        a = approach_times(routes, v)                  # минуты по выборке
+        if a is None:                                  # маршрутов нет
+            return ""
+        src = ("тип «%s»" % uav.name) if uav is not None else "скорость панели"   # откуда скорость
+        return ("<p>время подлёта (%s, %.0f км/ч; t = L / v): минимум %.0f мин, медиана %.0f мин, максимум %.0f мин "
+                "— по %d маршрутам, медиана длины %.0f км</p>"
+                % (src, a["v_kmh"], a["t_min"], a["t_med"], a["t_max"], a["n"], a["L_med_km"]))
+
+    def _analysis_html(self, target=None):
+        """HTML окна «Анализ»: засечка, по типам, по 12 направлениям (красным — кратности не
+        хватает). Вход: None — обобщённый анализ по всем целям, номер с нуля — одна цель."""
+        m = self.model  # модель
+        me = m.metrics() or {}  # показатели расстановки
+        multi = len(m.targets) > 1                     # целей несколько (план 13)
+        if not me:
+            return ("<h3>ЗАСЕЧКА ПРОЛЁТОВ</h3>"
+                    "<p>Показателей ещё нет — сначала расставьте датчики.</p>")
+        if target is None:                             # обобщённый: вся выборка
+            d = dict(n=int(me.get("n_routes_eval", 0)), det1=me.get("detect_frac", 0),
+                     detk=me.get("detect_k_frac", 0), mean_hits=me.get("mean_hits", 0),
+                     by_type=me.get("by_type") or {}, covered=me.get("covered_frac", 0))
+            stats = m.sector_stats()  # компас по всей выборке
+            title = "ЗАСЕЧКА ПРОЛЁТОВ" + (" — ОБОБЩЁННО, ВСЕ ЦЕЛИ" if multi else "")  # заголовок отчёта
+        else:                                          # одна цель: её часть выборки
+            d = m.target_analysis(int(target))
+            d["covered"] = None                        # доля веса — про карту, а не про цель
+            stats = d["sectors"]  # компас по маршрутам цели
+            title = "ЗАСЕЧКА ПРОЛЁТОВ — ЦЕЛЬ №%d" % (int(target) + 1)  # заголовок отчёта
+        lines = ["<h3>%s</h3>" % title]  # HTML по кускам
+        # ⚠️ ВЕЗДЕ «КОЛИЧЕСТВО (ПРОЦЕНТ)», А НЕ ГОЛЫЙ ПРОЦЕНТ (заказчик, довесок
+        # 06.09.2026: «пиши количество (процент)») — так же, как уже сделано в разделе
+        # «ПО НАПРАВЛЕНИЯМ» ниже. `_evaluate` хранит только долю (`detect_frac`), не
+        # само число маршрутов — считаем его обратно, округляя долю × общее число.
+        n_ev = int(d["n"])                             # маршрутов в разборе, шт.
+        lines.append(
+            "<p>по %d маршрутам: засечено &ge;1 — %d (%.0f%%), засечено %s — "
+            "%d (%.0f%%), средняя кратность %.1f%s</p>"
+            % (n_ev, round(d["det1"] * n_ev), d["det1"] * 100,
+               self._k_label(html=True), round(d["detk"] * n_ev), d["detk"] * 100, d["mean_hits"],
+               ", доля покрытия веса %.0f%%" % (d["covered"] * 100)
+               if d["covered"] is not None else ""))
+        lines.append(self._approach_time_html(target))   # время подлёта по ТТХ типа БПЛА (журнал 365)
+        by = d["by_type"]  # показатели по типам
+        if by:
+            lines.append("<h3>ПО ТИПАМ ДАТЧИКОВ</h3><ul>")
+            for t in sorted(by):
+                bt = by[t]                             # показатели типа
+                cov = ("" if "covered_frac" not in bt   # доля веса — только в обобщённом
+                       else ", покрытие веса %.0f%%" % (bt["covered_frac"] * 100))
+                lines.append(
+                    "<li>тип %d: %d шт., R=%.3g км, k=%d — ловит &ge;1: %d (%.0f%%), "
+                    "&ge;k: %d (%.0f%%), средняя кратность %.1f%s%s</li>"
+                    % (t, bt["n"], bt["r_km"], bt.get("k", 0),
+                       round(bt["detect_frac"] * n_ev), bt["detect_frac"] * 100,
+                       round(bt.get("detect_k_frac", 0) * n_ev),
+                       bt.get("detect_k_frac", 0) * 100, bt["mean_hits"], cov,
+                       (" · простаивает: %d" % bt["idle"]) if bt.get("idle") else ""))
+            lines.append("</ul>")
+        if target is not None:                         # одна цель — её защита (план 13.1, Д10)
+            lines.append(self._protection_html(int(target)))
+        elif not multi and len(m.target_points_km()) == 1:   # цель одна — защита в общем разборе
+            lines.append(self._protection_html(0))
+        if target is None and multi:                   # сводка по целям — только в обобщённом
+            lines.append(self._analysis_by_target_html())
+        if target is None:                             # зазор до оптимума — про расстановку целиком (Д4)
+            lines.append(self._gap_html(me))
+        cardinal = {0: " (север)", 90: " (восток)", 180: " (юг)", 270: " (запад)"}
+        lines.append("<h3>ПО НАПРАВЛЕНИЯМ (компас от %s, шаг 30°, по заходу маршрута, "
+                     "не по старту)</h3><ul>"
+                     % ("СВОЕЙ цели каждого маршрута" if target is None and multi else "цели"))
+        for e in stats:
+            deg = e["deg"]
+            n = e["n_routes"]
+            pct = (lambda x: (100.0 * x / n) if n else 0.0)
+            row = ("%d&deg;%s: маршрутов %d — не засечено (0 раз) %d (%.0f%%), "
+                  "засечено &ge;1 — %d (%.0f%%), засечено %s — %d (%.0f%%)"
+                  % (deg, cardinal.get(deg, ""), n, e["n_zero"], pct(e["n_zero"]),
+                     e["n_ge1"], pct(e["n_ge1"]), self._k_label(html=True),
+                     e["n_ge_k"], pct(e["n_ge_k"])))
+            if e["n_routes"] and not e["ok"]:
+                lines.append('<li style="color:#ff5555"><b>%s — кратности не хватает'
+                            '</b></li>' % row)
+            else:
+                lines.append("<li>%s</li>" % row)
+        lines.append("</ul>")
+        return "".join(lines)
+
+    def _analysis_by_target_html(self):
+        """Сводка «ПО ЦЕЛЯМ» для обобщённого анализа: у каждой цели маршрутов, засечено ≥1
+        и ≥k — количество (процент). Отдаёт: HTML-строку."""
+        m = self.model  # модель
+        k_lab = self._k_label(html=True)               # «≥k(3)» или «своей кратностью типа»
+        out = ["<h3>ПО ЦЕЛЯМ</h3><ul>"]
+        for i, part in enumerate(m.routes_by_target()):
+            d = m._detection(part)                     # засечка маршрутов к этой цели
+            n = int(d["n"])                            # маршрутов к цели, шт.
+            out.append("<li>цель №%d: маршрутов %d — засечено &ge;1 — %d (%.0f%%), "
+                       "%s — %d (%.0f%%), средняя кратность %.1f</li>"
+                       % (i + 1, n, round(d["det1"] * n), d["det1"] * 100, k_lab,
+                          round(d["detk"] * n), d["detk"] * 100, d["mean_hits"]))
+            pr = m.target_protection(i)                # защита объекта (Д10) или None
+            if pr and pr.get("zone") and pr.get("n"):  # у цели есть этап ПВН и подлёт
+                out.append("<li style=\"list-style:none\">&nbsp;&nbsp;защита: ПВН %d, подлёт &ge;%d — %.0f%% "
+                           "(уровень %.0f%%)%s</li>" % ((pr.get("stage") or {}).get("placed", 0), pr["k"],
+                                                         100 * pr["share"], pr["level"], self._need_text(pr, short=True)))
+        out.append("</ul>")
+        return "".join(out)
+
+    def _gap_html(self, me):
+        """Раздел «ЗАЗОР ДО ОПТИМУМА» окна «Анализ» (план 13.1, Д4): на разрешённых местах и от лучшего вообще.
+        Вход: показатели расстановки. Отдаёт: HTML; оценок нет — пусто."""
+        gap = me.get("gap") or {}                      # на разрешённых (тех же) местах
+        if not gap:                                    # расстановки по маршрутам не было
+            return ""
+        allg = self.model.gap_all()                    # от лучшего вообще — по запросу, дорого
+        out = ["<h3>ЗАЗОР ДО ОПТИМУМА (граница Минью)</h3><ul>"]
+        for t, ratio in sorted(gap.items()):              # тип и его доля «от лучшего вообще»
+            if t in allg:                              # у типа карта места — две величины
+                out.append("<li>тип %d: не хуже %.0f%% от лучшего <b>на разрешённых местах</b> · %.0f%% <b>от лучшего "
+                           "вообще</b> (без запрета мест, по итоговому набору)</li>" % (t, 100 * ratio, 100 * allg[t]))
+            else:                                      # тип «везде» — величины совпадают
+                out.append("<li>тип %d: не хуже %.0f%% от лучшего (места не ограничены — величина одна)</li>"
+                           % (t, 100 * ratio))
+        out.append("</ul><p style=\"color:#8a93a6\">Это нижняя граница, а не точная доля: настоящий результат "
+                   "обычно ближе к лучшему. Разбор — датчики/ЗАЗОР_И_МАТРОИД §5.</p>")
+        return "".join(out)
+
+    def _need_text(self, pr, short=False):
+        """«Сколько ПВН добавить» до уровней (Д10). Вход: итог `target_protection`, короткая ли строка.
+        Отдаёт: текст; уровень набран — пусто."""
+        parts = []                                     # по уровням
+        for lv, need in sorted((pr.get("need") or {}).items()):   # уровень защиты — сколько ПВН до него добавить
+            if need == 0:                              # уже набран
+                continue
+            parts.append("до %.0f%% — ещё %d ПВН" % (100 * lv, need) if need is not None
+                         else "до %.0f%% не дотянуть: максимум %.1f%%" % (100 * lv, 100 * pr["best"]))
+        if not parts:                                  # всё набрано
+            return ""
+        return (" · " if short else "") + (" · ".join(parts[:1] if short else parts))
+
+    def _protection_html(self, i):
+        """Раздел «ЗАЩИТА ОБЪЕКТА» окна «Анализ» (план 13.1, Д9–Д10): подлёт с кратностью защиты, рубеж,
+        почему кратность мала и сколько ПВН добавить. Вход: номер цели с нуля. Отдаёт: HTML; нет этапа — пусто."""
+        pr = self.model.target_protection(i)           # защита объекта или None
+        if not pr:                                     # нет типа у целей — раздела нет
+            return ""
+        k, st = pr["k"], pr.get("stage") or {}         # кратность защиты; итог этапа целей
+        out = ["<h3>ЗАЩИТА ОБЪЕКТА — ЦЕЛЬ №%d (подлёт в зоне цели, кратность защиты %d)</h3><ul>" % (i + 1, k)]
+        if not pr["zone"]:                             # цель в лесу, района нет
+            return out[0] + "<li>зоны нет — укажите район защиты</li></ul>"
+        n = int(pr["n"])                               # подлётов к цели
+        out.append("<li>ПВН у цели: %d (минимум %d, доля по приоритету %s, нужно %s), остановка: %s · порог прироста "
+                   "%g%%, уровень защиты %.0f%%</li>"
+                   % (st.get("placed", 0), st.get("n_min", 0), st.get("allot", "—"), st.get("want", "—"),
+                      st.get("why") or "—", pr["gain"], pr["level"]))
+        out.append("<li>подлёт %d маршрутов: засечён &ge;1 — %d (%.0f%%), &ge;%d — %d (%.0f%%)</li>"
+                   % (n, round(pr["share1"] * n), 100 * pr["share1"], k, round(pr["share"] * n), 100 * pr["share"]))
+        out.append("<li>рубеж первой засечки (все малые датчики): медиана %.1f км, худшие 10%% — %.1f км от цели</li>"
+                   % (pr["line_med"], pr["line_p10"]))
+        if n and pr["share"] < pr["level"] / 100.0 - 1e-9:   # уровень не набран — почему и сколько добавить
+            miss = n - round(pr["share"] * n)          # подлётов без кратности защиты
+            rest = max(0, miss - pr["lack_places"] - pr["lack_sep"])   # им просто не хватает ПВН
+            out.append('<li style="color:#ff5555"><b>почему кратность мала</b> (%d подлётов без &ge;%d): мест в '
+                       'радиусе R меньше %d — %d, мешает разнос — %d, не хватает ПВН — %d</li>'
+                       % (miss, k, k, pr["lack_places"], pr["lack_sep"], rest))
+            out.append('<li style="color:#ff5555"><b>сколько добавить у цели:</b> %s (с разносом встаёт ещё %d)</li>'
+                       % (self._need_text(pr) or "—", pr["room"]))
+        out.append("</ul>")
+        return "".join(out)
+
+    def run(self):
+        self.view.show()

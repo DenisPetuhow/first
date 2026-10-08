@@ -1,0 +1,75 @@
+# -*- coding: utf-8 -*-
+"""Все проверки одной командой: полный вывод — в файлы, на экран — одна таблица «код · сек · итог».
+
+Запуск: `python tools/check_all.py` · `--docs` (документы) · `--prog` (программа) · `--all` (плюс медленные).
+Проверки программы дописывать в CHECKS с набором "prog" (медленные — "slow") по мере появления.
+"""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # корень проекта
+LOGS = os.path.join(tempfile.gettempdir(), "{{ПРОЕКТ}}_checks")       # куда класть полный вывод
+P = "tools/переносимое/"                                              # переносимые проверки документов
+# (имя, аргументы python, набор): prog — программа, docs — документы, slow — только с --all
+CHECKS = [
+    ("codemap", [P + "codemap.py"], "docs"),
+    ("codemap --stale", [P + "codemap.py", "--stale"], "docs"),
+    ("check_names", [P + "check_names.py"], "docs"),
+    ("check_numbers", [P + "check_numbers.py"], "docs"),
+    ("check_claims", [P + "check_claims.py"], "docs"),
+    ("check_dead_code", [P + "check_dead_code.py"], "docs"),
+    ("check_dates", [P + "check_dates.py"], "docs"),
+    ("check_comments", [P + "check_comments.py"], "docs"),
+    ("check_index", [P + "check_index.py"], "docs"),
+    ("docmap --check", [P + "docmap.py", "--check"], "docs"),
+]
+WIDTH = 96                                                            # ширина итоговой строки, знаков
+# итог проверки узнаётся по словам; нет такой строки — берётся последняя содержательная
+VERDICT = re.compile(r"ВСЁ|ВСЕ |ПРОШЛ|РАСХОЖДЕН|НАХОДОК|НЕ НАЙДЕНО|БЕЗ ЕДИНОГО|УПАЛО|расхождений|требуется|"
+                     r"битых ссылок|отстал|ОТСТАЛ|записано:|ПОЛНЫЕ|ПРОПУСК", re.IGNORECASE)
+
+
+def last_line(text):
+    """Итог проверки — строка-вердикт, иначе последняя содержательная. Вход: вывод. Отдаёт: строка ≤ WIDTH."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]   # строки без пустых
+    hit = [ln for ln in lines if VERDICT.search(ln)]                  # строки-вердикты
+    s = hit[-1] if hit else (lines[-1] if lines else "(вывода нет)")  # итог
+    return s if len(s) <= WIDTH else s[:WIDTH - 1] + "…"
+
+
+def run(name, args):
+    """Прогнать проверку, вывод — в файл. Вход: имя, аргументы python. Отдаёт: (код, секунды, итог)."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")                 # кириллица в выводе без порчи
+    t0 = time.time()                                                 # начало, с
+    pr = subprocess.run([sys.executable] + args, cwd=ROOT, env=env, capture_output=True)   # процесс проверки
+    out = (pr.stdout + pr.stderr).decode("utf-8", "replace")         # вывод целиком
+    with open(os.path.join(LOGS, re.sub(r"\W+", "_", name) + ".txt"), "w", encoding="utf-8") as f:
+        f.write(out)
+    return pr.returncode, time.time() - t0, last_line(out)
+
+
+def main():
+    """Выбрать набор, прогнать, напечатать таблицу. Вход: argv. Отдаёт: код — число упавших."""
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    a = set(sys.argv[1:])                                            # ключи запуска
+    want = ({"prog", "docs", "slow"} if "--all" in a else {"docs"} if "--docs" in a
+            else {"prog"} if "--prog" in a else {"prog", "docs"})    # какие наборы гнать
+    os.makedirs(LOGS, exist_ok=True)
+    bad = 0                                                          # упавших проверок
+    print("%-16s %4s %7s  %s" % ("проверка", "код", "сек", "итог (полный вывод — %s)" % LOGS))
+    for name, args, kind in CHECKS:                                  # проверки по порядку
+        if kind not in want:                                         # не из выбранного набора
+            continue
+        code, sec, line = run(name, args)                            # код возврата, секунды, итог
+        bad += code != 0
+        print("%-16s %4d %7.1f  %s" % (name, code, sec, line), flush=True)
+    print("ВСЕ ПРОШЛИ" if not bad else "УПАЛО ПРОВЕРОК: %d — смотреть файлы вывода" % bad)
+    return min(bad, 100)
+
+
+if __name__ == "__main__":                                           # запуск скриптом, не импорт
+    sys.exit(main())

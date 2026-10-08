@@ -20,6 +20,7 @@ import numpy as np
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 LINE = "=" * 70
@@ -31,8 +32,8 @@ def measure(routes, seed, centered=False):
     # (требование заказчика 20.09.2026 «замеры делай на районе из arh»), а не
     # центрируется на цели, как в эталоне движения.
     from motion_check import build_scenario
-    from model.threat_routes import sample_one_route
-    import model.threat_routes as tr
+    from model.threat.threat_routes import sample_one_route
+    import model.threat.threat_routes as tr
 
     t0 = time.perf_counter()
     m, _auto, lmax = build_scenario(centered=centered)   # сетка, слои, рельеф

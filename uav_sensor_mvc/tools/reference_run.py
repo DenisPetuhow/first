@@ -35,8 +35,10 @@ if hasattr(sys.stdout, "reconfigure"):          # см. про cp1251 в шап�
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+
 from config import Params, THREAT_AREA, THREAT_BBOX_LONLAT      # noqa: E402
-from model.threat_grid import ThreatModel, _label8              # noqa: E402
+from model.threat.threat_grid import ThreatModel, _label8              # noqa: E402
 
 
 # ЭТАЛОН — по участкам. Числа взяты из ОГРАНИЧЕНИЯ §6/§6.0; там же условия замера.

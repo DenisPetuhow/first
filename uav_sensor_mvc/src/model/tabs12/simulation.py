@@ -1,0 +1,217 @@
+# -*- coding: utf-8 -*-
+"""
+MODEL · Главный класс модели SimulationModel.
+
+Держит состояние задачи (параметры, ГСЧ, накопленную выборку, структуру
+покрытия, текущее расположение датчиков) и реализует:
+  * динамику инкрементального SAA (step / add_and_replace);
+  * пакетный расчёт (run_batch) и сравнение режимов (compare_modes);
+  * «вероятные пути» (probable_paths): веер дуг с шагом угла (этап 1) либо
+    кластеры частых пролётов (этап 2), с пометкой крайних путей;
+  * поле плотности маршрутов (density_field) для тепловой карты;
+  * итоговые и онлайн-показатели.
+
+Класс не зависит от средств отображения.
+"""
+import numpy as np
+
+from config import Params      # MODES теперь используется в RouteModelBase
+from model.tabs12 import detection
+from model.tabs12.geometry import ellipse_geometry, geo_to_local_km
+from model.tabs12.trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
+                           signed_max_lateral, corridor_bbox, corridor_outline,
+                           frequent_arcs, frequent_serpentines, serpentine_fan,
+                           frequent_maneuvers, maneuver_fan, turn_radius_km,
+                           representative_trajectories)
+from model.placement.optimization import candidate_grid, CoverageCache, filter_not_past_target
+from model.tabs12.route_model import RouteModelBase
+
+
+class SimulationModel(RouteModelBase):
+    """Вычислительная модель размещения датчиков обнаружения БПЛА (вкладка 1, маршрут A→B).
+
+    Общее поведение «накопление выборки → жадная расстановка» — в RouteModelBase; здесь —
+    геометрия коридора A→B, порождение маршрута и показатели."""
+
+    def __init__(self, params: Params):
+        params.validate()
+        self.p = params
+        self._geo_info = None
+        self.geom = ellipse_geometry(params.A, params.B, params.L_max)
+        if params.geo:
+            _, _, lat0, lon0 = geo_to_local_km(params.A_geo, params.B_geo)
+            self._geo_info = (lat0, lon0)
+        self.reset()
+
+    # ------------------------------------------------------------------
+    def reset(self, seed=None):
+        """Полный сброс: НОВАЯ случайная выборка, пустое расположение датчиков.
+
+        Если seed не задан явно (p.seed=None), генератор инициализируется от
+        системной энтропии — каждый прогон даёт другой случайный результат.
+        Передайте seed (или задайте p.seed) для воспроизводимости.
+        """
+        p = self.p
+        if seed is not None:
+            p.seed = seed
+        self.rng = np.random.default_rng(p.seed)
+        self.geom = ellipse_geometry(p.A, p.B, p.L_max)
+        self.theta_max = max_deflection_angle(p.A, p.B, p.L_max)
+        self.r_min = turn_radius_km(p.speed_kmh / 3.6, p.bank_deg)   # радиус разворота, км
+        self.candidates = candidate_grid(p.A, p.B, p.L_max, p.grid_step,
+                                         traj_model=p.traj_model)
+        self.candidates = filter_not_past_target(self.candidates, p.A, p.B)
+        self.cache = CoverageCache(self.candidates, p.R, p.L_seg, p.k)
+        self.trajectories = []
+        self.features = []
+        self.sensors = np.empty((0, 2), float)
+        self.iteration = 0
+        # кэш геометрии отображения (пересчитывается при смене параметров)
+        self._corr_outline = corridor_outline(p.A, p.B, p.L_max, p.traj_model)
+        self._corr_bbox = corridor_bbox(p.A, p.B, p.L_max, p.traj_model)
+        self._view_bbox = self._compute_view_bbox()
+
+    def _compute_view_bbox(self, n=200, margin=0.06):
+        """Габариты ЗОНЫ МАРШРУТОВ: где реально лежат ~96% траекторий выбранного
+        профиля (детерминированная пред-выборка, не зависит от живого прогона).
+        Используется для зума карты вместо полного коридора."""
+        p = self.p
+        sampler = SAMPLERS[p.traj_model]
+        rng = np.random.default_rng(12345)
+        pts = []
+        for _ in range(n):
+            tr, _ = sampler(p.A, p.B, p.L_max, rng, sigma_frac=p.sigma_frac,
+                            n_points=p.n_points, theta_max=self.theta_max,
+                            profile=p.motion_profile)
+            pts.append(tr)
+        P = np.vstack(pts)
+        x0, x1 = np.percentile(P[:, 0], [1, 99])
+        y0, y1 = np.percentile(P[:, 1], [2, 98])
+        x0 = min(x0, p.A[0]); x1 = max(x1, p.B[0])      # концы A, B всегда в кадре
+        dx, dy = (x1 - x0) * margin, (y1 - y0) * margin + 1e-6
+        return (float(x0 - dx), float(x1 + dx), float(y0 - dy), float(y1 + dy))
+
+    def set_traj_model(self, traj_model):
+        self.p.traj_model = traj_model
+
+    # set_mode / set_profile / weights — в RouteModelBase (общие для вкладок 1 и 2)
+
+    def corridor_bbox(self):
+        """Габариты полного коридора движения (все возможные маршруты)."""
+        return self._corr_bbox
+
+    def corridor_outline(self):
+        """Границы коридора движения (upper, lower) — для контура на карте."""
+        return self._corr_outline
+
+    def view_bbox(self):
+        """Габариты зоны типичных маршрутов (зум карты, профиль-зависимо)."""
+        return self._view_bbox
+
+    # ------------------------------------------------------------------
+    # Порождение и накопление маршрутов
+    # ------------------------------------------------------------------
+    def sample_trajectory(self):
+        p = self.p
+        sampler = SAMPLERS[p.traj_model]
+        return sampler(p.A, p.B, p.L_max, self.rng,
+                       sigma_frac=p.sigma_frac, n_points=p.n_points,
+                       theta_max=self.theta_max, profile=p.motion_profile,
+                       r_min=self.r_min, nrange=(p.n_min, p.n_max), law=p.maneuver_law)
+
+    def _anchor_idx(self):
+        """Индекс кандидата для «якорного» датчика у цели B (1/3 R заходит за B)."""
+        if len(self.candidates) == 0:
+            return None
+        A = np.asarray(self.p.A, float); B = np.asarray(self.p.B, float)
+        d = B - A; L = float(np.linalg.norm(d))
+        if L < 1e-6:
+            return None
+        P = B - (2.0 / 3.0) * self.p.R * (d / L)
+        return int(np.argmin(np.linalg.norm(self.candidates - P, axis=1)))
+
+    # recompute_placement / add_and_replace / step / run_batch — в RouteModelBase
+
+    # ------------------------------------------------------------------
+    # Слои вероятных путей (аналитические, данные не требуются)
+    # ------------------------------------------------------------------
+    def frequent_paths(self, n=10):
+        """10 наиболее вероятных маршрутов.
+
+        ПРЕДИКТИВНО: если выборка накоплена — это обобщение ВСЕЙ выборки
+        (кластеризация по форме, медоиды кластеров, вес = доля кластера). До
+        накопления — аналитический набор по профилю (квантили)."""
+        if len(self.trajectories) > n:
+            return representative_trajectories(self.trajectories, n=n)
+        p = self.p
+        if p.traj_model == "arc":
+            return frequent_arcs(p.A, p.B, p.L_max, p.motion_profile,
+                                 p.sigma_frac, n=n, n_points=p.n_points)
+        if p.traj_model == "maneuver":
+            return frequent_maneuvers(p.A, p.B, p.L_max, p.motion_profile,
+                                      p.sigma_frac, n=n, n_points=p.n_points,
+                                      r_min=self.r_min, nrange=(p.n_min, p.n_max),
+                                      law=p.maneuver_law)
+        return frequent_serpentines(p.A, p.B, p.L_max, p.motion_profile,
+                                    p.sigma_frac, n=n, n_points=p.n_points)
+
+    def fan_paths(self):
+        """Веер ВОЗМОЖНЫХ маршрутов по шагу (геометрия пространства маршрутов):
+        дуги — по шагу угла (предельные пунктиром), петли — по шагу амплитуды."""
+        p = self.p
+        if p.traj_model == "arc":
+            return arc_fan(p.A, p.B, p.L_max, p.angle_step_deg,
+                           sigma_frac=p.sigma_frac, n_points=p.n_points,
+                           profile=p.motion_profile)
+        if p.traj_model == "maneuver":
+            return maneuver_fan(p.A, p.B, p.L_max, profile=p.motion_profile,
+                                n_points=p.n_points, r_min=self.r_min,
+                                nrange=(p.n_min, p.n_max), law=p.maneuver_law)
+        return serpentine_fan(p.A, p.B, p.L_max, n_points=p.n_points)
+
+    def density_field(self, nbins=160):
+        """2D-плотность точек накопленных маршрутов для тепловой карты.
+
+        Возвращает (H, extent) либо (None, None), если выборка пуста.
+        """
+        if not self.trajectories:
+            return None, None
+        pts = np.vstack(self.trajectories)
+        x0, x1, y0, y1 = self.corridor_bbox()
+        H, xe, ye = np.histogram2d(pts[:, 0], pts[:, 1], bins=nbins,
+                                   range=[[x0, x1], [y0, y1]])
+        H = H.T
+        if H.max() > 0:
+            H = H / H.max()
+        return H, (x0, x1, y0, y1)
+
+    # ------------------------------------------------------------------
+    # Показатели
+    # ------------------------------------------------------------------
+    def evaluate(self, sensors=None, trajectories=None):
+        S = self.sensors if sensors is None else sensors
+        trajs = self.trajectories if trajectories is None else trajectories
+        p = self.p
+        if not trajs:
+            return dict(avg_crossings=0.0, avg_uncovered_distance=0.0,
+                        avg_coverage_percent=0.0, share_meeting_k=0.0,
+                        n_sensors=len(S))
+        n_list, cov_list, unc_list = [], [], []
+        for t in trajs:
+            n_list.append(detection.n_detections(t, S, p.R))
+            cov = detection.continuous_coverage(t, S, p.R)
+            cov_list.append(cov)
+            unc_list.append((1.0 - cov) * _length(t))
+        return dict(
+            avg_crossings=float(np.mean(n_list)),
+            avg_uncovered_distance=float(np.mean(unc_list)),
+            avg_coverage_percent=float(np.mean(cov_list) * 100.0),
+            share_meeting_k=float(np.mean([x >= p.k for x in n_list]) * 100.0),
+            n_sensors=len(S),
+        )
+
+    # compare_modes / live_metrics — в RouteModelBase
+
+
+def _length(traj):
+    return float(np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1)))

@@ -22,6 +22,7 @@ if hasattr(sys.stdout, "reconfigure"):          # консоль Windows cp1251 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "src"))   # код программы — в src/ (журнал 364)
 
 import area_file as af                                                    # noqa: E402
 
@@ -54,6 +55,7 @@ def config_under(env_area):
     if env_area is not None:                      # проверяем выбор из программы
         env[af.ENV_AREA] = env_area               # — как его выставляет main_qt
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONPATH"] = os.path.join(ROOT, "src")  # config — в src/ (журнал 364)
     code = ("import config as c; print(c.THREAT_AREA); print(tuple(c.THREAT_BBOX_LONLAT)); "
             "print(c.THREAT_AREA_ERROR or '-')")  # что напечатать из config
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
@@ -185,7 +187,7 @@ def main():
     # ⚠️ 14.09.2026: слои Marshut (2.6 млн массивов) читались десятки минут; упакованный
     # формат — два массива на слой. Итог обязан быть тем же до бита, иначе поедут веса.
     import numpy as np
-    from model.threat_grid import packed_npz_arrays, _load_layers_npz
+    from model.threat.threat_grid import packed_npz_arrays, _load_layers_npz
     rng = np.random.default_rng(3)
     layers = {"road_local": [rng.random((n, 2)).astype(np.float32) for n in (2, 7, 1, 40)],
               "place_poly": [rng.random((n, 3)).astype(np.float32) for n in (5, 9)],

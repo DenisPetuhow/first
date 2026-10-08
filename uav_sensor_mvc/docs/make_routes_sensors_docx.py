@@ -215,7 +215,7 @@ def build():
           "",
           "sc = np.asarray(score, float)               # РУЛЕТКА: вероятность ∝ оценке",
           "j = int(np.searchsorted(np.cumsum(sc), rng.random() * sc.sum()))"],
-         "model/threat_routes.py :: _walk_field")
+         "src/model/threat/threat_routes.py :: _walk_field")
     para("Величина tau — «температура» — считается из свободного запаса хода: "
          "slack = остаток хода − кратчайший путь до цели. Запас тает, tau падает, "
          "экспонента резко выделяет лучшего соседа — и маршрут перестаёт петлять сам, "
@@ -278,7 +278,7 @@ def build():
           "if sp == 'center':   pool = order[:max(1, n // 3)]",
           "elif sp == 'edge':   pool = order[-max(1, n // 2):]",
           "else:                pool = order[n // 4: max(n // 4 + 1, 3 * n // 4)]"],
-         "model/threat_routes.py :: _pick_via")
+         "src/model/threat/threat_routes.py :: _pick_via")
     warn("Отсев «не хватит хода» идёт ДО розыгрыша. Раньше такие точки разыгрывались "
          "наравне с остальными (на реальных данных — половина), и каждая попытка через "
          "них была гарантированным отказом.")
@@ -309,23 +309,23 @@ def build():
           "    ge = _dijkstra_dist(pas, s, grid.h)       # поле ОТ этого входа",
           "    total = ge + gt                           # вход → ячейка → цель, км",
           "    env |= np.isfinite(total) & (total <= entry_L_max(L_max, i))"],
-         "model/threat_routes.py :: flight_envelope")
+         "src/model/threat/threat_routes.py :: flight_envelope")
     para("Сложение двух полей даёт длину пути «вход → ячейка → цель» сразу для ВСЕХ 35 186 "
          "ячеек: одно сравнение с запасом хода — и готова вся розовая область на карте.")
     para("2) Отбор точек обхода — не отпадает ли крюк как заведомо невозможный:")
     code(["minlen = ctx['via_minlen']                    # длина вход → via → цель, км",
           "ok = np.nonzero(np.isfinite(minlen) & (minlen <= L_max))[0]"],
-         "model/threat_routes.py :: _pick_via")
+         "src/model/threat/threat_routes.py :: _pick_via")
     para("3) Старт маршрута — хватит ли хода в принципе:")
     code(["d_start = dgeo[start]                         # км до цели из точки старта",
           "if not np.isfinite(d_start) or d_start > budget:",
           "    return None                               # не хватает хода — попытка отброшена"],
-         "model/threat_routes.py :: _walk_field")
+         "src/model/threat/threat_routes.py :: _walk_field")
     para("4) Каждый шаг маршрута — сколько ещё можно потратить на виляние:")
     code(["slack = (budget - route_len) - dgeo[cur]      # свободный запас, км",
           "if slack < 0.0:",
           "    return None                               # дойти уже нельзя, обрываемся"],
-         "model/threat_routes.py :: _walk_field")
+         "src/model/threat/threat_routes.py :: _walk_field")
     para("Именно этот «свободный запас» и делает поведение маршрута живым: пока он велик, "
          "линия петляет по коридорам, когда тает — выпрямляется и идёт к цели. И всё это "
          "стоит одного чтения из массива на шаг.")
@@ -358,7 +358,7 @@ def build():
           "        self._iter_ctx = self._ctxs[0]",
           "        self._ctx_built_key = key",
           "    return self._iter_ctx"],
-         "model/threat_grid.py :: _ctx_key, _ensure_ctx (сокращено)")
+         "src/model/threat/threat_grid.py :: _ctx_key, _ensure_ctx (сокращено)")
     para("Отсюда и разница в цене: контекст — 3.7 секунды, а один маршрут поверх готового "
          "контекста — 0.053 секунды, в семьдесят раз дешевле. Двести пятьдесят маршрутов "
          "укладываются в 13.4 секунды.")
@@ -402,7 +402,7 @@ def build():
     code(["N = float(done.sum())                                  # дошедших всего, шт.",
           "w = np.clip(share * (N + 1.0) - done, 0.0, ORBIT_QUOTA_CAP)   # доля + недобор",
           "# дальше розыгрыш по w без повторов: первым идёт выпавший, за ним остальные"],
-         "model/threat_routes.py :: _quota_order")
+         "src/model/threat/threat_routes.py :: _quota_order")
 
     h("8. Запрет движения назад", 2)
     para("Позади каждой точки трассы ставится запретный сектор: раствор 140°, радиус 2 км. "
@@ -518,7 +518,7 @@ def build():
           "if primary.max() > 1e-9:      score = primary        # первый критерий",
           "elif secondary.max() > 1e-12: score = secondary      # доля покрытия маршрутов",
           "else:                         score = covsum         # сколько маршрутов накрывает"],
-         "model/optimization.py :: CoverageCache.greedy")
+         "src/model/placement/optimization.py :: CoverageCache.greedy")
     table(["№", "Критерий", "Что означает"],
           [["1а", "прирост кратности", "сколько раз маршрут засечён, с потолком k"],
            ["1б", "прирост прикрытых сегментов", "какая доля длины маршрута прикрыта"],
@@ -724,7 +724,7 @@ def build():
           "dy = traj[:, 1, None] - self.cand[None, a:b, 1]   # dy",
           "d *= d; dy *= dy; d += dy                          # dx² + dy² — в том же массиве",
           "np.sqrt(d, out=d)                                  # расстояние, км"],
-         "model/optimization.py :: CoverageCache.add_trajectory")
+         "src/model/placement/optimization.py :: CoverageCache.add_trajectory")
     para("Почему числа те же: norm по паре чисел — ровно одно сложение dx² + dy² и корень, код делает "
          "то же самое. Пример: пик одного маршрута 88.8 → 8.5 МБ, и он больше не растёт с числом мест; "
          "строка считается втрое быстрее.")
@@ -797,27 +797,27 @@ def build():
 
     h("19. Где это в коде", 2)
     table(["Механизм", "Файл и функция"],
-          [["шаг движения, рулетка, запретный сектор", "model/threat_routes.py :: _walk_field"],
-           ["набор VIA-точек и поля расстояний", "model/threat_routes.py :: build_iter_context"],
+          [["шаг движения, рулетка, запретный сектор", "src/model/threat/threat_routes.py :: _walk_field"],
+           ["набор VIA-точек и поля расстояний", "src/model/threat/threat_routes.py :: build_iter_context"],
            ["кэш контекста: от чего зависит и когда пересобирается",
-            "model/threat_grid.py :: _ctx_key, _ensure_ctx"],
+            "src/model/threat/threat_grid.py :: _ctx_key, _ensure_ctx"],
            ["картинки к этому документу", "docs/make_pictures.py"],
-           ["выбор VIA по разбросу", "model/threat_routes.py :: _pick_via"],
+           ["выбор VIA по разбросу", "src/model/threat/threat_routes.py :: _pick_via"],
            ["повадка захода и пояса облёта",
-            "model/threat_routes.py :: _pick_approach, _orbit_chain, _quota_order"],
-           ["сглаживание с проверками", "model/threat_routes.py :: _smooth_safe"],
-           ["один маршрут целиком", "model/threat_routes.py :: sample_one_route"],
-           ["выборка для показа и жадный отбор", "model/threat_grid.py :: plan_routes"],
-           ["выборка моделирования", "model/threat_grid.py :: iter_batch"],
-           ["сетка кандидатов", "model/threat_grid.py :: candidate_positions"],
-           ["расстановка по маршрутам", "model/threat_grid.py :: place_sensors, _place_by_routes"],
-           ["жадный алгоритм и три критерия", "model/optimization.py :: CoverageCache.greedy"],
-           ["таблица «маршрут × место» (строка на маршрут)", "model/optimization.py :: CoverageCache.add_trajectory"],
-           ["общий проход по типам датчиков", "model/joint_greedy.py :: joint_greedy"],
-           ["пересчёт датчиков во время итераций", "controller_qt/iter_worker.py :: IterWorker (поток «Пуска»)"],
-           ["строки таблицы нарастающим итогом", "model/optimization.py :: RowStore; threat_grid :: _row_cache"],
+            "src/model/threat/threat_routes.py :: _pick_approach, _orbit_chain, _quota_order"],
+           ["сглаживание с проверками", "src/model/threat/threat_routes.py :: _smooth_safe"],
+           ["один маршрут целиком", "src/model/threat/threat_routes.py :: sample_one_route"],
+           ["выборка для показа и жадный отбор", "src/model/threat/threat_grid.py :: plan_routes"],
+           ["выборка моделирования", "src/model/threat/threat_grid.py :: iter_batch"],
+           ["сетка кандидатов", "src/model/threat/threat_grid.py :: candidate_positions"],
+           ["расстановка по маршрутам", "src/model/threat/threat_grid.py :: place_sensors, _place_by_routes"],
+           ["жадный алгоритм и три критерия", "src/model/placement/optimization.py :: CoverageCache.greedy"],
+           ["таблица «маршрут × место» (строка на маршрут)", "src/model/placement/optimization.py :: CoverageCache.add_trajectory"],
+           ["общий проход по типам датчиков", "src/model/placement/joint_greedy.py :: joint_greedy"],
+           ["пересчёт датчиков во время итераций", "src/controller_qt/iter_worker.py :: IterWorker (поток «Пуска»)"],
+           ["строки таблицы нарастающим итогом", "src/model/placement/optimization.py :: RowStore; threat_grid :: _row_cache"],
            ["ПВН у целей: потребность, доля, порядок",
-            "model/target_stage.py :: need, allot, _water, _fill, stage"],
+            "src/model/placement/target_stage.py :: need, allot, _water, _fill, stage"],
            ["все параметры и пороги", "config.py (Params, THREAT_*)"]])
 
     para()

@@ -79,7 +79,9 @@ VARIANT = re.compile(
 
 def config_values():
     """{имя параметра: значение} из config.py — и константы, и поля Params."""
-    src = io.open(os.path.join(ROOT, "config.py"), encoding="utf-8").read()
+    cfg = next((p for p in (os.path.join(ROOT, "config.py"), os.path.join(ROOT, "src", "config.py"))   # где лежит
+                if os.path.exists(p)), os.path.join(ROOT, "config.py"))   # config — в корне или в src/ (журнал 364)
+    src = io.open(cfg, encoding="utf-8").read()
     vals = {}
     for m in re.finditer(r"(?m)^([A-Z][A-Z_0-9]+)\s*=\s*([-\d.]+)\s*(?:#|$)", src):
         vals[m.group(1)] = float(m.group(2).rstrip("."))

@@ -27,8 +27,10 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+
 from config import THREAT_AREA, THREAT_BBOX_LONLAT, THREAT_TILE_AREA  # noqa: E402
-from view_qt import geomap as gm                                       # noqa: E402
+from view_qt.maps import geomap as gm                                       # noqa: E402
 
 
 def count_layer(root, layer, lo, la, ho, ha, z0, z1, area=""):

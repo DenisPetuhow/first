@@ -31,6 +31,8 @@ if os.path.isdir(_PLUGINS):
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -51,9 +53,9 @@ def main():
     from PyQt5.QtWidgets import QApplication
     from PyQt5.QtCore import QPointF, Qt
     from config import Params, THREAT_BBOX_LONLAT
-    from model.threat_grid import ThreatModel
-    from model.geo_frame import bbox_lonlat_to_km
-    from view_qt.threat_view import ThreatMapView
+    from model.threat.threat_grid import ThreatModel
+    from model.threat.geo_frame import bbox_lonlat_to_km
+    from view_qt.tabs.threat_view import ThreatMapView
     from controller_qt.threat_controller import ThreatController
 
     app = QApplication([])                      # noqa: F841 — держит Qt живым
@@ -131,7 +133,7 @@ def main():
     # отказался открывать файл: «could be decompression bomb DOS attack». Проверяем обе
     # стороны решения: свой предел поднят выше штатного, а сверх него человек получает
     # понятный текст, а не системную ошибку.
-    import view_qt.map_image as _mi
+    import view_qt.maps.map_image as _mi
     from PIL import Image as _Im
     _small = os.path.join("geo_cache", "карты_картинки", "15.jpg")
     check(_mi.MAX_PIXELS_ALLOWED > 237219680,
@@ -187,8 +189,8 @@ def main():
         # принесённых карт есть поворот и перекос, и промах доходил до 5.6 км. Проверяем
         # ровно то, что чинили: опорные точки должны попадать в свои координаты, а кусок
         # детализации — ложиться туда же, куда лёг бы целый кадр.
-        import view_qt.map_anchor as _ma
-        import view_qt.geomap as _gm
+        import view_qt.maps.map_anchor as _ma
+        import view_qt.maps.geomap as _gm
         _W2, _H2 = _meta["w"], _meta["h"]
         # известная привязка с поворотом: строим точки ИЗ НЕЁ и требуем её обратно
         _true = _np.array([[0.004, -0.0007, 20.0], [0.0009, -0.0035, 60.0]])
@@ -235,7 +237,7 @@ def main():
         # у него общая с растром. Проверяем именно стык: размер, рендер для подбора и
         # посадку углов в километры (ловушка «карта вверх ногами» — там же).
         import tempfile as _tf
-        import view_qt.map_vector as _mv
+        import view_qt.maps.map_vector as _mv
         _svg = os.path.join(_tf.gettempdir(), "uav_proba_vector.svg")
         with open(_svg, "w", encoding="utf-8") as _f:
             _f.write('<svg xmlns="http://www.w3.org/2000/svg" width="1200" '
@@ -460,7 +462,7 @@ def main():
 
     # файл датчиков: запись → чтение, позиции обязаны совпасть до знака
     import tempfile
-    from view_qt.input_window import write_sensors_file, read_sensors_file
+    from view_qt.windows.input_window import write_sensors_file, read_sensors_file
     rows = c._sensor_rows()
     path = os.path.join(tempfile.gettempdir(), "uav_sensors_check.txt")
     write_sensors_file(path, rows, p)
@@ -576,7 +578,7 @@ def main():
 
     # СВОЯ ПАПКА ФАЙЛОВ ДАТЧИКОВ и имя по дате-времени (заказчик 05.09.2026)
     import time as _time
-    from view_qt.input_window import (sensors_dir, default_file_name,   # noqa: E402
+    from view_qt.windows.input_window import (sensors_dir, default_file_name,   # noqa: E402
                                       DIR_LOAD, DIR_SAVE)
     _dl, _ds = sensors_dir(DIR_LOAD), sensors_dir(DIR_SAVE)
     check(os.path.isdir(_dl) and os.path.isdir(_ds),
@@ -591,7 +593,7 @@ def main():
     # 7. ИСТОРИЯ ПОЛЁТОВ: выгрузка и загрузка (задача 8.6)
     # ================================================================
     print("\n7. ИСТОРИЯ ПОЛЁТОВ (задача 8.6)")
-    from model import flight_log as fl
+    from model.threat import flight_log as fl
     import tempfile as _tf2
 
     _flights_path = os.path.join(_tf2.gettempdir(), "uav_flights_check.txt")
@@ -815,7 +817,7 @@ def main():
     # 8. АНАЛИЗ РАЗМЕЩЕНИЯ: стрелки, устойчивые номера (задача 8.9)
     # ================================================================
     print("\n8. АНАЛИЗ РАЗМЕЩЕНИЯ (задача 8.9)")
-    from model import sensor_track as trk
+    from model.placement import sensor_track as trk
     import itertools as _it
 
     # ВЕНГЕРСКИЙ АЛГОРИТМ — сверка с ПОЛНЫМ ПЕРЕБОРОМ (план §8.9.5): своя реализация
@@ -1042,7 +1044,7 @@ def main():
 
     # ⭐ ЛИНЕЙКА КАК В GOOGLE EARTH (правило заказчика 21.09.2026): предпросмотр за
     # курсором, время по скорости типа, подписи повёрнуты вдоль отрезка.
-    from view_qt.measure_tool import format_time
+    from view_qt.maps.measure_tool import format_time
     check(format_time(2.5) == "2 ч 30 мин" and format_time(0.75) == "45 мин",
           "время в подписи: часы и минуты", format_time(2.5))
     n_lbl = len(v.measure._labels)                       # подписей до наведения
@@ -1086,7 +1088,7 @@ def main():
     print("\n10. АНАЛИЗ МОДЕЛИРОВАНИЯ: кнопка, окно, сектора по направлениям "
          "(план 8, задача 8.9, довесок 06.09.2026)")
 
-    check(hasattr(v, "btn_analysis"), "кнопка «Анализ моделирования» есть на панели")
+    check(hasattr(v, "btn_analysis"), "кнопка «Аналитика» есть на панели")
     check(hasattr(v, "chk_sector_stats"), "галочка «Сектора» есть в группе «пролёт БПЛА»")
     check(not v.chk_sector_stats.isChecked(), "по умолчанию выключена")
 
@@ -1163,8 +1165,8 @@ def main():
     # без порядка не попадёт в легенду и в окно «Векторные слои». Проверка заведена
     # 13.09.2026 при добавлении слоя ПРОСЕК: всё это пришлось сверять руками.
     from config import THREAT_LAYERS, THREAT_LAYER_ORDER
-    from model.threat_grid import OSM_LAYER_FILTERS
-    from view_qt.threat_view import LAYER_STYLE
+    from model.threat.threat_grid import OSM_LAYER_FILTERS
+    from view_qt.tabs.threat_view import LAYER_STYLE
     for where, names in (("фильтр тегов OSM", OSM_LAYER_FILTERS),
                          ("стиль линии", LAYER_STYLE),
                          ("порядок слоёв", THREAT_LAYER_ORDER)):
@@ -1376,8 +1378,8 @@ def main():
     # вечно, а запись ушла бы в настоящий справочник человека, а не во временный файл.
     import tempfile as _tmp
     from PyQt5 import QtWidgets as _QtW
-    from model import uav_types as _ut
-    from view_qt.uav_types_window import UavTypesDialog
+    from model.threat import uav_types as _ut
+    from view_qt.windows.uav_types_window import UavTypesDialog
     _said, _warn0, _path0 = [], _QtW.QMessageBox.warning, _ut.path   # что вернуть в конце
     _file = os.path.join(_tmp.mkdtemp(), _ut.FILE_NAME)              # временный справочник
     _QtW.QMessageBox.warning = lambda *a, **k: _said.append(a[2] if len(a) > 2 else "")
@@ -1690,7 +1692,7 @@ def main():
     sd20.close()
 
     print("\n21. АНАЛИЗ ПО ЦЕЛЯМ, ИТЕРАЦИЙ СТОЛЬКО, СКОЛЬКО В ПАНЕЛИ, АНАЛИЗ РАЗМЕЩЕНИЯ (23.09.2026)")
-    from model.geo_frame import km_to_lonlat as _k2l
+    from model.threat.geo_frame import km_to_lonlat as _k2l
     _B21 = m.target_only_km()                           # цель по умолчанию, км
     _lo, _la = _k2l(_B21[0] - 35, _B21[1] - 25, m.lon0, m.lat0)
     _ho, _ha = _k2l(_B21[0] + 35, _B21[1] + 25, m.lon0, m.lat0)
@@ -1750,7 +1752,7 @@ def main():
     _ad.combo.setCurrentIndex(2)
     check("ЦЕЛЬ №2" in _ad.text.toPlainText(), "выбор цели показывает её отчёт")
     # НАГРУЗКА НА СРЕДСТВА (план 13.4): кнопка «Анализа» → окно; «Все средства» — 4 столбца, тип — 3; выгрузка в Word
-    from model.sensor_load import ORDERS as _ld_orders, sort_rows as _sort_ld
+    from model.placement.sensor_load import ORDERS as _ld_orders, sort_rows as _sort_ld
     from PyQt5 import QtWidgets as _QtW_ld
     _ad.btn_load.click()
     _ld = v._load_dlg                                    # окно «Нагрузка на средства»
@@ -1797,6 +1799,82 @@ def main():
           "строка таблицы подсвечивает своё средство на карте", "№%d" % _pk["n"])
     _ld.close()
     check(not v._load_pick_items, "окно закрыли — подсветка снята")
+    # «АНАЛИТИКА» — окна рисунков 5–9 описания ПК (06.10.2026): цель из окна, настройки меняют рисунок, PNG по размеру
+    from PyQt5 import QtGui as _QtG_fig
+    check(_ad.windowTitle() == "Аналитика" and v.btn_analysis.text() == "Аналитика" and _ad.btn_load.isVisibleTo(_ad)
+          and all(b.isVisibleTo(_ad) for b in _ad.btn_figure.values()), "«Аналитика»: четыре кнопки вывода")
+    _ad.combo.setCurrentIndex(2)                         # цель №2 в «Аналитике»
+    _ad.btn_figure["load"].click()
+    _fl = v._figure_dlgs["load"]                         # окно «Анализ нагрузки»
+    _flr = _fl._snap["load"]["rows"]                     # строки нагрузки снимка
+    check(_fl.isVisible() and _fl.combo_target.currentData() == 1 and _fl._snap["load"]["target"] == 1
+          and len(_fl.fig.axes[0].patches) == len(_flr) > 0, "«Анализ нагрузки»: цель из «Аналитики», столбец на средство",
+          "%d средств" % len(_flr))
+    _fl.combo_type.setCurrentIndex(1)
+    _fl.set_opts({"horizontal": True}); _fl.redraw()
+    check(len(_fl.fig.axes[0].patches) == sum(1 for r in _flr if r["type_id"] == _fl.combo_type.currentData())
+          and _fl.fig.axes[0].get_ylabel() == "номер средства", "тип и горизонтальные столбцы — рисунок перестроен")
+
+    def _png_size(dlg, name):
+        """Записать PNG окна и прочитать его размер. Вход: окно, имя файла. Отдаёт: (ширина, высота) пикс. и ожидаемые."""
+        path = dlg.save_png(os.path.join(tempfile.gettempdir(), name))   # куда записать
+        img = _QtG_fig.QImage(path or "")                # записанная картинка
+        want = (dlg.png_w.value() / 2.54 * dlg.png_dpi.value(), dlg.png_h.value() / 2.54 * dlg.png_dpi.value())   # пикс.
+        return (img.width(), img.height()), want
+
+    (_pw, _ph), (_ww, _wh) = _png_size(_fl, "gui_check_нагрузка.png")
+    check(abs(_pw - _ww) <= 1 and abs(_ph - _wh) <= 1, "PNG нагрузки — размер из см и dpi", "%d × %d" % (_pw, _ph))
+    _ad.btn_figure["sector"].click()
+    _fs = v._figure_dlgs["sector"]                       # окно «Показ сектора»
+    _fax = _fs.fig.axes[0]                               # полярные оси
+    _fst = _fs._snap["sectors"]                          # 12 секторов цели №2
+    check(_fax.name == "polar" and len(_fax.patches) == 24
+          and abs(sum(p.get_height() for p in _fax.patches[:12]) - sum(e["n_routes"] for e in _fst)) < 1e-9
+          and "ЗАХОДА" in _fs.lbl_info.text(), "«Показ сектора»: 12 направлений, сумма маршрутов сходится",
+          "%d маршрутов" % sum(e["n_routes"] for e in _fst))
+    _fs.set_opts({"zero": True, "short": True, "values": True, "share": True}); _fs.redraw()
+    check(len(_fs.fig.axes[0].patches) >= 36, "столбцы «без засечки» и рамки недобора добавились",
+          "%d столбцов" % len(_fs.fig.axes[0].patches))
+    _ad.btn_figure["map"].click()
+    _fm = v._figure_dlgs["map"]                          # окно «Показ карты»
+    _fm.apply_preset("Рис. 5 — весовая карта"); _fm.redraw()
+    check(len(_fm.fig.axes) == 2 and len(_fm.fig.axes[0].images) == 1, "«Показ карты», вид «Рис. 5»: весовая сетка и шкала")
+    _fm.apply_preset("Рис. 7 — размещение средств"); _fm.redraw()
+    _fma = _fm.fig.axes[0]                               # оси карты
+    check(len(_fma.collections) == 1 and len(_fma.patches) == len(_fm._snap["sensors"]) > 0,
+          "вид «Рис. 7»: маршруты и зона на каждое средство", "%d средств" % len(_fma.patches))
+    _fm.set_opts({"frame": "view"}); _fm.redraw()
+    _vr = v.vb.viewRange()                               # рамка вида карты вкладки, км
+    check(np.allclose(_fm.fig.axes[0].get_xlim(), _vr[0], atol=1e-6) and np.allclose(_fm.fig.axes[0].get_ylim(), _vr[1],
+                                                                                    atol=1e-6),
+          "рамка «как на карте сейчас»", "%.1f–%.1f км" % tuple(_vr[0]))
+    _fm.set_opts({"background": "own"}); _fm.redraw()
+    check("Своя карта" in _fm.lbl_info.text(), "фон «своя карта» без загруженной карты — пояснение, а не ошибка")
+    _keep_off = v._map_offline                           # вернуть после опыта
+    v._map_offline = True                                # проверка не ходит в сеть
+    try:
+        _fm.set_opts({"background": "tiles", "frame": "area"}); _fm.redraw()
+        _got = _fm.wait_tiles(60000)                     # подложка из кэша тайлов участка
+    finally:
+        v._map_offline = _keep_off
+    check(_fm._tiles["state"] in ("done", "none") and (not _got or len(_fm.fig.axes[0].images) == 2),
+          "подложка собирается в потоке и ложится под весовую сетку", _fm._tiles["state"])
+    # подложка — строки мозаики на своей широте (07.10.2026): прямоугольником середина уезжала на 0,59 км
+    from view_qt.output.analytics_open import straighten_rows as _straight
+    from model.threat.geo_frame import KM_PER_DEG_LAT as _KML
+    _ext, _H, _la0 = (0.0, 150.0, -10.0, 110.0), 1800, 61.7   # рамка мозаики км, строк, широта якоря
+    _mlo, _mhi = (np.arcsinh(np.tan(np.radians(_la0 + v / _KML))) for v in _ext[2:])   # края в Меркаторе
+    _yrow = lambda r: (np.degrees(np.arctan(np.sinh(_mlo + (_mhi - _mlo) * (r + 0.5) / _H))) - _la0) * _KML   # строка -> км
+    _want = _ext[2] + (_ext[3] - _ext[2]) * (np.arange(_H) + 0.5) / _H   # где строка должна лежать, км
+    _src = _straight(np.arange(_H)[:, None], _ext, _la0)[:, 0]   # откуда взята каждая строка
+    _px = (_ext[3] - _ext[2]) / _H                       # пиксель мозаики, км
+    check(np.abs(_yrow(_src) - _want).max() <= _px * 0.51 < np.abs(_yrow(np.arange(_H)) - _want).max(),
+          "подложка: строки выпрямлены по широте — сдвиг не больше полпикселя",
+          "было %.3f км, стало %.3f км" % (np.abs(_yrow(np.arange(_H)) - _want).max(), np.abs(_yrow(_src) - _want).max()))
+    (_pw, _ph), (_ww, _wh) = _png_size(_fm, "gui_check_карта.png")
+    check(abs(_pw - _ww) <= 1 and abs(_ph - _wh) <= 1, "PNG карты — размер из см и dpi", "%d × %d" % (_pw, _ph))
+    for _d in (_fl, _fs, _fm):                           # окна рисунков — закрыть
+        _d.close()
     _ad.close()
 
     # АНАЛИЗ РАЗМЕЩЕНИЯ В РЕЖИМАХ (заказчик: «работает не совсем корректно, точки
@@ -1851,9 +1929,9 @@ def main():
     # вопрос «удалить?» и выбор цвета без экрана ждали бы нажатия вечно
     import tempfile as _tmp22
     from PyQt5 import QtGui as _QtG
-    from model import sensor_types as _cat
-    from model.sensors import sensor_types as _specs
-    from view_qt.threat_view import type_color as _tcol
+    from model.placement import sensor_types as _cat
+    from model.placement.sensors import sensor_types as _specs
+    from view_qt.tabs.threat_view import type_color as _tcol
     _yes = _QtW.QMessageBox.Yes                           # ответ на вопрос «удалить?»
     _keep = (_QtW.QMessageBox.warning, _QtW.QMessageBox.question, _QtW.QColorDialog.getColor, _cat.path)   # вернуть в конце
     _said22 = []                                          # предупреждения окна
@@ -2022,9 +2100,9 @@ def main():
 
     print("\n23. РАЙОН ЗАЩИТЫ ЦЕЛИ В ЛЕСУ: ОКНО, РИСОВАНИЕ, ТАБЛИЦА (план 13, 13.18, В13.21)")
     # ⚠️ Окно вопроса модальное — без экрана ждало бы вечно: подменяется ответом «прямоугольник»
-    from model.target_stage import zone_base as _zb23   # из чего массив цели — как в `target_zone`
-    from model.threat_grid import _dilate as _dl23, _label8 as _lb23
-    from view_qt.targets_window import _COLS as _tcols
+    from model.placement.target_stage import zone_base as _zb23   # из чего массив цели — как в `target_zone`
+    from model.threat.threat_grid import _dilate as _dl23, _label8 as _lb23
+    from view_qt.windows.targets_window import _COLS as _tcols
     _g23 = m.grid                                         # сетка карты
     _lab23, _n23 = _lb23(_dl23(_zb23(_g23, m.sensor_cells()), 1))   # массивы застройки
     _free23 = np.argwhere(_lab23 == 0)                    # ячейки вне массивов (строка, столбец)
@@ -2107,7 +2185,7 @@ def main():
     print("\n23а. «ИЗМЕНИТЬ ЦЕЛИ», ГАЛКИ ЦЕЛИ СНЯТЫ, ГРУППА ПОКАЗА В ОКНЕ ТИПА (заказчик 29.09.2026)")
     # ЧТО ЛОВИТ: крестик не переносится мышью, район не чертится без вопроса о форме, после района режим
     # закрывается; галки «Секторы» и «Район» включены у новой цели; места нельзя спрятать отдельно от карты
-    from model.targets import Target as _T23a
+    from model.placement.targets import Target as _T23a
     _t0 = _T23a(0.0, 0.0)                                 # новая цель
     check(not _t0.sectors and not _t0.show_area, "у новой цели галки «Секторы» и «Район» сняты")
     _keep23a = (list(m.targets.items), p.threat_N2)       # вернуть в конце
@@ -2301,7 +2379,7 @@ def main():
     while v.vb._free_timer.isActive():                     # возврат на уровень — тоже анимацией
         v.vb._free_tick()
     _s3 = _span()
-    import view_qt.geomap as _gm                           # noqa: E402 — формула ширины уровня
+    import view_qt.maps.geomap as _gm                           # noqa: E402 — формула ширины уровня
     _kpd = _gm._km_per_deg_lon(v._geo_lat0)                # км на градус долготы
     _lv = [(v._map_px() / 256.0) / 2.0 ** z * 360.0 * _kpd for z in range(_gm.ZOOM_MIN, _gm.ZOOM_MAX + 1)]   # охваты уровней
     check(not v._ctrl_timer.isActive() and min(abs(_s3 / w - 1) for w in _lv) < 1e-3

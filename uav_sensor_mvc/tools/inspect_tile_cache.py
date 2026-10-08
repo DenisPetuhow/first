@@ -19,7 +19,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from view_qt import geomap as gm   # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+from view_qt.maps import geomap as gm   # noqa: E402
 
 
 def _list_dirs(path):

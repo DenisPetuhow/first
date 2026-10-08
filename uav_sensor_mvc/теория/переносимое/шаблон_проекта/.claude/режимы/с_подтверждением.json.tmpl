@@ -1,0 +1,22 @@
+{
+  "_комментарий": "Режим «с подтверждением»: разрешено чтение, проверки и свои скрипты; спрашиваются git-история, удаление, сборка. Переключение — /bez-ostanovok, /s-podtverzhdeniem.",
+  "permissions": {
+    "allow": [
+      "Read", "Glob", "Grep", "Edit", "Write",
+      "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git branch --show-current)",
+      "Bash(python tools/check_all.py)", "Bash(python tools/check_all.py --docs)", "Bash(python tools/check_all.py --prog)",
+      "Bash(python tools/переносимое/codemap.py)", "Bash(python tools/переносимое/codemap.py --stale)",
+      "Bash(python tools/переносимое/docmap.py)", "Bash(python tools/переносимое/docmap.py --check)",
+      "Bash(python tools/переносимое/check_names.py)", "Bash(python tools/переносимое/check_numbers.py)",
+      "Bash(python tools/переносимое/check_claims.py)", "Bash(python tools/переносимое/check_dead_code.py)",
+      "Bash(python tools/переносимое/check_dates.py)", "Bash(python tools/переносимое/check_dates.py --write-logs)",
+      "Bash(python tools/переносимое/check_comments.py)", "Bash(python tools/переносимое/check_index.py)"
+    ],
+    "ask": [
+      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)", "Bash(git checkout:*)", "Bash(git switch:*)",
+      "Bash(git reset:*)", "Bash(git restore:*)", "Bash(git clean:*)", "Bash(git rebase:*)", "Bash(git merge:*)",
+      "Bash(git mv:*)", "Bash(git rm:*)", "Bash(rm:*)", "Bash(pyinstaller:*)",
+      "PowerShell(git commit:*)", "PowerShell(git push:*)", "PowerShell(Remove-Item:*)"
+    ]
+  }
+}

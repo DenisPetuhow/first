@@ -28,6 +28,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+    sys.path.insert(0, os.path.join(ROOT, "src"))   # код программы — в src/ (журнал 364)
 
 import numpy as np
 
@@ -38,7 +39,7 @@ def build_model(routes, seed=1000, relief=True):
     """Модель с готовой выборкой маршрутов. Вход: сколько маршрутов, зерно, рельеф.
     Отдаёт: (модель, секунд на выборку)."""
     from config import Params
-    from model.threat_grid import ThreatModel
+    from model.threat.threat_grid import ThreatModel
     m = ThreatModel(Params())
     m.set_relief(relief)
     m.build()

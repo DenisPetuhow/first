@@ -7,7 +7,7 @@
 сохраняет `geo_cache/threat_layers.npz` в км-фрейме участка. После этого вкладка 3
 берёт реальные данные вместо демо-СХЕМЫ.
 
-Логика чтения OSM живёт в model.threat_grid.layers_from_osm (единый источник — тот
+Логика чтения OSM живёт в model.threat.threat_grid.layers_from_osm (единый источник — тот
 же код использует окно «Выбрать цифровые карты» в интерфейсе). Здесь — только CLI-
 обёртка: прочитать → сохранить.
 
@@ -30,9 +30,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+
 from config import (THREAT_AREA, THREAT_AREAS, THREAT_BBOX_LONLAT,
                     THREAT_LAYERS_FILE, THREAT_SOURCE_FILE)
-from model.threat_grid import (area_cache_dir, area_file, bbox_anchor_lonlat,
+from model.threat.threat_grid import (area_cache_dir, area_file, bbox_anchor_lonlat,
                                geo_cache_root, layers_from_osm)
 
 

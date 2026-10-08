@@ -11,7 +11,7 @@
   «внутрь» временной папки, а не рядом с программой;
 
 * тяжёлые геобиблиотеки ИСКЛЮЧЕНЫ. pyrosm/geopandas/rasterio нужны только для чтения
-  сырого .osm.pbf (model/threat_grid.py импортирует их ЛЕНИВО, внутри функции). Для показа
+  сырого .osm.pbf (src/model/threat/threat_grid.py импортирует их ЛЕНИВО, внутри функции). Для показа
   карта берётся из готового geo_cache/threat_layers.npz, поэтому в сборку они не идут:
   это сотни мегабайт и главный источник проблем при упаковке;
 
@@ -74,7 +74,7 @@ datas.append((os.path.join(_geo_src, "область.txt"), _geo_dst))
 # программа открылась бы не на той области.
 #
 # КАРТИНКИ КАРТЫ — только сами файлы из geo_cache/карты_картинки, БЕЗ подпапки
-# «детализация». Та — кэш резкости (`view_qt/map_image.py` :: `DETAIL_DIR`, `build_detail`):
+# «детализация». Та — кэш резкости (`src/view_qt/maps/map_image.py` :: `DETAIL_DIR`, `build_detail`):
 # его строит кнопка в окне «Карта картинкой» уже на месте, картинка и без него показывается,
 # а весит он больше самих картинок (1 530 МБ против 1 385 МБ, замер 16.09.2026).
 _img_src = os.path.join(ROOT, "geo_cache", "карты_картинки")
@@ -160,7 +160,7 @@ excludes = [
 
 a = Analysis(
     ["main_qt.py"],
-    pathex=[ROOT],
+    pathex=[ROOT, os.path.join(ROOT, "src")],   # код — в src/ (журнал 364)
     binaries=[],
     datas=datas,
     hiddenimports=["pyqtgraph.graphicsItems.ColorBarItem"] + rasterio_hidden,

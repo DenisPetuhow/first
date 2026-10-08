@@ -29,7 +29,7 @@
 
 МЕСТА ДАТЧИКОВ (план 13, 13.17): постройки, лес и неудобья — ОТДЕЛЬНЫМ файлом
 `sensor_layers_<участок>.npz` рядом со слоями. В вес карты он не идёт, поэтому кэш слоёв
-ради него не пересобирается (`model/sensor_zones.py`).
+ради него не пересобирается (`src/model/placement/sensor_zones.py`).
 
 Имена выходных файлов — из `область.txt` (`слои`, `рельеф`). Разбор —
 теория/код/УПАКОВКА_ОБЛАСТИ.md, план 10 §10.5.8 и 10.13.
@@ -47,6 +47,8 @@ if hasattr(sys.stdout, "reconfigure"):          # консоль Windows cp1251 
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
 
 import area_file as af                                                    # noqa: E402
 
@@ -163,7 +165,7 @@ def _save_layers(path, layers, packed=False):
     # Слои в .npz. Вход: путь, dict имя -> список массивов (км), packed — упакованно
     # (`threat_grid.packed_npz_arrays`, два массива на слой). Отдаёт: ничего.
     if packed:                                       # итоговый файл области
-        from model.threat_grid import packed_npz_arrays
+        from model.threat.threat_grid import packed_npz_arrays
         out = packed_npz_arrays(layers)              # массивы файла: <слой>@xy и <слой>@off
     else:                                            # промежуточная часть
         out = {}                                     # массивы файла: <слой>__<i> на каждую линию
@@ -182,7 +184,7 @@ def _load_layers(path):
     # (у точек пунктов и их имён порядок обязан совпадать).
     d = np.load(path, allow_pickle=False)
     if any("@" in k for k in d.files):               # файл упакованный
-        from model.threat_grid import _load_layers_npz
+        from model.threat.threat_grid import _load_layers_npz
         return _load_layers_npz(path)                # — общим загрузчиком модели
     keyed = {}                                       # имя -> [(номер, массив)]
     for key in d.files:
@@ -216,7 +218,7 @@ def _worker(args):
     # Тело процесса по ядру: своя группа слоёв из того же файла тем же кодом.
     # Вход: (путь .pbf, lon0, lat0 град, рамка град, имена слоёв). Отдаёт: (dict слоёв, секунды).
     pbf, lon0, lat0, bbox, names = args
-    from model.threat_grid import layers_from_osm
+    from model.threat.threat_grid import layers_from_osm
     t0 = time.time()                                 # начало работы процесса
     only = {n for n in names if n != "place"}        # настоящие слои группы, без пунктов
     out = layers_from_osm(pbf, lon0, lat0, bbox, only_layers=only, with_places="place" in names)
@@ -227,7 +229,7 @@ def build_part(pbf, folder, lon0, lat0, bbox, force=False, jobs=1, part=None):
     # Слои одного .pbf -> часть `_части/<файл>.npz`; свежая часть не пересобирается.
     # Вход: .pbf, папка, якорь lon0/lat0 и рамка (град), force, jobs — процессов, part — свой путь.
     # Отдаёт: путь части.
-    from model.threat_grid import layers_from_osm, OSM_LAYER_FILTERS
+    from model.threat.threat_grid import layers_from_osm, OSM_LAYER_FILTERS
     part = part or _part_path(folder, pbf)           # куда писать часть
     if (not force and os.path.exists(part)
             and os.path.getmtime(part) >= os.path.getmtime(pbf)):   # часть есть и новее исходника
@@ -250,7 +252,7 @@ def build_part(pbf, folder, lon0, lat0, bbox, force=False, jobs=1, part=None):
             for got, sec in ex.map(_worker, [(pbf, lon0, lat0, bbox, sorted(g)) for g in groups]):
                 layers.update(got)                   # группы не пересекаются по слоям
                 log("  процесс готов за %.1f мин: %s" % (sec / 60, ", ".join(sorted(got))))
-        from model.threat_grid import PLACE_LAYER, PLACE_NAME_LAYER, PLACE_POLY_LAYER
+        from model.threat.threat_grid import PLACE_LAYER, PLACE_NAME_LAYER, PLACE_POLY_LAYER
         order = list(OSM_LAYER_FILTERS) + [PLACE_LAYER, PLACE_NAME_LAYER, PLACE_POLY_LAYER]   # порядок слоёв
         layers = {n: layers[n] for n in order if n in layers}   # как у последовательного разбора
     os.makedirs(os.path.dirname(part), exist_ok=True)
@@ -277,7 +279,7 @@ def _length_km(arr):
 def merge_parts(parts, out_path):
     # Слить части в один упакованный .npz, выбросив дубли со стыков полос.
     # Вход: пути частей, путь итога. Отдаёт: (сводка слой -> [частей, дублей, км, км дублей], пунктов).
-    from model.threat_grid import PLACE_LAYER, PLACE_NAME_LAYER
+    from model.threat.threat_grid import PLACE_LAYER, PLACE_NAME_LAYER
     out, seen, stat = {}, {}, {}                     # итог; отпечатки по слоям; сводка
     pts, names, seen_pts = [], [], set()             # точки пунктов, их имена, уже взятые пункты
     for part in parts:
@@ -346,7 +348,7 @@ def pack_layers(folder, rec, pbf_only, force, jobs=1):
 def pack_sensors(folder, rec):
     # Шаг «места датчиков» (план 13, 13.17): постройки, лес и неудобья всех .pbf -> один файл.
     # Вход: папка, запись области. Отдаёт: путь итога. ⚠️ Вес карты этот файл не читает.
-    from model.sensor_zones import BUILDING_LAYER, file_name, sensor_layers_from_osm
+    from model.placement.sensor_zones import BUILDING_LAYER, file_name, sensor_layers_from_osm
     lon0, lat0 = rec["bbox"][0], rec["bbox"][1]      # якорь — юго-западный угол ОБЛАСТИ, градусы
     pbfs = _files(folder, "*.pbf")                   # исходники: и в корне, и в `_части/`
     if not pbfs:                                     # исходников нет

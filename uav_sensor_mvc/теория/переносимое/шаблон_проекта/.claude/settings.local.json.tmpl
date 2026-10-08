@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tools/check_all.py)", "Bash(python tools/check_all.py --docs)", "Bash(python tools/check_all.py --prog)",
+      "Bash(python tools/check_all.py --all)", "Bash(python main.py)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [{"type": "command", "command": "python tools/переносимое/hook_bez_cd.py", "timeout": 10}]
+      }
+    ]
+  }
+}

@@ -32,9 +32,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+
 from config import Params, THREAT_AREA, THREAT_BBOX_LONLAT, THREAT_CELL_M  # noqa: E402
-from model.threat_grid import ThreatModel                                   # noqa: E402
-from model import geo_frame as gf                                           # noqa: E402
+from model.threat.threat_grid import ThreatModel                                   # noqa: E402
+from model.threat import geo_frame as gf                                           # noqa: E402
 
 LINE = "=" * 68
 _fails = []
@@ -61,7 +63,7 @@ def main(argv=None):
     # ⚠️ СПРАВОЧНИК ТИПОВ — ВСТРОЕННЫЙ, а не файл участка: заказчик правит свой (24.09.2026 — кратность защиты 2,
     # k ПВН 3), и проверка считала бы его числами
     import tempfile                                                # noqa: E402
-    from model import sensor_types as _cat0                        # noqa: E402
+    from model.placement import sensor_types as _cat0                        # noqa: E402
     _empty = tempfile.mkdtemp()                                    # пустая папка — файла справочника нет
     _cat0.path = lambda: os.path.join(_empty, _cat0.FILE_NAME)
 
@@ -133,7 +135,7 @@ def main(argv=None):
 
     # ---- 4б. четыре типа датчиков и заданные человеком позиции (задача 8.7) ----
     print("\n4б. ТИПЫ ДАТЧИКОВ И ЗАДАННЫЕ ПОЗИЦИИ · фаза ДО ИТЕРАЦИЙ")
-    from model.sensors import sensor_types, min_small_radius        # noqa: E402
+    from model.placement.sensors import sensor_types, min_small_radius        # noqa: E402
     n1 = p.threat_N
     # ⚠️ ФАЗА ЗДЕСЬ РЕШАЕТ ВСЁ (правило заказчика 05.09.2026). ДО итераций закреплены
     # ВСЕ заданные человеком датчики — и статические, и динамические: человек описывает
@@ -309,7 +311,7 @@ def main(argv=None):
           % (d_min2, d_min, len(S2)))
     p.threat_spread_types = True
     # КРАТНОСТЬ МЕЖДУ ТИПАМИ: кэш второго типа обязан видеть покрытие первого
-    from model.optimization import CoverageCache                 # noqa: E402
+    from model.placement.optimization import CoverageCache                 # noqa: E402
     sample = m._sample_for_sensors()[:20]
     c1 = CoverageCache(S[:1], p.threat_R2, p.L_seg, 3)
     c2 = CoverageCache(S[:1], p.threat_R2, p.L_seg, 3,
@@ -347,7 +349,7 @@ def main(argv=None):
 
     # ---- 4е. справочник типов датчиков (план 13, задача 13.1) ----
     print("\n4е. СПРАВОЧНИК ТИПОВ ДАТЧИКОВ (план 13, 13.1)")
-    from model import sensor_types as st                         # noqa: E402
+    from model.placement import sensor_types as st                         # noqa: E402
     base = st.defaults()                                         # встроенный справочник
     check([(t.type_id, t.name) for t in base] == [(1, "МОГ"), (2, "ПВН"), (4, "Большой"), (5, "Обычный")],
           "умолчания: МОГ №1, ПВН №2, большой №4, Обычный №5 (Д1)",
@@ -396,7 +398,7 @@ def main(argv=None):
 
     # ---- 4ж. места датчиков: постройки, лес, неудобья (план 13, задача 13.17) ----
     print("\n4ж. МЕСТА ДАТЧИКОВ: ПОСТРОЙКИ, ЛЕС, НЕУДОБЬЯ (план 13, 13.17)")
-    from model import sensor_zones as sz                         # noqa: E402
+    from model.placement import sensor_zones as sz                         # noqa: E402
     check(sz.file_name("threat_layers_arh.npz") == "sensor_layers_arh.npz",
           "файл мест датчиков лежит рядом с кэшем слоёв", sz.file_name("threat_layers_arh.npz"))
     w_before = m.grid.weight.copy()                              # вес до сводки
@@ -436,7 +438,7 @@ def main(argv=None):
         # Д3 (план 13.1): слагаемые по отдельности — итог обязан быть той же картой; болота — свой слой
         parts = m.allowed_parts(specs[2])                        # слагаемые карты места ПВН
         # ⚠️ в непроходимом места есть, но только в R от проходимого: с крыши у края города видно маршрут (29.09.2026)
-        from model.threat_grid import _dilate as _dl4z           # noqa: E402
+        from model.threat.threat_grid import _dilate as _dl4z           # noqa: E402
         _nr = max(0, int(round(float(specs[2].r_km) / m.grid.h)))   # R в ячейках
         _edge = _dl4z(~parts["nopass"], _nr) if _nr else ~parts["nopass"]   # проходимое ± R
         check(np.array_equal(parts["result"], zmap) and not (parts["result"] & ~_edge).any(),
@@ -478,7 +480,7 @@ def main(argv=None):
     print("\n4к. ОЦЕНКА ЗАЗОРА: ГРАНИЦА МИНЬЮ (план 13, 13.8)")
     from itertools import combinations                           # noqa: E402
     from config import MODES                                     # noqa: E402
-    from model.optimization import _popcount                     # noqa: E402
+    from model.placement.optimization import _popcount                     # noqa: E402
     w = MODES["balanced"]                                        # веса критериев жадного
     few = m._sample_for_sensors()[:40]                           # маршрутов в малой задаче
     cand_all = np.asarray(m.candidates, float)                   # общая сетка кандидатов
@@ -513,7 +515,7 @@ def main(argv=None):
 
     # ---- 4л. общий проход по типам вместо очереди (план 13, задача 13.6) ----
     print("\n4л. ОБЩИЙ ПРОХОД ПО ТИПАМ (план 13, 13.6)")
-    from model.joint_greedy import RULES                         # noqa: E402
+    from model.placement.joint_greedy import RULES                         # noqa: E402
     check(p.threat_type_order == "gain" and "types" in RULES, "по умолчанию — по наибольшему приросту",
           "правила: %s" % ", ".join(RULES))
     keep_j = (p.threat_N, p.threat_R, p.threat_N2, p.threat_R2,   # вернуть после опыта
@@ -542,7 +544,7 @@ def main(argv=None):
 
     # ---- 4м. ПВН у объектов защиты: этап целей (план 13, задача 13.18) ----
     print("\n4м. ПВН У ОБЪЕКТОВ ЗАЩИТЫ: ЭТАП ЦЕЛЕЙ (план 13, 13.18)")
-    from model import target_stage as tsg                        # noqa: E402
+    from model.placement import target_stage as tsg                        # noqa: E402
     pvn_st = st.by_id(2, st.defaults())                          # паспорт ПВН: правила у целей
     # ДОЛИ ПО ПРИОРИТЕТУ (заказчик 30.09.2026): бюджет λ·p, не больше потребности, не меньше наименьшего; нужно
     # младшей мало — излишек старшей («10 + 3»), 90/5/5 — всё сверх наименьших старшей, а не «3 3 3 → 10 3 3»;
@@ -574,7 +576,7 @@ def main(argv=None):
           " · ".join("k%d: %g / %.0f %%" % (kk, t, lv) for kk, (t, lv) in zip((1, 2, 3, 4, 6), thr_lvl)))
     # ПРИОРИТЕТ РАСЧЁТОМ: две цели, у каждой свои маршруты и своё место — ставится место весомой цели;
     # цель, набравшая уровень, выбывает (её маршруты больше не весят)
-    from model.optimization import CoverageCache                 # noqa: E402
+    from model.placement.optimization import CoverageCache                 # noqa: E402
     two = CoverageCache(np.array([[0.05, 0.0], [10.05, 0.0]]), 0.5, 4, 1)   # место у цели А и у цели Б, км
     for x0 in (0.0,) * 4 + (10.0,) * 4:                          # по четыре подлёта к каждой
         two.add_trajectory(np.array([[x0, 0.0], [x0 + 0.1, 0.0]]))
@@ -647,7 +649,7 @@ def main(argv=None):
           "%d и %d" % (n_rect, n_circ))
     keep_o = (list(m.targets.items), p.threat_N2, p.threat_R2)   # вернуть после опыта
     p.threat_N2, p.threat_R2 = 6, 0.5
-    from model.threat_grid import _dilate, _label8               # noqa: E402
+    from model.threat.threat_grid import _dilate, _label8               # noqa: E402
     # ⚠️ разметка массивов — ОДИН раз и из того же, что `target_zone` (`zone_base`, без буфера города и штрафа
     # деревень): перебор точек через неё шёл бы минутами
     lab4, _n4 = _label8(_dilate(tsg.zone_base(g4, m.sensor_cells()), 1))   # массивы застройки
@@ -687,7 +689,7 @@ def main(argv=None):
 
     # ---- 4п. доезд МОГ по дорогам (план 13.3) ----
     print("\n4п. ДОЕЗД МОГ ПО ДОРОГАМ: ДЕЙКСТРА, РЕКИ И БОЛОТА ± ОТСТУП (план 13.3)")
-    from model import road_access as ra                          # noqa: E402
+    from model.placement import road_access as ra                          # noqa: E402
 
     class _Grid4p:
         """Сетка-макет 5 × 12 ячеек по 0.5 км: только то, что читает `road_access`."""
@@ -790,7 +792,7 @@ def main(argv=None):
     # ⚠️ Раньше из панели брался только ВЕС, а разброс, расход и заход стояли жёстким "mix":
     # человек менял режим захода, нажимал «Применить», а синие линии не менялись вовсе.
     # Замер: средняя длина при min/max была 130.6 и 131.8 км (шум), стала 122.0 и 134.2.
-    import model.threat_routes as _tr
+    import model.threat.threat_routes as _tr
     seen = []                                        # режимы, с которыми звали розыгрыш
     _orig_sample = _tr.sample_one_route               # настоящий розыгрыш, вернём в конце
 
@@ -814,7 +816,7 @@ def main(argv=None):
           "ВСЕ ЧЕТЫРЕ режима панели дошли до выборки", str(sorted(got)[:2]))
 
     print("\n5б. СВОЙ ЗАПАС ХОДА У КАЖДОЙ ТОЧКИ ВХОДА (план 12, задача 12.4)")
-    from model import uav_types as _ut
+    from model.threat import uav_types as _ut
     # ⚠️ ВЫКЛЮЧАЕМОСТЬ В НОЛЬ — главное здесь: пока старт не задан, расчёт обязан идти
     # ровно как раньше, одним числом (правило проверок, «механизм выключается в ноль»).
     check(np.isscalar(m.route_L_max()) and m.entry_L_max_km() is None,
@@ -845,8 +847,8 @@ def main(argv=None):
     m.p.threat_L_max_manual = False
 
     print("\n5г. ОБЪЕКТЫ ЗАЩИТЫ: НЕСКОЛЬКО ЦЕЛЕЙ, РОЗЫГРЫШ БЕЗ ПОВТОРОВ (план 13, 13.12–13.14)")
-    from model.targets import TargetBag, route_target_index
-    from model.threat_routes import flight_envelope
+    from model.placement.targets import TargetBag, route_target_index
+    from model.threat.threat_routes import flight_envelope
     # ⚠️ ВЫКЛЮЧАЕМОСТЬ В НОЛЬ: мешок из одной цели не трогает ГПСЧ — иначе поток случайных
     # чисел сместился бы, и эталон §6 разъехался бы без единой настоящей правки
     rng5 = np.random.default_rng(5)
@@ -907,6 +909,15 @@ def main(argv=None):
     check(len(m.routes) == 0 and len(m.iter_routes) == 0, "маршруты сброшены")
     check(m.relief_on is False, "рельеф выключен")
     check(m.area_ready is False, "район помечен как незаданный")
+
+    # ---- 7. время подлёта по ТТХ: t = L / v (журнал 365) ----
+    print("\n7. ВРЕМЯ ПОДЛЁТА")
+    from model.threat.approach_time import approach_times   # noqa: E402 — показатель «Анализа»
+    a7 = approach_times([np.array([[0.0, 0.0], [30.0, 40.0], [30.0, 80.0]])], 180.0)   # 50 + 40 = 90 км при 180 км/ч
+    check(a7 is not None and abs(a7["t_med"] - 30.0) < 1e-9, "90 км при 180 км/ч — 30 мин",
+          "%.1f мин" % (a7["t_med"] if a7 else -1))
+    check(approach_times([], 180.0) is None and approach_times([np.zeros((2, 2))], 0.0) is None,
+          "нет маршрутов или скорость 0 — показателя нет")
 
     print("\n" + LINE)
     if _fails:

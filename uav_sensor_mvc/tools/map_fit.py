@@ -9,7 +9,7 @@
 заказчика (Плесецк) — медиана 3 660 м. Утилита находит на картинке населённые пункты по
 их пятнам застройки из OSM и решает привязку по ним: 34 пункта, невязка 224 м.
 
-Разбор метода — `model/map_fit.py`, математика привязки — `view_qt/map_anchor.py`.
+Разбор метода — `src/model/threat/map_fit.py`, математика привязки — `src/view_qt/maps/map_anchor.py`.
 """
 import argparse
 import io
@@ -21,11 +21,13 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+
 import config                                     # noqa: E402
-from model import map_fit as mf                   # noqa: E402
-from model.geo_frame import lonlat_to_km, km_to_lonlat  # noqa: E402
-from model.threat_grid import geo_cache_root, layers_cache_path  # noqa: E402
-from view_qt import map_image as mi               # только чтение файла, окон не создаёт
+from model.threat import map_fit as mf                   # noqa: E402
+from model.threat.geo_frame import lonlat_to_km, km_to_lonlat  # noqa: E402
+from model.threat.threat_grid import geo_cache_root, layers_cache_path  # noqa: E402
+from view_qt.maps import map_image as mi               # только чтение файла, окон не создаёт
 
 
 def main():

@@ -30,6 +30,8 @@ if os.path.isdir(_PLUGINS):
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -54,7 +56,7 @@ def _merc_lat_of_row(lon, lat, z):
     """Куда попадёт точка (lon, lat), если её тайл положен СВОИМ прямоугольником.
 
     Принимает: координаты точки (град) и зум. Отдаёт: километр по Y на сцене."""
-    from view_qt import geomap as gm
+    from view_qt.maps import geomap as gm
     xt, yt = gm.deg2num(lon, lat, z)
     tx, ty = int(math.floor(xt)), int(math.floor(yt))
     _ex0, _ex1, ey0, ey1 = gm.tile_bounds_km(z, tx, ty, _LON0, _LAT0)
@@ -63,7 +65,7 @@ def _merc_lat_of_row(lon, lat, z):
 
 def _mosaic_y(lon, lat, z, view):
     """То же, но при СКЛЕЙКЕ окна в одну картинку — как было до задачи 10.10."""
-    from view_qt import geomap as gm
+    from view_qt.maps import geomap as gm
     tx0, tx1, ty0, ty1 = gm.tiles_for_box(*view, z=z, lon0=_LON0, lat0=_LAT0)
     ny = ty1 - ty0 + 1
     tl_lon, tl_lat = gm.num2deg(tx0, ty0, z)
@@ -79,10 +81,10 @@ def main():
     from PyQt5.QtWidgets import QApplication
     from PyQt5.QtCore import QThreadPool, QTime, QEventLoop
     from config import Params, THREAT_AREAS, THREAT_AREA
-    from model.geo_frame import bbox_lonlat_to_km
-    from view_qt import geomap as gm
-    from view_qt.threat_view import ThreatMapView
-    from view_qt.basemap_mixin import TILES_MOSAIC
+    from model.threat.geo_frame import bbox_lonlat_to_km
+    from view_qt.maps import geomap as gm
+    from view_qt.tabs.threat_view import ThreatMapView
+    from view_qt.maps.basemap_mixin import TILES_MOSAIC
 
     area_cfg = THREAT_AREAS[THREAT_AREA]
     lo, la, ho, ha = area_cfg["bbox"]
@@ -166,7 +168,7 @@ def main():
     v.vb.setRange(xRange=(vx0 + dx, vx1 + dx), padding=0.0)
     v._refresh_basemap(force=True)
     settle()
-    from view_qt.tile_layer import MAX_ITEMS
+    from view_qt.maps.tile_layer import MAX_ITEMS
     check(len(tiles._items) <= MAX_ITEMS, "элементов не больше предела",
           "%d при пределе %d" % (len(tiles._items), MAX_ITEMS))
     check(len(tiles._free) > 0 or len(tiles._items) >= n1,
@@ -200,7 +202,7 @@ def main():
     fits = fx0 <= ax0 + 1e-6 and fx1 >= ax1 - 1e-6 and fy0 <= ay0 + 1e-6 and fy1 >= ay1 - 1e-6
     check(fits, "вся область в кадре после вписывания",
           "кадр %.0f × %.0f км, область %.0f × %.0f" % (fx1 - fx0, fy1 - fy0, ax1 - ax0, ay1 - ay0))
-    from view_qt.basemap_mixin import ZOOM_SNAP
+    from view_qt.maps.basemap_mixin import ZOOM_SNAP
     if ZOOM_SNAP:                                          # привязка включена — масштаб на уровне
         kpd = gm._km_per_deg_lon(la)
         levels = [(max(v.plot.width(), 256) / 256.0) / (2.0 ** zz) * 360.0 * kpd

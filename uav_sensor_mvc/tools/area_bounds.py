@@ -34,9 +34,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+
 from config import (THREAT_AREA, THREAT_BBOX_LONLAT, THREAT_SOURCE_FILE,   # noqa: E402
                     THREAT_DEM_FILE, THREAT_AREA_PAD_KM)
-from model.threat_grid import area_file, dem_files                          # noqa: E402
+from model.threat.threat_grid import area_file, dem_files                          # noqa: E402
 
 KM_PER_DEG_LAT = 110.574
 

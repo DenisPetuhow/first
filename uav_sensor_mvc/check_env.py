@@ -23,6 +23,7 @@ _plat = sys.argv[1] if len(sys.argv) > 1 else "offscreen"
 if _plat != "windows":
     os.environ["QT_QPA_PLATFORM"] = _plat        # строго ДО импорта QtWidgets
 sys.path.insert(0, ".")
+sys.path.insert(0, "src")                              # код программы — в src/ (журнал 364)
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 print("платформа:", _plat, flush=True)
 
@@ -33,8 +34,8 @@ print("qt ok:", app.platformName(), flush=True)
 
 # смоук-тест вкладки 3: создать view, отдать ему РЕАЛЬНЫЕ слои и прогнать отрисовку
 import numpy as np
-from view_qt.threat_view import ThreatMapView
-from model.threat_grid import bbox_anchor_lonlat, bbox_lonlat_to_km, load_layers
+from view_qt.tabs.threat_view import ThreatMapView
+from model.threat.threat_grid import bbox_anchor_lonlat, bbox_lonlat_to_km, load_layers
 from config import THREAT_BBOX_LONLAT, Params
 
 lon0, lat0 = bbox_anchor_lonlat()

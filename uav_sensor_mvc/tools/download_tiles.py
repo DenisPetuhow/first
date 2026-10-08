@@ -27,7 +27,9 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from view_qt import geomap as gm   # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))   # код программы — в src/ (журнал 364)
+from view_qt.maps import geomap as gm   # noqa: E402
 
 # Консоль Windows отдаёт cp1251, а в выводе есть символы вне неё — без этого скрипт
 # падает на печати сметы (UnicodeEncodeError), не начав качать.
