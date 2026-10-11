@@ -16,9 +16,9 @@
 
 | | |
 |---|---|
-| файлов кода | 113 |
-| строк кода | 43234 ≈ 562 тыс. токенов |
-| строк карты | 1620 ≈ 14 тыс. токенов |
+| файлов кода | 112 |
+| строк кода | 42861 ≈ 557 тыс. токенов |
+| строк карты | 1630 ≈ 14 тыс. токенов |
 | частей | 2 (порог деления — 1500 строк) |
 
 ## Модули: где искать
@@ -51,10 +51,9 @@
 | `src/model/placement/sensor_zones.py` | 403 | 5239 | 0 | 20 | [КАРТА_1.md](КАРТА_1.md) стр. **1342** |
 | `tools/reference_cases.py` | 401 | 5213 | 0 | 6 | [КАРТА_1.md](КАРТА_1.md) стр. **1368** |
 | `tools/переносимое/docmap.py` | 399 | 5187 | 0 | 12 | [КАРТА_1.md](КАРТА_1.md) стр. **1382** |
-| `tools/gen_code_doc_output.py` | 397 | 5161 | 0 | 1 | [КАРТА_1.md](КАРТА_1.md) стр. **1405** |
-| `src/model/tabs12/area_start.py` | 396 | 5148 | 1 | 28 | [КАРТА_1.md](КАРТА_1.md) стр. **1412** |
-| `tools/gen_code_docs.py` | 393 | 5109 | 0 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **1452** |
-| `src/model/placement/target_stage.py` | 387 | 5031 | 0 | 18 | [КАРТА_1.md](КАРТА_1.md) стр. **1461** |
+| `src/model/tabs12/area_start.py` | 396 | 5148 | 1 | 28 | [КАРТА_1.md](КАРТА_1.md) стр. **1405** |
+| `tools/переносимое/code_blocks.py` | 395 | 5135 | 0 | 20 | [КАРТА_1.md](КАРТА_1.md) стр. **1445** |
+| `src/model/placement/target_stage.py` | 387 | 5031 | 0 | 18 | [КАРТА_1.md](КАРТА_1.md) стр. **1471** |
 | `src/area_file.py` | 366 | 4758 | 1 | 14 | [КАРТА_2.md](КАРТА_2.md) стр. **10** |
 | `main_qt.py` | 364 | 4732 | 0 | 5 | [КАРТА_2.md](КАРТА_2.md) стр. **31** |
 | `tools/переносимое/check_comments.py` | 357 | 4641 | 0 | 15 | [КАРТА_2.md](КАРТА_2.md) стр. **42** |
@@ -73,10 +72,10 @@
 | `tools/переносимое/check_names.py` | 287 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
 | `src/controller/controller.py` | 285 | `SimulationController`, `__init__`, `_make_timer`, `_toggles`, `_layers`, `on_apply`, `on_mode`, `on_traj`, `on_profile`, `on_law`, `on_speed`, `on_toggle`, … (27 всего) |
 | `src/view_qt/output/figures.py` | 283 | `_opts`, `_rc`, `_ticks`, `_color`, `_empty`, `draw_load`, `draw_sectors`, `_grid_ext`, `_weights`, `_background`, `draw_map` |
+| `tools/переносимое/check_dates.py` | 280 | `folder_log_name`, `_find_root`, `git_date`, `_top_mark`, `mark_in_commit`, `_key`, `docs`, `git_rows`, `write_folder_logs`, `main` |
 | `src/view_qt/maps/map_anchor.py` | 275 | `MapAnchor`, `__init__`, `choose_model`, `matrix`, `_from_bbox`, `_from_points`, `px_to_km`, `invert`, `km_to_px`, `px_box_for_view`, `corners_km`, `bbox_km`, … (17 всего) |
 | `tools/переносимое/check_claims.py` | 266 | `_find_root`, `docs`, `paragraphs`, `selftest`, `main` |
 | `tools/placement_check.py` | 266 | `build_model`, `pair_stats`, `measure`, `print_table`, `exp_k`, `cross_rule_stats`, `exp_spread`, `exp_kmode`, `main` |
-| `tools/переносимое/check_dates.py` | 258 | `folder_log_name`, `_find_root`, `git_date`, `_key`, `docs`, `git_rows`, `write_folder_logs`, `main` |
 | `src/model/placement/joint_greedy.py` | 246 | `_Cover`, `__init__`, `_Kind`, `__init__`, `phi`, `gains`, `cov_gains`, `note_bound`, `bound`, `top_gain`, `_take`, `_exclude`, … (13 всего) |
 | `tools/tiles_check.py` | 229 | `check`, `_merc_lat_of_row`, `_mosaic_y`, `main` |
 | `src/view_qt/maps/map_vector.py` | 220 | `is_vector`, `svg_size`, `inspect_svg`, `describe_content`, `make_item`, `place_item`, `render_for_fit`, `measure_draw` |

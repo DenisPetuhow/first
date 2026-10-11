@@ -98,6 +98,28 @@ def git_date(rel):
         return ""
 
 
+def _top_mark(text):
+    """Верхняя строка «Правился» в шапке. Вход: текст файла. Отдаёт: строку или None."""
+    m = MARK_RE.search(text[:2000])                  # отметка живёт в шапке, не глубже
+    return text[m.start():text.find("\n", m.start())] if m else None
+
+
+def mark_in_commit(rel):
+    """Принёс ли последний коммит файла его верхнюю отметку. Вход: путь от корня. Отдаёт: да/нет.
+    Работа нескольких дней одним коммитом (шапка 06.10 < git 08.10) — не отставание, если отметка записана в нём же."""
+    def show(rev):
+        """Файл на ревизии. Вход: ревизия. Отдаёт: текст; файла нет — пусто."""
+        r = subprocess.run(["git", "show", "%s:./%s" % (rev, rel.replace("\\", "/"))], cwd=ROOT,
+                           capture_output=True, text=True, encoding="utf-8")   # содержимое на ревизии
+        return r.stdout if r.returncode == 0 else ""
+    h = subprocess.run(["git", "log", "-1", "--format=%H", "--", rel], cwd=ROOT, capture_output=True,
+                       text=True).stdout.strip()     # последний коммит файла
+    if not h:                                        # файла нет в истории — сверять не с чем
+        return True
+    now, before = _top_mark(show(h)), _top_mark(show(h + "^"))   # верхняя отметка в коммите и до него
+    return now is not None and now != before
+
+
 def _key(d):
     """ДД.ММ.ГГГГ -> сравнимый ключ."""
     p = d.split(".")
@@ -209,7 +231,7 @@ def main():
         mark = m.group(1)
         if show:
             print("  %-58s шапка %s   git %s" % (rel, mark, gd or "—"))
-        if gd and _key(mark) < _key(gd):
+        if gd and _key(mark) < _key(gd) and not mark_in_commit(rel):   # коммит позже шапки и отметку не принёс
             stale.append((rel, mark, gd))
         # знает ли папка о правке
         folder = os.path.dirname(rel)

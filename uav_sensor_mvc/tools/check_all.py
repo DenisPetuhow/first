@@ -33,7 +33,7 @@ CHECKS = [
     ("check_dates", [P + "check_dates.py"], "docs"),
     ("check_comments", [P + "check_comments.py"], "docs"),
     ("check_index", [P + "check_index.py"], "docs"),                 # указатели полные
-    ("gen_code_docs --check", ["tools/gen_code_docs.py", "--check"], "docs"),   # эталонные разборы = код
+    ("code_blocks", [P + "code_blocks.py", "--check"], "docs"),      # код под пометками в разборах = модули
     ("docmap --check", [P + "docmap.py", "--check"], "docs"),
 ]
 WIDTH = 96                                                            # ширина итоговой строки в таблице, знаков

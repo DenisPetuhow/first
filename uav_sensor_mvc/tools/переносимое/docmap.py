@@ -166,7 +166,7 @@ def apply_toc(rel, check_only=False):
         return "актуально"
     if check_only:
         return "УСТАРЕЛО" if had is not None else "НЕТ ОГЛАВЛЕНИЯ"
-    io.open(path, "w", encoding="utf-8").write(
+    io.open(path, "w", encoding="utf-8", newline="\n").write(   # LF и на Windows — как в git
         "\n".join(clean[:pos] + toc + [""] + clean[pos:]))
     return "обновлено" if had is not None else "создано"
 
