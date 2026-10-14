@@ -14,7 +14,6 @@ VIEW (Qt) · Линейка «Расстояние» — как в Google Earth 
 """
 import numpy as np
 import pyqtgraph as pg
-from PyQt5 import QtCore
 
 
 def format_time(hours):

@@ -50,7 +50,7 @@ def _find_root(markers=("CLAUDE.md", "config.py")):
 
 ROOT = _find_root()
 CODE_SKIP = {".git", ".claude", "теория", "__pycache__", "tile_cache", "geo_cache",
-             "offline_packages", "фото пример"}
+             "offline_packages", "фото пример", "out", "out_test"}   # out, out_test — вывод прогонов вне git, не код
 # ⚠️ Папка `docs` исключается ТОЛЬКО в корне (там генераторы .docx для заказчика).
 # По имени исключать нельзя: `tools/docs` — эти самые скрипты, и вместе с ними из
 # проверки выпадали бы их собственные имена (проверка выдавала 18 ложных находок).

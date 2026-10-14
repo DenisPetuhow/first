@@ -12,6 +12,7 @@ VIEW · Общие детали интерфейса для всех трёх в
 Настройка внешнего вида — [теория/НАСТРОЙКА_ИНТЕРФЕЙСА.md](../теория/НАСТРОЙКА_ИНТЕРФЕЙСА.md).
 """
 from PyQt5 import QtCore, QtWidgets
+import pyqtgraph as pg
 
 from config import THEME
 
@@ -21,6 +22,30 @@ PANEL_MIN_WIDTH = 360        # сама панель с параметрами
 PANEL_SCROLL_WIDTH = 394     # область прокрутки вокруг неё
 PANEL_MARGIN = 12            # отступ от краёв панели
 PANEL_SPACING = 8            # промежуток между строками
+ALL_TARGETS = "Все цели"     # первая строка выбора цели — по всей выборке
+
+
+def fill_target_combo(combo, labels, keep):
+    """Список целей: «Все цели» и подписи по номерам; прежний выбор сохраняется, цель одна — выбор закрыт.
+    Вход: QComboBox, подписи целей (пусто — цель одна), номер выбранной цели или None. Отдаёт: None."""
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItem(ALL_TARGETS, None)
+    for i, text in enumerate(labels):              # цель — строка выбора, данные — номер с нуля
+        combo.addItem(text, i)
+    i = combo.findData(keep)                       # прежний выбор в новом списке
+    combo.setCurrentIndex(i if keep is not None and i >= 0 else 0)
+    combo.blockSignals(False)
+    combo.setEnabled(bool(labels))
+
+
+def qcolor(hex_or_rgba, alpha=None):
+    """Цвет Qt из «#rrggbb» или (r, g, b[, a]); alpha поверх — прозрачность 0–255. Одно определение на все вкладки.
+    Вход: цвет, прозрачность или None. Отдаёт: QColor."""
+    c = pg.mkColor(hex_or_rgba)                    # цвет как QColor
+    if alpha is not None:                          # прозрачность задана → поверх своей
+        c.setAlpha(int(alpha))
+    return c
 
 
 def apply_dark_theme(widget):

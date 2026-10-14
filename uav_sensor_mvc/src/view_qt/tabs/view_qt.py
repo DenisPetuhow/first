@@ -20,20 +20,14 @@ import matplotlib.cm as cm
 
 from config import (MODE_LABELS, TRAJ_LABELS, MOTION_LABELS, MANEUVER_LAW_LABELS, THEME)
 from view.view import PARAM_SPECS          # единый источник списка параметров
-from view_qt.common.ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
+from view_qt.common.ui_common import (apply_dark_theme, make_side_panel,   # общие детали трёх вкладок
+                                      qcolor as _qcolor)
 
 # Дополнительные поля Qt-версии: ТТХ БПЛА (-> R_min) и диапазон числа точек маршрута
 QT_EXTRA = [("speed_kmh", "Скорость км/ч", float), ("bank_deg", "Крен °", float),
             ("n_min", "Точек от", int), ("n_max", "Точек до", int)]
 
 pg.setConfigOptions(antialias=True, background=THEME["axes"], foreground=THEME["text"])
-
-
-def _qcolor(hex_or_rgba, alpha=None):
-    c = pg.mkColor(hex_or_rgba)
-    if alpha is not None:
-        c.setAlpha(int(alpha))
-    return c
 
 
 def _viridis_qcolor(w):

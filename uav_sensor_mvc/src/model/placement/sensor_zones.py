@@ -234,22 +234,16 @@ def cell_buildings(grid, pts):
 def polygon_mask(grid, polys):
     """Ячейки, чей центр внутри хоть одного полигона. Вход: ThreatGrid, список колец (M, 2) км.
     Отдаёт: (ny, nx) bool. Проверка — только по ячейкам габарита каждого кольца, как у застройки."""
-    from model.threat.threat_grid import _points_in_polygon
+    from model.threat.threat_grid import _ring_cells   # габарит кольца и «центр внутри» — одна функция на три места
     out = np.zeros((grid.ny, grid.nx), bool)
     for ring in polys:                               # каждое кольцо — по ячейкам своего габарита
         P = np.asarray(ring, float)                  # вершины кольца, км
         if P.ndim != 2 or len(P) < 3:                # не кольцо
             continue
-        ix0 = max(0, int(np.floor((P[:, 0].min() - grid.ox) / grid.h)))            # габарит кольца
-        ix1 = min(grid.nx - 1, int(np.floor((P[:, 0].max() - grid.ox) / grid.h)))  # в номерах
-        iy0 = max(0, int(np.floor((P[:, 1].min() - grid.oy) / grid.h)))            # ячеек:
-        iy1 = min(grid.ny - 1, int(np.floor((P[:, 1].max() - grid.oy) / grid.h)))  # столбцы, строки
-        if ix0 > ix1 or iy0 > iy1:                   # кольцо вне сетки
-            continue
-        cx = grid.ox + (np.arange(ix0, ix1 + 1) + 0.5) * grid.h   # центры столбцов габарита, км
-        cy = grid.oy + (np.arange(iy0, iy1 + 1) + 0.5) * grid.h   # центры строк габарита, км
-        gx, gy = np.meshgrid(cx, cy)                 # центры ячеек габарита, км
-        out[iy0:iy1 + 1, ix0:ix1 + 1] |= _points_in_polygon(gx.ravel(), gy.ravel(), P).reshape(gy.shape)
+        cells = _ring_cells(grid, P)                 # габарит кольца и что в нём внутри
+        if cells is not None:                        # кольцо задело сетку → закрасить
+            sy, sx, inside = cells                   # строки, столбцы габарита; маска «внутри»
+            out[sy, sx] |= inside
     return out
 
 

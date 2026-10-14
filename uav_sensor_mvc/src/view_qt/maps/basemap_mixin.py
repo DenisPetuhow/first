@@ -22,6 +22,7 @@ from pyqtgraph.Qt import QtCore
 import pyqtgraph as pg
 
 from config import THEME
+from view_qt.common.ui_common import qcolor as gm_qcolor   # цвет Qt — одно определение на все вкладки
 from view_qt.maps import geomap as gm
 from view_qt.maps.tile_layer import TileLayer, set_span_x   # подложка поштучными тайлами (10.10)
 
@@ -259,6 +260,13 @@ class BasemapMixin:
         one_to_one = (width_px / 256.0) / (2.0 ** gm.ZOOM_MAX) * 360.0 * km_per_deg
         return one_to_one * 0.5                    # разрешаем приблизиться ещё вдвое
 
+    def _map_changed(self, i):
+        """Выбран слой подложки в списке вкладки — запомнить, сообщить контроллеру, перерисовать.
+        Вход: номер строки списка (порядок — `self._map_keys`). Отдаёт: None. Общий для вкладок 2 и 3."""
+        self._map_layer = self._map_keys[i]
+        self.on_map_layer(self._map_layer)
+        self._refresh_basemap(force=True)
+
     def _refresh_basemap(self, force=False):
         # ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ (вкладка 2): при некоторых промежуточных масштабах
         # (вид попадает МЕЖДУ уровнями зума) подложка бывает слегка мутноватой, плюс
@@ -424,10 +432,3 @@ class BasemapMixin:
 
     def _set_scheme_extra_visible(self, vis):
         pass
-
-
-def gm_qcolor(hex_or_rgba, alpha=None):
-    c = pg.mkColor(hex_or_rgba)
-    if alpha is not None:
-        c.setAlpha(int(alpha))
-    return c

@@ -97,11 +97,6 @@ class AreaStartView(SimulationView, BasemapMixin):
         self.chk_map_offline.stateChanged.connect(self._map_offline_changed)
         col.addWidget(self.chk_map_offline)
 
-    def _map_changed(self, i):
-        self._map_layer = self._map_keys[i]
-        self.on_map_layer(self._map_layer)
-        self._refresh_basemap(force=True)
-
     def _map_offline_changed(self, _state):
         self._map_offline = self.chk_map_offline.isChecked()
         self.on_map_offline(self._map_offline)

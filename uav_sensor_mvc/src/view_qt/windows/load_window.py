@@ -18,9 +18,9 @@ import os
 from PyQt5 import QtCore, QtWidgets
 
 from model.placement.sensor_load import ORDERS, sort_rows
+from view_qt.common.ui_common import fill_target_combo   # список целей — общий с окнами рисунков
 
 ALL = "Все средства"                                 # первая строка выбора типа
-ALL_TARGETS = "Все цели"                             # первая строка выбора цели
 SOURCE = {"iter": "итерации моделирования", "loaded": "загруженная выборка",
           "zone": "возможные маршруты (до моделирования)"}   # откуда выборка — подпись
 
@@ -91,17 +91,8 @@ class SensorLoadDialog(QtWidgets.QDialog):
 
     def _fill_targets(self):
         """Список целей: «Все цели» и подписи из `choices()`; цель одна — выбор скрыт. Отдаёт: ничего."""
-        keep = self.combo_target.currentData()       # номер выбранной цели; None — все
         labels = self._choices() or []               # «Цель №N — маршрутов M»; пусто — цель одна
-        self.combo_target.blockSignals(True)
-        self.combo_target.clear()
-        self.combo_target.addItem(ALL_TARGETS, None)
-        for i, text in enumerate(labels):            # цель — строка выбора, данные — номер с нуля
-            self.combo_target.addItem(text, i)
-        i = self.combo_target.findData(keep)         # прежний выбор в новом списке
-        self.combo_target.setCurrentIndex(i if keep is not None and i >= 0 else 0)
-        self.combo_target.blockSignals(False)
-        self.combo_target.setEnabled(bool(labels))
+        fill_target_combo(self.combo_target, labels, self.combo_target.currentData())
         self.combo_target.setToolTip("" if labels else "Цель одна — нагрузка считается по всей выборке.")
 
     def _rows(self):

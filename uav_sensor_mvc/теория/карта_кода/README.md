@@ -17,50 +17,50 @@
 | | |
 |---|---|
 | файлов кода | 112 |
-| строк кода | 42861 ≈ 557 тыс. токенов |
-| строк карты | 1630 ≈ 14 тыс. токенов |
+| строк кода | 42821 ≈ 556 тыс. токенов |
+| строк карты | 1628 ≈ 14 тыс. токенов |
 | частей | 2 (порог деления — 1500 строк) |
 
 ## Модули: где искать
 
 | Модуль | Строк | ≈токенов | Классов | Функций | Где в карте |
 |---|---|---|---|---|---|
-| `src/view_qt/tabs/threat_view.py` | 5686 | 73918 | 4 | 257 | [КАРТА_1.md](КАРТА_1.md) стр. **10** |
-| `src/model/threat/threat_grid.py` | 5347 | 69511 | 2 | 246 | [КАРТА_1.md](КАРТА_1.md) стр. **292** |
+| `src/view_qt/tabs/threat_view.py` | 5682 | 73866 | 4 | 256 | [КАРТА_1.md](КАРТА_1.md) стр. **10** |
+| `src/model/threat/threat_grid.py` | 5353 | 69589 | 2 | 247 | [КАРТА_1.md](КАРТА_1.md) стр. **291** |
 | `tools/gui_check.py` | 2492 | 32396 | 0 | 2 | [КАРТА_1.md](КАРТА_1.md) стр. **570** |
-| `src/controller_qt/threat_controller.py` | 2245 | 29185 | 3 | 127 | [КАРТА_1.md](КАРТА_1.md) стр. **579** |
-| `src/model/threat/threat_routes.py` | 1713 | 22269 | 0 | 42 | [КАРТА_1.md](КАРТА_1.md) стр. **745** |
-| `tools/переносимое/make_figures.py` | 1090 | 14170 | 0 | 26 | [КАРТА_1.md](КАРТА_1.md) стр. **795** |
-| `src/config.py` | 1076 | 13988 | 1 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **827** |
-| `tools/flow_check.py` | 931 | 12103 | 0 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **847** |
-| `src/view_qt/maps/map_image.py` | 757 | 9841 | 1 | 24 | [КАРТА_1.md](КАРТА_1.md) стр. **856** |
-| `src/model/tabs12/trajectories.py` | 708 | 9204 | 0 | 39 | [КАРТА_1.md](КАРТА_1.md) стр. **887** |
-| `src/view_qt/windows/sensors_window.py` | 627 | 8151 | 1 | 32 | [КАРТА_1.md](КАРТА_1.md) стр. **932** |
-| `tools/motion_check.py` | 612 | 7956 | 0 | 13 | [КАРТА_1.md](КАРТА_1.md) стр. **976** |
-| `src/view_qt/windows/input_window.py` | 560 | 7280 | 2 | 26 | [КАРТА_1.md](КАРТА_1.md) стр. **996** |
-| `src/model/threat/map_fit.py` | 542 | 7046 | 0 | 16 | [КАРТА_1.md](КАРТА_1.md) стр. **1034** |
-| `src/view_qt/maps/geomap.py` | 536 | 6968 | 0 | 25 | [КАРТА_1.md](КАРТА_1.md) стр. **1056** |
-| `src/view_qt/tabs/view_qt.py` | 514 | 6682 | 2 | 45 | [КАРТА_1.md](КАРТА_1.md) стр. **1087** |
-| `tools/переносимое/codemap.py` | 488 | 6344 | 0 | 16 | [КАРТА_1.md](КАРТА_1.md) стр. **1142** |
-| `src/model/placement/optimization.py` | 481 | 6253 | 2 | 14 | [КАРТА_1.md](КАРТА_1.md) стр. **1166** |
-| `src/view_qt/windows/sensor_types_window.py` | 467 | 6071 | 1 | 23 | [КАРТА_1.md](КАРТА_1.md) стр. **1188** |
-| `src/view_qt/maps/basemap_mixin.py` | 433 | 5629 | 3 | 17 | [КАРТА_1.md](КАРТА_1.md) стр. **1218** |
-| `tools/pack_area.py` | 418 | 5434 | 0 | 15 | [КАРТА_1.md](КАРТА_1.md) стр. **1244** |
-| `src/view/view.py` | 414 | 5382 | 1 | 33 | [КАРТА_1.md](КАРТА_1.md) стр. **1265** |
-| `src/view_qt/maps/tile_layer.py` | 406 | 5278 | 5 | 21 | [КАРТА_1.md](КАРТА_1.md) стр. **1310** |
-| `src/model/placement/sensor_zones.py` | 403 | 5239 | 0 | 20 | [КАРТА_1.md](КАРТА_1.md) стр. **1342** |
-| `tools/reference_cases.py` | 401 | 5213 | 0 | 6 | [КАРТА_1.md](КАРТА_1.md) стр. **1368** |
-| `tools/переносимое/docmap.py` | 399 | 5187 | 0 | 12 | [КАРТА_1.md](КАРТА_1.md) стр. **1382** |
-| `src/model/tabs12/area_start.py` | 396 | 5148 | 1 | 28 | [КАРТА_1.md](КАРТА_1.md) стр. **1405** |
-| `tools/переносимое/code_blocks.py` | 395 | 5135 | 0 | 20 | [КАРТА_1.md](КАРТА_1.md) стр. **1445** |
-| `src/model/placement/target_stage.py` | 387 | 5031 | 0 | 18 | [КАРТА_1.md](КАРТА_1.md) стр. **1471** |
+| `src/controller_qt/threat_controller.py` | 2247 | 29211 | 3 | 127 | [КАРТА_1.md](КАРТА_1.md) стр. **579** |
+| `src/model/threat/threat_routes.py` | 1741 | 22633 | 0 | 43 | [КАРТА_1.md](КАРТА_1.md) стр. **745** |
+| `tools/переносимое/make_figures.py` | 1090 | 14170 | 0 | 26 | [КАРТА_1.md](КАРТА_1.md) стр. **796** |
+| `src/config.py` | 1076 | 13988 | 1 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **828** |
+| `tools/flow_check.py` | 931 | 12103 | 0 | 3 | [КАРТА_1.md](КАРТА_1.md) стр. **848** |
+| `src/view_qt/maps/map_image.py` | 759 | 9867 | 1 | 25 | [КАРТА_1.md](КАРТА_1.md) стр. **857** |
+| `src/model/tabs12/trajectories.py` | 708 | 9204 | 0 | 39 | [КАРТА_1.md](КАРТА_1.md) стр. **889** |
+| `src/view_qt/windows/sensors_window.py` | 627 | 8151 | 1 | 32 | [КАРТА_1.md](КАРТА_1.md) стр. **934** |
+| `tools/motion_check.py` | 612 | 7956 | 0 | 13 | [КАРТА_1.md](КАРТА_1.md) стр. **978** |
+| `src/view_qt/windows/input_window.py` | 560 | 7280 | 2 | 26 | [КАРТА_1.md](КАРТА_1.md) стр. **998** |
+| `src/view_qt/maps/geomap.py` | 526 | 6838 | 0 | 24 | [КАРТА_1.md](КАРТА_1.md) стр. **1036** |
+| `src/view_qt/tabs/view_qt.py` | 508 | 6604 | 2 | 44 | [КАРТА_1.md](КАРТА_1.md) стр. **1066** |
+| `tools/переносимое/codemap.py` | 488 | 6344 | 0 | 16 | [КАРТА_1.md](КАРТА_1.md) стр. **1120** |
+| `src/model/threat/map_fit.py` | 488 | 6344 | 0 | 15 | [КАРТА_1.md](КАРТА_1.md) стр. **1144** |
+| `src/model/placement/optimization.py` | 481 | 6253 | 2 | 14 | [КАРТА_1.md](КАРТА_1.md) стр. **1165** |
+| `src/view_qt/windows/sensor_types_window.py` | 467 | 6071 | 1 | 23 | [КАРТА_1.md](КАРТА_1.md) стр. **1187** |
+| `src/view_qt/maps/basemap_mixin.py` | 434 | 5642 | 3 | 17 | [КАРТА_1.md](КАРТА_1.md) стр. **1217** |
+| `tools/pack_area.py` | 418 | 5434 | 0 | 15 | [КАРТА_1.md](КАРТА_1.md) стр. **1243** |
+| `src/view/view.py` | 414 | 5382 | 1 | 33 | [КАРТА_1.md](КАРТА_1.md) стр. **1264** |
+| `src/view_qt/maps/tile_layer.py` | 406 | 5278 | 5 | 21 | [КАРТА_1.md](КАРТА_1.md) стр. **1309** |
+| `tools/reference_cases.py` | 401 | 5213 | 0 | 6 | [КАРТА_1.md](КАРТА_1.md) стр. **1341** |
+| `tools/переносимое/docmap.py` | 399 | 5187 | 0 | 12 | [КАРТА_1.md](КАРТА_1.md) стр. **1355** |
+| `src/model/placement/sensor_zones.py` | 397 | 5161 | 0 | 20 | [КАРТА_1.md](КАРТА_1.md) стр. **1378** |
+| `src/model/tabs12/area_start.py` | 396 | 5148 | 1 | 28 | [КАРТА_1.md](КАРТА_1.md) стр. **1404** |
+| `tools/переносимое/code_blocks.py` | 395 | 5135 | 0 | 20 | [КАРТА_1.md](КАРТА_1.md) стр. **1444** |
+| `src/model/placement/target_stage.py` | 387 | 5031 | 0 | 18 | [КАРТА_1.md](КАРТА_1.md) стр. **1470** |
 | `src/area_file.py` | 366 | 4758 | 1 | 14 | [КАРТА_2.md](КАРТА_2.md) стр. **10** |
 | `main_qt.py` | 364 | 4732 | 0 | 5 | [КАРТА_2.md](КАРТА_2.md) стр. **31** |
 | `tools/переносимое/check_comments.py` | 357 | 4641 | 0 | 15 | [КАРТА_2.md](КАРТА_2.md) стр. **42** |
 | `tools/plot_run.py` | 332 | 4316 | 0 | 8 | [КАРТА_2.md](КАРТА_2.md) стр. **63** |
 | `tools/reference_run.py` | 326 | 4238 | 0 | 2 | [КАРТА_2.md](КАРТА_2.md) стр. **79** |
 | `src/model/placement/sensor_types.py` | 310 | 4030 | 3 | 15 | [КАРТА_2.md](КАРТА_2.md) стр. **87** |
-| `src/view_qt/tabs/area_view.py` | 306 | 3978 | 1 | 18 | [КАРТА_2.md](КАРТА_2.md) стр. **111** |
+| `src/view_qt/tabs/area_view.py` | 301 | 3913 | 1 | 17 | [КАРТА_2.md](КАРТА_2.md) стр. **111** |
 
 ## Мелкие модули — читаются целиком
 
@@ -68,10 +68,10 @@
 
 | Модуль | Строк | Что внутри |
 |---|---|---|
-| `src/view_qt/output/figure_base.py` | 290 | `_value`, `FigureDialog`, `__init__`, `_section`, `_add`, `_spin_box`, `_combo_box`, `_add_check`, `_add_spin`, `_add_combo`, `_add_line`, `_add_color`, … (24 всего) |
 | `tools/переносимое/check_names.py` | 287 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
 | `src/controller/controller.py` | 285 | `SimulationController`, `__init__`, `_make_timer`, `_toggles`, `_layers`, `on_apply`, `on_mode`, `on_traj`, `on_profile`, `on_law`, `on_speed`, `on_toggle`, … (27 всего) |
 | `src/view_qt/output/figures.py` | 283 | `_opts`, `_rc`, `_ticks`, `_color`, `_empty`, `draw_load`, `draw_sectors`, `_grid_ext`, `_weights`, `_background`, `draw_map` |
+| `src/view_qt/output/figure_base.py` | 281 | `_value`, `FigureDialog`, `__init__`, `_section`, `_add`, `_spin_box`, `_combo_box`, `_add_check`, `_add_spin`, `_add_combo`, `_add_line`, `_add_color`, … (24 всего) |
 | `tools/переносимое/check_dates.py` | 280 | `folder_log_name`, `_find_root`, `git_date`, `_top_mark`, `mark_in_commit`, `_key`, `docs`, `git_rows`, `write_folder_logs`, `main` |
 | `src/view_qt/maps/map_anchor.py` | 275 | `MapAnchor`, `__init__`, `choose_model`, `matrix`, `_from_bbox`, `_from_points`, `px_to_km`, `invert`, `km_to_px`, `px_box_for_view`, `corners_km`, `bbox_km`, … (17 всего) |
 | `tools/переносимое/check_claims.py` | 266 | `_find_root`, `docs`, `paragraphs`, `selftest`, `main` |
@@ -87,12 +87,12 @@
 | `tools/переносимое/new_project.py` | 196 | `_find_root`, `plan`, `index_rows`, `unlink_missing`, `mark_copied`, `render`, `main` |
 | `src/model/placement/road_access.py` | 196 | `road_cells`, `sources`, `road_distance`, `access_parts`, `place_nodes`, `road_graph`, `reach_lines` |
 | `src/model/threat/flight_log.py` | 195 | `routes_dir`, `default_file_name`, `_route_length_km`, `save_flights`, `split_repeats`, `load_flights`, `check_compatible` |
-| `src/view_qt/windows/load_window.py` | 187 | `SensorLoadDialog`, `__init__`, `refresh`, `_fill_targets`, `_rows`, `_view`, `_show`, `_picked`, `closeEvent`, `_export` |
 | `src/model/placement/sensors.py` | 186 | `SensorSpec`, `active`, `name`, `label`, `ManualSensor`, `_num`, `sensor_types`, `_n_types`, `type_ids`, `active_small`, `min_small_radius`, `format_types_header` |
 | `src/view_qt/output/map_figure_window.py` | 183 | `_TilesSignals`, `_TilesTask`, `__init__`, `run`, `MapFigureDialog`, `__init__`, `_build_settings`, `apply_preset`, `_on_snapshot`, `_tiles_box`, `_tiles_for`, `_tiles_ready`, … (15 всего) |
 | `src/view_qt/windows/route_viewer.py` | 182 | `RouteViewerDialog`, `__init__`, `set_generalize_state`, `set_data`, `_current_source`, `_refresh_list`, `_show_route`, `_show_on_map`, `_reset_preview` |
 | `tools/area_bounds.py` | 181 | `_varint`, `_zigzag`, `_fields`, `pbf_bbox`, `raster_bounds`, `main` |
-| `src/view_qt/maps/measure_tool.py` | 177 | `format_time`, `MeasureTool`, `__init__`, `reset`, `add_point`, `move_to`, `status`, `total_km`, `_hours`, `_text`, `_label`, `_angle_deg`, … (14 всего) |
+| `src/view_qt/windows/load_window.py` | 178 | `SensorLoadDialog`, `__init__`, `refresh`, `_fill_targets`, `_rows`, `_view`, `_show`, `_picked`, `closeEvent`, `_export` |
+| `src/view_qt/maps/measure_tool.py` | 176 | `format_time`, `MeasureTool`, `__init__`, `reset`, `add_point`, `move_to`, `status`, `total_km`, `_hours`, `_text`, `_label`, `_angle_deg`, … (14 всего) |
 | `src/model/placement/sensor_track.py` | 172 | `hungarian`, `_hungarian_square`, `match_by_type`, `total_movement` |
 | `src/view_qt/windows/sector_window.py` | 169 | `SectorDialog`, `__init__`, `_params_changed`, `_apply_params`, `set_state` |
 | `tools/download_tiles.py` | 168 | `_area_bbox`, `_area_tile_dir`, `_pad_km`, `main` |
@@ -112,6 +112,7 @@
 | `src/view_qt/windows/analysis_window.py` | 102 | `AnalysisDialog`, `__init__`, `refresh`, `target`, `_show` |
 | `tools/build_threat_grid.py` | 100 | `main` |
 | `src/view_qt/windows/sim_conditions_window.py` | 100 | `SimConditionsDialog`, `__init__`, `_type_changed`, `set_state` |
+| `src/view_qt/common/ui_common.py` | 98 | `fill_target_combo`, `qcolor`, `apply_dark_theme`, `make_side_panel` |
 | `src/controller_qt/iter_worker.py` | 92 | `IterWorker`, `__init__`, `consumed`, `drawn`, `stop`, `_place`, `run` |
 | `tools/check_all.py` | 91 | `last_line`, `run`, `main` |
 | `src/model/placement/sensor_load.py` | 89 | `seen_matrix`, `load_rows`, `sort_rows`, `write_docx` |
@@ -119,7 +120,6 @@
 | `src/model/tabs12/detection.py` | 80 | `_min_dist_point_to_sensors`, `n_detections`, `continuous_coverage`, `segment_coverage`, `utility`, `avg_utility` |
 | `src/view_qt/maps/grad_legend.py` | 79 | `ink_for`, `GradLegend`, `__init__`, `show_rows`, `hide_rows`, `place` |
 | `src/model/tabs12/geometry.py` | 76 | `ellipse_geometry`, `point_in_ellipse`, `points_in_ellipse`, `auto_axes_limits`, `geo_to_local_km` |
-| `src/view_qt/common/ui_common.py` | 73 | `apply_dark_theme`, `make_side_panel` |
 | `src/view_qt/output/load_chart_window.py` | 71 | `LoadChartDialog`, `_build_settings`, `_on_snapshot`, `_draw`, `_info` |
 | `tools/переносимое/check_index.py` | 63 | `_find_root`, `missing`, `main` |
 | `src/view_qt/common/ui_state.py` | 63 | `_path`, `load_all`, `get`, `save` |

@@ -19,7 +19,7 @@ from config import Params      # MODES теперь используется в 
 from model.tabs12 import detection
 from model.tabs12.geometry import ellipse_geometry, geo_to_local_km
 from model.tabs12.trajectories import (max_deflection_angle, SAMPLERS, arc_fan,
-                           signed_max_lateral, corridor_bbox, corridor_outline,
+                           corridor_bbox, corridor_outline,
                            frequent_arcs, frequent_serpentines, serpentine_fan,
                            frequent_maneuvers, maneuver_fan, turn_radius_km,
                            representative_trajectories)

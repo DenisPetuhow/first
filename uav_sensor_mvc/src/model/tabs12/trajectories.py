@@ -654,7 +654,7 @@ def _kmeans(X, k, iters=30, seed=0):
     """Простой k-means (numpy, без внешних зависимостей). Возвращает (labels, C)."""
     rng = np.random.default_rng(seed)
     n = len(X)
-    C = X[rng.choice(n, size=k, replace=False)].copy()
+    C = X[rng.choice(n, size=k, replace=False)]   # центры (k, d): выборка по индексам — уже новый массив, X не задет
     labels = np.zeros(n, int)
     for _ in range(iters):
         d = np.linalg.norm(X[:, None, :] - C[None, :, :], axis=2)   # (n, k)

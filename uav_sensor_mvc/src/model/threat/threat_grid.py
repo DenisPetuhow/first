@@ -304,19 +304,13 @@ class ThreatGrid:
             P = np.asarray(poly, float)
             if P.ndim != 2 or len(P) < 3:
                 continue
-            ix0 = max(0, int(math.floor((P[:, 0].min() - self.ox) / self.h)))
-            ix1 = min(self.nx - 1, int(math.floor((P[:, 0].max() - self.ox) / self.h)))
-            iy0 = max(0, int(math.floor((P[:, 1].min() - self.oy) / self.h)))
-            iy1 = min(self.ny - 1, int(math.floor((P[:, 1].max() - self.oy) / self.h)))
-            if ix0 > ix1 or iy0 > iy1:
+            cells = _ring_cells(self, P)               # габарит кольца и что в нём внутри
+            if cells is None:                          # кольцо вне сетки → пропуск
                 continue
-            cx = self.ox + (np.arange(ix0, ix1 + 1) + 0.5) * self.h
-            cy = self.oy + (np.arange(iy0, iy1 + 1) + 0.5) * self.h
-            gx, gy = np.meshgrid(cx, cy)
-            inside = _points_in_polygon(gx.ravel(), gy.ravel(), P).reshape(gy.shape)
-            contrib[iy0:iy1 + 1, ix0:ix1 + 1] += weight * inside
+            sy, sx, inside = cells                     # строки, столбцы габарита; маска «внутри»
+            contrib[sy, sx] += weight * inside
             if mark_urban:
-                self._built_cells[iy0:iy1 + 1, ix0:ix1 + 1] |= inside
+                self._built_cells[sy, sx] |= inside
         self.weight += contrib
         self.layers[name] = self.layers.get(name, 0.0) + contrib
         if attractor:
@@ -340,24 +334,17 @@ class ThreatGrid:
             code = int(round(P[0, 2]))
             if code < 1:                       # hamlet и мельче — пропускаем
                 continue
-            ix0 = max(0, int(math.floor((P[:, 0].min() - self.ox) / self.h)))
-            ix1 = min(self.nx - 1, int(math.floor((P[:, 0].max() - self.ox) / self.h)))
-            iy0 = max(0, int(math.floor((P[:, 1].min() - self.oy) / self.h)))
-            iy1 = min(self.ny - 1, int(math.floor((P[:, 1].max() - self.oy) / self.h)))
-            if ix0 > ix1 or iy0 > iy1:
+            cells = _ring_cells(self, P)       # габарит контура и что в нём внутри
+            if cells is None:                  # контур вне сетки → пропуск
                 continue
-            cx = self.ox + (np.arange(ix0, ix1 + 1) + 0.5) * self.h
-            cy = self.oy + (np.arange(iy0, iy1 + 1) + 0.5) * self.h
-            gx, gy = np.meshgrid(cx, cy)
-            inside = _points_in_polygon(gx.ravel(), gy.ravel(),
-                                        P[:, :2]).reshape(gy.shape)
+            sy, sx, inside = cells             # строки, столбцы габарита; маска «внутри»
             if not inside.any():
                 continue
             # ЗАСТРОЕН ли контур на самом деле. В OSM границы НП часто административные
             # и включают поля вокруг села (замер: контуры town дают 667 км² при участке
             # 7135 км², под запрет уходило 30 % вместо 14). Берём контур, только если
             # внутри реальная застройка — иначе это граница сельсовета, а не сам НП.
-            built_in = self._built_cells[iy0:iy1 + 1, ix0:ix1 + 1] & inside
+            built_in = self._built_cells[sy, sx] & inside   # застроенные ячейки внутри контура
             n_in = float(inside.sum())
             built_frac = float(built_in.sum()) / max(n_in, 1.0)
             built_km2 = float(built_in.sum()) * self.h * self.h
@@ -366,7 +353,7 @@ class ThreatGrid:
             area = n_in * self.h * self.h
             tgt = city if (code >= 3 or (code == 2 and area >= self._town_city_km2)) \
                 else village
-            tgt[iy0:iy1 + 1, ix0:ix1 + 1] |= inside
+            tgt[sy, sx] |= inside
         if settled is not None:
             city &= settled                     # не тянуть поля внутри границы
             village &= settled
@@ -1219,6 +1206,22 @@ def _points_in_polygon(px, py, poly):
     return inside
 
 
+def _ring_cells(grid, P):
+    """Ячейки габарита кольца и какие из них внутри (центр в полигоне) — проверка только в габарите.
+    Вход: сетка (ox, oy, h, nx, ny), вершины (M, ≥2) км. Отдаёт: (срез строк, срез столбцов, маска) либо None — вне сетки."""
+    ix0 = max(0, int(math.floor((P[:, 0].min() - grid.ox) / grid.h)))            # габарит кольца
+    ix1 = min(grid.nx - 1, int(math.floor((P[:, 0].max() - grid.ox) / grid.h)))  # в номерах
+    iy0 = max(0, int(math.floor((P[:, 1].min() - grid.oy) / grid.h)))            # ячеек:
+    iy1 = min(grid.ny - 1, int(math.floor((P[:, 1].max() - grid.oy) / grid.h)))  # столбцы, строки
+    if ix0 > ix1 or iy0 > iy1:                         # кольцо вне сетки → нечего размечать
+        return None
+    cx = grid.ox + (np.arange(ix0, ix1 + 1) + 0.5) * grid.h   # центры столбцов габарита, км
+    cy = grid.oy + (np.arange(iy0, iy1 + 1) + 0.5) * grid.h   # центры строк габарита, км
+    gx, gy = np.meshgrid(cx, cy)                       # центры ячеек габарита, км
+    inside = _points_in_polygon(gx.ravel(), gy.ravel(), P).reshape(gy.shape)   # центр внутри кольца
+    return slice(iy0, iy1 + 1), slice(ix0, ix1 + 1), inside
+
+
 def _label8(mask):
     """Разметка связных компонент булевой маски (8-связность). Возвращает (lab, n):
     lab — int-массив той же формы (0 = фон, 1..n — номер компоненты). Чистый numpy +
@@ -1302,12 +1305,14 @@ def load_layers(lon0, lat0, data_path=None, bbox_lonlat=None):
     # файл слоёв СВОЙ у каждого участка (config.THREAT_LAYERS_FILE): при смене куска
     # карты кэш прежнего участка остаётся лежать рядом и не подменяет новый
     path = layers_cache_path()
+    why = ""                                           # почему не кэш — в подпись источника
     if os.path.exists(path):
         try:
             return _load_layers_npz(path), f"OSM (офлайн-кэш: {os.path.basename(path)})"
-        except Exception:
-            pass
-    return _synthetic_layers(lon0, lat0), "СХЕМА (демо, офлайн)"
+        except Exception as e:                         # кэш битый → демо-схема, но с причиной:
+            # молча подменённая схема выглядела бы как настоящая карта без части слоёв
+            why = f": кэш {os.path.basename(path)} не прочитан — {type(e).__name__}"
+    return _synthetic_layers(lon0, lat0), "СХЕМА (демо, офлайн)" + why
 
 
 def _clip_layers_km(layers, bbox_km, margin_km):
@@ -2593,8 +2598,9 @@ class ThreatModel:
                                                 self._route_gap_km(),
                                                 slack_km=self._route_slack_km())
                 out["unreachable"] = out["unreachable"] or not np.isfinite(min_len)
-        except Exception:
-            pass
+        except Exception as e:                         # проверка упала → сказать, а не молчать:
+            # иначе заголовок говорил бы «всё достижимо», хотя достижимость не проверялась
+            out["check_error"] = f"{type(e).__name__}: {e}"
         return out
 
     # ---- источник данных / выбор слоёв ----

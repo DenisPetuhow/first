@@ -197,6 +197,17 @@ def read_detail_window(meta, box_frac, max_px=MAX_PX):
     y0 = int(np.clip(box_frac[1], 0.0, 1.0) * h)
     y1 = int(np.ceil(np.clip(box_frac[3], 0.0, 1.0) * h))
     x1, y1 = max(x0 + 1, x1), max(y0 + 1, y1)
+    out, step = _read_rgba(meta, x0, y0, x1, y1, max_px)   # кусок RGBA и шаг прореживания
+    # фактические границы куска (шаг мог их чуть урезать) — по ним ставится setRect
+    got = (x0 / float(w), y0 / float(h),
+           (x0 + out.shape[1] * step) / float(w), (y0 + out.shape[0] * step) / float(h))
+    return out, got
+
+
+def _read_rgba(meta, x0, y0, x1, y1, max_px):
+    """Пиксели [y0:y1, x0:x1] оригинала, прореженные под экран, — RGBA строками снизу вверх (сцена — осью Y вверх).
+    Вход: метаданные картинки, границы в пикселях, предел стороны. Отдаёт: (RGBA (rows, cols, 4) uint8, шаг)."""
+    w, h = int(meta["w"]), int(meta["h"])              # размер оригинала, пикселей
     # ⚠️ ШАГ ОКРУГЛЯЕТСЯ ВНИЗ, В СТОРОНУ ДЕТАЛИ. Шаг целый — брать можно каждый второй
     # пиксель или каждый третий, но не «два с половиной», и между соседними шагами
     # разрешение меняется скачком. Округление вверх (было) один раз промахнулось мимо
@@ -205,25 +216,26 @@ def read_detail_window(meta, box_frac, max_px=MAX_PX):
     # берёт следующий, более подробный шаг; данных при этом не больше чем вчетверо
     # (сторона не более двух `max_px`), а замер даёт 130 МБ в худшем случае и доли
     # секунды на чтение.
-    step = max(1, int(max(x1 - x0, y1 - y0) // float(max_px)))
+    step = max(1, int(max(x1 - x0, y1 - y0) // float(max_px)))   # брать каждый step-й пиксель
     # ⚠️ ПОТОЛОК ПО ПАМЯТИ. Округление вниз на большом экране может затребовать кусок в
     # 85 млн точек — это 342 МБ и 0.4 с на чтение (замер на 4K, видно 94 км). Дальше
     # шаг увеличивается, пока кусок не уложится в потолок: качество при этом остаётся
     # не хуже экранного, потому что запас у нас и так двукратный.
-    while ((x1 - x0) // step) * ((y1 - y0) // step) > MAX_WINDOW_PIXELS:
+    while ((x1 - x0) // step) * ((y1 - y0) // step) > MAX_WINDOW_PIXELS:   # кусок больше потолка → реже
         step += 1
-    mm = np.memmap(meta["dat"], dtype=np.uint8, mode="r", shape=(h, w, 3))
+    # ⚠️ ЧТЕНИЕ СРАЗУ В ГОТОВЫЙ МАССИВ: пиксели из файла ложатся прямо в RGBA строками снизу вверх —
+    # один массив 4 байта на точку вместо трёх подряд (копия RGB, RGBA, перевёрнутая копия: 11 байт),
+    # при потолке 40 млн точек пик 160 МБ вместо 440. Наружу — новый массив, memmap не удерживается.
+    mm = np.memmap(meta["dat"], dtype=np.uint8, mode="r", shape=(h, w, 3))   # картинка на диске
     try:
-        sub = np.array(mm[y0:y1:step, x0:x1:step, :])   # копия — memmap не держим
+        view = mm[y0:y1:step, x0:x1:step, :]           # вырезка — вид на файл, без копии
+        out = np.empty((view.shape[0], view.shape[1], 4), np.uint8)   # RGBA куска
+        out[:, :, :3] = view[::-1]                     # строка 0 — нижняя, как ждёт сцена
+        out[:, :, 3] = 255
+        del view
     finally:
         del mm
-    out = np.empty((sub.shape[0], sub.shape[1], 4), np.uint8)
-    out[:, :, :3] = sub
-    out[:, :, 3] = 255
-    # фактические границы куска (шаг мог их чуть урезать) — по ним ставится setRect
-    got = (x0 / float(w), y0 / float(h),
-           (x0 + sub.shape[1] * step) / float(w), (y0 + sub.shape[0] * step) / float(h))
-    return out[::-1].copy(), got
+    return out, step
 
 
 def read_detail_px(meta, box_px, max_px=MAX_PX):
@@ -242,18 +254,8 @@ def read_detail_px(meta, box_px, max_px=MAX_PX):
     y0 = int(np.clip(box_px[1], 0, h - 1))
     x1 = int(np.clip(np.ceil(box_px[2]), x0 + 1, w))
     y1 = int(np.clip(np.ceil(box_px[3]), y0 + 1, h))
-    step = max(1, int(max(x1 - x0, y1 - y0) // float(max_px)))
-    while ((x1 - x0) // step) * ((y1 - y0) // step) > MAX_WINDOW_PIXELS:
-        step += 1
-    mm = np.memmap(meta["dat"], dtype=np.uint8, mode="r", shape=(h, w, 3))
-    try:
-        sub = np.array(mm[y0:y1:step, x0:x1:step, :])
-    finally:
-        del mm
-    out = np.empty((sub.shape[0], sub.shape[1], 4), np.uint8)
-    out[:, :, :3] = sub
-    out[:, :, 3] = 255
-    return out[::-1].copy(), x0, y0, step
+    out, step = _read_rgba(meta, x0, y0, x1, y1, max_px)   # кусок RGBA и шаг прореживания
+    return out, x0, y0, step
 
 
 def read_for_fit(path, want_px=3000):

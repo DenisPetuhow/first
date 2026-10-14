@@ -17,9 +17,9 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 
+from view_qt.common.ui_common import fill_target_combo   # список целей — общий с окном нагрузки
 from view_qt.output.figures import FAMILIES
 
-ALL_TARGETS = "Все цели"                             # первая строка выбора цели
 KEEP = "keep"                                        # refresh: цель оставить, как выбрана
 
 
@@ -218,16 +218,7 @@ class FigureDialog(QtWidgets.QDialog):
         """Список целей: «Все цели» и подписи из `choices()`; цель одна — выбор закрыт. Вход: цель или KEEP.
         Отдаёт: ничего."""
         keep = self.combo_target.currentData() if target == KEEP else target   # какую цель выбрать
-        labels = self._choices() or []               # «Цель №N — маршрутов M»; пусто — цель одна
-        self.combo_target.blockSignals(True)
-        self.combo_target.clear()
-        self.combo_target.addItem(ALL_TARGETS, None)
-        for i, text in enumerate(labels):            # цель — строка выбора, данные — номер с нуля
-            self.combo_target.addItem(text, i)
-        i = self.combo_target.findData(keep)         # выбор в новом списке
-        self.combo_target.setCurrentIndex(i if keep is not None and i >= 0 else 0)
-        self.combo_target.blockSignals(False)
-        self.combo_target.setEnabled(bool(labels))
+        fill_target_combo(self.combo_target, self._choices() or [], keep)   # подписи «Цель №N — маршрутов M»
 
     def refresh(self, target=KEEP, fill=True):
         """Новый снимок данных по цели и перерисовка. Вход: цель (номер с нуля, None — все, KEEP — как выбрана),

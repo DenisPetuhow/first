@@ -30,7 +30,7 @@ from config import (THEME, THREAT_LAYERS, THREAT_LAYER_ORDER, MODE_LABELS,
                     THREAT_BBOX_POINTS, THREAT_ENTRY, THREAT_TARGET,
                     THREAT_ITER_MODE_LABELS, THREAT_ITER_SPREAD_LABELS, THREAT_APPROACH_LABELS,
                     THREAT_SPEND_LABELS, THREAT_TILE_AREA, THREAT_TARGETS_MAX,
-                    THREAT_CELL_M, THREAT_COMPASS_LINE_KM, THREAT_AREA_LABEL,
+                    THREAT_COMPASS_LINE_KM, THREAT_AREA_LABEL,
                     THREAT_AREA_SOURCE, THREAT_AREA_ERROR, THREAT_PAN_MARGIN_KM)
 from view_qt.maps.basemap_mixin import BasemapMixin, gm_qcolor as _qcolor
 from view_qt.common.ui_common import apply_dark_theme, make_side_panel   # общие детали трёх вкладок
@@ -3608,11 +3608,6 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.chk_offline.stateChanged.connect(self._offline_changed)
         col.addWidget(self.chk_offline)
 
-    def _map_changed(self, i):
-        self._map_layer = self._map_keys[i]
-        self.on_map_layer(self._map_layer)
-        self._refresh_basemap(force=True)
-
     def _offline_changed(self, _s):
         self._map_offline = self.chk_offline.isChecked()
         self.on_map_offline(self._map_offline)
@@ -5006,7 +5001,8 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self._grad_info["iter_heat"] = dict(top=float(top) if top else 1.0)   # маршрутов в самой частой ячейке
         ds = np.sqrt(np.clip(d, 0.0, 1.0))              # √ поднимает редкие пролёты (виднее)
         lut = _iter_heat_lut()
-        rgba = lut[np.clip((ds * 255).astype(int), 0, 255)].copy()
+        # выборка по массиву индексов уже даёт НОВЫЙ массив — палитра `lut` от записи ниже не меняется
+        rgba = lut[np.clip((ds * 255).astype(int), 0, 255)]   # цвет каждой ячейки (ny, nx, 4)
         rgba[..., 3] = np.where(d > 0.005, 220, 0).astype(np.ubyte)  # прозрачно, где не летали
         self.iter_heat_img.setImage(rgba, autoLevels=False)
         x0, x1, y0, y1 = extent

@@ -505,16 +505,6 @@ def oblast_outline_km(lon0=KURSK_LON, lat0=KURSK_LAT):
     return np.column_stack([xs, ys])
 
 
-def bbox_lonlat_to_km(bbox_lonlat, lon0, lat0):
-    """(lon_min, lat_min, lon_max, lat_max) -> (kx0, kx1, ky0, ky1) в локальных км
-    относительно якоря (lon0, lat0). Используется вкладкой 3 (свой участок карты)."""
-    lo, la, ho, ha = bbox_lonlat
-    x0, y0 = lonlat_to_km(lo, la, lon0, lat0)
-    x1, y1 = lonlat_to_km(ho, ha, lon0, lat0)
-    return (float(min(x0, x1)), float(max(x0, x1)),
-            float(min(y0, y1)), float(max(y0, y1)))
-
-
 def graticule_km(kx0, kx1, ky0, ky1, lon0=KURSK_LON, lat0=KURSK_LAT, step_deg=0.5):
     """Линии сетки широт/долгот в км для текущего окна. Возвращает список
     (тип, координаты, подпись): тип 'v'/'h'."""

@@ -34,7 +34,10 @@ MODEL · Построение маршрутов пролёта БПЛА по в
 Карта кода — теория/карта_кода/README.md (генерируется codemap.py).
 """
 import heapq                      # двоичная куча для Дейкстры (_dijkstra_dist)
+import math                       # math.inf — «недостижимо» в полях Дейкстры
+from bisect import bisect_left    # рулетка развилки: сектор, куда попала случайная точка
 from collections import deque     # окно истории курса (ограничение разворота)
+from itertools import accumulate  # рулетка развилки: нарастающие границы секторов
 import numpy as np
 
 from config import (THREAT_LOOKAHEAD_KM, THREAT_LOOKAHEAD_POWER, THREAT_COST_POWER,
@@ -56,29 +59,40 @@ def _cell_of(grid, xy):
     return (min(max(iy, 0), grid.ny - 1), min(max(ix, 0), grid.nx - 1))
 
 
+def _pad_flat(a, fill):
+    """Массив (ny, nx) — в плоский список Python с рамкой в одну ячейку: у края соседи есть всегда.
+    Вход: массив, значение рамки. Отдаёт: (список значений, ширина строки nx + 2)."""
+    ny, nx = a.shape                                   # размер сетки, ячеек
+    p = np.full((ny + 2, nx + 2), fill, dtype=a.dtype)   # сетка с рамкой
+    p[1:-1, 1:-1] = a
+    return p.ravel().tolist(), nx + 2
+
+
 def _dijkstra_dist(passable, start, h):
-    """Поле ГЕОМЕТРИЧЕСКИХ расстояний (км) от start по проходимым ячейкам (8-связно).
-    Шаг = h (орт.) или h·√2 (диаг.). Непроходимые (passable=False) не посещаются."""
-    ny, nx = passable.shape
-    dist = np.full(ny * nx, np.inf)
-    si = start[0] * nx + start[1]
+    """Поле ГЕОМЕТРИЧЕСКИХ расстояний от start по проходимым ячейкам (8-связно, шаг h или h·√2).
+    Вход: маска проходимости (ny, nx), ячейка (iy, ix), шаг сетки км. Отдаёт: (ny, nx) км, inf — недостижима."""
+    ny, nx = passable.shape                            # размер сетки, ячеек
+    # ⚠️ СПИСКИ PYTHON, А НЕ МАССИВ: чтение ячейки numpy в цикле кучи в разы дороже чтения списка,
+    # а сложения те же и в том же порядке — поле совпадает до бита. Рамка снимает проверку краёв.
+    ok, w = _pad_flat(np.asarray(passable), False)     # проходимость с рамкой, ширина строки
+    steps = [(dy * w + dx, mul * h) for dy, dx, mul in _NEIGHBORS]   # (сдвиг индекса, длина шага км)
+    dist = [math.inf] * len(ok)                        # расстояние до ячейки, км
+    si = (start[0] + 1) * w + start[1] + 1             # старт в нумерации с рамкой
     dist[si] = 0.0
-    pq = [(0.0, si)]
-    while pq:
-        d, u = heapq.heappop(pq)
-        if d > dist[u]:
+    pq = [(0.0, si)]                                   # куча (расстояние км, ячейка)
+    pop, push = heapq.heappop, heapq.heappush          # взять ближайшую, положить новую
+    while pq:                                          # ближайшая ещё не закрытая ячейка
+        d, u = pop(pq)                                 # расстояние км, ячейка
+        if d > dist[u]:                                # устаревшая запись кучи — пропуск
             continue
-        uy, ux = divmod(u, nx)
-        for dy, dx, mul in _NEIGHBORS:
-            vy, vx = uy + dy, ux + dx
-            if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not passable[vy, vx]:
-                continue
-            nd = d + mul * h
-            v = vy * nx + vx
-            if nd < dist[v]:
-                dist[v] = nd
-                heapq.heappush(pq, (nd, v))
-    return dist.reshape(ny, nx)
+        for off, c in steps:                           # 8 соседей
+            v = u + off                                # индекс соседа
+            if ok[v]:                                  # проходим → пробуем укоротить путь
+                nd = d + c                             # путь через u, км
+                if nd < dist[v]:                       # короче прежнего → запомнить
+                    dist[v] = nd
+                    push(pq, (nd, v))
+    return np.array(dist, float).reshape(ny + 2, w)[1:-1, 1:-1].copy()
 
 
 def _cost_mul(grid, wnorm, power, relief_power=0.0):
@@ -114,34 +128,35 @@ def _cost_mul(grid, wnorm, power, relief_power=0.0):
 
 
 def _dijkstra_cost(passable, start, h, mul):
-    """Поле СТОИМОСТИ пути от start (в км-эквивалентах) по проходимым ячейкам.
-
-    Цена шага — его длина, умноженная на среднее значение `mul` в двух ячейках: так
-    цена симметрична (из A в B столько же, сколько из B в A) и не зависит от того, с
-    какой стороны считали. `mul = None` -> обычные километры."""
-    if mul is None:
+    """Поле СТОИМОСТИ пути от start (км-эквиваленты) по проходимым ячейкам; `mul = None` — обычные км.
+    Вход: маска проходимости, ячейка (iy, ix), шаг км, множитель цены (ny, nx). Отдаёт: (ny, nx), inf — недостижима."""
+    if mul is None:                                    # множителя нет → чистая геометрия
         return _dijkstra_dist(passable, start, h)
-    ny, nx = passable.shape
-    m = np.asarray(mul, float).ravel()
-    dist = np.full(ny * nx, np.inf)
-    si = start[0] * nx + start[1]
+    ny, nx = passable.shape                            # размер сетки, ячеек
+    # Цена шага — длина × среднее `mul` двух ячеек: из A в B столько же, сколько из B в A.
+    # Списки и рамка — как в `_dijkstra_dist`: поле до бита то же, счёт в разы быстрее.
+    ok, w = _pad_flat(np.asarray(passable), False)     # проходимость с рамкой, ширина строки
+    m = _pad_flat(np.asarray(mul, float), 0.0)[0]      # множитель цены с рамкой (рамку не читаем)
+    # (step·h)·0.5 заранее — то же умножение в том же порядке, что `step * h * 0.5 * (…)`
+    steps = [(dy * w + dx, step * h * 0.5) for dy, dx, step in _NEIGHBORS]   # (сдвиг, полшага км)
+    dist = [math.inf] * len(ok)                        # стоимость пути до ячейки
+    si = (start[0] + 1) * w + start[1] + 1             # старт в нумерации с рамкой
     dist[si] = 0.0
-    pq = [(0.0, si)]
-    while pq:
-        d, u = heapq.heappop(pq)
-        if d > dist[u]:
+    pq = [(0.0, si)]                                   # куча (стоимость, ячейка)
+    pop, push = heapq.heappop, heapq.heappush          # взять самую дешёвую, положить новую
+    while pq:                                          # самая дешёвая ещё не закрытая ячейка
+        d, u = pop(pq)                                 # стоимость, ячейка
+        if d > dist[u]:                                # устаревшая запись кучи — пропуск
             continue
-        uy, ux = divmod(u, nx)
-        for dy, dx, step in _NEIGHBORS:
-            vy, vx = uy + dy, ux + dx
-            if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not passable[vy, vx]:
-                continue
-            v = vy * nx + vx
-            nd = d + step * h * 0.5 * (m[u] + m[v])
-            if nd < dist[v]:
-                dist[v] = nd
-                heapq.heappush(pq, (nd, v))
-    return dist.reshape(ny, nx)
+        mu = m[u]                                      # множитель цены в самой ячейке
+        for off, c in steps:                           # 8 соседей
+            v = u + off                                # индекс соседа
+            if ok[v]:                                  # проходим → пробуем удешевить путь
+                nd = d + c * (mu + m[v])               # стоимость через u
+                if nd < dist[v]:                       # дешевле прежней → запомнить
+                    dist[v] = nd
+                    push(pq, (nd, v))
+    return np.array(dist, float).reshape(ny + 2, w)[1:-1, 1:-1].copy()
 
 
 def passable_mask(grid, max_gap_km, slack_km=None):
@@ -384,25 +399,28 @@ def _catmull_rom(points, seg_km=1.5, alpha=0.5):
     if len(P) < 3:
         return P
     pts = np.vstack([P[0], P, P[-1]])                # дублируем концы (для крайних сегментов)
-    out = [P[0]]
-    for i in range(1, len(pts) - 2):
-        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
 
-        def _t(ti, a, b):
-            return ti + max(float(np.hypot(*(b - a))), 1e-6) ** alpha
+    def _t(ti, a, b):
+        # Узел центростремительной параметризации. Вход: прежний узел, две точки (2,). Отдаёт: float.
+        return ti + max(float(np.hypot(*(b - a))), 1e-6) ** alpha
 
+    out = [P[:1]]                                    # куски кривой (k, 2); первый — начало линии
+    for i in range(1, len(pts) - 2):                 # сегменты между соседними опорными точками
+        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]   # опорные точки сегмента p1→p2 и соседи, км
         t0 = 0.0; t1 = _t(t0, p0, p1); t2 = _t(t1, p1, p2); t3 = _t(t2, p2, p3)
         seg_len = float(np.hypot(*(p2 - p1)))
         n = int(np.clip(seg_len / seg_km, 2, 24))    # число точек на сегмент ∝ его длине
-        for t in np.linspace(t1, t2, n, endpoint=False):
-            a1 = (t1 - t) / (t1 - t0) * p0 + (t - t0) / (t1 - t0) * p1
-            a2 = (t2 - t) / (t2 - t1) * p1 + (t - t1) / (t2 - t1) * p2
-            a3 = (t3 - t) / (t3 - t2) * p2 + (t - t2) / (t3 - t2) * p3
-            b1 = (t2 - t) / (t2 - t0) * a1 + (t - t0) / (t2 - t0) * a2
-            b2 = (t3 - t) / (t3 - t1) * a2 + (t - t1) / (t3 - t1) * a3
-            out.append((t2 - t) / (t2 - t1) * b1 + (t - t1) / (t2 - t1) * b2)
-    out.append(P[-1])
-    return np.asarray(out)
+        # ВЕСЬ СЕГМЕНТ РАЗОМ: параметры точек — столбцом (n, 1). Формулы и порядок действий
+        # для каждой точки прежние, поэтому кривая до бита та же, а вызовов numpy в n раз меньше.
+        t = np.linspace(t1, t2, n, endpoint=False)[:, None]   # параметры точек сегмента
+        a1 = (t1 - t) / (t1 - t0) * p0 + (t - t0) / (t1 - t0) * p1   # первая ступень (n, 2): между p0 и p1
+        a2 = (t2 - t) / (t2 - t1) * p1 + (t - t1) / (t2 - t1) * p2   # — между p1 и p2
+        a3 = (t3 - t) / (t3 - t2) * p2 + (t - t2) / (t3 - t2) * p3   # — между p2 и p3
+        b1 = (t2 - t) / (t2 - t0) * a1 + (t - t0) / (t2 - t0) * a2   # вторая ступень (n, 2): из a1, a2
+        b2 = (t3 - t) / (t3 - t1) * a2 + (t - t1) / (t3 - t1) * a3   # — из a2, a3
+        out.append((t2 - t) / (t2 - t1) * b1 + (t - t1) / (t2 - t1) * b2)
+    out.append(P[-1:])
+    return np.concatenate(out)
 
 
 def _rdp(points, eps):
@@ -685,7 +703,7 @@ def _trail_push(trail, grid, vy, vx, k):
 
 def _back_sector_bad(trail, grid, cy, cx):
     """Какие из 8 соседей ячейки попадают в запретный сектор позади пройденных точек.
-    Вход: трасса, сетка, ячейка (iy, ix). Отдаёт: массив (8,) bool либо None (запрета нет)."""
+    Вход: трасса, сетка, ячейка (iy, ix). Отдаёт: список из 8 bool либо None (запрета нет)."""
     if trail["n"] == 0 or BACK_SECTOR_KM <= 0.0:       # трассы нет или правило выключено
         return None                                    # — запрещать нечего
     # ⚠️ МАСКА, А НЕ ПЕРЕБОР ТОЧЕК. Первая версия на каждом шаге сравнивала соседей со всеми
@@ -693,7 +711,7 @@ def _back_sector_bad(trail, grid, cy, cx):
     # Трафарет сектора закрашивается один раз при записи точки, а проверка — чтение ячейки.
     m = trail["mask"]
     ny, nx = m.shape
-    bad = np.zeros(8, bool)
+    bad = [False] * 8                                  # список, а не массив: 8 чисел на каждом шаге
     for k, (dy, dx, _mul) in enumerate(_NEIGHBORS):
         vy, vx = cy + dy, cx + dx
         if 0 <= vy < ny and 0 <= vx < nx and m[vy, vx]:   # сосед в чьём-то секторе
@@ -785,8 +803,24 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
     # МЯГКОЕ ДОСТИЖЕНИЕ промежуточной точки (VIA_REACH_KM): «дошли», когда до неё по
     # коридорам осталось не больше reach_km — поворот к следующей точке начнётся дугой
     soft = float(reach_km) if (reach_km > 0.0 and tail_km > 1e-9) else 0.0   # км; у цели — строго
-    for _ in range(step_cap):
-        if cur == goal or dfield[cur] <= reach_eps:
+    # ПОСТОЯННЫЕ ПРОХОДОВ ПО СОСЕДЯМ — один раз на участок: от шага они не зависят.
+    # ПРЕДЕЛ ПОВОРОТА — СВОЙ У ВЫБРАННОГО ТИПА БПЛА (заказчик 21.09.2026: «крен же
+    # влияет на модель маршрутов»). Нет типа — прежняя константа. Подробно — `turn_limit`.
+    t_max = float(ctx.get("turn_max_deg") or TURN_MAX_DEG)   # предел за шаг, градусы
+    # аварийное послабление: не строже основного предела этого аппарата
+    t_hard = max(float(TURN_HARD_DEG), t_max) if TURN_HARD_DEG > TURN_MAX_DEG else t_max   # градусы
+    # ДОПУСК НА ОКРУГЛЕНИЕ: курс хранится с точностью 0.001, и у диагонали
+    # скалярное произведение выходит 0.707 против точного cos 45° = 0.70711.
+    # Без запаса поворот ровно на предел отсекался как «слишком крутой», и
+    # оставалось единственное направление — строго прямо: из 150 маршрутов
+    # строилось 7. Соседние направления сетки разнесены на 45°, так что запас
+    # в 0.03 никогда не пропустит следующее (там разрыв 0.7).
+    cos_max = float(np.cos(np.radians(t_max))) - 0.03    # порог скалярного произведения курсов: предел
+    cos_hard = float(np.cos(np.radians(t_hard))) - 0.03  # — аварийный предел
+    win_cos = float(np.cos(np.radians(TURN_WINDOW_DEG))) - 0.03   # — окно разворота
+    for _ in range(step_cap):                          # шаг за шагом к цели, не дольше step_cap
+        d_cur = dfield[cur]                            # поле в текущей ячейке — одно чтение на шаг
+        if cur == goal or d_cur <= reach_eps:          # дошли → участок закончен
             break
         if soft > 0.0 and dgeo[cur] <= soft:           # подошли к промежуточной точке
             break                                      # — участок закончен, дальше к цели
@@ -819,7 +853,6 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         # потерянный кусок выборки.
         # курс в начале «окна разворота»: с ним сверяется каждый кандидат
         win_u0 = head_hist[0][1] if (head_hist and TURN_WINDOW_KM > 0.0) else None
-        win_cos = float(np.cos(np.radians(TURN_WINDOW_DEG))) - 0.03
         cand, score = [], []
         # ПОРЯДОК ПОСЛАБЛЕНИЙ. Окно разворота — предпочтение, а не запрет: если с ним
         # прохода нет, оно снимается. Жёстким оно быть не может — маршрут, отвернувший
@@ -832,33 +865,22 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         # всех восьми соседей. Снимается ПОСЛЕДНИМ — после окна разворота: окно лишь
         # предпочтение, а сектор — то, ради чего возвраты и убираются.
         back_bad = _back_sector_bad(trail, grid, cy, cx) if trail is not None else None
-        # ПРЕДЕЛ ПОВОРОТА — СВОЙ У ВЫБРАННОГО ТИПА БПЛА (заказчик 21.09.2026: «крен же
-        # влияет на модель маршрутов»). Нет типа — прежняя константа. Подробно — `turn_limit`.
-        t_max = float(ctx.get("turn_max_deg") or TURN_MAX_DEG)   # предел за шаг, градусы
-        # аварийное послабление: не строже основного предела этого аппарата
-        t_hard = max(float(TURN_HARD_DEG), t_max) if TURN_HARD_DEG > TURN_MAX_DEG else t_max
-        # порядок послаблений: (предел °, окно разворота, держать прямо, запретный сектор)
-        limits = [(t_max, True, hold_straight, True), (t_max, True, False, True),
-                  (t_max, False, False, True)]
-        if back_bad is not None and back_bad.any():   # сектор что-то запрещает
-            limits.append((t_max, False, False, False))   # — последний шанс без него
-        if t_hard > t_max:
-            limits.append((t_hard, False, False, False))
-        for turn_lim, use_win, straight, use_back in limits:
+        # порядок послаблений: (порог поворота, окно разворота, держать прямо, запретный сектор);
+        # пороги поворота посчитаны до цикла шагов — `cos_max`, `cos_hard`
+        limits = [(cos_max, True, hold_straight, True), (cos_max, True, False, True),
+                  (cos_max, False, False, True)]
+        if back_bad is not None and any(back_bad):     # сектор что-то запрещает
+            limits.append((cos_max, False, False, False))   # — последний шанс без него
+        if t_hard > t_max:                             # есть аварийный предел → последняя попытка
+            limits.append((cos_hard, False, False, False))
+        for turn_cos, use_win, straight, use_back in limits:   # проходы от строгого к мягкому
             win_u = win_u0 if use_win else None
-            # ДОПУСК НА ОКРУГЛЕНИЕ: курс хранится с точностью 0.001, и у диагонали
-            # скалярное произведение выходит 0.707 против точного cos 45° = 0.70711.
-            # Без запаса поворот ровно на предел отсекался как «слишком крутой», и
-            # оставалось единственное направление — строго прямо: из 150 маршрутов
-            # строилось 7. Соседние направления сетки разнесены на 45°, так что запас
-            # в 0.03 никогда не пропустит следующее (там разрыв 0.7).
-            turn_cos = float(np.cos(np.radians(turn_lim))) - 0.03
             for k, (dy, dx, mul) in enumerate(_NEIGHBORS):
                 vy, vx = cy + dy, cx + dx
                 if vy < 0 or vy >= ny or vx < 0 or vx >= nx or not pas[vy, vx]:
                     continue
                 dj = dfield[vy, vx]
-                if not np.isfinite(dj) or dj > dfield[cur] + allow_back:   # к цели, почти без «назад»
+                if not math.isfinite(dj) or dj > d_cur + allow_back:   # к цели, почти без «назад»
                     continue
                 if axis_s is not None and axis_s[vy, vx] < -START_BACK_KM:
                     continue                           # не уходить назад за точку вылета
@@ -885,7 +907,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                         else:            hf = 0.5       # на пределе — если нужно объехать
                     else:                               # прошли прямой участок — можно доворачивать
                         hf = 1.0 + 2.5 * max(dot, 0.0)  # но прямо всё равно охотнее
-                prog = dfield[cur] - dj
+                prog = d_cur - dj                      # продвижение к цели в единицах поля
                 corr = _mode_corridor_pref(wnorm[vy, vx], wmode)   # приоритет по весу (режим)
                 if ahead is not None and look_p > 0.0:
                     # ЧТО ЖДЁТ ДАЛЬШЕ по этому курсу: холм впереди снижает привлекательность
@@ -899,7 +921,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
                     continue
                 cand.append((vy, vx, mul, (uy, ux), k)); score.append(s)
             if cand or heading is None:
-                if not use_back and back_bad is not None and back_bad.any():   # прошли, сняв сектор
+                if not use_back and back_bad is not None and any(back_bad):   # прошли, сняв сектор
                     st = ctx.setdefault("_stats", {})
                     st["back_relax"] = st.get("back_relax", 0) + 1   # — счётчик для замера
                 break                                   # первый проход удался — второй не нужен
@@ -908,12 +930,18 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         # РАЗВИЛКА — «метод рулетки»: вероятность выбрать соседа ∝ его оценке score.
         # cumsum даёт нарастающие границы секторов, searchsorted находит сектор, в который
         # попала случайная точка на [0, сумма). Быстрее и без аллокаций rng.choice(p=...).
-        sc = np.asarray(score, float)
-        if not np.isfinite(sc).all() or sc.sum() <= 0.0:
-            j = int(np.argmax(np.nan_to_num(sc, posinf=np.finfo(float).max)))   # exp переполнился
-        else:                                           # при tau->0: берём лучшего соседа
-            cum = np.cumsum(sc)
-            j = min(int(np.searchsorted(cum, rng.random() * cum[-1])), len(cand) - 1)
+        # Рулетка — на списке: те же суммы подряд, что у np.cumsum, и тот же левый поиск, что у
+        # searchsorted, — выбор до бита прежний, без пяти вызовов numpy на 8 числах каждый шаг.
+        cum = list(accumulate(score))                   # нарастающие границы секторов
+        if math.isfinite(cum[-1]):                      # обычный случай → рулетка на списке
+            j = min(bisect_left(cum, rng.random() * cum[-1]), len(cand) - 1)
+        else:                                           # exp переполнился или nan → прежний путь numpy
+            sc = np.asarray(score, float)               # оценки соседей массивом
+            if not np.isfinite(sc).all() or sc.sum() <= 0.0:   # есть бесконечность → лучший сосед
+                j = int(np.argmax(np.nan_to_num(sc, posinf=np.finfo(float).max)))
+            else:                                       # конечны, но сумма переполнилась → рулетка numpy
+                cum_np = np.cumsum(sc)                  # нарастающие границы
+                j = min(int(np.searchsorted(cum_np, rng.random() * cum_np[-1])), len(cand) - 1)
         vy, vx, mul, unit, k_step = cand[j]
         step = mul * h
         route_len += step
@@ -1424,7 +1452,7 @@ def _round_corners(poly, raw, rounds, max_shift):
     «спрямляло» бы линию и уводило с коридора."""
     if rounds <= 0 or len(poly) < 5:
         return poly
-    P = np.array(poly, float)
+    P = np.asarray(poly, float)                        # ссылка, не копия: P не меняется, каждый проход пишет в новый Q
     R = np.asarray(raw, float)
     for _ in range(int(rounds)):
         Q = P.copy()

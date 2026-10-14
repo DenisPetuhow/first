@@ -55,7 +55,7 @@ if hasattr(sys.stdout, "reconfigure"):
 MARKERS = ("CLAUDE.md", "config.py", ".git")
 SKIP_DIRS = {".git", ".claude", "__pycache__", "venv", ".venv", "node_modules",
              "tile_cache", "geo_cache", "offline_packages", "resurce", "docs",
-             "теория", "dist", "build"}
+             "теория", "dist", "build", "out", "out_test"}   # out, out_test — вывод прогонов вне git, не код
 # имена, которые вызывает не код, а запуск/фреймворк
 ENTRY_POINTS = {"main", "run", "setup", "teardown"}
 

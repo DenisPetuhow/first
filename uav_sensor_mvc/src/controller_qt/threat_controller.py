@@ -195,6 +195,8 @@ class ThreatController:
             msg += " — ⚠ ЦЕЛЬ внутри зоны"
         elif info["unreachable"]:
             msg += " — ⚠ цель НЕДОСТИЖИМА: зона перекрыла коридор, обхода по весам нет"
+        elif info.get("check_error"):                  # достижимость посчитать не удалось → так и сказать
+            msg += " — ⚠ достижимость цели не проверена: " + info["check_error"]
         if info["zones"] == 0:
             msg = "Запретные зоны убраны"
         self.view.set_title(msg)

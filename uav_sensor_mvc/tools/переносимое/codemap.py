@@ -42,7 +42,7 @@ if hasattr(sys.stdout, "reconfigure"):
 MARKERS = ("CLAUDE.md", "config.py", ".git")
 SKIP_DIRS = {".git", ".claude", "__pycache__", "venv", ".venv", "node_modules",
              "tile_cache", "geo_cache", "offline_packages", "resurce", "dist", "build",
-             "docs", "теория", "фото пример"}
+             "docs", "теория", "фото пример", "out", "out_test"}   # out, out_test — вывод прогонов вне git, не код
 OUT_DIR_REL = os.path.join("теория", "карта_кода")   # README + части КАРТА_N.md
 PART_MAX_LINES = 1500      # порог деления карты на части — как у документов (docmap)
 # ⚠️ ПОРОГ ПОДРОБНОГО ОПИСАНИЯ — тот же, что у оглавлений документов в docmap.py.
