@@ -104,6 +104,15 @@ def _box(text, key):
     return (lo, la, ho, ha)
 
 
+def _sticks_out(inner, outer):
+    # Края рамки inner, вылезшие за рамку outer. Вход: две рамки (lon_min, lat_min, lon_max, lat_max),
+    # градусы. Отдаёт: названия краёв («западный» …) по порядку; пусто — inner лежит в outer.
+    eps = 1e-9                                       # допуск на запись чисел, градусы
+    (ilo, ila, iho, iha), (olo, ola, oho, oha) = inner, outer   # края двух рамок, градусы
+    return [name for name, bad in (("западный", ilo < olo - eps), ("южный", ila < ola - eps),
+                                   ("восточный", iho > oho + eps), ("северный", iha > oha + eps)) if bad]
+
+
 def _point(text, key):
     # Точка с подписью. Вход: текст «подпись, lon, lat» (градусы; в подписи могут быть
     # пробелы), имя ключа. Отдаёт: (подпись, lon, lat); иначе AreaFileError.
@@ -150,22 +159,13 @@ def parse_area_text(text, folder):
     # соседнюю карту; уже быть не может, иначе часть расчётной области не показать.
     view = _box(raw["карта"], "карта") if raw.get("карта") else None
     if view is not None:                             # карта задана — обязана накрыть область
-        eps = 1e-9                                   # допуск на запись чисел, градусы
-        vlo, vla, vho, vha = view
-        tight = [name for name, bad in (             # края карты, залезшие внутрь области
-                ("западный", vlo > lo + eps), ("южный", vla > la + eps),
-                ("восточный", vho < ho - eps), ("северный", vha < ha - eps))
-                 if bad]
+        tight = _sticks_out(bbox, view)              # края области, вылезшие за карту
         if tight:                                    # карта у́же области
             raise AreaFileError("«карта» должна накрывать «область» целиком, а она у́же: "
                                 "%s край" % ", ".join(tight))
     work = _box(raw["район"], "район") if raw.get("район") else None   # синяя рамка или None
     if work is not None:                             # район задан — обязан лежать в области
-        eps = 1e-9                                   # допуск на запись чисел, градусы
-        wlo, wla, who, wha = work
-        out = [name for name, bad in (("западный", wlo < lo - eps), ("южный", wla < la - eps),
-                                      ("восточный", who > ho + eps), ("северный", wha > ha + eps))
-               if bad]                               # края района, вылезшие за область
+        out = _sticks_out(work, bbox)                # края района, вылезшие за область
         if out:                                      # район вылез за край
             # расчёт вне области идёт без слоёв и рельефа, а на карте этого не видно
             raise AreaFileError("район выходит за область: %s край. Расчёт вне области "
@@ -320,9 +320,7 @@ def normalize_tiles_root(root, area_name):
     # мусорный путь выглядел бы настоящим корнем (поймано `area_check` 20.09.2026).
     if os.path.basename(os.path.normpath(root)) == name:   # выбрана сама папка участка
         return os.path.dirname(os.path.normpath(root))     # — корень уровнем выше
-    if os.path.isdir(os.path.join(root, name)):      # внутри есть папка участка
-        return root                                  # — это настоящий корень
-    return root                                      # чужая раскладка — не трогаем
+    return root                                      # внутри папка участка — настоящий корень; иначе чужая раскладка — не трогаем
 
 
 def tiles_root_for_area(area_name, folder, current=""):

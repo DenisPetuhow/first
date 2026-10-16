@@ -27,6 +27,8 @@ MODEL · Этап целей: ПВН у объектов защиты до об�
 """
 import numpy as np
 
+SEP_R = 1.6        # разнос ПВН у цели внутри типа, доля R: перекрытие зон ≤ ~10 % (как желаемый в `_sep_range`)
+
 
 def area_mask(grid, area):
     """Ячейки района защиты — центр ячейки внутри. Вход: сетка, район ("rect", x0, y0, x1, y1) или
@@ -51,17 +53,26 @@ def target_zone(grid, zc, place_mask, pt, R, area=None):
     """Зона цели. Вход: ThreatGrid, сводка `sensor_zones.cells`, карта места типа (ny,nx), цель (x, y) км,
     радиус типа км, район защиты человека или None. Отдаёт: маска (ny,nx) bool; None — у точки нет
     массива застройки (цель в лесу), а района нет."""
-    from model.threat.threat_grid import _dilate, _label8
+    from model.threat.threat_grid import _cell_index, _dilate, _label8
     if area is not None:                             # район задал человек (В13.21) — он и есть зона
         return area_mask(grid, area) & np.asarray(place_mask, bool)   # ∩ карта места: без леса, болот, воды
     r = max(1, int(round(float(R) / grid.h)))        # разрыв и полоса, ячеек (R 0.5 км — одна)
     built = zone_base(grid, zc)                      # сырая застройка ∪ ячейки с постройками
     lab, _n = _label8(_dilate(built, r))             # массивы: разрыв до R — один массив
-    ix = int(np.floor((pt[0] - grid.ox) / grid.h))   # ячейка цели: столбец
-    iy = int(np.floor((pt[1] - grid.oy) / grid.h))   # и строка
-    if not (0 <= ix < grid.nx and 0 <= iy < grid.ny) or lab[iy, ix] == 0:   # цель вне сетки или в лесу
+    (ix,), (iy,), (inside,) = _cell_index(grid, np.asarray([pt], float))   # ячейка цели: столбец, строка, в сетке ли
+    if not inside or lab[iy, ix] == 0:               # цель вне сетки или в лесу
         return None                                  # — зону задаёт человек
     return _dilate((lab == lab[iy, ix]) & built, r) & np.asarray(place_mask, bool)
+
+
+def own_places(grid, places, zone, pt, gap):
+    """Места цели: в её зоне и не ближе отступа к самой цели. Вход: сетка, места типа (M,2) км, зона (ny,nx) или
+    None, цель (x, y) км, отступ км. Отдаёт: (M',2) км; зоны нет — пусто."""
+    from model.placement.sensor_zones import cells_of
+    if zone is None:                                 # зоны нет — и мест нет
+        return np.empty((0, 2))
+    o = places[cells_of(grid, places, zone)]         # места в зоне цели, км
+    return o[np.hypot(o[:, 0] - pt[0], o[:, 1] - pt[1]) >= gap]
 
 
 def capacity(places, sep):
@@ -148,14 +159,20 @@ def allot(budget, pri, want, low, k=1):
     return _water(budget, pri, base, top) if sum(top) > budget else top
 
 
+def _sees(track, pts, R):
+    """Какие точки видят кусок маршрута — хоть одна его точка не дальше R. Вход: кусок (M,2) км, точки (J,2) км,
+    радиус км. Отдаёт: (J,) bool."""
+    t = np.asarray(track, float)                     # точки куска, км
+    return (np.linalg.norm(t[:, None, :] - pts[None, :, :], axis=2) <= R).any(axis=0)
+
+
 def approach_share(tails, pos, R, k):
     """Доля подлёта, засечённого ≥ k датчиками. Вход: куски подлёта (M,2) км, позиции (K,2) км, радиус км,
     кратность. Отдаёт: доля 0…1; подлёта нет — 0."""
     pos = np.asarray(pos, float).reshape(-1, 2)      # позиции датчиков, км
     if not tails or not len(pos):                    # ловить некого или нечем
         return 0.0
-    hits = [int((np.linalg.norm(np.asarray(t, float)[:, None, :] - pos[None, :, :], axis=2) <= R).any(axis=0).sum())  # датчиков
-            for t in tails]                          # видит каждый подлёт
+    hits = [int(_sees(t, pos, R).sum()) for t in tails]   # сколько датчиков видит каждый подлёт
     return float(np.mean(np.asarray(hits) >= int(k)))
 
 
@@ -164,12 +181,13 @@ def first_line(routes, pt, pos, rad):
     (M,2) км от старта к цели, цель (x, y) км, датчики (K,2) км, их радиусы (K,) км. Отдаёт: (маршрутов,) км."""
     pos = np.asarray(pos, float).reshape(-1, 2)      # датчики, км
     rad = np.asarray(rad, float).reshape(-1)         # их радиусы, км
+    pt = np.asarray(pt, float)                       # цель, км
     out = np.zeros(len(routes))                      # не засечён — рубеж 0: дошёл до цели невидимым
     for j, r in enumerate(routes):                   # каждый маршрут к цели
         pts = np.asarray(r, float)                   # точки маршрута, км
         seen = (np.linalg.norm(pts[:, None, :] - pos[None, :, :], axis=2) <= rad).any(axis=1)   # под наблюдением
         if seen.any():                               # засечён — где впервые
-            out[j] = float(np.hypot(*(pts[int(np.argmax(seen))] - np.asarray(pt, float))))
+            out[j] = float(np.hypot(*(pts[int(np.argmax(seen))] - pt)))
     return out
 
 
@@ -215,9 +233,7 @@ def _useful_left(tails, places, pos, R, k, sep):
     if not tails or not len(free):                   # ловить некого или ставить некуда
         return False
     for t in tails:                                  # каждый подлёт цели
-        t = np.asarray(t, float)                     # его точки, км
-        n = int((np.linalg.norm(t[:, None, :] - pos[None, :, :], axis=2) <= R).any(axis=0).sum()) if len(pos) else 0   # засечек
-        if n < k and (np.linalg.norm(t[:, None, :] - free[None, :, :], axis=2) <= R).any():   # не набран и место его видит
+        if _sees(t, pos, R).sum() < k and _sees(t, free, R).any():   # засечек меньше k, и свободное место его видит
             return True                              # — ставить есть куда
     return False
 
@@ -236,10 +252,7 @@ def protection(tails, places, pos, R, k, sep, L_seg, weights, levels):
 
     def seen(pts):
         """Какие из точек видят каждый подлёт. Вход: точки pts (J,2) км. Отдаёт: (T, J) bool."""
-        if not len(pts):                             # точек нет
-            return np.zeros((T, 0), bool)
-        return np.array([(np.linalg.norm(np.asarray(t, float)[:, None, :] - pts[None, :, :], axis=2) <= R).any(axis=0)
-                         for t in tails])
+        return np.array([_sees(t, pts, R) for t in tails]).reshape(T, len(pts))
     n_now = seen(pos).sum(axis=1)                    # сколько ПВН видит каждый подлёт сейчас
     out.update(share1=float((n_now >= 1).mean()), share=float((n_now >= k).mean()))
     # ПОЧЕМУ НЕ НАБРАНО: у подлёта мест в радиусе R меньше k — «мест мало»; мест хватает, но k штук с разносом
@@ -298,17 +311,14 @@ def stage(grid, zc, place_mask, places, targets, routes_by_t, st, n_total, R, L_
     """Этап целей для одного типа. Вход: сетка, сводка, карта места, места типа (M,2) км, цели
     [(x, y, приоритет)], маршруты по целям, паспорт, квота N, радиус км, сегментов, веса жадного,
     районы защиты по целям (None — нет). Отдаёт: (позиции (K,2) км, отчёт по целям — список dict)."""
-    from model.placement.sensor_zones import cells_of
-    sep = 1.6 * float(R)                             # разнос внутри типа, км
+    sep = SEP_R * float(R)                           # разнос внутри типа, км
     gap = float(st.tgt_gap_r) * float(R)             # отступ от самой цели, км (R/2, В13.26)
     places = np.asarray(places, float).reshape(-1, 2)   # места типа, км
     K = len(targets)                                 # число целей
     areas = list(areas) if areas is not None else [None] * K   # район человека у каждой цели
     zones = [target_zone(grid, zc, place_mask, (x, y), R, a)   # зоны целей
              for (x, y, _p), a in zip(targets, areas)]
-    own = [places[cells_of(grid, places, z)] if z is not None else np.empty((0, 2))   # места в зоне цели
-           for z in zones]
-    own = [o[np.hypot(o[:, 0] - x, o[:, 1] - y) >= gap] for o, (x, y, _p) in zip(own, targets)]   # не у самой цели
+    own = [own_places(grid, places, z, (x, y), gap) for z, (x, y, _p) in zip(zones, targets)]   # места цели, км
     caps = [capacity(o, sep) for o in own]           # вместимость зон
     pri = [max(float(p), 0.0) for _x, _y, p in targets]   # приоритеты
     pri = pri if sum(pri) > 0 else [1.0] * K         # все нули — поровну

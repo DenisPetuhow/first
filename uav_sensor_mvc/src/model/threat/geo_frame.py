@@ -76,7 +76,7 @@ def bbox_lonlat_to_km(bbox_lonlat, lon0, lat0):
 
 def bbox_size_km(bbox_lonlat):
     """Размер рамки (ширина, высота) в км — по её собственному юго-западному углу."""
-    lo, la, ho, ha = bbox_lonlat
+    lo, la = bbox_lonlat[:2]                     # юго-западный угол — якорь, градусы
     x0, x1, y0, y1 = bbox_lonlat_to_km(bbox_lonlat, lo, la)
     return (x1 - x0, y1 - y0)
 

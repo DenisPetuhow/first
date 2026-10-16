@@ -22,11 +22,8 @@ _STEPS = tuple((dy, dx, math.hypot(dy, dx)) for dy in (-1, 0, 1) for dx in (-1, 
 
 def road_cells(grid, layers=DRIVE_LAYERS):
     """Ячейки, где есть линия слоя. Вход: ThreatGrid, имена слоёв. Отдаёт: (ny,nx) bool; слоя нет — нет и ячеек."""
-    out = np.zeros((grid.ny, grid.nx), bool)         # есть ли линия в ячейке
-    for name in layers:                              # слои по очереди
-        if name in grid._present:                    # слой есть на карте
-            out |= grid._present[name]
-    return out
+    from model.threat.threat_grid import layer_cells
+    return layer_cells(grid, layers)
 
 
 def sources(grid, roads, pts):

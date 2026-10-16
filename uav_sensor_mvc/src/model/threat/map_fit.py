@@ -145,7 +145,8 @@ def locate_candidates(dark, step_px, built_km, area_km, scales=None,
     hp, wp = dark.shape
     out = []
     for m_per_px in (LOCATE_SCALES if scales is None else np.asarray(scales, float)):
-        k = (m_per_px * step_px / 1000.0) / cell_km
+        s = m_per_px * step_px / 1000.0                    # пиксель уменьшенной картинки, км
+        k = s / cell_km                                    # ячеек сетки поиска на пиксель
         h2, w2 = int(hp * k), int(wp * k)
         if h2 < 8 or w2 < 8 or h2 > ny or w2 > nx:
             continue
@@ -157,7 +158,6 @@ def locate_candidates(dark, step_px, built_km, area_km, scales=None,
         pad = np.zeros((ny, nx), np.float32)
         pad[:h2, :w2] = small
         dy, dx, sharp = _phase_corr(ref, pad)
-        s = m_per_px * step_px / 1000.0
         A = np.array([[s, 0.0, dx * cell_km], [0.0, -s, H_km - dy * cell_km]], float)
         out.append((A, float(m_per_px), float(sharp)))
     out.sort(key=lambda t: -t[2])
@@ -233,13 +233,16 @@ def dark_mask(rgb, threshold=110):
             & (a[:, :, 2] < threshold)).astype(np.float32)
 
 
-def _km_to_px(A_inv, kx, ky):
-    return (A_inv[0, 0] * kx + A_inv[0, 1] * ky + A_inv[0, 2],
-            A_inv[1, 0] * kx + A_inv[1, 1] * ky + A_inv[1, 2])
+def _apply(A, x, y):
+    """Точки через матрицу 2×3 — одна формула на модуль (пиксель → км и обратно, невязки).
+    Вход: A (2, 3), x, y — числа или массивы. Отдаёт: (x', y')."""
+    return (A[0, 0] * x + A[0, 1] * y + A[0, 2],
+            A[1, 0] * x + A[1, 1] * y + A[1, 2])
 
 
-def _search_one(dark, step, A_inv, cx, cy, tpl_x, tpl_y, rad_px, stride):
-    """Лучший сдвиг шаблона в окне ±rad_px. -> (dx, dy, доля чёрного, резкость)."""
+def _search_one(dark, cx, cy, tpl_x, tpl_y, rad_px, stride):
+    """Лучший сдвиг шаблона в окне ±rad_px. Вход: маска чёрного, центр (cx, cy) и шаблон (tpl_x, tpl_y) —
+    пиксели уменьшенной картинки, шаг перебора. Отдаёт: (dx, dy, доля чёрного, резкость) или None."""
     h, w = dark.shape
     ix, iy = int(round(cx)), int(round(cy))
     scores, offs = [], []
@@ -281,17 +284,17 @@ def find_pairs(dark, step_px, A, places_km, built_km, search_km=SEARCH1_KM,
     out = []
     P = np.asarray(built_km, float)
     for kx, ky in np.asarray(places_km, float)[:, :2]:
-        cx, cy = _km_to_px(A_inv, kx, ky)
+        cx, cy = _apply(A_inv, kx, ky)                # пункт на уменьшенной картинке, пиксели
         if not (20 <= cx <= w - 20 and 20 <= cy <= h - 20):
             continue
         m = ((np.abs(P[:, 0] - kx) < TEMPLATE_R_KM)
              & (np.abs(P[:, 1] - ky) < TEMPLATE_R_KM))
         if int(m.sum()) < MIN_TEMPLATE_PTS:
             continue
-        tx, ty = _km_to_px(A_inv, P[m, 0], P[m, 1])
+        tx, ty = _apply(A_inv, P[m, 0], P[m, 1])      # застройка вокруг пункта на картинке, пиксели
         tpl_x = np.round(tx - cx).astype(int)
         tpl_y = np.round(ty - cy).astype(int)
-        got = _search_one(dark, step_px, A_inv, cx, cy, tpl_x, tpl_y, rad, stride)
+        got = _search_one(dark, cx, cy, tpl_x, tpl_y, rad, stride)   # лучший сдвиг шаблона или None
         if got is None:
             continue
         ddx, ddy, frac, sharp = got
@@ -328,10 +331,8 @@ def solve_affine(pairs, tol_km=RANSAC_TOL_KM, iters=RANSAC_ITERS, seed=7):
             best_inl = inl
     if best_inl is None or best_inl.sum() < 3:
         best_inl = np.ones(n, bool)
-    ax, *_ = np.linalg.lstsq(M[best_inl], kx[best_inl], rcond=None)
-    ay, *_ = np.linalg.lstsq(M[best_inl], ky[best_inl], rcond=None)
-    A = np.array([ax, ay], float)
-    e = np.hypot(M @ ax - kx, M @ ay - ky)
+    A = solve_model(P[best_inl], MODEL_AFFINE)     # МНК по согласным — та же аффинная, что в `solve_model`
+    e = np.hypot(M @ A[0] - kx, M @ A[1] - ky)
     return A, best_inl, e
 
 
@@ -384,9 +385,7 @@ def cross_val_m(P, model):
     for i in range(n):
         m = np.ones(n, bool)
         m[i] = False
-        A = solve_model(P[m], model)
-        gx = A[0, 0] * P[i, 0] + A[0, 1] * P[i, 1] + A[0, 2]
-        gy = A[1, 0] * P[i, 0] + A[1, 1] * P[i, 1] + A[1, 2]
+        gx, gy = _apply(solve_model(P[m], model), P[i, 0], P[i, 1])   # куда модель без точки кладёт её, км
         errs.append(np.hypot(gx - P[i, 2], gy - P[i, 3]))
     return float(np.median(errs) * 1000.0), float(np.max(errs) * 1000.0)
 
@@ -456,6 +455,8 @@ def fit(dark, step_px, A0, places_km, built_km, passes=2):
     Бросает `ValueError`, если зацепиться не за что."""
     A = np.asarray(A0, float).copy()
     report = {}
+    w_px = dark.shape[1] * step_px                  # ширина картинки-оригинала, пиксели
+    h_px = dark.shape[0] * step_px                  # высота, пиксели
     for i in range(max(1, passes)):
         wide = (i == 0)
         pairs = find_pairs(dark, step_px, A, places_km, built_km,
@@ -469,14 +470,12 @@ def fit(dark, step_px, A0, places_km, built_km, passes=2):
         A, inl, e = solve_affine(pairs)
         kept = [pairs[j] for j in range(len(pairs)) if inl[j]]
         P = np.asarray([p[:4] for p in kept], float)
-        w_px = dark.shape[1] * step_px
-        h_px = dark.shape[0] * step_px
-        cover = (float(np.ptp(P[:, 0]) / max(1.0, w_px)),
+        cover = (float(np.ptp(P[:, 0]) / max(1.0, w_px)),   # охват картинки точками по осям, доли
                  float(np.ptp(P[:, 1]) / max(1.0, h_px)))
         model, cv = choose_model(P, cover)
         A = solve_model(P, model)
-        e = np.hypot(A[0, 0] * P[:, 0] + A[0, 1] * P[:, 1] + A[0, 2] - P[:, 2],
-                     A[1, 0] * P[:, 0] + A[1, 1] * P[:, 1] + A[1, 2] - P[:, 3])
+        gx, gy = _apply(A, P[:, 0], P[:, 1])        # согласные пары по выбранной модели, км
+        e = np.hypot(gx - P[:, 2], gy - P[:, 3])
         # ⚠️ ОХВАТ ОПОРНЫХ ТОЧЕК. Невязка меряется ТАМ, ГДЕ ТОЧКИ ЕСТЬ, и о пустой
         # половине карты ничего не говорит: за краем облака привязка ЭКСТРАПОЛИРУЕТ, и
         # там ошибка растёт. Поэтому охват возвращается наружу — человеку надо знать,

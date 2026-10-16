@@ -40,6 +40,7 @@ from collections import deque     # окно истории курса (огра
 from itertools import accumulate  # рулетка развилки: нарастающие границы секторов
 import numpy as np
 
+from model.threat.approach_time import route_length_km   # длина ломаной — одна функция на модель
 from config import (THREAT_LOOKAHEAD_KM, THREAT_LOOKAHEAD_POWER, THREAT_COST_POWER,
                     THREAT_COST_RELIEF, THREAT_COST_MIX_BIAS, THREAT_COST_MIX_STEPS,
                     THREAT_WEIGHT_GAIN, THREAT_SECTOR_ENTRY_COOLDOWN,
@@ -71,7 +72,7 @@ def _pad_flat(a, fill):
 def _dijkstra_dist(passable, start, h):
     """Поле ГЕОМЕТРИЧЕСКИХ расстояний от start по проходимым ячейкам (8-связно, шаг h или h·√2).
     Вход: маска проходимости (ny, nx), ячейка (iy, ix), шаг сетки км. Отдаёт: (ny, nx) км, inf — недостижима."""
-    ny, nx = passable.shape                            # размер сетки, ячеек
+    ny = passable.shape[0]                             # строк сетки
     # ⚠️ СПИСКИ PYTHON, А НЕ МАССИВ: чтение ячейки numpy в цикле кучи в разы дороже чтения списка,
     # а сложения те же и в том же порядке — поле совпадает до бита. Рамка снимает проверку краёв.
     ok, w = _pad_flat(np.asarray(passable), False)     # проходимость с рамкой, ширина строки
@@ -127,12 +128,21 @@ def _cost_mul(grid, wnorm, power, relief_power=0.0):
     return mul
 
 
+def weight_norm(grid):
+    """Вес карты, приведённый к 0…1 по 90-му процентилю положительных — одна шкала для выборки маршрутов
+    и отбора «возможных» (`ThreatModel._spread_over_area`). Вход: сетка. Отдаёт: (ny, nx)."""
+    w = np.clip(grid.weight, 0.0, None)                # отрицательный вес — ноль
+    pos = w[w > 0]                                     # положительные веса
+    ref = float(np.percentile(pos, 90)) if pos.size else 1.0   # «тяжёлый» вес, 1 на шкале
+    return np.clip(w / max(ref, 1e-6), 0.0, 1.0)
+
+
 def _dijkstra_cost(passable, start, h, mul):
     """Поле СТОИМОСТИ пути от start (км-эквиваленты) по проходимым ячейкам; `mul = None` — обычные км.
     Вход: маска проходимости, ячейка (iy, ix), шаг км, множитель цены (ny, nx). Отдаёт: (ny, nx), inf — недостижима."""
     if mul is None:                                    # множителя нет → чистая геометрия
         return _dijkstra_dist(passable, start, h)
-    ny, nx = passable.shape                            # размер сетки, ячеек
+    ny = passable.shape[0]                             # строк сетки
     # Цена шага — длина × среднее `mul` двух ячеек: из A в B столько же, сколько из B в A.
     # Списки и рамка — как в `_dijkstra_dist`: поле до бита то же, счёт в разы быстрее.
     ok, w = _pad_flat(np.asarray(passable), False)     # проходимость с рамкой, ширина строки
@@ -451,10 +461,14 @@ def _rdp(points, eps):
     return pts[keep]
 
 
-def _poly_len_km(poly):
-    """Длина ломаной (км) — сумма длин звеньев. Нужна для проверки «уложились в запас хода»."""
-    d = np.diff(np.asarray(poly, float), axis=0)
-    return float(np.hypot(d[:, 0], d[:, 1]).sum())
+def _cell_center(grid, cell):
+    """Центр ячейки. Вход: сетка, ячейка (iy, ix). Отдаёт: (x, y), км."""
+    return grid.ox + (cell[1] + 0.5) * grid.h, grid.oy + (cell[0] + 0.5) * grid.h
+
+
+def _axis_s(xy, A, B, ab):
+    """Место точки на оси A→B: 0 у A, ab у B, минус — позади A. Вход: точка, A, B (2,) км, |AB| км. Отдаёт: км."""
+    return float((np.array(xy) - A) @ (B - A)) / ab
 
 
 def _cells_yx_to_km(grid, cells_yx):
@@ -701,9 +715,9 @@ def _trail_push(trail, grid, vy, vx, k):
     trail["n"] += 1
 
 
-def _back_sector_bad(trail, grid, cy, cx):
+def _back_sector_bad(trail, cy, cx):
     """Какие из 8 соседей ячейки попадают в запретный сектор позади пройденных точек.
-    Вход: трасса, сетка, ячейка (iy, ix). Отдаёт: список из 8 bool либо None (запрета нет)."""
+    Вход: трасса, ячейка (iy, ix). Отдаёт: список из 8 bool либо None (запрета нет)."""
     if trail["n"] == 0 or BACK_SECTOR_KM <= 0.0:       # трассы нет или правило выключено
         return None                                    # — запрещать нечего
     # ⚠️ МАСКА, А НЕ ПЕРЕБОР ТОЧЕК. Первая версия на каждом шаге сравнивала соседей со всеми
@@ -864,7 +878,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
         # ЗАПРЕТНЫЙ СЕКТОР ПОЗАДИ ТРАССЫ (BACK_SECTOR_KM): считается один раз на шаг для
         # всех восьми соседей. Снимается ПОСЛЕДНИМ — после окна разворота: окно лишь
         # предпочтение, а сектор — то, ради чего возвраты и убираются.
-        back_bad = _back_sector_bad(trail, grid, cy, cx) if trail is not None else None
+        back_bad = _back_sector_bad(trail, cy, cx) if trail is not None else None
         # порядок послаблений: (порог поворота, окно разворота, держать прямо, запретный сектор);
         # пороги поворота посчитаны до цикла шагов — `cos_max`, `cos_hard`
         limits = [(cos_max, True, hold_straight, True), (cos_max, True, False, True),
@@ -966,8 +980,7 @@ def _walk_field(ctx, dfield, start, goal, budget, turn_interval_km, rng,
 
 def _nearest_passable_cell(pas, grid, y_km, x_km, max_km=12.0):
     """Ближайшая проходимая ячейка к точке (км). None, если ничего в радиусе max_km."""
-    iy = min(max(int(np.floor((y_km - grid.oy) / grid.h)), 0), grid.ny - 1)
-    ix = min(max(int(np.floor((x_km - grid.ox) / grid.h)), 0), grid.nx - 1)
+    iy, ix = _cell_of(grid, (x_km, y_km))             # ячейка точки, обрезанная по краю
     if pas[iy, ix]:
         return (iy, ix)
     ys, xs = np.nonzero(pas)
@@ -1025,10 +1038,7 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
     pas = _open_endpoints(passable_mask(grid, max_gap_km, slack_km),
                           tuple(starts) + (goal,), grid)
     ahead = _lookahead_fields(grid, THREAT_LOOKAHEAD_KM)   # что ждёт впереди по курсу
-    w = np.clip(grid.weight, 0.0, None)                 # нормировка веса по p90 (как в стоимости)
-    pos = w[w > 0]
-    ref = float(np.percentile(pos, 90)) if pos.size else 1.0
-    wnorm = np.clip(w / max(ref, 1e-6), 0.0, 1.0)
+    wnorm = weight_norm(grid)                           # вес 0…1 по p90 (как в стоимости)
     # ДВА ПОЛЯ РАССТОЯНИЙ ДО ЦЕЛИ, потому что вопросов два:
     #   gt_geo — честные километры: «хватит ли запаса хода» (физику подменять нельзя);
     #   gt     — стоимость в км-эквивалентах: «куда выгоднее идти» (по ней идёт спуск).
@@ -1100,13 +1110,12 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                                                 grid.ox + (cx + 0.5) * grid.h, max_km=18.0)
                     if vc is None or vc in via_cell or vc == goal or vc == start:
                         continue
-                    vxk = grid.ox + (vc[1] + 0.5) * grid.h
-                    vyk = grid.oy + (vc[0] + 0.5) * grid.h
+                    vxk, vyk = _cell_center(grid, vc)    # центр ячейки VIA, км
                     # VIA не должна лежать ПОЗАДИ старта или ЗА целью: маршрут через
                     # такую точку сперва уходит в сторону, обратную цели, либо пролетает
                     # мимо цели и возвращается — на карте это выглядит как «полетел не
                     # туда». Небольшой заступ допустим (обход препятствия у самой точки).
-                    s_axis = float((np.array([vxk, vyk]) - A) @ (B - A)) / ab
+                    s_axis = _axis_s([vxk, vyk], A, B, ab)   # место VIA на оси вход→цель, км
                     if s_axis < -VIA_BEHIND_KM or s_axis > ab + VIA_BEYOND_KM:
                         continue
                     # VIA рядом с целью, но НЕ за ней, заставляет маршрут отвернуть у
@@ -1131,9 +1140,8 @@ def build_iter_context(grid, entry_km, target_km, max_gap_km, n_grid=(4, 5),
                         if vc2 is None or vc2 in via_cell or vc2 == goal or vc2 == start:
                             continue
                         vc = vc2
-                        vxk = grid.ox + (vc[1] + 0.5) * grid.h
-                        vyk = grid.oy + (vc[0] + 0.5) * grid.h
-                        s_axis = float((np.array([vxk, vyk]) - A) @ (B - A)) / ab
+                        vxk, vyk = _cell_center(grid, vc)
+                        s_axis = _axis_s([vxk, vyk], A, B, ab)
                     # два поля ОТ этой via: геометрия — для бюджета, стоимость — для спуска.
                     # Для точки ЗА ЦЕЛЬЮ — по маске транзита (обход объекта), для остальных
                     # по обычной: им закрывать коридоры у цели незачем.
@@ -1222,8 +1230,7 @@ def _orbit_pool(grid, pmask, gt_geo, mul, B, D):
             or not any(p[1] + p[2] > 0 for p in mix.values())):   # облёт выключен
         return {}                                      # — поясов не строим
     r_min = FINAL_BYPASS_KM + 2.0 * grid.h             # ближе к цели точку не ставим, км
-    x0, y0 = grid.ox, grid.oy
-    x1, y1 = grid.ox + grid.nx * grid.h, grid.oy + grid.ny * grid.h   # рамка сетки, км
+    x0, x1, y0, y1 = grid.extent_km()                 # рамка сетки, км
     # ⚠️ ПОЯСА ОТ РАЗМЕРА РАЙОНА (заказчик 21.09.2026): раньше граница считалась как доля от
     # D — среднего расстояния вход→цель, — и у цели близко к краю D мало, пояса схлопывались,
     # обход переставал охватывать карту. Ширина и высота района от места цели не зависят.
@@ -1256,9 +1263,8 @@ def _orbit_pool(grid, pmask, gt_geo, mul, B, D):
                                             max_km=0.5 * (r_out - r_in) / rows + grid.h)
                 if vc is None or not np.isfinite(gt_geo[vc]):   # проходимого рядом нет
                     continue
-                vx_k = grid.ox + (vc[1] + 0.5) * grid.h
-                vy_k = grid.oy + (vc[0] + 0.5) * grid.h
-                rr = float(np.hypot(vx_k - B[0], vy_k - B[1]))
+                vx_k, vy_k = _cell_center(grid, vc)    # центр ячейки точки облёта, км
+                rr = float(np.hypot(vx_k - B[0], vy_k - B[1]))   # удаление точки от цели, км
                 if not (r_in - grid.h <= rr <= r_out + grid.h):   # примагнитилась мимо пояса
                     continue
                 # ⚠️ ПОЛЯ ЛЕНИВО (`_ring_fields`): точек около сотни, а нужны единицы.
@@ -1428,19 +1434,24 @@ def _pick_via(ctx, spread, rng, L_max):
     return int(pool[rng.integers(len(pool))])
 
 
+def route_cells(grid, poly):
+    """Ячейки под точками линии; точка за краем — в крайнюю ячейку. Вход: сетка, точки (M, ≥2) км.
+    Отдаёт: (строки, столбцы) — int64 (M,). Одна запись на проверки линии, отбор и частоту пролёта."""
+    ix = np.clip(((poly[:, 0] - grid.ox) / grid.h).astype(np.int64), 0, grid.nx - 1)   # столбцы
+    iy = np.clip(((poly[:, 1] - grid.oy) / grid.h).astype(np.int64), 0, grid.ny - 1)   # строки
+    return iy, ix
+
+
 def _off_corridor(poly, grid, pas):
     """Сколько точек линии вышло за ПРОХОДИМУЮ зону (город / провал шире разрыва)."""
-    ix = np.clip(((poly[:, 0] - grid.ox) / grid.h).astype(np.int64), 0, grid.nx - 1)
-    iy = np.clip(((poly[:, 1] - grid.oy) / grid.h).astype(np.int64), 0, grid.ny - 1)
+    iy, ix = route_cells(grid, poly)                   # ячейки под линией
     return int((~pas[iy, ix]).sum())
 
 
 def _mean_weight(poly, grid):
     """Средний вес карты под линией — по ячейкам, через которые она проходит."""
-    w = grid.weight
-    ix = np.clip(((poly[:, 0] - grid.ox) / grid.h).astype(np.int64), 0, grid.nx - 1)
-    iy = np.clip(((poly[:, 1] - grid.oy) / grid.h).astype(np.int64), 0, grid.ny - 1)
-    return float(np.clip(w[iy, ix], 0.0, None).mean())
+    iy, ix = route_cells(grid, poly)                   # ячейки под линией
+    return float(np.clip(grid.weight[iy, ix], 0.0, None).mean())
 
 
 def _round_corners(poly, raw, rounds, max_shift):
@@ -1662,7 +1673,7 @@ def sample_one_route(ctx, mode, L_max, turn_interval_km, rng, spread="mix", spen
     poly = _smooth_safe(_cells_yx_to_km(grid, cells), grid, ctx["pas"], eps)
     # Запас хода — строго: длина маршрута не может его превышать (сглаживание маршрут
     # только СПРЯМЛЯЕТ, т.е. укорачивает, поэтому прежний допуск ×1.15 был лишним).
-    if _poly_len_km(poly) > L_max:                      # не уложился в запас
+    if route_length_km(poly) > L_max:                   # не уложился в запас
         return None
     st["last_belt"] = -1 if behav == "direct" else belt  # пояс этого маршрута — для замера
     st["last_behav"] = behav                            # повадка этого маршрута — для замера

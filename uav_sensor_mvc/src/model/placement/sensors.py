@@ -67,10 +67,6 @@ class SensorSpec:
         """Название типа: из паспорта; номера нет в справочнике — «Тип N». Отдаёт: строку."""
         return self.passport.name if self.passport is not None else "Тип %d" % self.type_id
 
-    @property
-    def label(self):
-        return "%s · %s" % (self.name, KIND_LABEL.get(self.kind, self.kind))
-
 
 @dataclass
 class ManualSensor:
@@ -167,11 +163,10 @@ def min_small_radius(p):
     free = [s for s in act if s.passport is None or s.passport.zone == "везде"]   # типы «везде»
     # ⚠️ одни ограниченные — общей сеткой не пользуется никто, шаг как без малых: иначе ПВН 0.5 км мельчил её
     # вчетверо, когда МОГ стал «дорогой» (план 13.3)
-    act = free
-    if act:                                          # есть типы «везде» — шаг по самому мелкому
+    if free:                                         # есть типы «везде» — шаг по самому мелкому
         # ⚠️ по минимальному, а не по первому: шаг крупнее обзора оставляет между кандидатами дыру. Замер (R 2 км,
         # 5 датчиков, 150 маршрутов): шаг 0.5 км — засечка 96.7 %, 3 км — 82.7 %, 6 км — 17.3 %
-        return min(float(s.r_km) for s in act)
+        return min(float(s.r_km) for s in free)
     return float(_num(p, "threat_R", 2.0) or 2.0)    # общей сеткой не ставится никто
 
 

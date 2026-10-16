@@ -204,13 +204,12 @@ def cell_buildings(grid, pts):
     top_floors = np.full((ny, nx), np.nan)           # её этажей (оценка)
     top_known = np.zeros((ny, nx), bool)             # этажность указана в данных
     mean_floors = np.full((ny, nx), np.nan)          # средняя этажность построек ячейки (оценка, Д2)
+    from model.threat.threat_grid import _cell_index
     pts = np.asarray(pts, float).reshape(-1, 5)      # постройки: x, y, этажей, класс, м²
     if not len(pts):                                 # построек нет
         return dict(count=count, top_xy=top_xy, top_floors=top_floors, top_known=top_known,
                     mean_floors=mean_floors)
-    ix = np.floor((pts[:, 0] - grid.ox) / grid.h).astype(np.int64)   # столбец ячейки
-    iy = np.floor((pts[:, 1] - grid.oy) / grid.h).astype(np.int64)   # строка ячейки
-    ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)   # постройка внутри сетки
+    ix, iy, ok = _cell_index(grid, pts)              # ячейки построек; внутри ли сетки
     pts, ix, iy = pts[ok], ix[ok], iy[ok]
     np.add.at(count, (iy, ix), 1)
     flat = iy * nx + ix                              # номер ячейки
@@ -270,7 +269,7 @@ def allowed_mask(grid, zc, st, passable, r_km=0.0, targets=None):
 def allowed_parts(grid, zc, st, passable, r_km=0.0, targets=None):
     """Слагаемые карты места (план 13.1, Д3) — для показа по отдельности; `result` — сама карта. Вход: как у
     `allowed_mask`. Отдаёт: dict (ny,nx) bool — settled, buildings, strip, forest, wetland, rough, nopass, result."""
-    from model.threat.threat_grid import _dilate
+    from model.threat.threat_grid import _dilate, layer_cells
     if st is not None and st.zone == "дорога":       # МОГ — доезд по дорогам от целей (план 13.3)
         from model.placement.road_access import access_parts
         return access_parts(grid, zc, st, passable, r_km, targets or [])
@@ -280,10 +279,7 @@ def allowed_parts(grid, zc, st, passable, r_km=0.0, targets=None):
     ns = max(0, int(round(float(st.strip_km) / grid.h)))      # полоса в лесу у дорог и построек, ячеек
     settled = settled_mask(grid)                     # застройка — с пунктами в свободных зонах
     bcell = zc["count"] > 0                          # ячейки с постройками
-    roads = np.zeros_like(bcell)                     # ячейки с дорогами и ЖД
-    for name in ROAD_LAYERS:                         # дороги и ЖД — все виды
-        if name in grid._present:                    # слой есть на карте
-            roads |= grid._present[name]
+    roads = layer_cells(grid, ROAD_LAYERS)            # ячейки с дорогами и ЖД
     # ⚠️ полоса — только у ПОСТРОЕК, а не у всей застройки: так снят замер §0.4в (карта N2, 473 км²)
     near = _dilate(bcell, nb)                        # постройки ± полоса
     built = settled | near                           # застройка ∪ постройки ± полоса
@@ -304,24 +300,28 @@ def allowed_parts(grid, zc, st, passable, r_km=0.0, targets=None):
 def cells_of(grid, pts, mask):
     """Какие точки лежат в разрешённых ячейках. Вход: ThreatGrid, точки (M,2) км, маска (ny,nx).
     Отдаёт: (M,) bool; точка вне сетки — False."""
+    from model.threat.threat_grid import _cell_index
     pts = np.asarray(pts, float).reshape(-1, 2)      # точки, км
-    ix = np.floor((pts[:, 0] - grid.ox) / grid.h).astype(np.int64)   # столбец ячейки
-    iy = np.floor((pts[:, 1] - grid.oy) / grid.h).astype(np.int64)   # строка ячейки
-    ok = (ix >= 0) & (ix < grid.nx) & (iy >= 0) & (iy < grid.ny)     # внутри сетки
+    ix, iy, ok = _cell_index(grid, pts)              # ячейки точек; внутри ли сетки
     out = np.zeros(len(pts), bool)                   # разрешена ли точка
     out[ok] = np.asarray(mask, bool)[iy[ok], ix[ok]]
     return out
+
+
+def node_grid(box, step_km):
+    """Узлы сетки кандидатов шагом `step_km` по рамке, первый — на полшага от края. Вход: рамка
+    (x0, x1, y0, y1) км, шаг км. Отдаёт: (M,2) км, строка за строкой — общая сетка и своя сетка типа."""
+    x0, x1, y0, y1 = box                             # рамка, км
+    gx, gy = np.meshgrid(np.arange(x0 + 0.5 * step_km, x1, step_km),   # узлы сеткой, км
+                         np.arange(y0 + 0.5 * step_km, y1, step_km))
+    return np.column_stack([gx.ravel(), gy.ravel()])
 
 
 def type_nodes(grid, step_km, mask, zc):
     """Своя сетка типа (план 13, 13.5): узлы шагом `step_km` в разрешённых ячейках без построек, а в
     ячейке с постройками — одна точка, самая высокая постройка. Вход: ThreatGrid, шаг км, маска
     (ny,nx), сводка `cells`. Отдаёт: (точки (M,2) км, крыша ли (M,) bool) — сперва крыши, затем узлы."""
-    x0, x1, y0, y1 = grid.extent_km()                # охват сетки, км
-    xs = np.arange(x0 + 0.5 * step_km, x1, step_km)   # столбцы узлов, км
-    ys = np.arange(y0 + 0.5 * step_km, y1, step_km)   # строки узлов, км
-    gx, gy = np.meshgrid(xs, ys)                     # узлы сеткой, км
-    nodes = np.column_stack([gx.ravel(), gy.ravel()])  # все узлы района
+    nodes = node_grid(grid.extent_km(), step_km)     # все узлы района по охвату сетки, км
     mask = np.asarray(mask, bool)                    # карта места типа по ячейкам
     built = mask & (zc["count"] > 0)                 # разрешённые ячейки с постройками
     # ⚠️ в ячейке с постройками узлы не нужны: ПВН встаёт на крышу, а не рядом (В13.15); замер
@@ -341,8 +341,9 @@ def bonus_vector(grid, zc, pts, st):
     pts = np.asarray(pts, float).reshape(-1, 2)      # места, км
     if (bh <= 0 and bc <= 0) or not len(pts):        # бонусов нет — выбор прежний до бита
         return None
-    ix = np.clip(np.floor((pts[:, 0] - grid.ox) / grid.h).astype(np.int64), 0, grid.nx - 1)   # ячейки
-    iy = np.clip(np.floor((pts[:, 1] - grid.oy) / grid.h).astype(np.int64), 0, grid.ny - 1)   # и строки
+    from model.threat.threat_grid import _cell_index
+    ix, iy, _ok = _cell_index(grid, pts)             # ячейки мест
+    ix, iy = np.clip(ix, 0, grid.nx - 1), np.clip(iy, 0, grid.ny - 1)   # место у края — в крайнюю ячейку
     roof = np.hypot(*(zc["top_xy"][iy, ix] - pts).T) < 1e-9   # точка — крыша самой высокой постройки
     floors = np.where(roof, np.nan_to_num(zc["top_floors"][iy, ix], nan=1.0), 1.0)   # этажей под точкой
     rank_h = np.clip((floors - 1.0) / 4.0, 0.0, 1.0)   # 1 этаж — 0, 5 и выше — 1

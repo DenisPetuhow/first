@@ -136,14 +136,7 @@ def match_by_type(old_xy, old_types, new_xy, new_types):
     for t in types:
         oi = np.where(old_types == t)[0]
         ni = np.where(new_types == t)[0]
-        if len(oi) == 0 or len(ni) == 0:
-            for i in oi:
-                out.append(dict(type_id=t, old_idx=int(i), new_idx=None,
-                                old_xy=tuple(old_xy[i]), new_xy=None, dist_km=None))
-            for j in ni:
-                out.append(dict(type_id=t, old_idx=None, new_idx=int(j),
-                                old_xy=None, new_xy=tuple(new_xy[j]), dist_km=None))
-            continue
+        # одна из сторон пуста — `hungarian` отдаст пустую пару, и все датчики уйдут в «без пары» ниже
         op, npnts = old_xy[oi], new_xy[ni]
         cost = np.hypot(op[:, 0][:, None] - npnts[:, 0][None, :],
                         op[:, 1][:, None] - npnts[:, 1][None, :])

@@ -19,7 +19,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from config import THEME
 from model.placement import sensor_types as catalog
-from model.placement.sensors import BIG_TYPE, TYPE_IDS, sensor_types, type_ids
+from model.placement.sensors import _FIELDS, BIG_TYPE, TYPE_IDS, sensor_types, type_ids
 from view_qt.common import ui_state
 from view_qt.windows.input_window import (DIR_LOAD, DIR_SAVE, STATE_FILE, SensorRowDialog, default_file_name,
                            mode_word, read_sensors_file, sensors_dir, write_sensors_file)
@@ -39,10 +39,7 @@ class SensorsWindow(QtWidgets.QDialog):
     НЕ блокирует основное окно — карту можно двигать, не закрывая."""
 
     INT_FIELDS = {"threat_N", "threat_N2", "threat_N3", "threat_N_big", "threat_k", "threat_k2", "threat_k3"}   # целые поля, шт.
-    TYPE_FIELDS = {1: ("threat_N", "threat_R", "threat_k"),   # поля номера: число, радиус, кратность
-                   2: ("threat_N2", "threat_R2", "threat_k2"),
-                   3: ("threat_N3", "threat_R3", "threat_k3"),
-                   4: ("threat_N_big", "threat_R_big", "threat_k")}
+    TYPE_FIELDS = _FIELDS   # поля номера 1–4: число, радиус, кратность — те же, по которым собирает модель
     TYPE_COLUMNS = ("№", "тип", "цвет", "N, шт.", "R, км", "k")   # мини-таблица типов
     COLUMNS = ("№", "тип", "режим", "долгота", "широта")          # таблица датчиков
 

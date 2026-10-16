@@ -67,15 +67,6 @@ def default_file_name(when=None):
     return time.strftime("%Y_%m_%d_%H_%M_routes.txt", when or time.localtime())
 
 
-def _route_length_km(route_km):
-    """Длина маршрута в километрах — считается по КИЛОМЕТРОВОМУ представлению (точнее и
-    дешевле, чем пересчитывать обратно из градусов)."""
-    a = np.asarray(route_km, float).reshape(-1, 2)
-    if len(a) < 2:
-        return 0.0
-    return float(np.sum(np.hypot(np.diff(a[:, 0]), np.diff(a[:, 1]))))
-
-
 def save_flights(path, model):
     """Записать НАКОПЛЕННЫЕ итерационные маршруты (`model.iter_routes`) в текстовый файл.
 
@@ -84,6 +75,8 @@ def save_flights(path, model):
     ОДНОЙ СТРОКОЙ, через " | " (заказчик 06.09.2026: построчно на точку выходило слишком
     длинно). UTF-8 БЕЗ BOM (правило 5, МЕТОДИЧКА_ВВОД_ВЫВОД §2). Возвращает
     `(маршрутов, точек всего)`."""
+    # длина — по КИЛОМЕТРОВОМУ представлению: точнее и дешевле, чем обратно из градусов
+    from model.threat.approach_time import route_length_km
     routes_km = list(model.iter_routes)
     routes_deg = model.routes_lonlat()
     n_points = sum(len(r) for r in routes_deg)
@@ -92,7 +85,7 @@ def save_flights(path, model):
              "# маршрутов: %d   точек всего: %d" % (len(routes_deg), n_points),
              "#"]
     for i, (r_km, r_deg) in enumerate(zip(routes_km, routes_deg), 1):
-        lines.append("# R %d  длина %.1f км" % (i, _route_length_km(r_km)))
+        lines.append("# R %d  длина %.1f км" % (i, route_length_km(r_km)))
         lines.append(" | ".join(
             "%d - %.6f %.6f" % (j, float(lon), float(lat))
             for j, (lon, lat) in enumerate(r_deg, 1)))

@@ -69,6 +69,7 @@ from config import (THREAT_BBOX_LONLAT, THREAT_WORK_LONLAT, THREAT_CELL_M, THREA
                     THREAT_COMPASS_STEP_DEG, THREAT_COMPASS_APPROACH_KM,
                     THREAT_SECTOR_AUTO_STEP_DEG, THREAT_TARGETS_MAX)
 from model.placement.targets import TargetSet, TargetBag, route_target_index   # объекты защиты (план 13)
+from model.placement.sensor_load import seen_matrix   # какие датчики видят какой маршрут — одна формула
 # кольцо и угловой разнос БОЛЬШИХ датчиков — поля Params (правятся в окне «Датчики»),
 # поэтому берутся оттуда; здесь только умолчания на случай старого Params
 from config import Params as _P
@@ -77,21 +78,14 @@ THREAT_BIG_RING_HI = getattr(_P, "threat_big_ring_hi", 1.0)
 THREAT_BIG_ANGLE_TOL = getattr(_P, "threat_big_angle_tol", 0.55)
 
 
-# ----------------------------------------------------------------------
-# Локальная проекция км<->lon/lat (та же формула и якорь, что во src/view_qt/maps/geomap.py,
-# но без импорта view — модель не должна зависеть от слоя отображения). Совпадение
-# формул гарантирует, что векторные слои лягут ровно на тайловую подложку вкладки 3.
-# ----------------------------------------------------------------------
-_KM_PER_DEG_LAT = 110.574
-
-
 # ПЕРЕВОД ГРАДУСОВ В КИЛОМЕТРЫ ЖИВЁТ В `src/model/threat/geo_frame.py` — одна формула на весь
 # проект (план 8, задача 8.3). Раньше он был здесь и, ОТДЕЛЬНОЙ КОПИЕЙ, в
 # `src/view_qt/maps/geomap.py`: формулы совпадали, но правка одной не доходила до другой, а
 # расхождение проявилось бы не ошибкой, а тихим сдвигом карты относительно данных.
 # Имена ниже оставлены прежними — на них ссылается весь остальной код и документация.
 from model.threat.geo_frame import (km_per_deg_lon as _km_per_deg_lon,   # noqa: E402
-                        lonlat_to_km, bbox_lonlat_to_km)
+                                    KM_PER_DEG_LAT as _KM_PER_DEG_LAT,
+                                    lonlat_to_km, km_to_lonlat, bbox_lonlat_to_km)
 
 
 def bbox_anchor_lonlat():
@@ -110,7 +104,7 @@ def bbox_anchor_lonlat():
     ⚠️ ПРИ СМЕНЕ ЯКОРЯ КЭШ СЛОЁВ `.npz` НУЖНО ПЕРЕСОБРАТЬ: в нём лежат уже пересчитанные
     километры, и слои, собранные при другом якоре, окажутся сдвинуты на пол-участка
     (`python tools/build_threat_grid.py`)."""
-    lo, la, ho, ha = THREAT_BBOX_LONLAT
+    lo, la = THREAT_BBOX_LONLAT[:2]             # юго-западный угол рамки, градусы
     return (lo, la)
 
 
@@ -378,7 +372,7 @@ class ThreatGrid:
             return free
         gx, gy = self.cell_centers_km()
         occupied = city | village
-        lab, nlab = _label8(occupied) if occupied.any() else (None, 0)
+        lab = _label8(occupied)[0] if occupied.any() else None   # номера пунктов; None — пунктов нет
         for pt in free_points:
             x, y, rad = float(pt[0]), float(pt[1]), float(max(0.0, pt[2]))
             expand = pt[3] if len(pt) > 3 else None
@@ -514,7 +508,7 @@ class ThreatGrid:
             self.layers["built_up"] = np.zeros_like(self.weight)
         if zero_weight:
             self.weight[city_zone] = 0.0
-            for name, arr in self.layers.items():
+            for arr in self.layers.values():           # вклад каждого слоя — тоже обнулить в городе
                 if isinstance(arr, np.ndarray) and arr.shape == self.weight.shape:
                     arr[city_zone] = 0.0
             self._attr_count[city_zone] = 0
@@ -842,9 +836,7 @@ class ThreatGrid:
         found = np.zeros(nlab + 1, bool)
         P = np.asarray(places_km, float) if places_km is not None else np.empty((0, 3))
         if P.ndim == 2 and len(P) and P.shape[1] >= 3:
-            ix = np.floor((P[:, 0] - self.ox) / self.h).astype(int)
-            iy = np.floor((P[:, 1] - self.oy) / self.h).astype(int)
-            ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
+            ix, iy, ok = _cell_index(self, P)          # ячейки меток; внутри ли сетки
             ix, iy, code = ix[ok], iy[ok], P[ok, 2].astype(np.int8)
             comp = lab[iy, ix]
             # метка вне застройки — отнести к ближайшему пятну в радиусе 2 ячеек
@@ -1005,22 +997,14 @@ class ThreatGrid:
         if m is None:
             self._bridge_mask = np.zeros((self.ny, self.nx), bool)
             return
-        water = np.zeros((self.ny, self.nx), bool)
-        for key in ("river", "stream"):
-            w = self._present.get(key)
-            if w is not None:
-                water |= w
+        water = layer_cells(self, ("river", "stream"))   # ячейки рек и ручьёв
         self._bridge_mask = m & _dilate(water, 1) if water.any() else m.copy()
 
     def bridge_points_km(self, bridge_polys):
         """ТОЧНЫЕ координаты переправ: середина каждой мостовой линии OSM, проходящей
         над водой. Раньше маркер ставился в центр ЯЧЕЙКИ (500 м), и при приближении
         треугольник заметно не совпадал с самим мостом — до 250 м в сторону."""
-        water = np.zeros((self.ny, self.nx), bool)
-        for key in ("river", "stream"):
-            w = self._present.get(key)
-            if w is not None:
-                water |= w
+        water = layer_cells(self, ("river", "stream"))   # ячейки рек и ручьёв
         if not water.any():
             return []
         wet = _dilate(water, 1)
@@ -1029,9 +1013,7 @@ class ThreatGrid:
             P = np.asarray(poly, float)
             if P.ndim != 2 or len(P) < 2:
                 continue
-            ix = np.floor((P[:, 0] - self.ox) / self.h).astype(int)
-            iy = np.floor((P[:, 1] - self.oy) / self.h).astype(int)
-            ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
+            ix, iy, ok = _cell_index(self, P)          # ячейки вершин моста; внутри ли сетки
             if not ok.any() or not wet[iy[ok], ix[ok]].any():
                 continue                       # мост не над водой — это путепровод
             seg = P[ok]
@@ -1162,6 +1144,13 @@ class ThreatGrid:
 # ----------------------------------------------------------------------
 # Вспомогательное: точка в полигоне, связные компоненты, дилатация
 # ----------------------------------------------------------------------
+def _covered_weight(xy, w, sens, rad):
+    """Вес клеток, которые видит хоть один датчик. Вход: центры клеток (M,2) км, их веса (M,), датчики (S,2) км,
+    радиусы (S,) км. Отдаёт: float — сумма весов видимых клеток."""
+    d = np.linalg.norm(xy[:, None, :] - sens[None, :, :], axis=2)   # клетка — датчик, км
+    return float(np.sum(w[(d <= rad[None, :]).any(axis=1)]))
+
+
 def _box_mean(a, r):
     """Среднее по квадратному окну (2r+1)² вокруг каждой ячейки — через интегральное
     изображение, O(ячеек). Нужно для «среднего уровня местности» вокруг ячейки."""
@@ -1204,6 +1193,24 @@ def _points_in_polygon(px, py, poly):
         inside ^= cond & (px < xint)
         j = i
     return inside
+
+
+def _cell_index(grid, pts):
+    """Ячейки точек — одна формула на модель. Вход: сетка (ox, oy, h, nx, ny), точки (M, ≥2) км.
+    Отдаёт: (столбцы, строки, внутри ли сетки) — массивы (M,); номер вне сетки не обрезан."""
+    ix = np.floor((pts[:, 0] - grid.ox) / grid.h).astype(np.int64)   # столбец ячейки
+    iy = np.floor((pts[:, 1] - grid.oy) / grid.h).astype(np.int64)   # строка ячейки
+    return ix, iy, (ix >= 0) & (ix < grid.nx) & (iy >= 0) & (iy < grid.ny)
+
+
+def layer_cells(grid, names):
+    """Ячейки, где проходит линия хоть одного из слоёв. Вход: сетка (ny, nx, `_present`), имена слоёв. Отдаёт: (ny,nx)
+    bool; слоя нет — нет и ячеек. Одна запись на переправы (реки), места МОГ (дороги) и полосу ПВН (дороги и ЖД)."""
+    out = np.zeros((grid.ny, grid.nx), bool)         # есть ли линия в ячейке
+    for name in names:                               # слои по очереди
+        if name in grid._present:                    # слой есть на карте → добавить его ячейки
+            out |= grid._present[name]
+    return out
 
 
 def _ring_cells(grid, P):
@@ -1250,16 +1257,7 @@ def _dilate(mask, r):
     """Дилатация булевой маски на r ячеек (квадратная окрестность, чистый numpy).
     Через паддинг-срез — без заворота краёв (np.roll заворачивает и пометил бы воду
     у противоположной кромки)."""
-    if r <= 0:
-        return mask.copy()
-    ny, nx = mask.shape
-    pad = np.zeros((ny + 2 * r, nx + 2 * r), bool)
-    out = np.zeros((ny, nx), bool)
-    pad[r:r + ny, r:r + nx] = mask
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            out |= pad[r + dy:r + dy + ny, r + dx:r + dx + nx]
-    return out
+    return _morph(mask, r, erode=False)
 
 
 def _erode(mask, r):
@@ -1270,15 +1268,22 @@ def _erode(mask, r):
     За границей массива считаем «занято» (True) — в отличие от `_dilate`, который
     паддится нулями. Иначе замыкание подъедало бы коридоры, прижатые к рамке участка:
     у края не хватило бы соседей, и ячейка ошибочно считалась бы непроходимой."""
+    return _morph(mask, r, erode=True)
+
+
+def _morph(mask, r, erode):
+    """Общий цикл `_dilate` / `_erode`: квадратное окно (2r+1)² сдвигами среза. Вход: маска (ny,nx) bool,
+    r ячеек, erode — сужать (за краем «занято», И) или расширять (за краем пусто, ИЛИ). Отдаёт: (ny,nx) bool."""
     if r <= 0:
         return mask.copy()
     ny, nx = mask.shape
-    pad = np.ones((ny + 2 * r, nx + 2 * r), bool)
-    out = np.ones((ny, nx), bool)
+    pad = np.full((ny + 2 * r, nx + 2 * r), erode, bool)   # маска с полями: за краем — erode
+    out = np.full((ny, nx), erode, bool)                   # итог: для И начинаем с True, для ИЛИ — с False
     pad[r:r + ny, r:r + nx] = mask
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            out &= pad[r + dy:r + dy + ny, r + dx:r + dx + nx]
+    op = np.logical_and if erode else np.logical_or       # сужение — все соседи, расширение — хоть один
+    for dy in range(-r, r + 1):                            # сдвиги окна по строкам
+        for dx in range(-r, r + 1):                        # и по столбцам
+            op(out, pad[r + dy:r + dy + ny, r + dx:r + dx + nx], out=out)
     return out
 
 
@@ -1336,23 +1341,34 @@ def _clip_layers_km(layers, bbox_km, margin_km):
     x0, x1, y0, y1 = bbox_km
     clip = (x0 - margin_km, x1 + margin_km, y0 - margin_km, y1 + margin_km)
     cx0, cx1, cy0, cy1 = clip
-    line_layers = {n for n, d in THREAT_LAYERS.items() if d.get("geom") == "line"}
+
+    def touches(a):
+        """Габарит контура задевает рамку с запасом. Вход: контур (N, ≥2) км. Отдаёт: bool."""
+        return (a[:, 0].max() >= cx0 and a[:, 0].min() <= cx1 and
+                a[:, 1].max() >= cy0 and a[:, 1].min() <= cy1)
+    return _clip_layers(layers, lambda parts: _clip_parts(parts, clip), touches)
+
+
+def _clip_layers(layers, cut_lines, touches):
+    """Общий обход слоёв для обрезки рамкой и кругом: пара «имена — точки» не трогается.
+    Вход: слои, `cut_lines(parts)` — разрезка линий, `touches(a)` — брать ли контур целиком.
+    Отдаёт: новый словарь слоёв."""
+    line_layers = {n for n, d in THREAT_LAYERS.items() if d.get("geom") == "line"}   # линейные слои
     out = {}
     for name, parts in layers.items():
         if name in ("place_names", "place_pts"):        # связанная пара — не трогаем
             out[name] = parts
             continue
-        if name in line_layers:
-            out[name] = _clip_parts(parts, clip)        # рвём по границе рамки
+        if name in line_layers:                         # линия — рвём по границе
+            out[name] = cut_lines(parts)
             continue
-        kept = []
+        kept = []                                       # контуры слоя, задевшие район
         for arr in parts:
             a = np.asarray(arr)
             if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] < 2 or a.dtype.kind in "US":
                 kept.append(arr)                        # не координаты — оставляем как есть
                 continue
-            if (a[:, 0].max() >= cx0 and a[:, 0].min() <= cx1 and
-                    a[:, 1].max() >= cy0 and a[:, 1].min() <= cy1):
+            if touches(a):                              # контур задевает район — целиком
                 kept.append(arr)
         out[name] = kept
     return out
@@ -1623,9 +1639,6 @@ def load_dem_display(lon0, lat0, bbox_km, max_px=1400):
     return np.flipud(band), (float(ex0), float(ex1), float(ey0), float(ey1))
 
 
-from model.threat.geo_frame import km_to_lonlat            # noqa: E402,F401 — общий фрейм (8.3)
-
-
 def _sample_geotiff(path, lon, lat, cell_deg=None):
     """Выборка высот GeoTIFF в точках (lon,lat).
 
@@ -1677,14 +1690,21 @@ def _sample_geotiff(path, lon, lat, cell_deg=None):
         r = r_all - r_lo                            # строки точек в окне, пиксели
         c = c_all - c_lo                            # столбцы точек в окне, пиксели
         if cell_deg is None:                        # ближайший пиксель
-            h, w = band.shape                       # размер окна, пиксели
-            ci = np.rint(c).astype(int); ri = np.rint(r).astype(int)
-            ok = ((ci >= 0) & (ci < w) & (ri >= 0) & (ri < h))   # точка внутри окна (= внутри растра)
-            vals = np.full(lon.shape, np.nan)
-            take = ok & ~bad[np.clip(ri, 0, h - 1), np.clip(ci, 0, w - 1)]
-            vals[take] = band[ri[take], ci[take]]
-            return vals
+            return _nearest_px(band, r, c, bad)
         return _block_mean_at(band, bad, r, c, hy, hx)
+
+
+def _nearest_px(band, r, c, bad=None):
+    """Ближайший пиксель растра в дробных (строка, столбец) — одно правило для GeoTIFF и .hgt.
+    Вход: растр (h, w), r, c одной формы, `bad` — маска пустых пикселей или None. Отдаёт: высоты, NaN — нет."""
+    h, w = band.shape                               # размер растра (окна), пиксели
+    ri, ci = np.rint(r).astype(int), np.rint(c).astype(int)   # ближайший пиксель
+    ok = (ri >= 0) & (ri < h) & (ci >= 0) & (ci < w)          # точка внутри растра
+    if bad is not None:                             # пустые пиксели объявлены маской
+        ok &= ~bad[np.clip(ri, 0, h - 1), np.clip(ci, 0, w - 1)]   # — их не берём
+    vals = np.full(np.shape(r), np.nan)             # высоты точек, NaN — нет данных
+    vals[ok] = band[ri[ok], ci[ok]]
+    return vals
 
 
 def _block_mean_at(band, bad, r, c, hy, hx):
@@ -1727,15 +1747,8 @@ def _sample_hgt(path, lon, lat):
         return None
     tile = raw.reshape(n, n).astype(float)
     tile[tile <= -32768] = np.nan
-    # строка 0 — СЕВЕРНЫЙ край тайла
-    fy = (lat0_t + 1 - lat) * (n - 1)
-    fx = (lon - lon0_t) * (n - 1)
-    r = np.rint(fy).astype(int)
-    c = np.rint(fx).astype(int)
-    ok = (r >= 0) & (r < n) & (c >= 0) & (c < n)
-    vals = np.full(lon.shape, np.nan)
-    vals[ok] = tile[r[ok], c[ok]]
-    return vals
+    # строка 0 — СЕВЕРНЫЙ край тайла; пустые пиксели уже NaN — маска не нужна
+    return _nearest_px(tile, (lat0_t + 1 - lat) * (n - 1), (lon - lon0_t) * (n - 1))
 
 
 def _clip_box_km(lon0, lat0, bbox_lonlat, margin_km):
@@ -1752,29 +1765,36 @@ def _clip_parts(parts, clip):
     участок, отбрасывается, а проходящая насквозь линия сохраняется куском внутри.
     Полностью внешние объекты исчезают — за этим и нужен клип."""
     x0, x1, y0, y1 = clip
+    return _cut_lines(parts,
+                      lambda P: (P[:, 0] >= x0) & (P[:, 0] <= x1) & (P[:, 1] >= y0) & (P[:, 1] <= y1),
+                      lambda p_in, p_out: _edge_point(p_in, p_out, clip))
+
+
+def _cut_lines(parts, inside_of, edge):
+    """Куски линий внутри района — общая разрезка для рамки и круга. Вход: линии (N, 2) км,
+    `inside_of(P)` — маска вершин внутри, `edge(p_in, p_out)` — точка на границе. Отдаёт: список кусков."""
     out = []
     for p in parts:
         P = np.asarray(p, float)
         if P.ndim != 2 or len(P) < 2:
             continue
-        inside = ((P[:, 0] >= x0) & (P[:, 0] <= x1) &
-                  (P[:, 1] >= y0) & (P[:, 1] <= y1))
-        if inside.all():
+        inside = inside_of(P)                           # вершины внутри района
+        if inside.all():                                # линия целиком внутри
             out.append(P)
             continue
-        if not inside.any():
+        if not inside.any():                            # целиком снаружи
             continue
-        # разрезать на непрерывные куски внутри рамки; на выходе за край добавляем не
+        # разрезать на непрерывные куски внутри района; на выходе за край добавляем не
         # исходную дальнюю точку (она уводила линию на длину сегмента за рамку —
         # замер: до 11.7 км при допуске 10), а точку ПЕРЕСЕЧЕНИЯ с границей
         idx = np.nonzero(inside)[0]
         for s in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
             a, b = int(s[0]), int(s[-1])
             piece = [P[a:b + 1]]
-            if a > 0:
-                piece.insert(0, _edge_point(P[a], P[a - 1], clip)[None, :])
-            if b < len(P) - 1:
-                piece.append(_edge_point(P[b], P[b + 1], clip)[None, :])
+            if a > 0:                                   # кусок начался на входе в район
+                piece.insert(0, edge(P[a], P[a - 1])[None, :])
+            if b < len(P) - 1:                          # кусок кончился на выходе
+                piece.append(edge(P[b], P[b + 1])[None, :])
             seg = np.vstack(piece)
             if len(seg) >= 2:
                 out.append(seg)
@@ -1800,59 +1820,24 @@ def _clip_layers_circle(layers, circle, margin_km):
     Отдаёт: новый словарь слоёв; линии порваны по окружности, контуры отобраны целиком."""
     cx, cy, R = (float(v) for v in circle)
     rr = R + float(margin_km)                          # радиус отсечки с запасом, км
-    line_layers = {n for n, d in THREAT_LAYERS.items() if d.get("geom") == "line"}
-    out = {}
-    for name, parts in layers.items():
-        if name in ("place_names", "place_pts"):       # связанная пара — не трогаем, как у рамки
-            out[name] = parts
-            continue
-        if name in line_layers:                        # линия — рвём по окружности
-            out[name] = _clip_parts_circle(parts, cx, cy, rr)
-            continue
-        kept = []
-        for arr in parts:
-            a = np.asarray(arr)
-            if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] < 2 or a.dtype.kind in "US":
-                kept.append(arr)                       # не координаты — оставляем как есть
-                continue
-            # КОНТУР ЦЕЛИКОМ, как у рамки: разрезанный перестал бы быть замкнутым. Берём, если
-            # хоть одна вершина в круге либо круг задевает габарит контура (большой контур
-            # может накрывать край круга, не имея вершин внутри)
-            d = np.hypot(a[:, 0].astype(float) - cx, a[:, 1].astype(float) - cy)
-            nx_ = min(max(cx, float(a[:, 0].min())), float(a[:, 0].max()))   # ближайшая к центру
-            ny_ = min(max(cy, float(a[:, 1].min())), float(a[:, 1].max()))   # точка габарита, км
-            if d.min() <= rr or np.hypot(nx_ - cx, ny_ - cy) <= rr:          # контур задевает круг
-                kept.append(arr)
-        out[name] = kept
-    return out
+
+    def touches(a):
+        """Контур задевает круг с запасом. Вход: контур (N, ≥2) км. Отдаёт: bool."""
+        # КОНТУР ЦЕЛИКОМ, как у рамки: разрезанный перестал бы быть замкнутым. Берём, если
+        # хоть одна вершина в круге либо круг задевает габарит контура (большой контур
+        # может накрывать край круга, не имея вершин внутри)
+        d = np.hypot(a[:, 0].astype(float) - cx, a[:, 1].astype(float) - cy)
+        nx_ = min(max(cx, float(a[:, 0].min())), float(a[:, 0].max()))   # ближайшая к центру
+        ny_ = min(max(cy, float(a[:, 1].min())), float(a[:, 1].max()))   # точка габарита, км
+        return d.min() <= rr or np.hypot(nx_ - cx, ny_ - cy) <= rr
+    return _clip_layers(layers, lambda parts: _clip_parts_circle(parts, cx, cy, rr), touches)
 
 
 def _clip_parts_circle(parts, cx, cy, rr):
     """Куски линий внутри круга (cx, cy, rr) км — правило то же, что у `_clip_parts`: на выходе
     за край ставится точка ПЕРЕСЕЧЕНИЯ с окружностью, а не дальняя вершина. Отдаёт: список кусков."""
-    out = []
-    for p in parts:
-        P = np.asarray(p, float)
-        if P.ndim != 2 or len(P) < 2:
-            continue
-        inside = np.hypot(P[:, 0] - cx, P[:, 1] - cy) <= rr
-        if inside.all():                               # линия целиком в круге
-            out.append(P)
-            continue
-        if not inside.any():                           # целиком снаружи
-            continue
-        idx = np.nonzero(inside)[0]
-        for s in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
-            a, b = int(s[0]), int(s[-1])
-            piece = [P[a:b + 1]]
-            if a > 0:                                  # кусок начался на входе в круг
-                piece.insert(0, _circle_point(P[a], P[a - 1], cx, cy, rr)[None, :])
-            if b < len(P) - 1:                         # кусок кончился на выходе из круга
-                piece.append(_circle_point(P[b], P[b + 1], cx, cy, rr)[None, :])
-            seg = np.vstack(piece)
-            if len(seg) >= 2:
-                out.append(seg)
-    return out
+    return _cut_lines(parts, lambda P: np.hypot(P[:, 0] - cx, P[:, 1] - cy) <= rr,
+                      lambda p_in, p_out: _circle_point(p_in, p_out, cx, cy, rr))
 
 
 def _circle_point(p_in, p_out, cx, cy, rr):
@@ -1948,7 +1933,7 @@ def _geom_to_kms(geom, lon0, lat0):
     out = []
     gt = geom.geom_type
     if gt == "LineString":
-        out.append(_ll(np.asarray(geom.coords, float), lon0, lat0))
+        out.append(_ll(geom.coords, lon0, lat0))
     elif gt == "MultiLineString":
         try:
             from shapely.ops import linemerge
@@ -1956,18 +1941,16 @@ def _geom_to_kms(geom, lon0, lat0):
         except Exception:
             pass
         if geom.geom_type == "LineString":
-            out.append(_ll(np.asarray(geom.coords, float), lon0, lat0))
+            out.append(_ll(geom.coords, lon0, lat0))
         else:                                  # несмежные куски — каждый цельным
-            for g in geom.geoms:
-                out.append(_ll(np.asarray(g.coords, float), lon0, lat0))
+            out += [_ll(g.coords, lon0, lat0) for g in geom.geoms]
     elif gt == "GeometryCollection":
         for g in geom.geoms:
             out += _geom_to_kms(g, lon0, lat0)
     elif gt == "Polygon":
-        out.append(_ll(np.asarray(geom.exterior.coords, float), lon0, lat0))
+        out.append(_ll(geom.exterior.coords, lon0, lat0))
     elif gt == "MultiPolygon":
-        for g in geom.geoms:
-            out.append(_ll(np.asarray(g.exterior.coords, float), lon0, lat0))
+        out += [_ll(g.exterior.coords, lon0, lat0) for g in geom.geoms]
     return out
 
 
@@ -2297,15 +2280,9 @@ class ThreatModel:
     # Почему нельзя считать по всей области: сетка 500 м на 291 × 250 км — это
     # 582 × 499 = 290 тыс. ячеек против рабочих 21 тыс., в четырнадцать раз больше.
     def set_area(self, bbox_lonlat):
-        """Задать РАБОЧИЙ РАЙОН (lon_min, lat_min, lon_max, lat_max).
-
-        Пересчитывает якорь км-фрейма (юго-западный угол нового района) и сбрасывает всё,
-        что от рамки зависит: сетку, слои, маршруты, датчики, контекст выборки. Сама карта
-        пересобирается следующим `build()`.
-
-        ⚠️ ЯКОРЬ МЕНЯЕТСЯ ВМЕСТЕ С РАЙОНОМ, а в кэше `.npz` лежат уже посчитанные
-        километры — от ПРЕЖНЕГО якоря. Поэтому при своём районе слои читаются из
-        `.osm.pbf` напрямую (`build`), иначе они легли бы со сдвигом молча."""
+        """Задать РАБОЧИЙ РАЙОН в км прежнего якоря (он один на область показа) и сбросить всё, что от
+        рамки зависит (`_forget_area`); карту пересоберёт следующий `build()`.
+        Вход: (lon_min, lat_min, lon_max, lat_max), градусы. Отдаёт: рамку (x0, x1, y0, y1), км."""
         lo, la, ho, ha = (float(v) for v in bbox_lonlat)
         lo, ho = min(lo, ho), max(lo, ho)
         la, ha = min(la, ha), max(la, ha)
@@ -2327,7 +2304,12 @@ class ThreatModel:
         self.bbox_lonlat = (lo, la, float(ho2), float(ha2))
         self.area_custom = True                    # район задан пользователем
         self.area_ready = True
-        # всё, что считалось по прежней рамке, больше не годится
+        self._forget_area()                         # всё, что считалось по прежней рамке, не годится
+        return self.bbox_km
+
+    def _forget_area(self):
+        """Сбросить всё, что считалось по прежней рамке района, — общее для `set_area` и `clear_area`.
+        Вход: ничего — рамку, источник и рельеф ставят вызывающие. Отдаёт: ничего."""
         self._drop_read_cache()                     # район сменился — читать заново
         self.grid = None
         self.layers = {}
@@ -2335,10 +2317,7 @@ class ThreatModel:
         self._dem_display = None
         self._reset_sensors()
         self.candidates = np.empty((0, 2), float)
-        self.routes = []
-        self.iter_routes = []
-        self.iter_iteration = 0
-        self._iter_ctx = None
+        self._drop_routes()
         self.route_area = None
         self.target_km = None                       # цель задавалась в прежних км
         self.uav_start_km = None                    # и старт БПЛА — тоже в прежних (12.2)
@@ -2351,7 +2330,14 @@ class ThreatModel:
         self.manual_entries = []
         self.entry_points = []
         self.area_circle = None                     # прямоугольник; круг ставит `set_area_circle`
-        return self.bbox_km
+
+    def _drop_routes(self):
+        """Забыть выборку: примеры, итерационные маршруты, счётчик итераций, контекст первой цели.
+        Вход: ничего. Отдаёт: ничего. Загруженную из файла выборку не трогает — это входные данные (8.6)."""
+        self.routes = []
+        self.iter_routes = []
+        self.iter_iteration = 0
+        self._iter_ctx = None
 
     def set_area_circle(self, cx_km, cy_km, r_km):
         """Задать КРУГЛЫЙ район моделирования (план 11, 11.6): вход — центр и радиус, км.
@@ -2386,43 +2372,17 @@ class ThreatModel:
         заново (правило заказчика 04.09.2026)."""
         self.area_ready = False
         self.area_custom = False
-        self._drop_read_cache()        # освободить память: слои и высоты больше не нужны
         self.bbox_lonlat = tuple(THREAT_WORK_LONLAT)
         self.bbox_km = bbox_lonlat_to_km(self.bbox_lonlat, self.lon0, self.lat0)
-        self.grid = None
-        self.layers = {}
+        self._forget_area()            # и память освобождается: слои и высоты больше не нужны
         self.source = ""
-        self.dem = None
-        self._dem_display = None
         # ⚠️ РЕЛЬЕФ ТОЖЕ СБРАСЫВАЕТСЯ. Он оставался включённым после снятия района, и
         # следующее построение шло уже «с рельефом» — при том, что кнопка обещала
         # обратное, а высоты грузились по другой рамке (заказчик 04.09.2026: «после
         # моделирования рельеф не сбросился и при повторном построении карты упала
         # программа»).
         self.relief_on = bool(THREAT_DEM_ON_START)
-        self._reset_sensors()
-        self.candidates = np.empty((0, 2), float)
-        self.routes = []
-        self.iter_routes = []
-        self.iter_iteration = 0
-        self._iter_ctx = None
-        self.route_area = None
-        self.target_km = None
-        self.uav_start_km = None                    # старт БПЛА — в прежних км (12.2)
-        self.sector_point_km = None
-        self.sector_kind = None
-        self._sector_pts = []
-        self._sector_taken = []
-        self.moved_entries = []
-        self.manual_entries = []
-        self.entry_points = []
-        self.area_circle = None
         self._metrics = {}
-
-    def area_size_km(self):
-        """Размер рабочего района (ширина, высота) в км — для проверок и подписей."""
-        x0, x1, y0, y1 = self.bbox_km
-        return (x1 - x0, y1 - y0)
 
     # ---- КООРДИНАТЫ НАРУЖУ (план 8, задача 8.3) ----
     #
@@ -2535,11 +2495,8 @@ class ThreatModel:
         от проходимости зависит: контекст выборки, маршруты, область залёта."""
         if self.grid is not None:
             self.grid.set_no_fly_zones(self.no_fly_zones)
-        self._iter_ctx = None
+        self._drop_routes()
         self._ctx_built_key = None
-        self.routes = []
-        self.iter_routes = []
-        self.iter_iteration = 0
         self.route_area = None
 
     def add_no_fly_zone(self, poly):
@@ -2586,15 +2543,16 @@ class ThreatModel:
         out["area_km2"] = float(m.sum()) * self.grid.h * self.grid.h
         entry, _ = self.entry_target_km()
         tpts = self.target_points_km()               # все цели (план 13), км
-        for key, pt in [("blocked_entry", entry)] + [("blocked_target", t) for t in tpts]:
-            ix = int(np.clip((pt[0] - self.grid.ox) / self.grid.h, 0, self.grid.nx - 1))
-            iy = int(np.clip((pt[1] - self.grid.oy) / self.grid.h, 0, self.grid.ny - 1))
-            out[key] = out[key] or bool(m[iy, ix])  # хоть одна цель в зоне — уже беда
+        pts = np.array([entry] + list(tpts), float).reshape(-1, 2)   # вход, затем цели, км
+        ix, iy, _ = _cell_index(self.grid, pts)      # их ячейки (за краем — обрежем ниже)
+        hit = m[np.clip(iy, 0, self.grid.ny - 1), np.clip(ix, 0, self.grid.nx - 1)]   # вход, цели — в зоне?
+        out["blocked_entry"] = bool(hit[0])
+        out["blocked_target"] = bool(hit[1:].any())  # хоть одна цель в зоне — уже беда
         # достижима ли КАЖДАЯ цель: тот же критерий, что у самих маршрутов
         try:
             from model.threat.threat_routes import flight_envelope
             for t in tpts:
-                area, min_len = flight_envelope(self.grid, entry, t, self.route_L_max(),
+                _, min_len = flight_envelope(self.grid, entry, t, self.route_L_max(),   # путь к цели, км; inf — нет
                                                 self._route_gap_km(),
                                                 slack_km=self._route_slack_km())
                 out["unreachable"] = out["unreachable"] or not np.isfinite(min_len)
@@ -2671,9 +2629,6 @@ class ThreatModel:
         # карта-картинка. Так «район моделирования» и на карте виден как район: где есть
         # слои — там идёт работа.
         #
-        # ⚠️ ПРИ СВОЁМ РАЙОНЕ КЭШ `.npz` НЕ ГОДИТСЯ: в нём готовые километры от ПРЕЖНЕГО
-        # якоря, а свой район ставит якорь в свой юго-западный угол — слои легли бы со
-        # сдвигом, молча и без единой ошибки. Поэтому читаем исходный `.osm.pbf`.
         # ⚠️ ЧИТАЕМ КЭШ `.npz`, А НЕ `.osm.pbf` — даже когда район свой.
         #
         # Сначала при своём районе принудительно читался исходный `.osm.pbf`: кэш хранит
@@ -2693,7 +2648,7 @@ class ThreatModel:
         # рельеф выключен. С кэшем повторное построение — доли секунды.
         # круг входит в ключ: у круга и прямоугольника с той же рамкой слои режутся по-разному
         key = (self.bbox_lonlat, src_path, THREAT_SOURCE_FILE, self.area_circle)
-        if getattr(self, "_read_key", None) == key and self._layers_cache is not None:
+        if self._read_key == key and self._layers_cache is not None:   # район и источник те же — из памяти
             self.layers, self.source = dict(self._layers_cache), self._source_cache
             self.dem = self._dem_cache
         else:
@@ -2751,10 +2706,7 @@ class ThreatModel:
         # асимметрия, заметная глазом на карте. На контрольный прогон не влияет: там
         # `build()` идёт ДО расстановки, обнулять нечего.
         self._reset_sensors()
-        self.routes = []
-        self.iter_routes = []
-        self.iter_iteration = 0
-        self._iter_ctx = None                          # карта пересобрана — контекст устарел
+        self._drop_routes()                            # карта пересобрана — выборка и контекст устарели
         return self.grid
 
     def _route_gap_km(self):
@@ -2874,25 +2826,30 @@ class ThreatModel:
         spend = self._spend() if panel else "mix"                                  # расход
         approach = self._approach() if panel else "mix"                            # заход
         # 1) НАБИРАЕМ пул кандидатов (больше, чем нужно)
-        pool, seen, tries = [], set(), 0
-        cap = int(want * THREAT_ROUTE_POOL_MULT)
-        since_new = 0
-        while len(pool) < cap and tries < cap * 3 and since_new < 400:
-            tries += 1
-            r = self._sample_route(bag, rng, wmode, spread, spend, approach)
-            if r is None:
-                since_new += 1
-                continue
-            sig = self._route_sig(r)
-            if sig in seen:                            # уже есть почти такой же маршрут
-                since_new += 1
-                continue
-            seen.add(sig); pool.append(r); since_new = 0
-            bag.commit()                               # маршрут принят — очередь следующей цели
+        cap = int(want * THREAT_ROUTE_POOL_MULT)       # размер пула, маршрутов
+        pool = self._collect_routes(bag, rng, (wmode, spread, spend, approach), [], cap, cap * 3, 400)   # кандидаты, (M, 2) км
         # 2) ОТБИРАЕМ из пула самые «расходящиеся» — максимальное покрытие области,
         #    но с учётом ценности ячеек: тяжёлый коридор дороже пустого поля
         self.routes = self._spread_over_area(pool, want, spread_w=THREAT_ROUTE_SPREAD_W)
         return self.routes
+
+    def _collect_routes(self, bag, rng, modes, out, want, max_tries, stale):
+        """Набрать в `out` до `want` разных маршрутов: почти одинаковые (`_route_sig`) — мимо. Вход: мешок целей,
+        генератор, (вес, разброс, расход, заход), список, сколько, предел попыток, попыток подряд без нового. Отдаёт: out."""
+        seen, tries, since_new = set(), 0, 0           # подписи принятых; попыток всего и подряд без нового
+        while len(out) < want and tries < max_tries and since_new < stale:   # пока не набрали и не выдохлись
+            tries += 1
+            r = self._sample_route(bag, rng, *modes)   # (M, 2) км или None
+            if r is None:                              # не дошёл или не уложился
+                since_new += 1
+                continue
+            sig = self._route_sig(r)                   # огрублённая подпись маршрута
+            if sig in seen:                            # уже есть почти такой же маршрут
+                since_new += 1
+                continue
+            seen.add(sig); out.append(r); since_new = 0
+            bag.commit()                               # маршрут принят — очередь следующей цели
+        return out
 
     def _spread_over_area(self, pool, want, spread_w=0.0):
         """Жадно отобрать `want` маршрутов, покрывающих область залёта КАК МОЖНО ШИРЕ.
@@ -2908,6 +2865,7 @@ class ThreatModel:
         ориентиров нет вовсе. Теперь ценность ячейки = `1 + spread_w · вес(0…1)` —
         разброс сохраняется (единица есть у всех), но при равном покрытии предпочитается
         тяжёлый коридор. 0.0 -> прежнее поведение."""
+        from model.threat.threat_routes import route_cells, weight_norm
         if not pool or want >= len(pool):
             return list(pool)
         g = self.grid
@@ -2915,16 +2873,12 @@ class ThreatModel:
         # матрица «маршрут × ячейка» (булева): что задевает каждый кандидат
         M = np.zeros((len(pool), ncell), bool)
         for i, r in enumerate(pool):
-            ix = np.clip(((r[:, 0] - g.ox) / g.h).astype(np.int64), 0, g.nx - 1)
-            iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(np.int64), 0, g.ny - 1)
+            iy, ix = route_cells(g, r)                 # ячейки под маршрутом
             M[i, iy * g.nx + ix] = True
         # ценность ячейки: нормировка веса та же, что в выборке маршрутов (p90 по
         # положительным) — чтобы «тяжело» значило одно и то же в обоих местах
         if spread_w > 0.0:
-            w = np.clip(g.weight, 0.0, None)
-            pos = w[w > 0]
-            ref = float(np.percentile(pos, 90)) if pos.size else 1.0
-            val = (1.0 + float(spread_w) * np.clip(w / max(ref, 1e-6), 0.0, 1.0)).ravel()
+            val = (1.0 + float(spread_w) * weight_norm(g)).ravel()
         else:
             val = np.ones(ncell, float)
         # ⭐ КВОТА НА КАЖДУЮ ТОЧКУ СТАРТА (правило заказчика 21.09.2026): выборка делится
@@ -3045,21 +2999,8 @@ class ThreatModel:
             return []
         T = self.iter_target_count()                   # число из панели; его же видят заголовок и «Пуск»
         cap = int(T * 8)                               # было min(T*6, 800) — см. шапку
-        stale = max(350, T)
-        seen, tries, since_new = set(), 0, 0
-        while len(self.iter_routes) < T and tries < cap and since_new < stale:
-            tries += 1
-            r = self._sample_route(self._iter_bag, self._iter_rng, self.p.threat_iter_mode,
-                                   self.p.threat_iter_spread, self._spend(), self._approach())
-            if r is None:
-                since_new += 1
-                continue
-            sig = self._route_sig(r)
-            if sig in seen:                            # дедуп почти одинаковых
-                since_new += 1
-                continue
-            seen.add(sig); self.iter_routes.append(r); since_new = 0
-            self._iter_bag.commit()                    # маршрут принят — очередь следующей цели
+        modes = (self.p.threat_iter_mode, self.p.threat_iter_spread, self._spend(), self._approach())   # режимы панели
+        self._collect_routes(self._iter_bag, self._iter_rng, modes, self.iter_routes, T, cap, max(350, T))
         self.iter_iteration = len(self.iter_routes)
         return self.iter_routes
 
@@ -3170,13 +3111,9 @@ class ThreatModel:
         """Возможные места установки датчика — узлы регулярной сетки с шагом
         `cand_step_km()`, МИНУС вода (датчик на воду не ставим). Из них жадный алгоритм
         выбирает N лучших (см. place_sensors)."""
+        from model.placement.sensor_zones import node_grid
         g = self.ensure_built()
-        step = self.cand_step_km()
-        kx0, kx1, ky0, ky1 = self.bbox_km
-        xs = np.arange(kx0 + 0.5 * step, kx1, step)
-        ys = np.arange(ky0 + 0.5 * step, ky1, step)
-        gx, gy = np.meshgrid(xs, ys)
-        cand = np.column_stack([gx.ravel(), gy.ravel()])
+        cand = node_grid(self.bbox_km, self.cand_step_km())   # узлы общей сетки по рамке участка, км
         if self.area_circle is not None:            # район круглый (план 11, 11.6)
             # ⚠️ сетка кандидатов квадратная — без этого датчик встал бы в угол за окружностью
             cand = cand[self.in_area(cand[:, 0], cand[:, 1])]
@@ -3186,14 +3123,8 @@ class ThreatModel:
 
     def _on_water(self, pts):
         """Маска кандидатов, попавших в водную ячейку (или её буфер) — запрет датчика."""
-        g = self.grid
-        ix = np.floor((pts[:, 0] - g.ox) / g.h).astype(int)
-        iy = np.floor((pts[:, 1] - g.oy) / g.h).astype(int)
-        ok = (ix >= 0) & (ix < g.nx) & (iy >= 0) & (iy < g.ny)
-        out = np.zeros(len(pts), bool)
-        wm = g.water_mask()
-        out[ok] = wm[iy[ok], ix[ok]]
-        return out
+        from model.placement.sensor_zones import cells_of
+        return cells_of(self.grid, pts, self.grid.water_mask())
 
     # ---- датчики, заданные человеком (задача 8.7) ----
     def _reset_sensors(self):
@@ -3332,15 +3263,21 @@ class ThreatModel:
         """Добавить датчик, заданный человеком (клик по карте, строка таблицы, файл).
 
         Возвращает добавленную запись — окну нужно её показать в таблице."""
-        from model.placement.sensors import ManualSensor, type_ids
-        tid = int(type_id)
-        known = type_ids(self.p)                     # номера задания, с типами справочника ≥ 5
-        if tid not in known:                         # такого типа нет
-            raise ValueError("нет типа датчика %r (есть %s)" % (type_id, list(known)))
-        rec = ManualSensor(type_id=tid, static=bool(static),
+        from model.placement.sensors import ManualSensor
+        rec = ManualSensor(type_id=self._known_type(type_id), static=bool(static),   # заявка человека
                            x_km=float(x_km), y_km=float(y_km))
         self.manual_sensors.append(rec)
         return rec
+
+    def _known_type(self, type_id):
+        """Номер типа, проверенный по заданию (номера 1–4 и справочник ≥ 5). Вход: номер.
+        Отдаёт: int; такого типа нет — ValueError."""
+        from model.placement.sensors import type_ids
+        tid = int(type_id)                           # номер типа
+        known = type_ids(self.p)                     # номера задания, с типами справочника ≥ 5
+        if tid not in known:                         # такого типа нет
+            raise ValueError("нет типа датчика %r (есть %s)" % (type_id, list(known)))
+        return tid
 
     def _find_placed(self, x_km, y_km, tol_km=0.05):
         """Найти датчик РАССТАНОВКИ в этой точке: `("small"|"big", индекс)` или None.
@@ -3387,23 +3324,30 @@ class ThreatModel:
                 self.sensors_manual[j] = True
             return True
         # класс сменился — вынимаем из одного массива и дописываем в другой
+        self._drop_placed(kind, j)
         if big_now:
-            self.sensors_big = np.delete(self.sensors_big, j, axis=0)
-            self.sensors_big_static = np.delete(self.sensors_big_static, j)
-            self.sensors_big_manual = np.delete(self.sensors_big_manual, j)
             self.sensors = np.vstack([self.sensors, [new_xy[0], new_xy[1]]])
             self.sensors_type = np.append(self.sensors_type, tid)
             self.sensors_static = np.append(self.sensors_static, st)
             self.sensors_manual = np.append(self.sensors_manual, True)
         else:
-            self.sensors = np.delete(self.sensors, j, axis=0)
-            self.sensors_type = np.delete(self.sensors_type, j)
-            self.sensors_static = np.delete(self.sensors_static, j)
-            self.sensors_manual = np.delete(self.sensors_manual, j)
             self.sensors_big = np.vstack([self.sensors_big, [new_xy[0], new_xy[1]]])
             self.sensors_big_static = np.append(self.sensors_big_static, st)
             self.sensors_big_manual = np.append(self.sensors_big_manual, True)
         return True
+
+    def _drop_placed(self, kind, j):
+        """Вынуть датчик расстановки вместе со спутниками (тип, режим, «поставил человек») — длины не расходятся.
+        Вход: "small" | "big", индекс в своём массиве. Отдаёт: ничего."""
+        if kind == "big":                            # большой — свой массив и два спутника
+            self.sensors_big = np.delete(self.sensors_big, j, axis=0)
+            self.sensors_big_static = np.delete(self.sensors_big_static, j)
+            self.sensors_big_manual = np.delete(self.sensors_big_manual, j)
+        else:                                        # малый — ещё и тип
+            self.sensors = np.delete(self.sensors, j, axis=0)
+            self.sensors_type = np.delete(self.sensors_type, j)
+            self.sensors_static = np.delete(self.sensors_static, j)
+            self.sensors_manual = np.delete(self.sensors_manual, j)
 
     def remove_placed_sensor(self, x_km, y_km):
         """Убрать датчик РАССТАНОВКИ в этой точке (клавиша Delete в режиме правки).
@@ -3413,16 +3357,7 @@ class ThreatModel:
         found = self._find_placed(x_km, y_km)
         if found is None:
             return False
-        kind, j = found
-        if kind == "big":
-            self.sensors_big = np.delete(self.sensors_big, j, axis=0)
-            self.sensors_big_static = np.delete(self.sensors_big_static, j)
-            self.sensors_big_manual = np.delete(self.sensors_big_manual, j)
-        else:
-            self.sensors = np.delete(self.sensors, j, axis=0)
-            self.sensors_type = np.delete(self.sensors_type, j)
-            self.sensors_static = np.delete(self.sensors_static, j)
-            self.sensors_manual = np.delete(self.sensors_manual, j)
+        self._drop_placed(*found)
         return True
 
     def _mark_manual_placed(self):
@@ -3494,11 +3429,7 @@ class ThreatModel:
         Правит запись НА МЕСТЕ, сохраняя её порядок в списке: строка остаётся там же в
         таблице. `placed` снимается — позиция стала другой, и до следующего расчёта её
         показывают как только что поставленную, иначе правка не была бы видна на карте."""
-        from model.placement.sensors import type_ids
-        tid = int(type_id)
-        known = type_ids(self.p)                     # номера задания, с типами справочника ≥ 5
-        if tid not in known:                         # такого типа нет
-            raise ValueError("нет типа датчика %r (есть %s)" % (type_id, list(known)))
+        tid = self._known_type(type_id)              # проверенный номер типа
         x, y = lonlat_to_km(float(lon), float(lat), self.lon0, self.lat0)
         rec.type_id = tid
         rec.static = bool(static)
@@ -3522,7 +3453,7 @@ class ThreatModel:
         """Расставить датчики по тепловой карте МАРШРУТОВ (где реально/вероятно летает БПЛА),
         а не по сырому весу — поэтому минус-города датчикам не мешают. Выборка: идут ИТЕРАЦИИ
         → их пролёты; иначе → ВСЕ возможные пути (строятся, если их нет). Правила A/B и разнос."""
-        g = self.ensure_built()
+        self.ensure_built()                        # карта построена
         # «РЕЖИМ АНАЛИЗА» (план 8, задача 8.9, довесок 06.09.2026): во время
         # моделирования расстановка (свои датчики и большие) не пересчитывается —
         # см. докстринг `threat_analysis_static` в config.py. Флаг проверяется В ДВУХ
@@ -3593,9 +3524,7 @@ class ThreatModel:
             # чем. Первый РЕАЛЬНО посчитанный набор — всегда лучшая точка отсчёта,
             # даже если он уже частично учитывает итерации.
             self._take_snapshot()
-        cells_xy, cells_w = g.flat_cells(positive_only=False)
-        keep = cells_w != 0.0
-        self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
+        self._metrics = self._evaluate_current()        # показатели по новой расстановке
         return self.sensors
 
     def _take_snapshot(self):
@@ -3692,9 +3621,7 @@ class ThreatModel:
         self._tag_sensors()
         self._mark_manual_placed()
         self._manual_sig_placed = self._manual_sig()  # по какой таблице стоим
-        cells_xy, cells_w = self.grid.flat_cells(positive_only=False)
-        keep = cells_w != 0.0
-        self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
+        self._metrics = self._evaluate_current()        # показатели по новой расстановке
         return self.sensors
 
     def _place_manual(self):
@@ -3735,21 +3662,18 @@ class ThreatModel:
         # таблицей — человек ещё задаёт обстановку; с началом моделирования замирает
         if self.initial_sensors is None or not self.in_iterations():
             self._take_snapshot()
-        cells_xy, cells_w = self.grid.flat_cells(positive_only=False)
-        keep = cells_w != 0.0
-        self._metrics = self._evaluate(cells_xy[keep], cells_w[keep])
+        self._metrics = self._evaluate_current()        # показатели по новой расстановке
         return self.sensors
 
     def _place_by_weight(self, cand):
         """Расстановка по СТАТИЧЕСКОЙ весовой карте (единица покрытия — клетка веса)."""
         from model.placement.optimization import CoverageCache
-        from config import MODES
         cells_xy, cells_w = self.grid.flat_cells(positive_only=False)
         keep = cells_w != 0.0
         cells_xy, cells_w = cells_xy[keep], cells_w[keep]
         cache = CoverageCache(cand, self.p.threat_R, 1, self.p.threat_k)
         cache.set_weighted_cells(cells_xy, cells_w)
-        weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
+        weights = self._greedy_weights()             # веса жадного
         return cache.greedy_weighted(
             self.p.threat_N, weights, min_sep=self.p.threat_min_sep_frac * self.p.threat_R)
 
@@ -3763,7 +3687,6 @@ class ThreatModel:
 
         Работает одинаково ДО и ПОСЛЕ итераций: до них выборка — «все возможные пути»
         (`plan_routes`), после — накопленные пролёты (`_sample_for_sensors`)."""
-        from config import MODES
         if len(cand) == 0 or not routes:
             return np.empty((0, 2), float)
         R = self.p.threat_R
@@ -3780,9 +3703,8 @@ class ThreatModel:
         # и уже учитывает ВСЕ точки входа, запас хода, проходимость и обходы цели.
         area = self.route_area
         if area is not None and self.grid is not None:
-            g = self.grid
-            ix = np.clip(((cand[:, 0] - g.ox) / g.h).astype(int), 0, g.nx - 1)
-            iy = np.clip(((cand[:, 1] - g.oy) / g.h).astype(int), 0, g.ny - 1)
+            from model.threat.threat_routes import route_cells
+            iy, ix = route_cells(self.grid, cand)      # ячейки кандидатов
             keep = np.asarray(area)[iy, ix]
             if keep.any():                             # пустая зона — не терять кандидатов
                 cand = cand[keep]
@@ -3849,14 +3771,13 @@ class ThreatModel:
         # anchor_a = anchor_near(A + 0.45 * R * u)     # у входа A (внутрь, к B)
         # anchors = [anchor_b] + ([anchor_a] if anchor_a != anchor_b else [])
         anchors = []
-        weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
+        weights = self._greedy_weights()             # веса жадного
         # Разнос: ЖЕЛАЕМЫЙ 1.6·R (перекрытие зон ≤ ~10 %), но если при нём полезных
         # позиций не хватило на заказанные N — постепенно ослабляем до нижней границы
         # threat_min_sep_frac·R. Раньше 1.6·R был жёстким: на реальных данных набиралось
         # 9 из 12, а остальные 3 уходили в пустоту (см. greedy — третичный ключ).
         N = int(self.p.threat_N)
-        sep_min = max(0.1, float(self.p.threat_min_sep_frac)) * R
-        sep = max(1.6 * R, sep_min)
+        sep, sep_min = self._sep_range(R)            # желаемый и нижний разнос, км
         sens = cache.greedy(N, weights, anchors=anchors, anchor_sep=sep, min_sep=sep)
         while len(sens) < N and sep > sep_min:
             sep = max(sep_min, sep * 0.85)
@@ -3872,8 +3793,8 @@ class ThreatModel:
         # ⚠️ КЭШ У КАЖДОГО ТИПА СВОЙ: `CoverageCache` строится под ОДИН радиус; общий — только выбор
         from model.placement import sensor_zones
         from model.placement.joint_greedy import joint_greedy
-        from config import MODES, THREAT_SPREAD_PAIR
-        weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
+        from config import THREAT_SPREAD_PAIR
+        weights = self._greedy_weights()           # веса жадного
         # галка «распределять между типами» снимает ТОЛЬКО разнос разных типов; внутри типа он всегда
         spread = bool(getattr(self.p, "threat_spread_types", True))
         # ⚠️ КРАТНОСТЬ МЕЖДУ ТИПАМИ — ТОЛЬКО ПРИ «ОДНА НА ВСЕХ» (заказчик 23.09.2026, В13.13):
@@ -3886,9 +3807,10 @@ class ThreatModel:
         self.target_report = {}              # номер типа -> отчёт этапа целей по целям (13.18)
         manual_mode = bool(getattr(self.p, "threat_manual_mode", False))   # «Задать позиции» — места называет человек
         kinds = []                           # (тип, закреплённые номера, кэш покрытия, бонус мест) — кому ставить
-        for spec in types:
+        cand = np.asarray(cand, float)       # общая сетка, км — одна на все типы
+        for spec in types:                   # каждый работающий малый тип
             R = float(spec.r_km)
-            c = np.asarray(cand, float)
+            c = cand                         # кандидаты типа, км; правило места — своя сетка ниже
             zone = self.allowed_mask(spec)   # карта места типа (13.4); None — ставится везде
             if zone is not None:             # у типа правило места (ПВН — застройка)
                 c = self.type_candidates(spec, zone)   # своя сетка типа (13.5), а не общая
@@ -3931,8 +3853,7 @@ class ThreatModel:
             self.sensors_type = np.empty(0, int)
             return np.empty((0, 2), float)           # — датчиков нет
         radii = [float(kd[0].r_km) for kd in kinds]   # радиусы типов, км
-        sep_min = [max(0.1, float(self.p.threat_min_sep_frac)) * r for r in radii]   # нижний разнос, км
-        seps = [max(1.6 * r, lo) for r, lo in zip(radii, sep_min)]   # желаемый разнос 1.6·R, км
+        seps, sep_min = (list(v) for v in zip(*(self._sep_range(r) for r in radii)))   # желаемый 1.6·R и нижний разнос, км
         quotas = [int(kd[0].n) for kd in kinds]   # сколько ставить каждого типа
         # Разнос: желаемый 1.6·R; тип не набрал квоту — его разнос ослабляется ×0.85 до 0.75·R,
         # и проход повторяется целиком (так же, как прежде у одного типа)
@@ -3983,7 +3904,6 @@ class ThreatModel:
 
         Внутри допустимого кольца и угла позиция выбирается ПО МАРШРУТАМ: берётся
         кандидат, накрывающий больше всего пролётов."""
-        from model.placement.optimization import CoverageCache
         # `n_big` задаётся аргументом только в режиме «Задать позиции» при моделировании:
         # там число берётся из ТАБЛИЦЫ, а не из поля N (оно там только для чтения).
         n_big = (int(getattr(self.p, "threat_N_big", 0) or 0) if n_big is None
@@ -4113,11 +4033,11 @@ class ThreatModel:
         k = max(1, int(round(frac * n)))
         if k >= n:
             return list(src)
+        from model.threat.threat_routes import route_cells
         g = self.grid
         cells, dens = [], np.zeros(g.ny * g.nx, np.float64)
         for r in src:                                       # клетки маршрута + поле частоты
-            ix = np.clip(((r[:, 0] - g.ox) / g.h).astype(int), 0, g.nx - 1)
-            iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(int), 0, g.ny - 1)
+            iy, ix = route_cells(g, r)                      # ячейки под маршрутом
             idx = np.unique(iy * g.nx + ix)
             cells.append(idx); dens[idx] += 1.0
         remaining = dens.copy()
@@ -4144,15 +4064,32 @@ class ThreatModel:
         src = self._sample_for_sensors()
         if not src or self.grid is None:
             return None
+        from model.threat.threat_routes import route_cells
         g = self.grid
         dens = np.zeros(g.ny * g.nx, np.float64)
-        for r in src:
-            ix = np.clip(((r[:, 0] - g.ox) / g.h).astype(int), 0, g.nx - 1)
-            iy = np.clip(((r[:, 1] - g.oy) / g.h).astype(int), 0, g.ny - 1)
+        for r in src:                                 # каждый маршрут выборки
+            iy, ix = route_cells(g, r)                # ячейки под маршрутом
             dens[np.unique(iy * g.nx + ix)] += 1.0        # клетка учитывается раз на маршрут
         mx = dens.max()
         self.route_density_top = float(mx)           # маршрутов в самой частой клетке — верх шкалы показа (13.5.1)
         return (dens / mx if mx > 0 else dens).reshape(g.ny, g.nx)
+
+    def _greedy_weights(self):
+        """Веса жадного (a1 — кратность, a2 — равномерность) по режиму из панели. Отдаёт: кортеж `config.MODES`;
+        незнакомый режим — «сбалансированный»."""
+        from config import MODES
+        return MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])
+
+    def _sep_range(self, R):
+        """Разнос датчиков типа: желаемый 1.6·R (перекрытие зон ≤ ~10 %) и нижний `threat_min_sep_frac`·R, до
+        которого он ослабляется, если квота не набрана. Вход: радиус типа, км. Отдаёт: (желаемый, нижний), км."""
+        lo = max(0.1, float(self.p.threat_min_sep_frac)) * R   # нижний разнос, км
+        return max(1.6 * R, lo), lo
+
+    def _sensor_tids(self):
+        """Тип каждого малого датчика. Отдаёт: (N,) — `sensors_type`; типы не проставлены (длины разные) — все 1."""
+        same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
+        return self.sensors_type if same else np.ones(len(self.sensors), int)
 
     def _sensor_radii(self):
         """Радиус КАЖДОГО малого датчика — по его типу.
@@ -4194,9 +4131,7 @@ class ThreatModel:
         xy = cells_xy[pos] if len(cells_xy) else np.empty((0, 2), float)
         w = cells_w[pos] if len(cells_w) else np.empty(0, float)
         if len(self.sensors) and len(xy):
-            d = np.linalg.norm(xy[:, None, :] - self.sensors[None, :, :], axis=2)
-            seen = (d <= rad[None, :]).any(axis=1)
-            covered = float(np.sum(w[seen]))
+            covered = _covered_weight(xy, w, self.sensors, rad)
         sample = self._sample_for_sensors()
         # ЗАСЕЧКА МАРШРУТОВ — отдельным методом (23.09.2026): тот же счёт нужен окну
         # «Анализ» по каждой цели, на её части выборки
@@ -4211,8 +4146,7 @@ class ThreatModel:
                 lines.append(dict(n=len(d), med=float(np.median(d)) if len(d) else 0.0,
                                   p10=float(np.percentile(d, 10)) if len(d) else 0.0))
         by_type = {}  # показатели по типам, с долей покрытия
-        same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
-        tids = self.sensors_type if same else np.ones(len(self.sensors), int)   # тип датчика
+        tids = self._sensor_tids()                     # тип датчика
         for t, d_t in det["by_type"].items():
             # ДОЛЯ ПОКРЫТИЯ ЭТОГО ТИПА (довесок 06.09.2026) — тот же приём, что у
             # общего `covered_frac` выше, но по сенсорам ОДНОГО типа: сколько веса
@@ -4220,8 +4154,7 @@ class ThreatModel:
             col = (tids == t)                          # датчики этого типа
             sens_t, rad_t = self.sensors[col], rad[col]
             if len(sens_t) and len(xy):
-                dT = np.linalg.norm(xy[:, None, :] - sens_t[None, :, :], axis=2)  # датчик — клетка, км
-                covered_t = float(np.sum(w[(dT <= rad_t[None, :]).any(axis=1)]))  # вес, видимый этим типом
+                covered_t = _covered_weight(xy, w, sens_t, rad_t)   # вес, видимый этим типом
             else:
                 covered_t = 0.0  # датчиков типа нет
             by_type[t] = dict(d_t, covered_frac=(covered_t / total if total > 0 else 0.0))
@@ -4260,19 +4193,14 @@ class ThreatModel:
         if not (len(self.sensors) and sample):         # мерить нечем или нечего
             return out
         rad = self._sensor_radii()                     # радиус каждого датчика, км
-        # для каждого маршрута — какие датчики его видят (маска по датчикам)
-        seen_by = np.array([
-            (np.linalg.norm(r[:, None, :] - self.sensors[None, :, :],
-                            axis=2).min(axis=0) <= rad)
-            for r in sample])                          # (маршрутов, датчиков)
+        seen_by = seen_matrix(sample, self.sensors, rad)   # какие датчики видят маршрут, (маршрутов, датчиков)
         hits = seen_by.sum(axis=1)                     # сколько датчиков видит маршрут
         out.update(det1=float((hits >= 1).mean()),
                    detk=float(self._meets_k(seen_by).mean()),   # по правилу галки «одна на всех»
                    mean_hits=float(hits.mean()))
         from model.placement.sensors import sensor_types
         k_of = {s.type_id: int(s.k) for s in sensor_types(self.p)}   # кратность типа
-        same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
-        tids = self.sensors_type if same else np.ones(len(self.sensors), int)   # тип датчика
+        tids = self._sensor_tids()                     # тип датчика
         for t in sorted(set(int(v) for v in tids)):
             col = (tids == t)                          # датчики этого типа
             h_t = seen_by[:, col].sum(axis=1)          # засечки маршрута этим типом
@@ -4297,8 +4225,7 @@ class ThreatModel:
             return seen_by.sum(axis=1) >= max(1, int(self.p.threat_k))   # — считают все типы вместе
         from model.placement.sensors import sensor_types
         k_of = {s.type_id: int(s.k) for s in sensor_types(self.p)}   # своя кратность типа
-        same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
-        tids = self.sensors_type if same else np.ones(len(self.sensors), int)   # тип датчика
+        tids = self._sensor_tids()                     # тип датчика
         ok = np.zeros(len(seen_by), bool)              # засечён ли своей кратностью
         for t in set(int(v) for v in tids):
             k_t = max(1, int(k_of.get(t, self.p.threat_k)))   # кратность этого типа
@@ -4318,33 +4245,29 @@ class ThreatModel:
     def target_protection(self, i):
         """Защита объекта №i (план 13.1, Д10): подлёт с кратностью защиты, почему мало, сколько ПВН добавить,
         рубеж. Вход: номер цели с нуля. Отдаёт: dict; None — нет типа с этапом целей или карты."""
-        from config import MODES
         from model.placement import target_stage as ts
-        from model.placement.sensor_zones import cells_of, type_nodes
         spec = self._targets_type()                  # тип у целей (ПВН)
-        if spec is None or self.grid is None or not 0 <= int(i) < len(self.target_points_km()):   # не о чем
+        i = int(i)                                   # номер цели с нуля
+        if spec is None or self.grid is None or not 0 <= i < len(self.target_points_km()):   # не о чем
             return None
         st, R = spec.passport, float(spec.r_km)      # паспорт и радиус типа
         zone, zc = self.allowed_mask(spec), self.sensor_cells()   # карта места и постройки
-        pt = self.target_points_km()[int(i)]         # цель, км
-        area = self.targets.items[int(i)].area if self.targets.items else None   # район человека
+        pt = self.target_points_km()[i]              # цель, км
+        area = self.targets.items[i].area if self.targets.items else None   # район человека
         z = ts.target_zone(self.grid, zc, zone, pt, R, area)   # зона цели
         rep = (getattr(self, "target_report", {}).get(spec.type_id) or [])   # отчёт этапа
         base = dict(k=int(st.tgt_k), level=ts.level_pct(st), gain=ts.gain_pct(st), zone=z is not None,
-                    stage=dict(rep[int(i)]) if int(i) < len(rep) else {})   # правила и итог этапа
+                    stage=dict(rep[i]) if i < len(rep) else {})   # правила и итог этапа
         if z is None:                                # цель в лесу, района нет
             return base
-        places, roof = type_nodes(self.grid, max(self.grid.h, 0.5 * R), zone, zc)   # места типа, км
-        places = self._places_filter(places, roof)   # без воды и углов района
-        own = places[cells_of(self.grid, places, z)]   # места зоны цели
-        own = own[np.hypot(own[:, 0] - pt[0], own[:, 1] - pt[1]) >= float(st.tgt_gap_r) * R]   # не у самой цели
-        part = self.routes_by_target()[int(i)]       # маршруты к цели
+        own = ts.own_places(self.grid, self._type_places(spec, zone), z, pt, float(st.tgt_gap_r) * R)   # места цели, км
+        part = self.routes_by_target()[i]            # маршруты к цели
         tails = ts.approach(part, self.grid, z) if part else []   # подлёт
         same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
         pos = self.sensors[np.asarray(self.sensors_type) == spec.type_id] if same else np.empty((0, 2))   # ПВН, км
-        weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])   # веса жадного
+        weights = self._greedy_weights()             # веса жадного
         levels = sorted({0.9, 0.95, base["level"] / 100.0})   # уровни для «сколько добавить»
-        base.update(ts.protection(tails, own, pos, R, base["k"], 1.6 * R, self.p.L_seg, weights, levels))
+        base.update(ts.protection(tails, own, pos, R, base["k"], ts.SEP_R * R, self.p.L_seg, weights, levels))
         # рубеж первой засечки по маршрутам к цели, км; маршрутов или датчиков нет — пусто
         d = ts.first_line(part, pt, self.sensors, self._sensor_radii()) if part and len(self.sensors) else np.zeros(0)
         base.update(line_med=float(np.median(d)) if len(d) else 0.0,   # рубеж первой засечки, км
@@ -4409,16 +4332,14 @@ class ThreatModel:
         if not sample or not len(self.sensors):
             return out
         tpts = self.target_points_km()               # цели (план 13), км
-        rad = self._sensor_radii()
-        for r in sample:
+        seen_all = seen_matrix(sample, self.sensors, self._sensor_radii())   # какие датчики видят маршрут
+        for r, seen in zip(sample, seen_all):        # маршрут и датчики, что его видят
             # направление подхода — к СВОЕЙ цели маршрута, а не к первой (план 13, 13.14)
             B = np.asarray(tpts[route_target_index(r, tpts)], float)
             bearing = self._approach_bearing(r, B)
             if bearing is None:
                 continue                  # маршрут целиком лежит в цели — без направления
             idx = int(round(bearing / step)) % n_sec
-            seen = (np.linalg.norm(r[:, None, :] - self.sensors[None, :, :],
-                                   axis=2).min(axis=0) <= rad)
             hits = int(seen.sum())
             e = out[idx]
             e["n_routes"] += 1
@@ -4463,10 +4384,7 @@ class ThreatModel:
 
     def _targets_changed(self):
         """Цели сменились: маршруты и контексты устарели, сектор переотбирается от первой цели."""
-        self.routes = []
-        self.iter_routes = []
-        self.iter_iteration = 0
-        self._iter_ctx = None                          # цель сменилась — контекст устарел
+        self._drop_routes()                            # цель сменилась — выборка и контекст устарели
         self._ctx_built_key = None
         self._ctxs = []                                # и контексты остальных целей — память
         # СЕКТОР ОТСЧИТЫВАЕТСЯ ОТ ЦЕЛИ: сменилась цель — сместился и он, точки входа
@@ -4559,7 +4477,6 @@ class ThreatModel:
     def set_target_area(self, i, area):
         """Район защиты цели мышью (В13.21): зона = район ∩ карта места ПВН. Вход: номер с нуля, район
         ("rect", x0, y0, x1, y1) | ("circle", cx, cy, r) км. Отдаёт: (причина отказа или '', мест в зоне)."""
-        from model.placement.sensor_zones import type_nodes
         from model.placement.target_stage import area_mask, target_zone
         if not 0 <= int(i) < len(self.targets):      # номера нет
             return "нет цели №%d" % (int(i) + 1), 0
@@ -4569,9 +4486,7 @@ class ThreatModel:
             return "", 0
         allowed = self.allowed_mask(spec)            # карта места ПВН
         zone = target_zone(self.grid, self.sensor_cells(), allowed, (0.0, 0.0), spec.r_km, area)   # район ∩ карта
-        step = max(self.grid.h, 0.5 * float(spec.r_km))   # шаг своей сетки типа, км
-        places, roof = type_nodes(self.grid, step, zone, self.sensor_cells())   # места в районе, км
-        n = len(self._places_filter(places, roof))   # мест после отсечек (круг района, вода)
+        n = len(self._type_places(spec, zone))       # мест в районе после отсечек (круг района, вода)
         if n == 0:                                   # ⚠️ пустая зона — ПВН у цели не встанет: не принимать
             return ("в указанном районе нет разрешённых мест: 0 из %d ячеек района"
                     % int(area_mask(self.grid, area).sum())), 0
@@ -4691,7 +4606,6 @@ class ThreatModel:
         """Зазор «от лучшего вообще» (план 13.1, Д4): у типа с картой места — граница Минью по его своей сетке БЕЗ
         карты, на итоговом наборе. Отдаёт: {номер: доля 0…1}. ⚠️ Дорого (ПВН `arh`: 17 682 кандидата, 6.9 с, 40 МБ) —
         только по запросу «Анализа»; кэш строится на время счёта, итог помнится до следующей расстановки."""
-        from config import MODES
         from model.placement.joint_greedy import top_gain
         from model.placement.optimization import CoverageCache
         from model.placement.sensors import sensor_types
@@ -4703,10 +4617,9 @@ class ThreatModel:
         specs = {s.type_id: s for s in sensor_types(self.p)}   # типы задания по номеру
         if self.grid is None or not routes or not len(self.sensors):   # считать не по чему
             return out
-        weights = MODES.get(getattr(self.p, "mode", "balanced"), MODES["balanced"])   # веса жадного
+        weights = self._greedy_weights()             # веса жадного
         joint = bool(getattr(self.p, "threat_k_same", True))   # покрытие общее («одна на все типы»)
-        same = len(self.sensors_type) == len(self.sensors)   # типы проставлены
-        tids = np.asarray(self.sensors_type, int) if same else np.ones(len(self.sensors), int)   # тип каждого датчика
+        tids = np.asarray(self._sensor_tids(), int)   # тип каждого датчика
 
         def cover(ids):
             """Покрытие набора S: засечки и сегменты. Вход: номера типов в наборе. Отдаёт: (n, mask)."""
@@ -4773,12 +4686,9 @@ class ThreatModel:
         Вход: SensorSpec, карта места (ny,nx), выборка, веса жадного, свободная квота типа, шт.
         Отдаёт: позиции (K,2) км; отчёт по целям — в `self.target_report`."""
         from model.placement import target_stage
-        from model.placement.sensor_zones import type_nodes
         zc = self.sensor_cells()                     # постройки, лес по ячейкам
-        step = max(self.grid.h, 0.5 * float(spec.r_km))   # шаг своей сетки типа, км
         # ⚠️ места — по ВСЕЙ карте, без отсечки зоной пролёта: вместимость — про место, а не про маршруты
-        places, roof = type_nodes(self.grid, step, zone, zc)   # места типа, км; крыша ли
-        places = self._places_filter(places, roof)   # круг района, вода (крыши она не отсекает)
+        places = self._type_places(spec, zone)       # места типа, км
         items = list(self.targets.items)             # объекты защиты, поставленные человеком
         targets = ([(t.x_km, t.y_km, float(t.weight)) for t in items] if items   # (x, y, приоритет)
                    else [tuple(self.target_only_km()) + (1.0,)])   # нет их — цель по умолчанию
@@ -4796,9 +4706,7 @@ class ThreatModel:
         сетки — круг района, вода (1.1), зона пролёта (1.2)."""
         from model.placement.road_access import place_nodes
         from model.placement.sensor_zones import cells_of, type_nodes
-        # ⚠️ не мельче ЯЧЕЙКИ КАРТЫ: карта поячеечная, и узлы 0.25 км у ПВН новых мест не дают, а
-        # уводят его с крыш — замер: на постройке 6 из 20 против 10 при узле в центре ячейки
-        step = max(self.grid.h, 0.5 * float(spec.r_km))   # шаг своей сетки, км
+        step = self._type_step(spec)                 # шаг своей сетки, км
         st = getattr(spec, "passport", None)         # паспорт типа
         if st is not None and st.zone == "дорога":   # МОГ — места блоками по дорогам, крыш нет (план 13.3 §2.3)
             c = place_nodes(self.grid, step, zone)   # кандидаты типа, км
@@ -4812,6 +4720,19 @@ class ThreatModel:
             if keep.any():                           # пустая зона — не терять кандидатов
                 c = c[keep]
         return c
+
+    def _type_step(self, spec):
+        """Шаг своей сетки типа: R/2, но не мельче ячейки карты. Вход: SensorSpec. Отдаёт: км."""
+        # ⚠️ не мельче ЯЧЕЙКИ КАРТЫ: карта поячеечная, и узлы 0.25 км у ПВН новых мест не дают, а
+        # уводят его с крыш — замер: на постройке 6 из 20 против 10 при узле в центре ячейки
+        return max(self.grid.h, 0.5 * float(spec.r_km))
+
+    def _type_places(self, spec, zone):
+        """Места типа на карте места: узлы своей сетки и крыши, без воды и углов района. Вход: SensorSpec,
+        карта (ny,nx). Отдаёт: (M,2) км."""
+        from model.placement.sensor_zones import type_nodes
+        places, roof = type_nodes(self.grid, self._type_step(spec), zone, self.sensor_cells())   # места, км; крыша ли
+        return self._places_filter(places, roof)     # круг района, вода (крыши она не отсекает)
 
     def _places_filter(self, pts, roof):
         """Отсечки мест типа: круг района и вода. Вход: точки (M,2) км, крыша ли (M,). Отдаёт: (K,2) км.
@@ -4847,12 +4768,13 @@ class ThreatModel:
     def set_entry_L_max(self, i, km):
         """Задать запас хода одной точке входа руками (таблица точек, 12.5).
         Вход: номер точки с нуля, км (None — вернуть расчётный). Отдаёт: True — принято."""
-        if not 0 <= int(i) < len(self.entry_points_km()):   # номера такой точки нет
+        i = int(i)                                   # номер точки с нуля
+        if not 0 <= i < len(self.entry_points_km()):   # номера такой точки нет
             return False
         if km is None:                               # «вернуть как считалось»
-            self.entry_L_max_manual.pop(int(i), None)
+            self.entry_L_max_manual.pop(i, None)
         else:
-            self.entry_L_max_manual[int(i)] = max(0.0, float(km))
+            self.entry_L_max_manual[i] = max(0.0, float(km))
         self.sync_auto_L_max()                       # среднее в панели изменилось
         return True
 
@@ -5096,11 +5018,8 @@ class ThreatModel:
 
     def _reset_after_entry_change(self):
         """Сброс после смены входа: контекст, маршруты, область залёта, запас хода."""
-        self._iter_ctx = None
+        self._drop_routes()
         self._ctx_built_key = None
-        self.routes = []
-        self.iter_routes = []
-        self.iter_iteration = 0
         self.route_area = None
         self.sync_auto_L_max()
 
@@ -5335,7 +5254,8 @@ class ThreatModel:
         half = n_ac // 2
         out = np.zeros(len(xs))
         for t, (px, py) in enumerate(zip(xs, ys)):
-            d = B - np.array([px, py], float)
+            p0 = np.array([px, py], float)           # кандидат, км
+            d = B - p0                               # от кандидата к цели, км
             n = float(np.hypot(*d))
             if n < 1e-9:
                 continue
@@ -5344,7 +5264,7 @@ class ThreatModel:
             acc = cnt = 0
             for i in range(n_al):
                 for j in range(-half, half + 1):
-                    q = np.array([px, py]) + a * (i * g.h) + b * (j * g.h)
+                    q = p0 + a * (i * g.h) + b * (j * g.h)   # клетка окна: i вдоль курса, j поперёк, км
                     jx = int((q[0] - g.ox) / g.h)
                     jy = int((q[1] - g.oy) / g.h)
                     if 0 <= jx < nx and 0 <= jy < ny:

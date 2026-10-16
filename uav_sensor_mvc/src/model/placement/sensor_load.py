@@ -23,8 +23,8 @@ ORDERS = (
 
 
 def seen_matrix(sample, pts, radii):
-    """Какие маршруты прошли через какие средства. Вход: маршруты [(K,2) км], средства (N,2) км, радиусы (N,) км.
-    Отдаёт: (M, N) bool; то же выражение, что `seen_by` в `_detection`, — числа сходятся до бита."""
+    """Какие маршруты прошли через какие средства — одна формула на модель: её зовут `_detection`, `sector_stats` и
+    нагрузка. Вход: маршруты [(K,2) км], средства (N,2) км, радиусы (N,) км. Отдаёт: (M, N) bool."""
     pts = np.asarray(pts, float).reshape(-1, 2)      # средства, км
     rad = np.asarray(radii, float).reshape(-1)       # их радиусы, км
     out = np.zeros((len(sample), len(pts)), bool)    # прошёл ли маршрут через средство
@@ -76,8 +76,9 @@ def write_docx(path, title, info, headers, cells):
     tab = doc.add_table(rows=1, cols=len(headers))   # таблица: строка подписей и строки средств
     tab.style = "Table Grid"
     for c, h in enumerate(headers):                  # подписи столбцов — жирным
-        tab.rows[0].cells[c].text = ""
-        tab.rows[0].cells[c].paragraphs[0].add_run(h).bold = True
+        cell = tab.rows[0].cells[c]                  # ячейка подписи
+        cell.text = ""
+        cell.paragraphs[0].add_run(h).bold = True
     for row in cells:                                # строка таблицы на средство
         tr = tab.add_row().cells                     # ячейки новой строки
         for c, v in enumerate(row):                  # значения по столбцам

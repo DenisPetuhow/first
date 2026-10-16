@@ -312,7 +312,7 @@ class SensorTypesWindow(QtWidgets.QDialog):
         self._editing = bool(on)
         zone = self._w["zone"].currentText()         # правило места в форме
         mid = self._types[self._cur].type_id if 0 <= self._cur < len(self._types) else None   # номер в форме
-        for field, _title, kind, rule in FIELDS:     # доступность каждого поля: правка и правило места
+        for field, _title, _kind, rule in FIELDS:    # доступность каждого поля: правка и правило места
             w = self._w[field]                       # поле формы
             live = (not rule) or rule == zone        # поле открыто своим правилом места
             if isinstance(w, QtWidgets.QLineEdit):   # текст — только для чтения, но выделяется и копируется
