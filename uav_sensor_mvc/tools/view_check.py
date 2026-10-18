@@ -58,6 +58,14 @@ def radius_by_az(dst, vis):
     return np.where(n_ok >= len(dst), dst[-1], np.where(n_ok > 0, dst[np.maximum(n_ok - 1, 0)] + 0.5 * step, 0.5 * step))
 
 
+def visible_by_az(dst, vis):
+    """Видимая длина луча: до первой тени плюс острова за ней (R_факт с островами — его среднее, заказчик 18.10).
+    Вход: дальности (n,) км, видимость (A, n). Отдаёт: (A,) км; островов нет — как `radius_by_az`."""
+    step = float(dst[1] - dst[0]) if len(dst) > 1 else float(dst[0])   # шаг луча, км
+    isl = (vis & ~np.logical_and.accumulate(vis, axis=1)).sum(axis=1)   # отсчётов на островах
+    return radius_by_az(dst, vis) + isl * step
+
+
 def island_share(dst, vis):
     """Доля площади круга под островами (видно за тенью). Вход: дальности, видимость (A, n). Отдаёт: доля 0…1."""
     isl = vis & ~np.logical_and.accumulate(vis, axis=1)   # видно, но после тени — остров
@@ -102,6 +110,8 @@ def selftest():
     ob[0, int(np.argmin(np.abs(d - 0.3)))] = 20.0
     vis = visibility(0.0, g, ob, d, 0.0, 100.0)   # видимость по лучу
     cases.append(("остров за тенью: r = 1.5 км, остров не входит", float(radius_by_az(d, vis)[0]), 1.5, 0.06))
+    # 6) тот же луч с островами: снова виден с 6 км ((100·(D − 3) + 100)/D > 20/0.3) до конца луча 8 км — 1.5 + 2.0
+    cases.append(("с островами: видимая длина 1.5 + 2.0 = 3.5 км", float(visible_by_az(d, vis)[0]), 3.5, 0.1))
     has_isl = island_share(d, vis) > 0                 # остров действительно есть
     for name, got, want, tol in cases:                 # печать и счёт
         ok = abs(got - want) <= tol
@@ -171,7 +181,7 @@ def load_area():
 
 def place_radius(a, rc, R_km, step_km, hs, hu):
     """r(аз) и острова у места по данным участка. Вход: участок, (строка, столбец), R км, шаг км, высота глаза и БПЛА м.
-    Отдаёт: (r (72,) км, доля островов)."""
+    Отдаёт: (r до первой тени (72,) км, видимая длина с островами (72,) км, доля островов)."""
     Z, H, nr, nc = a["Z"], a["H"], a["Z"].shape[0], a["Z"].shape[1]   # рельеф, предметы, размер окна
     d = ray(R_km, step_km)   # дальности по лучу, км
     az = np.radians(AZ_DEG)   # азимуты, радианы
@@ -180,7 +190,7 @@ def place_radius(a, rc, R_km, step_km, hs, hu):
     # столбцы отсчётов
     ci = np.clip(np.floor(rc[1] + np.sin(az)[:, None] * d[None] / a["PX"]).astype(np.int64), 0, nc - 1)
     vis = visibility(Z[int(rc[0]), int(rc[1])], Z[ri, ci], H[ri, ci], d, hs, hu)   # видимость по 72 лучам
-    return radius_by_az(d, vis), island_share(d, vis)
+    return radius_by_az(d, vis), visible_by_az(d, vis), island_share(d, vis)
 
 
 def main(argv=None):
@@ -205,23 +215,24 @@ def main(argv=None):
             # место в км модели
             x, y = lonlat_to_km(np.array([ar.place[0]]), np.array([ar.place[1]]), a["m"].lon0, a["m"].lat0)
             # r по направлениям и доля островов
-            r, isl = place_radius(a, a["km_px"](np.c_[x, y])[0], ar.R, step, ar.hs, ar.hu)
-            print("место %.4f, %.4f · R %.1f км, глаз %.0f м, БПЛА %.0f м, шаг %.3f км: R_факт %.2f км (%.0f %% R); "
-                  "наименьший r %.2f км (аз %.0f°); без тени %d из 72; острова %.1f %% круга"
-                  % (ar.place[0], ar.place[1], ar.R, ar.hs, ar.hu, step, r.mean(), 100 * r.mean() / ar.R, r.min(),
-                     AZ_DEG[int(np.argmin(r))], int((r >= ar.R - 1e-9).sum()), 100 * isl))
+            r, rv, isl = place_radius(a, a["km_px"](np.c_[x, y])[0], ar.R, step, ar.hs, ar.hu)
+            print("место %.4f, %.4f · R %.1f км, глаз %.0f м, БПЛА %.0f м, шаг %.3f км: R_факт с островами %.2f км "
+                  "(%.0f %% R), до первой тени %.2f км; наименьший r %.2f км (аз %.0f°); без тени %d из 72; острова %.1f %% "
+                  "круга" % (ar.place[0], ar.place[1], ar.R, ar.hs, ar.hu, step, rv.mean(), 100 * rv.mean() / ar.R,
+                            r.mean(), r.min(), AZ_DEG[int(np.argmin(r))], int((r >= ar.R - 1e-9).sum()), 100 * isl))
             print("  r по направлениям через 30°: " + " · ".join("%.0f° %.2f" % (AZ_DEG[i], r[i]) for i in range(0, 72, 6)))
         if ar.mog:                                     # все места МОГ
-            rs, isls = [], []   # R_факт и доли островов по местам
+            rs, rvs, isls = [], [], []   # R_факт до первой тени, с островами и доли островов по местам
             for rc in a["km_px"](a["places"]):         # место за местом
-                r, isl = place_radius(a, rc, ar.R, step, ar.hs, ar.hu)
+                r, rv, isl = place_radius(a, rc, ar.R, step, ar.hs, ar.hu)
                 rs.append(r.mean())
+                rvs.append(rv.mean())
                 isls.append(isl)
-            rs, isls = np.array(rs), np.array(isls)
-            print("МОГ, %d мест · R %.1f км, глаз %.0f м, БПЛА %.0f м: R_факт медиана %.2f км (10-й…90-й перцентиль "
-                  "%.2f…%.2f); острова — медиана %.1f %%, наибольшее %.1f %% круга"
-                  % (len(rs), ar.R, ar.hs, ar.hu, np.median(rs), np.percentile(rs, 10), np.percentile(rs, 90),
-                     100 * np.median(isls), 100 * isls.max()))
+            rs, rvs, isls = np.array(rs), np.array(rvs), np.array(isls)
+            print("МОГ, %d мест · R %.1f км, глаз %.0f м, БПЛА %.0f м: R_факт с островами — медиана %.2f км (10-й…90-й "
+                  "перцентиль %.2f…%.2f), до первой тени — %.2f км; острова — медиана %.1f %%, наибольшее %.1f %% круга"
+                  % (len(rs), ar.R, ar.hs, ar.hu, np.median(rvs), np.percentile(rvs, 10), np.percentile(rvs, 90),
+                     np.median(rs), 100 * np.median(isls), 100 * isls.max()))
     print("%s · %.1f с" % ("ВСЁ СОШЛОСЬ" if bad == 0 else "РАСХОЖДЕНИЙ: %d" % bad, time.time() - t0))
     return 1 if bad else 0
 

@@ -17,8 +17,8 @@
 | | |
 |---|---|
 | файлов кода | 115 |
-| строк кода | 43389 ≈ 564 тыс. токенов |
-| строк карты | 1652 ≈ 14 тыс. токенов |
+| строк кода | 43404 ≈ 564 тыс. токенов |
+| строк карты | 1663 ≈ 14 тыс. токенов |
 | частей | 2 (порог деления — 1500 строк) |
 
 ## Модули: где искать
@@ -60,7 +60,8 @@
 | `tools/reference_run.py` | 339 | 4407 | 0 | 2 | [КАРТА_2.md](КАРТА_2.md) стр. **90** |
 | `tools/plot_run.py` | 332 | 4316 | 0 | 8 | [КАРТА_2.md](КАРТА_2.md) стр. **98** |
 | `src/model/placement/sensor_types.py` | 310 | 4030 | 3 | 15 | [КАРТА_2.md](КАРТА_2.md) стр. **114** |
-| `src/view_qt/tabs/area_view.py` | 301 | 3913 | 1 | 17 | [КАРТА_2.md](КАРТА_2.md) стр. **138** |
+| `tools/переносимое/check_names.py` | 301 | 3913 | 0 | 5 | [КАРТА_2.md](КАРТА_2.md) стр. **138** |
+| `src/view_qt/tabs/area_view.py` | 301 | 3913 | 1 | 17 | [КАРТА_2.md](КАРТА_2.md) стр. **149** |
 
 ## Мелкие модули — читаются целиком
 
@@ -68,7 +69,6 @@
 
 | Модуль | Строк | Что внутри |
 |---|---|---|
-| `tools/переносимое/check_names.py` | 297 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
 | `src/controller/controller.py` | 285 | `SimulationController`, `__init__`, `_make_timer`, `_toggles`, `_layers`, `on_apply`, `on_mode`, `on_traj`, `on_profile`, `on_law`, `on_speed`, `on_toggle`, … (27 всего) |
 | `src/view_qt/output/figures.py` | 283 | `_opts`, `_rc`, `_ticks`, `_color`, `_empty`, `draw_load`, `draw_sectors`, `_grid_ext`, `_weights`, `_background`, `draw_map` |
 | `tools/переносимое/check_dates.py` | 282 | `folder_log_name`, `_find_root`, `git_date`, `_top_mark`, `mark_in_commit`, `_key`, `docs`, `git_rows`, `write_folder_logs`, `main` |
@@ -77,7 +77,7 @@
 | `tools/переносимое/check_claims.py` | 266 | `_find_root`, `docs`, `paragraphs`, `selftest`, `main` |
 | `tools/placement_check.py` | 266 | `build_model`, `pair_stats`, `measure`, `print_table`, `exp_k`, `cross_rule_stats`, `exp_spread`, `exp_kmode`, `main` |
 | `src/model/placement/joint_greedy.py` | 243 | `_Cover`, `__init__`, `_Kind`, `__init__`, `phi`, `gains`, `cov_gains`, `note_bound`, `bound`, `top_gain`, `_primary_gain`, `_take`, … (14 всего) |
-| `tools/view_check.py` | 230 | `drop_m`, `visibility`, `radius_by_az`, `island_share`, `ray`, `selftest`, `load_area`, `place_radius`, `main` |
+| `tools/view_check.py` | 241 | `drop_m`, `visibility`, `radius_by_az`, `visible_by_az`, `island_share`, `ray`, `selftest`, `load_area`, `place_radius`, `main` |
 | `tools/tiles_check.py` | 229 | `check`, `_merc_lat_of_row`, `_mosaic_y`, `main` |
 | `src/view_qt/maps/map_vector.py` | 220 | `is_vector`, `svg_size`, `inspect_svg`, `describe_content`, `make_item`, `place_item`, `render_for_fit`, `measure_draw` |
 | `src/model/tabs12/simulation.py` | 217 | `SimulationModel`, `__init__`, `reset`, `_compute_view_bbox`, `set_traj_model`, `corridor_bbox`, `corridor_outline`, `view_bbox`, `sample_trajectory`, `_anchor_idx`, `frequent_paths`, `fan_paths`, … (15 всего) |
