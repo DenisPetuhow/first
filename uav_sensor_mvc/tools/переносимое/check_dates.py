@@ -209,7 +209,7 @@ def write_folder_logs():
             body.append("| — | — | правок в истории нет (папка новая) |")
         body.append("")
         io.open(os.path.join(ROOT, folder, folder_log_name(folder)), "w",
-                encoding="utf-8").write("\n".join(body))
+                encoding="utf-8", newline="\n").write("\n".join(body))   # LF: на Windows текстовый режим ставит CRLF
         made += 1
     print("пересобрано мини-журналов папок: %d" % made)
     return made

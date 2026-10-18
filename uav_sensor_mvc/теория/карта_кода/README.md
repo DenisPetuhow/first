@@ -16,8 +16,8 @@
 
 | | |
 |---|---|
-| файлов кода | 112 |
-| строк кода | 42755 ≈ 555 тыс. токенов |
+| файлов кода | 115 |
+| строк кода | 43389 ≈ 564 тыс. токенов |
 | строк карты | 1652 ≈ 14 тыс. токенов |
 | частей | 2 (порог деления — 1500 строк) |
 
@@ -68,7 +68,7 @@
 
 | Модуль | Строк | Что внутри |
 |---|---|---|
-| `tools/переносимое/check_names.py` | 287 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
+| `tools/переносимое/check_names.py` | 297 | `_find_root`, `collect_code_names`, `is_noise`, `docs`, `main` |
 | `src/controller/controller.py` | 285 | `SimulationController`, `__init__`, `_make_timer`, `_toggles`, `_layers`, `on_apply`, `on_mode`, `on_traj`, `on_profile`, `on_law`, `on_speed`, `on_toggle`, … (27 всего) |
 | `src/view_qt/output/figures.py` | 283 | `_opts`, `_rc`, `_ticks`, `_color`, `_empty`, `draw_load`, `draw_sectors`, `_grid_ext`, `_weights`, `_background`, `draw_map` |
 | `tools/переносимое/check_dates.py` | 282 | `folder_log_name`, `_find_root`, `git_date`, `_top_mark`, `mark_in_commit`, `_key`, `docs`, `git_rows`, `write_folder_logs`, `main` |
@@ -77,10 +77,12 @@
 | `tools/переносимое/check_claims.py` | 266 | `_find_root`, `docs`, `paragraphs`, `selftest`, `main` |
 | `tools/placement_check.py` | 266 | `build_model`, `pair_stats`, `measure`, `print_table`, `exp_k`, `cross_rule_stats`, `exp_spread`, `exp_kmode`, `main` |
 | `src/model/placement/joint_greedy.py` | 243 | `_Cover`, `__init__`, `_Kind`, `__init__`, `phi`, `gains`, `cov_gains`, `note_bound`, `bound`, `top_gain`, `_primary_gain`, `_take`, … (14 всего) |
+| `tools/view_check.py` | 230 | `drop_m`, `visibility`, `radius_by_az`, `island_share`, `ray`, `selftest`, `load_area`, `place_radius`, `main` |
 | `tools/tiles_check.py` | 229 | `check`, `_merc_lat_of_row`, `_mosaic_y`, `main` |
 | `src/view_qt/maps/map_vector.py` | 220 | `is_vector`, `svg_size`, `inspect_svg`, `describe_content`, `make_item`, `place_item`, `render_for_fit`, `measure_draw` |
 | `src/model/tabs12/simulation.py` | 217 | `SimulationModel`, `__init__`, `reset`, `_compute_view_bbox`, `set_traj_model`, `corridor_bbox`, `corridor_outline`, `view_bbox`, `sample_trajectory`, `_anchor_idx`, `frequent_paths`, `fan_paths`, … (15 всего) |
 | `tools/area_check.py` | 216 | `check`, `rejects`, `config_under`, `main` |
+| `tools/sector_check.py` | 213 | `r_min_km`, `min_radius`, `turns_per_100km`, `trimmed`, `crossings`, `lane_order`, `check_lines`, `arc`, `selftest`, `main` |
 | `tools/переносимое/check_dead_code.py` | 212 | `find_root`, `py_files`, `collect_defs`, `collect_uses`, `unused_functions`, `unused_config`, `main` |
 | `src/view_qt/windows/targets_window.py` | 211 | `TargetsDialog`, `__init__`, `refresh`, `_add_row`, `_edited`, `_clear`, `_with_row` |
 | `tools/metrics_check.py` | 207 | `check`, `main` |
@@ -91,6 +93,7 @@
 | `src/view_qt/windows/route_viewer.py` | 182 | `RouteViewerDialog`, `__init__`, `set_generalize_state`, `set_data`, `_current_source`, `_refresh_list`, `_show_route`, `_show_on_map`, `_reset_preview` |
 | `tools/area_bounds.py` | 181 | `_varint`, `_zigzag`, `_fields`, `pbf_bbox`, `raster_bounds`, `main` |
 | `src/model/placement/sensors.py` | 181 | `SensorSpec`, `active`, `name`, `ManualSensor`, `_num`, `sensor_types`, `_n_types`, `type_ids`, `active_small`, `min_small_radius`, `format_types_header` |
+| `tools/heights_files_check.py` | 179 | `need_box`, `tile_names`, `raster_set`, `probe`, `gba_set`, `main` |
 | `src/view_qt/windows/load_window.py` | 178 | `SensorLoadDialog`, `__init__`, `refresh`, `_fill_targets`, `_rows`, `_view`, `_show`, `_picked`, `closeEvent`, `_export` |
 | `src/view_qt/maps/measure_tool.py` | 176 | `format_time`, `MeasureTool`, `__init__`, `reset`, `add_point`, `move_to`, `status`, `total_km`, `_hours`, `_text`, `_label`, `_angle_deg`, … (14 всего) |
 | `src/view_qt/windows/sector_window.py` | 169 | `SectorDialog`, `__init__`, `_params_changed`, `_apply_params`, `set_state` |
@@ -113,8 +116,8 @@
 | `tools/build_threat_grid.py` | 100 | `main` |
 | `src/view_qt/windows/sim_conditions_window.py` | 100 | `SimConditionsDialog`, `__init__`, `_type_changed`, `set_state` |
 | `src/view_qt/common/ui_common.py` | 98 | `fill_target_combo`, `qcolor`, `apply_dark_theme`, `make_side_panel` |
+| `tools/check_all.py` | 93 | `last_line`, `run`, `main` |
 | `src/controller_qt/iter_worker.py` | 92 | `IterWorker`, `__init__`, `consumed`, `drawn`, `stop`, `_place`, `run` |
-| `tools/check_all.py` | 91 | `last_line`, `run`, `main` |
 | `src/model/placement/sensor_load.py` | 90 | `seen_matrix`, `load_rows`, `sort_rows`, `write_docx` |
 | `src/view_qt/output/analytics_open.py` | 84 | `type_colors`, `straighten_rows`, `basemap`, `own_map`, `view_box`, `open_figure` |
 | `src/model/tabs12/detection.py` | 80 | `_min_dist_point_to_sensors`, `n_detections`, `continuous_coverage`, `segment_coverage`, `utility`, `avg_utility` |

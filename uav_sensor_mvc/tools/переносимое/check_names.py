@@ -165,6 +165,16 @@ EXTERNAL = {
     "tzdata", "protobuf",
     "pyshp", "fiona", "geopandas", "fastkml", "ezdxf", "shapefile", "json",
     "cp1251", "d_min",          # кодировка и обозначение из формулы плана
+    # ПЛАН 16 (16.12, 16.5; 17.10.2026): классы pyqtgraph для «копии экрана» — чужой API, в коде появятся при
+    # исполнении; `curl` — программа скачивания плиток высот (план 16.5 §2), в коде её нет и быть не должно
+    "ImageExporter", "SVGExporter", "curl",
+    # ПЛАН 16 (17.10.2026, поздний вечер): имена будущих параметров `config.py` и полей типа средства — описание в
+    # ДОЛИ_И_КОНСТАНТЫ §8 и СТРУКТУРА_ПРОЕКТА §config.py; появятся при исполнении 16.x — тогда убрать отсюда
+    "threat_view_real", "threat_forest_canopy", "threat_scale_rule", "view_real", "eye_h_m", "areal",
+    "THREAT_VIEW_K_REFR", "THREAT_FOREST_CANOPY_M", "THREAT_FOREST_CELL_FRAC", "THREAT_FLOOR_H_M",
+    "THREAT_FLOOR_PAIRS_MIN", "THREAT_BUILD_MEDIAN_N", "THREAT_SECTOR_HALF_KM", "THREAT_SECTOR_MARGIN_AREA",
+    "THREAT_SECTOR_ROUTES", "THREAT_SECTOR_CELL_KM", "THREAT_SECTOR_LANE_STEP", "THREAT_SECTOR_LANE_CONVERGE",
+    "THREAT_SECTOR_TAUT_TOL", "THREAT_SCALE_RATIO",
 }
 # ВЕТКА demo-build / exe-build: этих имён в рабочей ветке нет намеренно — не расхождение.
 # ⚠️ `UAV_SELFTEST` из списка УБРАН 02.09.2026: режим перенесён в общий код

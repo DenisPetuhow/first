@@ -22,6 +22,8 @@ CHECKS = [
     ("gui_check", ["tools/gui_check.py"], "prog"),
     ("area_check", ["tools/area_check.py"], "prog"),
     ("tiles_check", ["tools/tiles_check.py"], "prog"),
+    ("view_check", ["tools/view_check.py"], "prog"),                 # эталон обзора — самопроверка, без данных
+    ("sector_check", ["tools/sector_check.py"], "prog"),             # меры маршрутов сектора — самопроверка
     ("reference_run", ["tools/reference_run.py"], "slow"),
     ("motion_check", ["tools/motion_check.py"], "slow"),
     ("codemap", [P + "codemap.py"], "docs"),                         # пересборка карты кода — до сверки с ней
