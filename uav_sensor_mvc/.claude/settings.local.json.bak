@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python \"C:\\\\Users\\\\17D3~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--1Petuhow-2Proger-5-Pyton-100----------------1--------uav-sensor-mvc-13-Work-uav-sensor-mvc\\\\666b58b8-16ed-4661-a08b-67c4fa4c82ff\\\\scratchpad\\\\recon9b.py\")",
+      "Bash(python tools/переносимое/check_dates.py)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python tools/переносимое/check_dates.py | Select-String -Pattern \"шапка\" -Context 1,0)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python tools/переносимое/codemap.py > $null; python tools/переносимое/check_names.py | Select-Object -Last 6)",
+      "PowerShell(Out-File *)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python \"C:\\\\Users\\\\17D3~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--1Petuhow-2Proger-5-Pyton-100----------------1--------uav-sensor-mvc-13-Work-uav-sensor-mvc\\\\666b58b8-16ed-4661-a08b-67c4fa4c82ff\\\\scratchpad\\\\reorg.py\" --apply 2>&1 | Select-Object -Last 12)"
+    ]
+  }
+}
