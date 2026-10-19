@@ -151,7 +151,8 @@ def cross_rule_stats(m, r1, r2):
     ⚠️ Нужно, чтобы отличить «правило не работает» от «правило не связывает»: если
     выбранные точки и так дальше порога, одинаковые числа при ВКЛ и ВЫКЛ — не поломка."""
     from config import THREAT_SPREAD_PAIR
-    thr = float(THREAT_SPREAD_PAIR) * (float(r1) + float(r2))   # порог разноса, км
+    from model.placement.joint_greedy import pair_sep
+    thr = pair_sep(float(THREAT_SPREAD_PAIR), float(r1), float(r2))   # порог разноса пары малых типов, км (16.1 — одна формула)
     S, T = np.asarray(m.sensors, float), np.asarray(m.sensors_type, int)
     first = S[T == 1] if (T == 1).any() else S[:0]              # позиции типа 1
     second = S[T == 2] if (T == 2).any() else S[:0]

@@ -542,6 +542,65 @@ def main(argv=None):
      p.threat_k_same, p.threat_spread_types, p.threat_type_order) = keep_j
     m.place_sensors()
 
+    # ---- 4л2. «степень покрытия» при средствах разного масштаба — вариант H (план 16.01, задача 16.1) ----
+    print("\n4л2. СТЕПЕНЬ ПОКРЫТИЯ РАЗНОГО МАСШТАБА — H (план 16.01, 16.1)")
+    from config import THREAT_COVER_ALL_W, THREAT_SPREAD_PAIR             # noqa: E402
+    from model.placement import joint_greedy as jg                          # noqa: E402
+    # СЛУЧАИ С ИЗВЕСТНЫМ ОТВЕТОМ — примеры 1 и 2 разбора (датчики/СТЕПЕНЬ_ПОКРЫТИЯ_РАЗНЫЙ_МАСШТАБ §4–§5): два
+    # маршрута по 10 участков, веса (0, 1) — считается одна степень покрытия; прирост × T·L — в участках
+    hit2 = np.ones((2, 2), np.uint8)                             # оба места засекают оба маршрута
+    no_n = np.zeros(2, np.int64)                                 # засечек пока нет
+    full = 0x3FF                                                 # все 10 участков маршрута, битами
+    seg1 = np.array([[0x30, 0], [0, 0x3]], np.uint32)            # M1 — участки 4–5 маршрута 0, M2 — 0–1 маршрута 1
+    post = np.array([full, 0], np.uint32)                        # пост накрыл маршрут 0, малых нет
+    h1 = 20 * jg._two_gain(hit2, seg1, no_n, post, np.zeros(2, np.uint32), 3, 10, 0.0, 1.0, False)   # H, участки
+    e1 = 20 * jg._two_gain(hit2, seg1, no_n, post, None, 3, 10, 0.0, 1.0, False)   # E — задача одна
+    check(np.allclose(h1, [1.0, 2.0]) and np.allclose(e1, [0.0, 2.0]),
+          "пример 1: МОГ у поста — ½·(0 + 2) = 1, вне поста — ½·(2 + 2) = 2",
+          "H %s · E %s" % (np.round(h1, 3).tolist(), np.round(e1, 3).tolist()))
+    seg2 = np.array([[full, 0], [0, full]], np.uint32)           # P1 — весь маршрут A (0), P2 — весь B (1)
+    small_a = np.array([full, 0], np.uint32)                     # маршрут A накрыт малыми
+    h2 = 20 * jg._two_gain(hit2, seg2, no_n, small_a, small_a, 3, 10, 0.0, 1.0, True)   # пост — площадное
+    check(np.allclose(h2, [0.0, 5.0]), "пример 2: пост поверх малых — 0, где малых нет — ½·10 = 5",
+          "H %s (у F было бы 10 и 10)" % np.round(h2, 3).tolist())
+    check(abs(jg.pair_sep(THREAT_SPREAD_PAIR, 1.0, 25.0, False, True) - 1.6) < 1e-12
+          and abs(jg.pair_sep(THREAT_SPREAD_PAIR, 1.0, 0.5) - 1.2) < 1e-12,
+          "разнос: «площадное — малое» — 0.8·2·R_малого, два малых — 0.8·(R₁ + R₂)",
+          "МОГ 1 км у поста 25 км — %.1f км (было 20.8)" % jg.pair_sep(THREAT_SPREAD_PAIR, 1.0, 25.0, False, True))
+    check(st.from_row({"номер": 7, "радиус_км": 25}).areal and not st.from_row({"номер": 7, "радиус_км": 5}).areal
+          and not st.from_row({"номер": 7, "радиус_км": 25, "площадное": "нет"}).areal,
+          "галки нет в записи — по радиусу R > 5 км, записанная — как записана", "25 км — да, 5 км — нет")
+    # ГРАНИЦА ПРИ H НЕ НИЖЕ НАСТОЯЩЕГО ОПТИМУМА — малая задача перебором: 8 мест малого типа, 4 площадного
+    cs = CoverageCache(cand_all[top[:8]], p.threat_R, p.L_seg, p.threat_k)        # малый тип
+    ca = CoverageCache(cand_all[top[::3]], 3.0 * p.threat_R, p.L_seg, p.threat_k)  # площадное — втрое шире
+    for r in few:                                                # строки кэшей на маршрут
+        cs.add_trajectory(r)
+        ca.add_trajectory(r)
+    args = ([cs, ca], [2, 1], w, [0.0, 0.0], [[], []])           # кэши, квоты, веса, разнос внутри типа, закреплённые
+    pk, bd = jg.joint_greedy(*args, areal=[False, True])         # две задачи — H
+    pk0, bd0 = jg.joint_greedy(*args)                            # галок не передано
+    pk1, bd1 = jg.joint_greedy(*args, areal=[False, False])      # галки сняты
+    check(pk0 == pk1 and bd0 == bd1, "галки сняты — проход тот же, что без галок", "выбрано %s" % pk0)
+    Hm = [np.asarray(c._hit, np.int64) for c in (cs, ca)]        # засечки типов: маршрут × место
+    Mm = [np.asarray(c._mask, np.uint32) for c in (cs, ca)]      # сегменты типов: маршрут × место
+
+    def f_h(i_s, i_a):
+        """F варианта H набора — независимо от `joint_greedy`. Вход: номера мест малого и площадного. Отдаёт: float."""
+        n = Hm[0][:, list(i_s)].sum(axis=1) + Hm[1][:, list(i_a)].sum(axis=1)   # засечек у маршрута
+        m_s = np.bitwise_or.reduce(Mm[0][:, list(i_s)], axis=1)  # сегменты малыми
+        m_all = m_s | np.bitwise_or.reduce(Mm[1][:, list(i_a)], axis=1)   # сегменты всеми
+        seg = THREAT_COVER_ALL_W * _popcount(m_all) + (1 - THREAT_COVER_ALL_W) * _popcount(m_s)   # две задачи
+        return float((w[0] * np.minimum(n, p.threat_k) / p.threat_k + w[1] * seg / p.L_seg).mean())
+
+    opt_h = max(f_h(i_s, (j,)) for i_s in combinations(range(8), 2) for j in range(4))   # оптимум перебором
+    b5 = bd[0]                                                   # при общем покрытии оценка одна на проход
+    check(abs(b5["F"] - f_h(pk[0], pk[1])) < 1e-9 and b5["F"] <= opt_h + 1e-9 and opt_h <= b5["UB"] + 1e-9,
+          "H: F прохода — та же функция; граница Минью не ниже настоящего оптимума",
+          "F %.4f ≤ OPT %.4f ≤ граница %.4f" % (b5["F"], opt_h, b5["UB"]))
+    whole = jg.whole_bound({1: bd[0], 5: bd[1]}, True)          # «в целом» при общем покрытии
+    check(whole is not None and abs(whole - b5["ratio"]) < 1e-12, "«в целом» при общем покрытии — оценка прохода",
+          "не хуже %.0f %% от лучшего" % (100 * (whole or 0.0)))
+
     # ---- 4м. ПВН у объектов защиты: этап целей (план 13, задача 13.18) ----
     print("\n4м. ПВН У ОБЪЕКТОВ ЗАЩИТЫ: ЭТАП ЦЕЛЕЙ (план 13, 13.18)")
     from model.placement import target_stage as tsg                        # noqa: E402

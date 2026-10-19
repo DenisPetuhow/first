@@ -3,7 +3,8 @@
 MODEL · Справочник типов датчиков (план 13, задача 13.1).
 
 Тип датчика — ПАСПОРТ: название, радиус, кратность, палитра показа, правило места
-установки, режим по умолчанию; у ПВН — ещё правила числа у объектов защиты (13.18).
+установки, режим по умолчанию, галка «площадное» (план 16.01, 16.1); у ПВН — ещё правила
+числа у объектов защиты (13.18).
 Число датчиков в паспорт не входит: «поставить 20 штук» — задание на расчёт, а не
 свойство типа (В13.2), оно живёт в `Params`.
 
@@ -27,7 +28,9 @@ import io
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from config import THREAT_AREAL_R_KM
 
 FILE_NAME = "типы_датчиков.json"   # имя справочника в папке участка
 ZONES = ("везде", "застройка", "дорога")   # правила места: «застройка» — карта ПВН (13.4), «дорога» — доезд МОГ (13.3)
@@ -64,6 +67,7 @@ class SensorType:
     tgt_k: int = 1                 # кратность защиты цели — критерий этапа целей
     bonus_height: float = 0.0      # бонус высоте крыши (13.7), доля от лучшего прироста первого шага
     bonus_city: float = 0.0        # бонус размеру пункта (13.7), та же доля
+    areal: bool = False            # «площадное» (16.1): его участки малым не в счёт — «степень покрытия» H
 
     KIND = "малый"                 # как класс записан в файле справочника
     SPEC_KIND = "small"            # как класс понимает расстановка (`SensorSpec.kind`)
@@ -142,6 +146,7 @@ _KEYS = (
     ("кратность_цели", "tgt_k", int),
     ("бонус_высоте", "bonus_height", float),
     ("бонус_крупному_пункту", "bonus_city", float),
+    ("площадное", "areal", bool),
 )
 # поле класса -> ключ файла; нужен тому, кто собирает запись по одному полю (окно типа, 13.3)
 KEY_BY_FIELD = dict([("type_id", "номер"), ("name", "название")] + [(f, k) for k, f, _ in _KEYS])
@@ -153,15 +158,23 @@ def defaults():
     """Встроенный справочник — с чего начинают, когда файла нет. Отдаёт: список типов.
     МОГ и ПВН — умолчания заказчика (21.09.2026), большой — нынешний тип 4."""
     # МОГ — доезд по дорогам, реки и болота ± 0.5 км (заказчик 29.09.2026, план 13.3); справочник участка — как записан
-    return [Small(type_id=1, name="МОГ", r_km=1.0, k=3, color="sensor", zone="дорога", wet_buf_km=0.5),
-            # бонус высоте 0.1 — наименьший, при котором ПВН на ≥ 2 этажах чаще 3 из 20 (замер 13.7: 3 → 5);
-            # бонус городу 0 — его цену выбирает заказчик (В13.23, план 13 §13.7.4)
-            Small(type_id=2, name="ПВН", r_km=0.5, k=4, color="sensor_t2",
-                  zone="застройка", zone_buf_km=0.5, strip_km=0.5, targets=True,
-                  bonus_height=0.1, bonus_city=0.0),
-            Big(type_id=BIG_ID, name="Большой", r_km=15.0, k=3, color="sensor_big",
-                static=True),
-            plain()]
+    types = [Small(type_id=1, name="МОГ", r_km=1.0, k=3, color="sensor", zone="дорога", wet_buf_km=0.5),
+             # бонус высоте 0.1 — наименьший, при котором ПВН на ≥ 2 этажах чаще 3 из 20 (замер 13.7: 3 → 5);
+             # бонус городу 0 — его цену выбирает заказчик (В13.23, план 13 §13.7.4)
+             Small(type_id=2, name="ПВН", r_km=0.5, k=4, color="sensor_t2",
+                   zone="застройка", zone_buf_km=0.5, strip_km=0.5, targets=True,
+                   bonus_height=0.1, bonus_city=0.0),
+             Big(type_id=BIG_ID, name="Большой", r_km=15.0, k=3, color="sensor_big",
+                 static=True),
+             plain()]                                # встроенные типы
+    # галка «площадное» — по тому же правилу, что у записи без неё (В16.01.2): «Большой» 15 км — да, прочие — нет
+    return [replace(t, areal=areal_by_radius(t.r_km)) for t in types]
+
+
+def areal_by_radius(r_km):
+    """Умолчание галки «площадное» (16.1, В16.01.2): R > THREAT_AREAL_R_KM. Вход: радиус паспорта, км. Отдаёт: bool.
+    ⚠️ у номеров 1–3 радиус расчёта — поле `Params`, а не паспорт: галку у них решает человек в окне типа."""
+    return float(r_km) > THREAT_AREAL_R_KM
 
 
 def plain(type_id=PLAIN_ID):
@@ -223,8 +236,11 @@ def from_row(row):
         cls = KINDS.get(str(row.get("класс", "")).strip(), Small)
     base = cls()                                     # умолчания класса — запасные значения
     name = _val(row, "название", base.name, str)
-    return cls(type_id=tid, name=name,
-               **{field: _val(row, key, getattr(base, field), kind) for key, field, kind in _KEYS})
+    vals = {field: _val(row, key, getattr(base, field), kind) for key, field, kind in _KEYS}   # поля паспорта
+    # справочник до 16.1 галки «площадное» не знает — она ставится по радиусу (В16.01.2), записанная — как записана
+    if KEY_BY_FIELD["areal"] not in row:
+        vals["areal"] = areal_by_radius(vals["r_km"])
+    return cls(type_id=tid, name=name, **vals)
 
 
 def _parse(rows):

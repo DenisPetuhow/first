@@ -1765,9 +1765,29 @@ def _clip_parts(parts, clip):
     участок, отбрасывается, а проходящая насквозь линия сохраняется куском внутри.
     Полностью внешние объекты исчезают — за этим и нужен клип."""
     x0, x1, y0, y1 = clip
-    return _cut_lines(parts,
+    return _cut_lines(_near_frame(parts, clip),
                       lambda P: (P[:, 0] >= x0) & (P[:, 0] <= x1) & (P[:, 1] >= y0) & (P[:, 1] <= y1),
                       lambda p_in, p_out: _edge_point(p_in, p_out, clip))
+
+
+def _near_frame(parts, clip):
+    """Линии, чей габарит задевает рамку, в прежнем порядке: у прочих ни одной вершины внутри — `_cut_lines` их и так
+    выбросит. Вход: линии (N, 2) км, рамка (x0, x1, y0, y1). Отдаёт: список. ⚠️ Разом по слою: у области-суммы
+    2.2 млн линий, поштучная маска стоила 12.4 с из 13 (замер 19.10.2026); итог — тот же до бита."""
+    x0, x1, y0, y1 = clip                            # края рамки, км
+    try:
+        lens = np.array([len(p) for p in parts], np.int64)   # точек в каждой линии
+        P = np.concatenate(parts).astype(np.float64)         # все точки слоя подряд, км
+    except (ValueError, TypeError):                  # формы разные или не массивы — без отбора, как раньше
+        return list(parts)
+    if P.ndim != 2 or P.shape[1] < 2 or not len(P):  # не точки (x, y) — без отбора
+        return list(parts)
+    ok = lens > 0                                    # пустые линии — reduceat на них не годится
+    start = (np.cumsum(lens) - lens)[ok]             # где начинается каждая непустая линия
+    near = np.zeros(len(parts), bool)                # линия задевает рамку
+    near[ok] = ((np.maximum.reduceat(P[:, 0], start) >= x0) & (np.minimum.reduceat(P[:, 0], start) <= x1) &
+                (np.maximum.reduceat(P[:, 1], start) >= y0) & (np.minimum.reduceat(P[:, 1], start) <= y1))
+    return [parts[i] for i in np.nonzero(near)[0]]
 
 
 def _cut_lines(parts, inside_of, edge):
@@ -3863,7 +3883,8 @@ class ThreatModel:
                                          [kd[1] for kd in kinds],
                                          pair=(THREAT_SPREAD_PAIR if spread else 0.0), joint=k_joint,
                                          rule=str(getattr(self.p, "threat_type_order", "gain")),
-                                         bonuses=[kd[3] for kd in kinds])
+                                         bonuses=[kd[3] for kd in kinds],
+                                         areal=[kd[0].areal for kd in kinds])   # галки «площадное» (16.1)
             short = [i for i in range(len(kinds))   # типы, не набравшие квоту при этом разносе
                      if len(picks[i]) < quotas[i] and seps[i] > sep_min[i]]   # недобравшие типы
             if not short:                            # все набрали квоту
@@ -4606,12 +4627,13 @@ class ThreatModel:
         """Зазор «от лучшего вообще» (план 13.1, Д4): у типа с картой места — граница Минью по его своей сетке БЕЗ
         карты, на итоговом наборе. Отдаёт: {номер: доля 0…1}. ⚠️ Дорого (ПВН `arh`: 17 682 кандидата, 6.9 с, 40 МБ) —
         только по запросу «Анализа»; кэш строится на время счёта, итог помнится до следующей расстановки."""
-        from model.placement.joint_greedy import top_gain
+        from model.placement.joint_greedy import top_gain, two_tasks
         from model.placement.optimization import CoverageCache
         from model.placement.sensors import sensor_types
         if getattr(self, "_gap_all", None) is not None:   # уже считали для этой расстановки
             return dict(self._gap_all)
         out = {}                                     # номер типа -> доля от лучшего вообще
+        self._gap_diff = {}                          # номер типа -> прибавка к границе без запрета мест — для «в целом»
         routes = self._sample_for_sensors()          # выборка, по которой стоят датчики
         bounds = getattr(self, "gap_bounds", {}) or {}   # оценки прохода: F, F0, UB
         specs = {s.type_id: s for s in sensor_types(self.p)}   # типы задания по номеру
@@ -4620,10 +4642,14 @@ class ThreatModel:
         weights = self._greedy_weights()             # веса жадного
         joint = bool(getattr(self.p, "threat_k_same", True))   # покрытие общее («одна на все типы»)
         tids = np.asarray(self._sensor_tids(), int)   # тип каждого датчика
+        # две задачи «степени покрытия» (16.1) — по тому же правилу, что в проходе: его типы — те, у кого есть оценка
+        two = two_tasks([specs[t].areal for t in bounds if t in specs], joint)
 
         def cover(ids):
-            """Покрытие набора S: засечки и сегменты. Вход: номера типов в наборе. Отдаёт: (n, mask)."""
+            """Покрытие набора S: засечки, сегменты всеми и малыми (16.1). Вход: номера типов в наборе.
+            Отдаёт: (n, mask, mask_s); mask_s — None, если задача одна."""
             n, mask = np.zeros(len(routes), np.int64), np.zeros(len(routes), np.uint32)   # засечки и сегменты маршрутов
+            mask_s = np.zeros(len(routes), np.uint32) if two else None   # сегменты, накрытые малыми
             for t in ids:                            # типы набора
                 pos = self.sensors[tids == t]        # датчики типа, км
                 if not len(pos) or t not in specs:   # типа нет в наборе
@@ -4632,30 +4658,49 @@ class ThreatModel:
                 for r in routes:                     # строка кэша на маршрут
                     c.add_trajectory(r)
                 n = n + np.asarray(c._hit, np.int64).sum(axis=1)
-                mask = mask | np.bitwise_or.reduce(np.asarray(c._mask, np.uint32), axis=1)   # сегменты под наблюдением
-            return n, mask
+                seg = np.bitwise_or.reduce(np.asarray(c._mask, np.uint32), axis=1)   # сегменты под наблюдением типа
+                mask = mask | seg
+                if two and not specs[t].areal:       # «наблюдать малыми» — только малые
+                    mask_s = mask_s | seg
+            return n, mask, mask_s
 
         for t, bd in bounds.items():                 # типы с оценкой зазора прохода
             spec = specs.get(t)                      # тип задания
             zone = self.allowed_mask(spec) if spec is not None else None   # карта места
             if not bd or zone is None:               # тип «везде» — величины совпадают
                 continue
-            n, mask = cover(sorted(set(tids.tolist())) if joint else [t])   # покрытие итогового набора
+            n, mask, mask_s = cover(sorted(set(tids.tolist())) if joint else [t])   # покрытие итогового набора
             extra = {}                               # лучшие приросты: на карте и без неё
             for key, z in (("zone", zone), ("all", np.ones_like(zone, bool))):   # на карте места и без неё
                 cand = self.type_candidates(spec, z)   # своя сетка типа — на карте или по всей зоне пролёта
                 cache = CoverageCache(cand, float(spec.r_km), self.p.L_seg, int(spec.k))   # кэш покрытия
                 for r in routes:                     # строка кэша на маршрут
                     cache.add_trajectory(r)
-                extra[key] = top_gain(cache, n, mask, weights, int(spec.n))
+                extra[key] = top_gain(cache, n, mask, weights, int(spec.n), mask_s, spec.areal)
                 del cache                            # кэш без карты — десятки МБ, не держать
             # ⚠️ граница прохода (минимум по шагам / общая) + разница лучших приростов «без карты − на карте» — не
             # ниже прежней: разрешённые места — часть всех
-            ub_all = float(bd["UB"]) + max(0.0, extra["all"] - extra["zone"])   # граница OPT без запрета мест
+            self._gap_diff[t] = max(0.0, extra["all"] - extra["zone"])
+            ub_all = float(bd["UB"]) + self._gap_diff[t]   # граница OPT без запрета мест
             room = ub_all - float(bd["F0"])          # сколько вообще можно было добавить
             out[t] = (float(bd["F"]) - float(bd["F0"])) / room if room > 1e-12 else 1.0
         self._gap_all = dict(out)
         return out
+
+    def gap_whole(self, all_places=False, gain=False):
+        """Зазор «в целом» по всем типам прохода (план 16.01, 16.1; В16.01.3). Вход: all_places — от лучшего вообще (зовёт
+        `gap_all`, дорого); gain — «от прироста»: что добавил жадный сверх закреплённых и ПВН у целей (20.10.2026).
+        Отдаёт: доля 0…1; расстановки не было или (при gain) закреплённых нет — None."""
+        from model.placement.joint_greedy import whole_bound
+        bounds = getattr(self, "gap_bounds", {}) or {}   # оценки прохода по типам: F, F0, FA, UB
+        # «от прироста», а закреплённых нет (FA = F0 у всех типов) → None: число равно «от всего», вторая строка не нужна
+        if gain and not any(b and float(b.get("FA", b["F0"])) > float(b["F0"]) + 1e-12 for b in bounds.values()):
+            return None
+        extra = None                                 # прибавки к границе без запрета мест
+        if all_places:                               # от лучшего вообще — прибавки всех типов с картой места
+            self.gap_all()
+            extra = getattr(self, "_gap_diff", None)
+        return whole_bound(bounds, bool(getattr(self.p, "threat_k_same", True)), extra, gain=gain)
 
     def allowed_parts(self, spec):
         """Слагаемые карты места типа по отдельности (план 13.1, Д3) — для показа в окне типа.

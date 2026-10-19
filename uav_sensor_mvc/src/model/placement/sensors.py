@@ -67,6 +67,11 @@ class SensorSpec:
         """Название типа: из паспорта; номера нет в справочнике — «Тип N». Отдаёт: строку."""
         return self.passport.name if self.passport is not None else "Тип %d" % self.type_id
 
+    @property
+    def areal(self):
+        """Галка «площадное» паспорта (план 16.01, 16.1); номера нет в справочнике — малое. Отдаёт: bool."""
+        return bool(getattr(self.passport, "areal", False))
+
 
 @dataclass
 class ManualSensor:

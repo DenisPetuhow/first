@@ -245,6 +245,9 @@ THREAT_COLORS = {
     # РАМКА РАЙОНА — ярко-красная (заказчик 30.09.2026: «не голубая, прям ярко-красная»); была THEME["accent"].
     # Ею же рисуется район, который тянут мышью (`area_draw_item`)
     "area_frame":  "#ff1a1a",
+    # ГДЕ ЕСТЬ ДАННЫЕ — белая линия (заказчик 19.10.2026) по тёмной подложке: на светлой карте одна белая теряется
+    "data_outline":      "#ffffff",     # self.data_outline_item
+    "data_outline_edge": "#1a1f26",     # подложка под ней, self.data_outline_shadow
     "zone_hatch":  (142, 14, 107, 190), # диагональная штриховка внутри, self.zone_hatch
     "zone_fill":   (142, 14, 107, 45),  # лёгкая подложка под штриховкой, self.zone_fill
     # Зона, которую рисуют ПРЯМО СЕЙЧАС. Раньше была #ffd166 — ровно цвет перекрёстков,
@@ -481,9 +484,11 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
     # `src/view_qt/windows/input_window.py`, вместе со своими подсказками и замерами; панель
     # теперь только управляет расчётом и показом.
 
-    def __init__(self, model_bbox_km, lon0, lat0, params, area_max_km=None, view_max_km=None):
+    def __init__(self, model_bbox_km, lon0, lat0, params, area_max_km=None, view_max_km=None, data_boxes_km=None):
         super().__init__()
         self.bbox_km = model_bbox_km
+        # ГДЕ ЕСТЬ ДАННЫЕ (19.10.2026): прямоугольники (x0, x1, y0, y1) км, их контур — белая линия; None — линии нет
+        self.data_boxes_km = [tuple(b) for b in (data_boxes_km or [])]
         # МАКСИМАЛЬНАЯ ОБЛАСТЬ РАСЧЁТА — чёрная рамка на карте. За ней нет ни векторных
         # данных, ни рельефа, поэтому район моделирования дальше неё не имеет смысла.
         # Не задана — совпадает с рамкой (так у прежних участков, где область и район одно).
@@ -3867,6 +3872,19 @@ class ThreatMapView(QtWidgets.QWidget, BasemapMixin):
         self.area_max_item.setZValue(-4.1)
         mx0, mx1, my0, my1 = self.area_max_km
         self.area_max_item.setData([mx0, mx1, mx1, mx0, mx0], [my0, my0, my1, my1, my0])
+        # БЕЛАЯ ЛИНИЯ — ГДЕ ВООБЩЕ ЕСТЬ РЕЛЬЕФ И ВЕКТОРЫ (заказчик 19.10.2026): у области-суммы данные шире чёрной
+        # рамки; контур объединения прямоугольников, внутренние стыки не рисуются (`geo_frame.boxes_outline`)
+        from model.threat.geo_frame import boxes_outline
+        ox, oy = boxes_outline(self.data_boxes_km)   # концы отрезков контура парами, км
+        self.data_outline_shadow = pg.PlotDataItem(ox, oy, connect="pairs",
+                                                   pen=pg.mkPen(_qcolor(THREAT_COLORS["data_outline_edge"], 170), width=4.5))
+        self.data_outline_item = pg.PlotDataItem(ox, oy, connect="pairs",
+                                                 pen=pg.mkPen(_qcolor(THREAT_COLORS["data_outline"], 255), width=2.2))
+        self.data_outline_shadow.setZValue(-4.3)
+        self.data_outline_item.setZValue(-4.2)       # под чёрной рамкой области (−4.1)
+        for it in (self.data_outline_shadow, self.data_outline_item):   # подложка и сама линия
+            # ⚠️ вне границ вида: линия уходит на сотни км за область и утянула бы «вписать всё»
+            self.pi.addItem(it, ignoreBounds=True)
 
         # РАМКА УЧАСТКА. Была тонкой и полупрозрачной (1.6 px, alpha 180) и на плотной
         # весовой карте терялась — граница района читалась как случайная линия слоя.

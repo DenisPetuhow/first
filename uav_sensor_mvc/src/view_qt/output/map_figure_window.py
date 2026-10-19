@@ -12,6 +12,7 @@ Word), по весовой сетке или как на карте програ
 """
 from PyQt5 import QtCore, QtWidgets
 
+from config import EXPORT_SCREEN_QUALITY, EXPORT_SCREEN_QUALITY_MAX
 from view_qt.output.figure_base import FigureDialog
 from view_qt.output.figures import MAP_DEFAULTS, MAP_PRESETS, draw_map
 
@@ -52,7 +53,8 @@ class MapFigureDialog(FigureDialog):
     COLORS = True                                    # цвета типов — как на карте или как в Word
 
     def __init__(self, parent, data, choices=None, colors=None, target=None, basemap=None, own_map=None,
-                 view_box=None):
+                 view_box=None, screen=None):
+        self._screen_fn = screen or (lambda: None)   # виджет карты программы — для копии экрана (16.12)
         super().__init__(parent, data, choices, colors, target)
         self._basemap_fn = basemap                   # сборка подложки по рамке
         self._own_map_fn = own_map or (lambda: None)   # своя карта вкладки
@@ -65,6 +67,17 @@ class MapFigureDialog(FigureDialog):
     def _build_settings(self):
         """Настройки рисунков 5–7: готовые виды, фон, веса, маршруты, средства, рамка. Отдаёт: ничего."""
         d = MAP_DEFAULTS                             # умолчания — рисунок 7 Word
+        # КОПИЯ ЭКРАНА (план 16.01, 16.12): то, что видно на карте программы, — её же средствами, а не рисунок ниже;
+        # качество — настройка (заказчик 19.10.2026: «база 1»), в перерисовку рисунка не входит
+        self._section("Копия экрана (как на карте программы)")
+        self.screen_q = self._spin_box(EXPORT_SCREEN_QUALITY, 1, EXPORT_SCREEN_QUALITY_MAX, 1, 0, " ×")   # качество
+        self.screen_q.setToolTip("×1 — точь-в-точь экран (с учётом масштаба Windows), ×2–×4 — крупнее для печати: "
+                                 "линии и подписи растут вместе с картинкой")
+        self.form.addRow("Качество:", self.screen_q)
+        for title, fmt in (("Копия экрана — PNG…", "png"), ("Копия экрана — SVG…", "svg")):   # кнопка на формат
+            b = QtWidgets.QPushButton(title)         # кнопка выгрузки
+            b.clicked.connect(lambda _c=False, f=fmt: self.save_screen(f))
+            self.form.addRow(b)
         self._section("Готовый вид")
         for name in MAP_PRESETS:                     # кнопка на каждый готовый вид
             b = QtWidgets.QPushButton(name)          # кнопка вида
@@ -102,6 +115,34 @@ class MapFigureDialog(FigureDialog):
                                             ("area", "весовая сетка района"), ("view", "как на карте сейчас")],
                         d["frame"])
         self._add_check("axes", "оси в километрах", d["axes"])
+
+    def save_screen(self, fmt, path=None):
+        """«Копия экрана — PNG / SVG»: то, что видно на карте программы (16.12). Вход: «png» | «svg», путь или None —
+        спросить. Отдаёт: путь записанного файла или None."""
+        import datetime
+        from view_qt.output import screen_export
+        w = self._screen_fn()                        # виджет карты программы
+        if w is None:                                # окно открыто не с карты — копировать нечего
+            self.lbl_info.setText("<b>Копия экрана: карта программы не передана</b>")
+            return None
+        if path is None:                             # путь не задан — окно выбора файла
+            name = "карта_экран_%s.%s" % (datetime.datetime.now().strftime("%Y%m%d_%H%M"), fmt)   # имя по умолчанию
+            path, _flt = QtWidgets.QFileDialog.getSaveFileName(self, "Копия экрана", name, "%s (*.%s)" % (fmt.upper(), fmt))
+            if not path:                             # человек передумал
+                return None
+        try:
+            if fmt == "png":                         # растр: физические пиксели × качество
+                got = screen_export.save_png(w, path, self.screen_q.value())   # (путь, ширина, высота) или None
+                if got is None:                      # Qt не записал файл
+                    raise OSError("файл не записан")
+                path, note = got[0], "%d × %d пикс., качество ×%d" % (got[1], got[2], self.screen_q.value())
+            else:                                    # вектор
+                path, note = screen_export.save_svg(w, path), "векторами"
+        except Exception as e:                       # не записалось — сказать, а не упасть
+            self.lbl_info.setText("<b>Копия экрана не записана: %s</b>" % e)
+            return None
+        self.lbl_info.setText("<b>Копия экрана записана: %s (%s)</b>" % (path, note))
+        return path
 
     def apply_preset(self, name):
         """Готовый вид: умолчания, поверх — вид; оформление (заголовок, шрифт, рамка) — как было. Вход: имя вида.

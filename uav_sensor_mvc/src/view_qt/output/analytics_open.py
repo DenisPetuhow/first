@@ -74,7 +74,8 @@ def open_figure(view, kind, target=None):
                   colors=type_colors)                # снимок, цели, цвета
         if kind == "map":                            # карте нужны ещё фон и рамка вида
             kw.update(basemap=lambda box, px: basemap(view, box, px), own_map=lambda: own_map(view),
-                      view_box=lambda: view_box(view))
+                      view_box=lambda: view_box(view),
+                      screen=lambda: view.plot)      # виджет карты — для копии экрана (16.12)
         cls = {"load": LoadChartDialog, "sector": SectorChartDialog, "map": MapFigureDialog}[kind]   # класс окна
         dlg = dlgs[kind] = cls(view, **kw)
     dlg.refresh(target)

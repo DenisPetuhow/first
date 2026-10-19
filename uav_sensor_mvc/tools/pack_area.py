@@ -89,14 +89,15 @@ def _part_path(folder, pbf):
 # ----------------------------------------------------------------------
 # Рельеф
 # ----------------------------------------------------------------------
-def merge_dem(folder, out_name):
-    # Сшить все .tif папки (и `_части/`) в один GeoTIFF. Вход: папка области, имя итога
-    # без расширения. Отдаёт: путь итога; сетки не совпадают — SystemExit с причиной.
+def merge_dem(folder, out_name, paths=None):
+    # Сшить все .tif папки (и `_части/`) в один GeoTIFF. Вход: папка области, имя итога без расширения, paths —
+    # свой список растров (сумма областей, `merge_areas.py`; первый главнее на перекрытии) или None — все .tif папки.
+    # Отдаёт: путь итога; сетки не совпадают — SystemExit с причиной.
     import rasterio
     from rasterio.transform import from_origin
 
     out = os.path.join(folder, out_name + ".tif")    # путь итогового растра
-    paths = [p for p in _files(folder, "*.tif")
+    paths = [p for p in (paths or _files(folder, "*.tif"))
              if os.path.basename(p).lower() != os.path.basename(out).lower()]   # итог сам с собой не сшиваем
     if len(paths) < 2:                               # меньше двух растров
         raise SystemExit("рельеф: в папке меньше двух .tif — сшивать нечего (%d)" % len(paths))

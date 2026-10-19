@@ -2475,6 +2475,36 @@ def main():
           "«Пакетно»: расстановка в фоне, главный поток только рисует",
           "маршрутов %d, датчиков %d, главный занят до %.2f с" % (len(m.iter_routes), len(m.sensors), _pe2))
 
+    print("\n28. ПЛАН 16.01, 16.12: КОПИЯ ЭКРАНА PNG / SVG, «КАЧЕСТВО ×» (19.10.2026)")
+    import tempfile                                                          # noqa: E402
+    import pyqtgraph as _pg                                                  # noqa: E402
+    from PyQt5 import QtGui as _QtGui                                        # noqa: E402
+    from view_qt.output import screen_export as _se                          # noqa: E402
+    _w = _pg.PlotWidget(background="w")                    # сцена с известным ответом: одна линия пера 2 пикс.
+    _w.hideAxis("left"); _w.hideAxis("bottom"); _w.resize(400, 300)
+    _ln = _pg.PlotCurveItem([0, 100], [50, 50], pen=_pg.mkPen((0, 0, 0), width=2))   # горизонтальная линия
+    _w.addItem(_ln); _w.setRange(xRange=(0, 100), yRange=(0, 100), padding=0); _w.show(); app.processEvents()
+
+    def _dark(img, x):
+        """Тёмных пикселей в столбце x картинки. Вход: QImage, столбец. Отдаёт: int."""
+        return sum(1 for y in range(img.height()) if _QtGui.QColor(img.pixel(x, y)).black() > 128)
+
+    _vp, _dpr = _w.viewport(), _w.viewport().devicePixelRatioF()   # область карты и разрешение экрана
+    _i1, _i2 = _se.render_image(_w, 1), _se.render_image(_w, 2)   # копия ×1 и ×2
+    check((_i1.width(), _i1.height()) == (round(_vp.width() * _dpr), round(_vp.height() * _dpr)),
+          "×1 — физические пиксели области карты", "%d × %d при разрешении %.2f" % (_i1.width(), _i1.height(), _dpr))
+    _t1, _t2 = _dark(_i1, _i1.width() // 10), _dark(_i2, _i2.width() // 10)   # толщина линии, пикс.
+    check(_i2.width() == 2 * _i1.width() and _t1 >= 1 and _t2 == 2 * _t1, "×2 — лист вдвое больше, линия вдвое толще",
+          "линия %d → %d пикс." % (_t1, _t2))
+    check(abs(_ln.opts["pen"].widthF() - 2.0) < 1e-9, "после выгрузки перья — как на экране",
+          "перо %.1f пикс." % _ln.opts["pen"].widthF())
+    _svg = _se.save_svg(_w, os.path.join(tempfile.gettempdir(), "uav_screen_check.svg"))   # векторная копия
+    _txt = open(_svg, encoding="utf-8").read()             # её текст
+    check("<polyline" in _txt or "<path" in _txt, "SVG — линии векторами", "%.1f КБ" % (len(_txt) / 1024))
+    _iv = _se.render_image(v.plot, 1)                      # копия карты вкладки
+    check((_iv.width(), _iv.height()) == (round(v.plot.viewport().width() * _dpr), round(v.plot.viewport().height() * _dpr)),
+          "копия карты вкладки — её область на экране", "%d × %d" % (_iv.width(), _iv.height()))
+
     print("\n" + LINE)
     if _fails:
         print("НЕ ПРОШЛО: %d — %s" % (len(_fails), "; ".join(_fails)))
@@ -2484,7 +2514,7 @@ def main():
          "полнота слоёв, район радиусом, окно сектора, точки старта, справочник "
          "типов БПЛА, условия моделирования, таблица точек входа, широкая карта, "
          "объекты защиты, анализ по целям, анализ размещения по режимам, окна «Датчики» и "
-         "«Тип датчика», район защиты цели в лесу, «Применить» без расстановки — в норме.")
+         "«Тип датчика», район защиты цели в лесу, «Применить» без расстановки, копия экрана — в норме.")
     return 0
 
 

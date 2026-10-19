@@ -321,11 +321,14 @@ def main():
     # Синяя рамка (район моделирования) появится, когда район зададут (план 8, задача 8.2).
     from model.threat.geo_frame import bbox_lonlat_to_km as _bb2km
     from config import THREAT_BBOX_LONLAT as _AREA_BBOX, THREAT_VIEW_LONLAT as _VIEW_BBOX
+    from config import THREAT_DATA_BOXES as _DATA_BOXES
     # view_max_km — рамка ПОКАЗА (план 12, 12.1): докуда видно подложку. Шире чёрной рамки,
     # если в `область.txt` задан ключ «карта»; иначе совпадает с ней, и всё как прежде.
+    # data_boxes_km — где есть рельеф и векторы (ключ «данные», 19.10.2026): белая линия; нет ключа — нет линии
     v3 = ThreatMapView(m3.bbox_km, m3.lon0, m3.lat0, p3,
                        area_max_km=_bb2km(_AREA_BBOX, m3.lon0, m3.lat0),
-                       view_max_km=_bb2km(_VIEW_BBOX, m3.lon0, m3.lat0))
+                       view_max_km=_bb2km(_VIEW_BBOX, m3.lon0, m3.lat0),
+                       data_boxes_km=[_bb2km(b, m3.lon0, m3.lat0) for b in _DATA_BOXES])
     c3 = ThreatController(m3, v3)
 
     tabs = QtWidgets.QTabWidget()
